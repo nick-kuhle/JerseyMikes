@@ -1,0 +1,31 @@
+# build artifacts
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/node_modules/
+bot/target/
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+node_modules/
+
+# runtime state
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+frontend/tsconfig.tsbuildinfo
+next-env.d.ts
