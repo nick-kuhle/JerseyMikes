@@ -38,8 +38,15 @@ The dashboard works before the bot does: if the API is unreachable it renders
 generated data behind a **DEMO DATA** badge so you can see the shape of
 everything first.
 
-Requirements: Rust 1.79+, [Foundry](https://getfoundry.sh) (`anvil` is the
-simulation engine), Node 20+, and an archive-capable mainnet RPC.
+Requirements (install walkthrough + troubleshooting in
+[`docs/SETUP.md`](docs/SETUP.md)):
+
+| Tool | Version | Why |
+| --- | --- | --- |
+| **Rust** | 1.79+ | searcher, simulator and API (`bot/`) |
+| **[Foundry](https://getfoundry.sh)** | latest | contracts build/tests; `anvil` is the simulation engine |
+| **Node.js** | 20+ | the console (`frontend/`) |
+| Ethereum RPC | archive-capable, mainnet | live + historical state |
 
 ---
 
@@ -163,6 +170,7 @@ to measure what is reachable, not to be profitable. See
 
 | Document | Contents |
 | --- | --- |
+| [`docs/SETUP.md`](docs/SETUP.md) | Install walkthrough for all three toolchains, `.env`, `make doctor`, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Wiring, data flow, repo layout, how to add a chain |
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
 | [`docs/RISK.md`](docs/RISK.md) | Why nothing can be broadcast, every guard, known limitations |
