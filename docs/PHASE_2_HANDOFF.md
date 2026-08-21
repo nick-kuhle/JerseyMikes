@@ -1,44 +1,49 @@
 # Phase 2 — Engineering Work Order
 
 **Audience:** the dev teams picking up Phase 2 of JerseyMikes.
-**Status of this document:** it is the single source of truth for Phase 2. It
-replaces and consolidates the previous `PHASE_2_DESIGN.md`, `PHASE_2_REVIEW.md`
-and `MAINTAINING.md` (all three deleted; recoverable from git history at commit
-`e62bbc2` if you need the originals).
-**Scope:** everything below is simulation-only work. Nothing in Phase 2 touches
-the live-execution path.
+**What this is:** the consolidation of the former `PHASE_2_DESIGN.md` (the
+engineering spec) and `PHASE_2_REVIEW.md` (the maintainer review of that spec)
+into one actionable work order, reconciled against the actual state of the
+checkout. Both source files are deleted; they are recoverable from git history
+at commit `e62bbc2`.
+**Lifecycle:** this document is **temporary**. Delete it when the Definition of
+Done in §3 is met — see §4, *Retiring this document*.
+**Companion:** [`MAINTAINING.md`](MAINTAINING.md) is the permanent guide to how
+this codebase thinks. It is not superseded by this document and does not get
+deleted. Read its §1 (Mindset), §3 (Common Change Patterns) and §5 (Footguns)
+before writing code; this work order references specific sections rather than
+restating them.
+**Scope:** everything below is simulation-only. Nothing in Phase 2 touches the
+live-execution path.
 
 ---
 
-## 0. Read this first (10 minutes)
+## 0. The three rules for this phase
 
-Three things about this codebase that will save you a week each.
-
-**The bot is a measurement instrument, not a money printer.** Every gate in the
-pipeline is deliberately conservative. "Few opportunities" is the designed
-steady state, not a bug. If the funnel reads all zeros, the fix is almost never
-to lower `MIN_NET_PROFIT_WEI` — it is that the mempool feed is quiet, the pool
-cache is empty, or the RPC does not support `eth_getRawTransactionByHash`.
-Loosening a gate just produces more simulations that revert.
+Longer versions of the first two are in `MAINTAINING.md` §1.
 
 **Measure before you expand.** Phase 2 has one hard ordering rule: the funnel
-must be correct and read for a full week before any new strategy surface is
-added. Every workstream below is instrumented so its effect on the funnel is
+must be *correct* (W1) and read for a full week before any new strategy surface
+is added. Every workstream below is instrumented so its effect on the funnel is
 observable. "The simulation tape looks busier" is a feeling; "multi-leg arb
 added 12 candidates/block that pass risk" is data.
 
-**Nothing broadcasts.** `live_execution` is a two-key switch and stays off for
-all of Phase 2. Phase 1 (replay validation, competition modelling, latency
-budget) is the prerequisite for going live and is explicitly *not* in scope
-here. Do not touch `LIVE_EXECUTION`, `BRIBE_BPS`, or the profit guard in
-`MevExecutor.sol` as part of this work.
+**Don't loosen gates to chase opportunities.** Few opportunities is the designed
+steady state. If the funnel reads zero, the cause is almost never
+`MIN_NET_PROFIT_WEI` — it is a quiet mempool feed, an empty pool cache, or an
+RPC that doesn't support `eth_getRawTransactionByHash`.
+
+**Nothing broadcasts.** `live_execution` stays off for all of Phase 2. Phase 1
+(replay validation, competition modelling, latency budget) is the prerequisite
+for going live and is explicitly *not* in scope here. Do not touch
+`LIVE_EXECUTION`, `BRIBE_BPS`, or the profit guard in `MevExecutor.sol`.
 
 ---
 
 ## 1. Verified current state
 
-This section was checked against the checkout at `e62bbc2`, not against the
-prior design docs. Treat it as ground truth.
+Checked against the checkout at `e62bbc2`, not against the two source documents
+— several of their claims were stale. Treat this table as ground truth.
 
 | Area | State | Evidence |
 | --- | --- | --- |
@@ -54,9 +59,15 @@ prior design docs. Treat it as ground truth.
 | Rust build/test verification | **Never run** | no Rust toolchain in the authoring environment; 51 `#[test]`/`#[tokio::test]` blocks exist but have not been executed |
 | CI | **Written, not enabled** | `ci/github-actions-ci.yml` is parked outside `.github/workflows/` |
 
-The single most important line in that table is the second-to-last one: **the
-Rust in this repo has never been compiled or tested by CI.** W0 exists because
-of it, and it blocks everything else.
+Two corrections to the source documents worth calling out, because they change
+the plan:
+
+- The design doc presented the funnel counter and pool discovery as work to be
+  done. Both are already merged. The review caught this; the work that remains
+  on them is *correctness*, not construction (W1, W2).
+- **The Rust in this repo has never been compiled or tested by CI.** Neither
+  source document stated this plainly. W0 exists because of it and blocks
+  everything else.
 
 ---
 
@@ -74,20 +85,37 @@ of it, and it blocks everything else.
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
+This ordering is the review's recommended sequence, made concrete: measure
+first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
+last. It matches `MAINTAINING.md` §7.
+
 **Explicitly out of scope for Phase 2.** 1inch v6 and 0x v2 decoders (revisit
-after W6 produces data); Curve/Balancer/Maverick pool math; Compound/Morpho/Maker
-liquidations; MEV-Share backrun bidding; any new chain; anything in Phase 1 or
-Phase 3 of `ROADMAP.md`. If a ticket starts growing toward one of these, stop
-and re-scope.
+after W6 produces data); Curve/Balancer/Maverick pool math;
+Compound/Morpho/Maker liquidations; MEV-Share backrun bidding; any new chain;
+anything in Phase 1 or Phase 3 of `ROADMAP.md`. If a ticket starts growing
+toward one of these, stop and re-scope.
+
+**Footguns by ticket.** Rather than restate `MAINTAINING.md` §5, here is the
+mapping — read the referenced section before starting the ticket:
+
+| Ticket | Read first |
+| --- | --- |
+| W1 | §3.3 step 6 (funnel integration is not optional) |
+| W2, W3 | §3.1 (read pools from chain, don't add constants) |
+| W4 | §2 (`v2_amount_out` rounding, `ternary_search_max` unimodality), §5 (no `f64` in arb sizing) |
+| W5 | §2 (`optimal_sandwich_in`'s victim-revert check), §5 (`sol!` selectors, `eth_call` revert reasons) |
+| W6 | §5 (`sol!` selector verification) |
+| any new strategy variant | §3.3 (the full six-step checklist) |
 
 ---
 
 ## W0 — Make the build verifiable
 
 **Why first.** No one has ever run `cargo check` on this crate. Every other
-workstream's "acceptance criteria" is meaningless until a compiler has an
-opinion. Budget for the possibility that the existing code does not compile
-cleanly on first contact.
+workstream's acceptance criteria is meaningless until a compiler has an opinion.
+Budget for the possibility that the existing code does not compile cleanly on
+first contact. This is the review's recommended next step #1, promoted to a
+blocking ticket.
 
 **Tasks**
 
@@ -102,31 +130,31 @@ cleanly on first contact.
    `bot` (`cargo clippy --all-targets`, `cargo test --all`),
    `frontend` (`tsc --noEmit`, `next build`).
 3. Locally: `make bot-check`, `make bot-test`, `make contracts`, `make front-build`.
-4. Fix whatever breaks. Compile errors and clippy findings get fixed in this
-   workstream, not deferred. Behaviour changes beyond the minimum needed to
-   compile go in a separate PR.
+4. Fix whatever breaks. Compile errors and clippy findings get fixed here, not
+   deferred. Behaviour changes beyond the minimum needed to compile go in a
+   separate PR.
 5. Update `docs/BUILD_NOTES.md` to record what CI now verifies.
 
 **Acceptance criteria**
 
-- CI is green on `arena/01a023c1-jerseymikes` and required on PRs to `main`.
+- CI is green on the working branch and required on PRs to `main`.
 - `cargo test --all` passes with all 51 existing tests running (not skipped).
 - `cargo clippy --all-targets` has zero warnings, or documented `#[allow]`s with
   a reason comment.
 - `docs/BUILD_NOTES.md` no longer claims anything is unverified that CI now
   verifies.
 
-**Non-goals.** Do not add an end-to-end integration test here. It needs a
-deterministic mainnet state fixture and is a research project of its own; it is
-a known, accepted gap.
+**Non-goals.** No end-to-end integration test here. It needs a deterministic
+mainnet state fixture and is a research project of its own; it is a known,
+accepted gap (`MAINTAINING.md` §4).
 
 ---
 
 ## W1 — Fix the funnel's semantics
 
-**The defect.** `engine.rs:295-303` and `engine.rs:329-337` bump
-`candidates_emitted` / `candidates_skipped` **once per strategy invocation**,
-not once per `Opportunity`:
+**The defect** (raised in the review, located here). `engine.rs:295-303` and
+`engine.rs:329-337` bump `candidates_emitted` / `candidates_skipped` **once per
+strategy invocation**, not once per `Opportunity`:
 
 ```rust
 let opps = strat.on_block(&this.ctx, &head).await;
@@ -138,7 +166,7 @@ this.stats.record_funnel(kind, |f| {
 A block that yields 30 candidates and a block that yields 1 are indistinguishable.
 Downstream counters (`gated_by_risk`, `simulations_*`, `submittable`) *are*
 per-opportunity, so the funnel silently mixes two units and the dashboard's
-implied "conversion rate" between the first stage and the rest is wrong. This
+implied conversion rate between the first stage and the rest is wrong. This
 matters now because W4 and W5 are judged by their effect on candidate volume,
 and the current counter cannot see volume.
 
@@ -170,18 +198,16 @@ and the current counter cannot see volume.
   `invocations_with_output` by 1.
 - A strategy returning 0 bumps `invocations_empty` by 1 and leaves
   `candidates_emitted` at 0.
-- Snapshot serialises both units for a strategy that has never been recorded
-  (empty map must not panic — existing `funnel_starts_empty` covers this).
-- Global atomics (`opportunities`, `simulations`, …) remain independent of the
-  funnel (existing regression test).
+- Snapshot serialises both units for a strategy never recorded (empty map must
+  not panic — existing `funnel_starts_empty` covers this).
+- Global atomics remain independent of the funnel (existing regression test).
 
 **Acceptance criteria**
 
 - `/api/funnel` returns both units, with `candidates_emitted ≥
   invocations_with_output` for every strategy under load.
 - The dashboard labels each row with its unit.
-- Documented in `docs/STRATEGIES.md` so operators reading the funnel know what
-  they are looking at.
+- Documented in `docs/STRATEGIES.md` so operators know what they are reading.
 
 ---
 
@@ -191,8 +217,8 @@ and the current counter cannot see volume.
 inserts into `seen` *after* a successful fetch that passes the filters, so a
 transient `fetch_v2_pool` failure or a rate-limited provider does not
 permanently blacklist a pool. That invariant is load-bearing during provider
-rate limiting and reorg recovery. **Do not "optimise" it by marking seen
-early.** It currently has no test.
+rate limiting and reorg recovery, and it is exactly what the review flagged.
+**Do not "optimise" it by marking seen early.** It currently has no test.
 
 **Tasks**
 
@@ -206,17 +232,18 @@ early.** It currently has no test.
    - duplicate `PairCreated` logs for the same pair load the pool once;
    - a non-WETH pair and a sub-`MIN_WETH_RESERVE` (0.5 WETH) pair are both
      rejected and, per the invariant above, are *not* inserted into `seen`.
-2. **Reorg behaviour.** `last_log_block` moves forward monotonically, so a reorg
-   that rewinds the head silently skips the re-org'd range. Either re-scan a
-   small overlap window (simplest: `from = last.saturating_sub(REORG_DEPTH) + 1`
-   with `REORG_DEPTH = 12`) or document why the gap is acceptable. Duplicate
-   logs are already harmless once the dedup test above passes.
-3. **Extract shared log decoding.** `scan_pair_created` in `strategies/mod.rs:283`
+2. **Reorg behaviour.** Not raised in either source doc. `last_log_block` moves
+   forward monotonically, so a reorg that rewinds the head silently skips the
+   re-org'd range. Either re-scan a small overlap window (simplest:
+   `from = last.saturating_sub(REORG_DEPTH) + 1` with `REORG_DEPTH = 12`) or
+   document why the gap is acceptable. Duplicate logs are already harmless once
+   the dedup test above passes.
+3. **Extract shared log decoding.** `scan_pair_created` (`strategies/mod.rs:283`)
    hardcodes the two V2 factories and the `PairCreated` topic, and
    `strategies/sniper.rs` does its own scan. Pull out a generic
    `scan_factory_logs(rpc, addresses, topic, from, to) -> Vec<Log>` plus
-   per-event decoders, so W3 can add `PoolCreated` without copy-paste. Do this
-   **before** W3, not during it.
+   per-event decoders, so W3 can add `PoolCreated` without copy-paste. The
+   review is explicit that this happens **before** W3, not during it.
 4. **Bound the window.** A cold start with a stale `last_log_block`, or a long
    RPC outage, can request thousands of blocks in one `eth_getLogs` and get
    rejected by the provider. Cap the span (suggest 500 blocks/scan, catching up
@@ -238,13 +265,14 @@ early.** It currently has no test.
 (`strategies/mod.rs:90`) stores `V2Pool`, whose `reserve0`/`reserve1` model is
 meaningless for concentrated liquidity. Inserting a V3 pool into it would make
 `v2_amount_out` produce plausible-looking, wrong quotes that every downstream
-gate would accept. This is the most dangerous available mistake in Phase 2.
+gate would accept. The review calls this out as unsafe; it is the most dangerous
+available mistake in Phase 2.
 
 **Tasks**
 
 1. Add `V3Pool { address, token0, token1, fee, tick_spacing, block }` to `dex.rs`
-   (state — `slot0`, `liquidity` — is read on demand via the existing
-   `jit.rs` pool-state helper; do not cache mutable V3 state).
+   (mutable state — `slot0`, `liquidity` — is read on demand via the existing
+   `jit.rs` pool-state helper; do not cache it).
 2. Add a separate `V3PoolCache` alongside `PoolCache`. Same `insert`/`get`/`all`
    shape, no shared storage.
 3. Scan `PoolCreated(address,address,uint24,address)` from
@@ -253,8 +281,8 @@ gate would accept. This is the most dangerous available mistake in Phase 2.
    `PairCreated`: `token0`, `token1` and `fee` are indexed topics; `tickSpacing`
    and `pool` are in `data`. Getting this wrong yields garbage addresses that
    look valid.
-4. Filter to WETH-quoted pools and to the fee tiers we can act on (500 / 3000 /
-   10000). Skip 100 unless someone shows a reason.
+4. Filter to WETH-quoted pools and to actionable fee tiers (500 / 3000 / 10000).
+   Skip 100 unless someone shows a reason.
 5. Gate behind the existing `POOL_DISCOVERY` toggle plus a new
    `POOL_DISCOVERY_V3` (default **off** until W5 can consume it) in
    `config.rs::Config::from_env` and `.env.example`.
@@ -262,7 +290,7 @@ gate would accept. This is the most dangerous available mistake in Phase 2.
 **Tests**
 
 - `PoolCreated` topic/data decoding against a captured mainnet log fixture
-  (checked in as a JSON fixture — no network).
+  (checked in as JSON — no network).
 - A `PairCreated` log fed to the V3 decoder is rejected, and vice versa.
 - V3 pools never appear in `PoolCache::all()`.
 
@@ -284,15 +312,16 @@ search over 50 discovered pools is the point.
 
 ### Algorithm — direct cycle enumeration, not Bellman–Ford
 
-This is a decided question; do not relitigate it in review. A textbook
-Bellman–Ford over the log-rate graph produces false positives: edge weights are
-logs of exchange rates, and a coarse fixed-point `log_e` reports edges with
-coincidentally equal bit-lengths as relaxable, surfacing cycles that do not
-exist on chain. Doing it correctly needs a high-precision `log_e` table plus a
-Newton iteration on input size — a research-grade port, not a PR. Direct
-enumeration is correct by construction because every leg is priced with the same
-`dex::v2_amount_out` that the existing tests pin against Solidity. The cost is
-more candidates, which is why the budgets below are mandatory.
+Decided in the design doc, endorsed by the review as the auditable choice. Do
+not relitigate it in code review. A textbook Bellman–Ford over the log-rate
+graph produces false positives: edge weights are logs of exchange rates, and a
+coarse fixed-point `log_e` reports edges with coincidentally equal bit-lengths
+as relaxable, surfacing cycles that do not exist on chain. Doing it correctly
+needs a high-precision `log_e` table plus a Newton iteration on input size — a
+research-grade port, not a PR. Direct enumeration is correct by construction
+because every leg is priced with the same `dex::v2_amount_out` the existing
+tests pin against Solidity. The cost is more candidates, which is why the
+budgets below are mandatory.
 
 ### Implementation
 
@@ -310,18 +339,20 @@ New file `bot/crates/mev-bot/src/dex/graph.rs`:
    reachable from different anchors and by different walks.
 5. Size each cycle with the existing `dex::ternary_search_max` over
    `cycle.evaluate(...) - x`. The composed constant-product profit curve is
-   unimodal with positive fees, which is exactly what that search assumes.
-6. Build calls by reusing `strategies::sandwich::build_leg` per leg: transfer in,
-   call `swap`, output lands at the next pool. Capital is a zero-fee Balancer
-   flash loan, as today.
+   unimodal with positive fees, which is what that search assumes
+   (`MAINTAINING.md` §2).
+6. Build calls by reusing `strategies::sandwich::build_leg` per leg: transfer
+   in, call `swap`, output lands at the next pool. Capital is a zero-fee
+   Balancer flash loan, as today.
 7. Replace the pair-pair double loop in `arb.rs::on_block` (`arb.rs:48-62`).
    **Leave `on_pending`'s back-run path intact** — it operates on post-victim
    state and is a different search.
 
 ### Mandatory budgets
 
-The old design said "3–5 legs" with no numbers. These are the numbers; they are
-acceptance criteria, not suggestions.
+The design doc said "3–5 legs" with no numbers and the review refused it on
+exactly that basis. These are the numbers; they are acceptance criteria, not
+suggestions.
 
 | Budget | Value | Enforcement |
 | --- | --- | --- |
@@ -338,14 +369,14 @@ is intended.
 
 ### Tests
 
-Unit tests in `graph.rs` for: empty input; identical pools; diverged pools
-(a real triangle that must be found); 3-leg triangle profit matches a
-hand-computed `v2_amount_out` chain; dust pool dropped; cycle closes to the
-start token; dedup across anchors; depth never exceeds `MAX_CYCLE_LEN`; the
-time budget cancels cleanly and returns the best-so-far.
+Unit tests in `graph.rs` for: empty input; identical pools; diverged pools (a
+real triangle that must be found); 3-leg triangle profit matches a hand-computed
+`v2_amount_out` chain; dust pool dropped; cycle closes to the start token; dedup
+across anchors; depth never exceeds `MAX_CYCLE_LEN`; the time budget cancels
+cleanly and returns best-so-far.
 
 A criterion bench (or a plain timed test) on a synthetic 200-pool graph proving
-the 25 ms budget holds. Ship the number in the PR description.
+the 25 ms budget holds. Put the number in the PR description.
 
 ### Acceptance criteria
 
@@ -353,35 +384,33 @@ the 25 ms budget holds. Ship the number in the PR description.
 - `arb.rs::on_block` produces a superset of today's 2-leg results on the same
   pool set — add a test with two pools where the multi-leg path must find the
   same cycle the old loop found.
-- Funnel shows the change: report `candidates_emitted` per block before and
-  after on the same feed. If it does not move, say so — that is a valid result.
+- Funnel delta reported: `candidates_emitted` per block before and after on the
+  same feed. If it does not move, say so — that is a valid result.
 
 ---
 
 ## W5 — V3 sandwich via QuoterV2
 
 **Gate: after W1 and W3.** Ship behind a config toggle (`STRATEGY_SANDWICH_V3`,
-default off).
+default off), as the review requires.
 
 ### Sizing — QuoterV2, not hand-rolled Q64.96
 
-Also a decided question. `TickMath.getSqrtRatioAtTick` and
+Also decided and endorsed. `TickMath.getSqrtRatioAtTick` and
 `SqrtPriceMath.getNextSqrtPriceFromAmount0RoundingUp` need `mulDiv` over 512-bit
-intermediates, which `alloy-primitives` does not give us, and a subtly wrong
+intermediates, which `alloy-primitives` does not provide, and a subtly wrong
 port yields silently wrong quotes that a same-author unit test will happily
 assert. `dex::quote_v3` (`dex.rs:459`) already calls
-`QuoterV2.quoteExactInputSingle` via `eth_call` against
-`known::UNIV3_QUOTER_V2` and returns the exact integer output. One extra RPC
-round-trip per candidate, correct by construction, consistent with how JIT
-already works.
+`QuoterV2.quoteExactInputSingle` via `eth_call` against `known::UNIV3_QUOTER_V2`
+and returns the exact integer output. One extra RPC round-trip per candidate,
+correct by construction, consistent with how JIT already works.
 
 ### Implementation
 
 1. Decode the victim: reuse `jit::decode_v3_swap` (`jit.rs:190`) — it already
    handles `ISwapRouter02.exactInputSingle` (`0x04e45aaf`) and returns
-   `V3SwapIntent`. Verify the selector matches the `sol!` definition; a
-   parameter reorder changes the 4-byte selector and the decoder must be
-   checked against the macro, both sides.
+   `V3SwapIntent`. Verify the selector against the `sol!` definition on both
+   sides (`MAINTAINING.md` §5).
 2. Candidate filter: `amount_in > 0`, `token_in != token_out`, pool present in
    the W3 V3 cache.
 3. Read pool state with the existing `jit.rs` `pool_state` helper (`slot0`,
@@ -391,8 +420,8 @@ already works.
    per candidate and will get the bot rate-limited off its provider.
 5. Victim-revert trap: any `x` that pushes the victim's output below their
    `amountOutMinimum` scores **zero**. This is the trap that catches
-   front-runners who do not model the slippage bound. It is non-negotiable and
-   needs an explicit test.
+   front-runners who do not model the slippage bound (`MAINTAINING.md` §2). It
+   is non-negotiable and needs an explicit test.
 6. Back-run: the quoter prices the *current* pool state, not the post-front-run
    state. Ship the conservative path — issue the back-run with
    `amountOutMinimum = 0` and let the executor's atomic profit guard catch a
@@ -412,14 +441,15 @@ already works.
 
 The pending-tx path is the bot's hot path: a 5 ms strategy × 200 pending
 txs/block = 1 s/block on a serial executor, against a design assumption of
-~50 ms/block. Profile before merging, and record the p95 in the PR.
+~50 ms/block (`MAINTAINING.md` §3.3). Profile before merging; record the p95 in
+the PR.
 
 ### Tests
 
 Selector decoding against a captured mainnet `exactInputSingle` calldata
 fixture; a victim whose `amountOutMinimum` makes every size unprofitable
-produces zero opportunities; sizing is monotone in the quoter's responses
-(fake quoter, no network); toggle off means zero added RPC calls.
+produces zero opportunities; sizing is monotone in the quoter's responses (fake
+quoter, no network); toggle off means zero added RPC calls.
 
 ### Acceptance criteria
 
@@ -428,26 +458,28 @@ produces zero opportunities; sizing is monotone in the quoter's responses
 - Funnel distinguishes V2 from V3 sandwich outcomes (either a new `Strategy`
   variant or a labelled sub-counter — pick one and be consistent across
   `types.rs::Strategy::all()`, `config::StrategyToggles`, `engine.rs::new`,
-  `frontend/lib/format.ts::STRATEGY_LABEL` and `STRATEGY_COLOR`).
+  `frontend/lib/format.ts::STRATEGY_LABEL` and `STRATEGY_COLOR`; the full
+  checklist is `MAINTAINING.md` §3.3).
 
 ---
 
 ## W6 — UniversalRouter decoding
 
 **Gate: only after a week of funnel data shows a meaningful public-mempool gap.**
+Both source documents agree on this, and the review is explicit that 1inch and
+0x wait for evidence.
 
 Be honest about the payoff. A large share of big-swap flow on mainnet is
 deliberately *not* in the public mempool — Flashbots Protect, MEV-Blocker, CoW
-batch auctions, 1inch Fusion, UniswapX. Decoding public calldata only helps for
-the portion that is public, which is the portion established searchers already
-compete for. This is the highest-effort, lowest-certainty workstream in Phase 2,
-which is why it is last and gated on evidence.
+batch auctions, 1inch Fusion, UniswapX (`MAINTAINING.md` §6.1). Decoding public
+calldata only helps for the portion that is public, which is the portion
+established searchers already compete for. Highest effort, lowest certainty,
+therefore last and gated on data.
 
 **Scope: UniversalRouter only** (`0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD`).
 Decode `execute(commands, inputs)` by walking the command byte string and the
 per-command input arrays, handling at minimum `V3_SWAP_EXACT_IN` and
-`V2_SWAP_EXACT_IN`. 1inch v6 and 0x v2 are **out of scope** — revisit only if
-the funnel shows UniversalRouter decoding moved the numbers.
+`V2_SWAP_EXACT_IN`. 1inch v6 and 0x v2 are **out of scope**.
 
 **Structure**
 
@@ -461,12 +493,11 @@ the funnel shows UniversalRouter decoding moved the numbers.
 **Acceptance criteria**
 
 - Fixture-driven tests: ≥ 5 captured mainnet UniversalRouter calldata samples
-  decoded to the expected `SwapIntent`, plus malformed-input cases that must
-  return `None` rather than panic.
-- Decoder adds < 1 ms per pending tx (it is pure calldata parsing; assert it in
-  a bench).
-- A written report on what the funnel did after one week with it enabled. If
-  the answer is "nothing", that is the deliverable and 1inch/0x stay closed.
+  decoded to the expected `SwapIntent`, plus malformed inputs that must return
+  `None` rather than panic.
+- Decoder adds < 1 ms per pending tx (pure calldata parsing; assert in a bench).
+- A written report on what the funnel did after one week with it enabled. If the
+  answer is "nothing", that is the deliverable and 1inch/0x stay closed.
 
 ---
 
@@ -475,7 +506,7 @@ the funnel shows UniversalRouter decoding moved the numbers.
 Phase 2 is complete when all of these hold:
 
 1. CI is enabled and green; `cargo test --all`, `forge test`, `tsc --noEmit` and
-   `next build` all run on every PR.
+   `next build` run on every PR.
 2. The funnel reports per-opportunity and per-invocation counts distinctly, and
    the dashboard labels both.
 3. Pool discovery covers V2 and V3 with disjoint caches, bounded log windows,
@@ -492,52 +523,30 @@ Phase 2 is complete when all of these hold:
 
 ---
 
-## Appendix A — Footguns
+## 4. Retiring this document
 
-Each of these has bitten this codebase once already.
+When §3 is satisfied, this file gets deleted. Before deleting it:
 
-**Never use `f64` for sandwich or arb sizing.** Always `U256`. The JIT
-strategy's `size_position` uses floats and that is fine — it is approximate and
-the fork is the arbiter. A floating-point sandwich sizer round-trips to zero in
-the fork on roughly 1-in-1000 swaps: unit tests pass, dashboard lies, bundles
-revert.
+1. Tick the Phase 2 boxes in [`ROADMAP.md`](ROADMAP.md) and remove its pointer
+   to this file.
+2. Fold anything that became a **durable rule about the codebase** into
+   [`MAINTAINING.md`](MAINTAINING.md) — likely candidates are the W4 search
+   budgets, the W5 RPC budget, and the V2/V3 cache separation rule. A budget
+   that only lived in this file will be violated by the next person.
+3. Move operator-facing behaviour into [`STRATEGIES.md`](STRATEGIES.md) and any
+   new gates into [`RISK.md`](RISK.md).
+4. Remove this document's row from the README documentation table.
+5. `git rm docs/PHASE_2_HANDOFF.md`.
 
-**`v2_amount_out` rounds down**, matching on-chain `getAmountOut` exactly. Any
-port that rounds differently produces bundles that revert in the fork.
-
-**`ternary_search_max` assumes unimodality.** True for V2 sandwich and cyclic
-arb profit curves. A new strategy with a non-unimodal curve gets a silent local
-maximum.
-
-**`optimal_sandwich_in`'s victim-revert check** scores any size that pushes the
-victim below `amountOutMin` as zero profit. Do not optimise it away.
-
-**Never add a `sol!` interface without verifying the selector.** The macro
-derives the 4-byte selector from the signature; reordering or renaming params
-changes it. Some `decode_*` functions hardcode selectors — check both sides.
-`decode_v3_swap` and `IUniswapV3Pool::swapCall::SELECTOR` are the reference.
-
-**Do not serialise a `U256` without `.to_string()`.** Large values otherwise
-serialise in a form viem will not parse. The existing code is consistent; match it.
-
-**`eth_call` does not return a revert reason on mainnet** — only on the Anvil
-fork. Any pre-filter reading `sim.revert_reason` must live inside the fork path.
-
-**Watch the spawn budget.** The per-tx loop spawns one task per (tx, strategy)
-pair — 5× the pending rate at peak. `max_inflight_per_strategy` and
-`SIM_TIMEOUT_MS` are the backstops; both may need tuning when W4/W5 land.
-
-**Things that look like over-engineering but are not:** the per-call
-`pool_by_addr: HashMap` index in strategy files (avoids repeated `RwLock`
-walks); the flat `if let Some(x) = …;` chains instead of `?` (early-return per
-candidate, not per tx); the `sol!` blocks in `dex.rs`, `jit.rs` — those are the
-ABI truth claims.
+`MAINTAINING.md` is **not** deleted with it. It is the permanent guide and
+outlives every phase.
 
 ---
 
-## Appendix B — Existing API surface to reuse
+## Appendix A — Existing API surface to reuse
 
-Do not reimplement any of these.
+Do not reimplement any of these. (Verified against the checkout; line numbers
+are from `e62bbc2`.)
 
 | Symbol | Location | Use |
 | --- | --- | --- |
@@ -556,98 +565,43 @@ Do not reimplement any of these.
 | `strategies::jit::V3State` | `jit.rs:211` | slot0 + liquidity snapshot |
 | `engine::Stats::record_funnel` | `engine.rs:100` | the only funnel mutation path |
 
-**Adding a strategy** (the most dangerous routine change): add the
-`types::Strategy` variant (update `all()`), add a `config::StrategyToggles`
-field and parse it in `Config::from_env`, `pub mod` it in `strategies/mod.rs`,
-implement `StrategyImpl` (`jit.rs` is the most complete example), wire it in
-`engine.rs::new`, add funnel integration (**not optional**), and add a "Why no
-simulations?" entry to `frontend/components/RiskPanel.tsx`.
-
-**Adding a feed event:** add a `types::FeedEvent` variant, emit from `engine.rs`,
-add a renderer — SSE dispatch is tag-based. High-rate events need their own
-channel or a sampled emit; `broadcast::channel` is sized for the current mix.
+For the procedures — adding a strategy, adding a feed event, adding a pair,
+tuning risk gates — follow `MAINTAINING.md` §3. Adding a strategy in particular
+has a six-step checklist there; skipping step 6 (funnel integration) is how a
+new strategy becomes unobservable.
 
 ---
 
-## Appendix C — Config knobs
+## Appendix B — Config knobs touched by Phase 2
 
 | Var | Default | Notes |
 | --- | --- | --- |
 | `POOL_DISCOVERY` | `true` | V2 discovery per block (`config.rs:261`) |
 | `POOL_DISCOVERY_V3` | *(new in W3)* `false` | keep off until W5 consumes it |
 | `STRATEGY_SANDWICH_V3` | *(new in W5)* `false` | |
-| `MIN_NET_PROFIT_WEI` | `1` | do not raise/lower to chase funnel numbers |
+| `MIN_NET_PROFIT_WEI` | `1` | do not move to chase funnel numbers |
 | `MAX_POSITION_WEI` | `100e18` | notional gate |
 | `MAX_BASE_FEE_WEI` | `500 gwei` | |
 | `MAX_INFLIGHT_PER_STRATEGY` | `32` | also W4's candidate cap |
-| `SIM_TIMEOUT_MS` | `2500` | second backstop on spawn storms |
-| `BRIBE_BPS` | `9000` | **do not change in Phase 2.** Builders sort by payment per gas; a 50% bribe loses to a 90% bribe on the same opportunity. Lower only makes sense when amortising across a batch. |
+| `SIM_TIMEOUT_MS` | `2500` | backstop on spawn storms |
+| `BRIBE_BPS` | `9000` | **do not change in Phase 2** — rationale in `MAINTAINING.md` §3.5 |
 | `LIVE_EXECUTION` | `false` | two-key switch; out of scope |
 
-**Reading the funnel when tuning risk.** `simulationsReverted >>
-simulationsSucceeded` means gates are too loose — the fix is almost always the
-strategy's pre-filter sizing, not `MIN_NET_PROFIT_WEI`. `candidatesEmitted > 0`
-with `gatedByRisk` dominating means gates are too tight — raise
-`MAX_BASE_FEE_WEI` (if base fee is the gate), `MAX_POSITION_WEI` (notional), or
-`MAX_INFLIGHT_PER_STRATEGY` (queueing).
+Interpreting the funnel when a gate looks wrong: `MAINTAINING.md` §3.5.
 
 ---
 
-## Appendix D — Watch items (not Phase 2 work)
+## Appendix C — What Phase 2 deliberately does not answer
 
-Review these quarterly; act when the data moves.
+Carried over from the design doc's closing section, because it is still true:
 
-**Private orderflow keeps growing.** Watch the funnel's `pendingSeen` rate over
-months. If it trends down, every public-mempool strategy trends down with it.
-`MEV_SHARE_SSE_URL` and `EXTRA_MEMPOOL_WS` are the partial mitigations already
-configured. The real long-term direction is intent auctions (solver networks);
-the executor contract is the right primitive, the solver integration is missing,
-and it is not on the roadmap yet. It probably should be.
-
-**L2 economics differ structurally.** Gas is ~10⁻⁴ of mainnet, so the mainnet
-`BRIBE_BPS` calibration is wrong there. Sequencer auctions (Arbitrum express
-lane, OP preconfirmations) are the "sequencer feed" the README references;
-integrate via the chain's published protocol, not polling. Cross-chain MEV is
-real but narrow — build one chain properly first.
-
-**New AMM designs:** add them as *pricing modules* in `dex/`, the way
-`v2_amount_out` and `quote_v3` are, and let strategies compose them. Never as a
-new strategy. Curve and Balancer math are the next obvious additions.
-
-**Account abstraction:** 4337 user ops bundle multiple calls, which the
-"one tx = one swap" pre-filter silently drops; sponsored gas breaks the victim's
-cost-basis assumption in sandwich sizing. Small share today — watch it.
-
-**Legal/operational:** simulation-only mode is a feature, not a development
-convenience. The relay's `eth_callBundle` cross-check is a real, timestamped
-audit trail; treat it as a log you would be willing to share.
-
----
-
-## Appendix E — Priority order beyond Phase 2
-
-From `docs/ROADMAP.md`, the practical order once Phase 2 closes:
-
-1. **Phase 1 replay validation** — re-simulate historical blocks from the
-   database against actual relay bid traces to get a true-positive rate for the
-   pipeline. That number is the only one that matters before `LIVE_EXECUTION`.
-2. Competition modelling and the latency budget (mempool→bundle under ~150 ms).
-3. Nonce/inventory manager, reorg reconciliation.
-4. Phase 3 live-execution work, opt-in, separate PRs.
-5. New chains, in roadmap order: Base → Arbitrum → BNB → Solana. Solana is a
-   separate engine, not a config change.
-
----
-
-## Appendix F — Keeping the codebase small
-
-~6,400 lines of Rust, ~300 of Solidity, ~2,400 of TypeScript. That is a feature.
-Every line is one you have to defend; every dependency is one you have to vet;
-every ABI definition is a truth claim about mainnet you have to keep honest. If
-a feature is heading past a hundred lines, ask whether twenty lines of
-restructuring gets the same outcome.
-
-If a maintainer six months from now opens this repo and asks "where does this
-start?", the answer must still be `bot/crates/mev-bot/src/main.rs` — one
-function, ~150 lines — with `engine.rs` next and everything else following from
-there. Preserve that property.
+- Phase 2 does not guarantee opportunities. It adds strategies; the simulator
+  discovers opportunities. The count per block is a property of the market,
+  competition and latency, not of this code.
+- Phase 2 is not a path to live trading. The simulation-only guard stays. Phase 1
+  (replay validation, competition modelling, latency budget) is the prerequisite
+  and is not addressed here.
+- Neither source document was written with a working Rust toolchain, and no
+  claim in them about compilation or test results was ever verified. W0 is how
+  that gets fixed; until it is green, treat any performance or correctness claim
+  in this file as a hypothesis.

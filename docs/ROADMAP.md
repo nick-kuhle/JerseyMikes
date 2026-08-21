@@ -28,7 +28,8 @@ before the next is started.
 ## Phase 2 — coverage
 
 Scoped and ticketed in [`PHASE_2_HANDOFF.md`](PHASE_2_HANDOFF.md), which is the
-source of truth for this phase (workstreams, budgets, acceptance criteria).
+source of truth for this phase (workstreams, budgets, acceptance criteria) and
+is deleted once the phase ships.
 
 - [ ] UniswapV3 sandwiches and V3 legs in the arb search
 - [ ] Aggregator calldata decoding: UniversalRouter, 1inch, 0x, CoWSwap
