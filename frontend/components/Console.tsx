@@ -8,6 +8,8 @@ import RiskPanel from "./RiskPanel";
 import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
 import Phase1Panel from "./Phase1Panel";
+import ModeSwitch from "./ModeSwitch";
+import WalletButton from "./WalletButton";
 import type {
   CompetitionResponse,
   FeedEvent,
@@ -19,7 +21,16 @@ import type {
   SimulationRow,
   StatusResponse,
 } from "@/lib/types";
-import {ago, gwei, shortHash, signedEth, STRATEGY_COLOR, STRATEGY_LABEL, weiToEth} from "@/lib/format";
+import {
+  ago,
+  gwei,
+  shortHash,
+  signedEth,
+  STRATEGY_COLOR,
+  STRATEGY_LABEL,
+  weiToEth,
+} from "@/lib/format";
+import {blockUrl, txUrl} from "@/lib/explorer";
 
 const FEED_MAX = 400;
 const POLL_MS = 4000;
@@ -91,6 +102,7 @@ export default function Console() {
   }, []);
 
   const demo = Boolean(status?.demo);
+  const chainId = status?.chain.id;
   const totalNet = pnl?.totalNetWei ?? 0;
   const filteredSims = useMemo(
     () => (strategyFilter === "all" ? sims : sims.filter((s) => s.strategy === strategyFilter)),
@@ -113,9 +125,7 @@ export default function Console() {
           <span className="muted" style={{marginLeft: 8, fontSize: 11}}>MEV simulation console</span>
         </div>
 
-        <span className="badge" style={{color: status?.mode === "live" ? "#ff5c5c" : "#35d07f"}}>
-          {status?.mode === "live" ? "LIVE EXECUTION" : "SIMULATION ONLY"}
-        </span>
+        <ModeSwitch mode={status?.mode} armed={status?.liveArmed} demo={demo} onChanged={load} />
 
         {demo && (
           <span className="badge" style={{color: "#f5b544"}} title="bot API unreachable — showing generated data">
@@ -126,6 +136,8 @@ export default function Console() {
         <span className={connected ? "badge live" : "badge"} style={{color: connected ? "#35d07f" : "#6b7c93"}}>
           <span className="dot" style={{background: connected ? "#35d07f" : "#6b7c93"}} /> feed
         </span>
+
+        <WalletButton expectedChainId={chainId} />
 
         <div style={{marginLeft: "auto", display: "flex", gap: 18, alignItems: "center", flexWrap: "wrap"}}>
           <HeadStat label="chain" value={status ? `${status.chain.name} (${status.chain.id})` : "—"} />
@@ -253,7 +265,7 @@ export default function Console() {
               ))}
             </select>
           </div>
-          <LiveFeed events={events} filter={feedFilter} />
+          <LiveFeed events={events} filter={feedFilter} chainId={chainId} />
         </div>
 
         <div className="panel">
@@ -277,28 +289,48 @@ export default function Console() {
                   <th style={{textAlign: "right"}}>gas</th>
                   <th style={{textAlign: "right"}}>gross</th>
                   <th style={{textAlign: "right"}}>net ETH</th>
+                  <th>victim tx</th>
                   <th>result</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredSims.map((s, i) => (
-                  <tr key={`${s.opportunityId}-${i}`} title={s.notes}>
-                    <td className="muted">{ago(s.createdAtMs)}</td>
-                    <td style={{color: STRATEGY_COLOR[s.strategy]}}>{s.strategy}</td>
-                    <td className="muted">{s.backend}</td>
-                    <td style={{textAlign: "right"}}>{s.gasUsed.toLocaleString()}</td>
-                    <td style={{textAlign: "right"}}>{weiToEth(s.grossWei, 5)}</td>
-                    <td style={{textAlign: "right"}} className={s.netWei >= 0 ? "pos" : "neg"}>
-                      {signedEth(s.netWei)}
-                    </td>
-                    <td className={s.success ? "pos" : "muted"}>
-                      {s.success ? "profitable" : s.revertReason ?? "no edge"}
-                    </td>
-                  </tr>
-                ))}
+                {filteredSims.map((s, i) => {
+                  const victim = s.victims ? s.victims.split(",")[0] : null;
+                  const link = txUrl(chainId, victim);
+                  return (
+                    <tr key={`${s.opportunityId}-${i}`} title={s.notes}>
+                      <td className="muted">{ago(s.createdAtMs)}</td>
+                      <td style={{color: STRATEGY_COLOR[s.strategy]}}>{s.strategy}</td>
+                      <td className="muted">{s.backend}</td>
+                      <td style={{textAlign: "right"}}>{s.gasUsed.toLocaleString()}</td>
+                      <td style={{textAlign: "right"}}>{weiToEth(s.grossWei, 5)}</td>
+                      <td style={{textAlign: "right"}} className={s.netWei >= 0 ? "pos" : "neg"}>
+                        {signedEth(s.netWei)}
+                      </td>
+                      <td>
+                        {link && victim ? (
+                          <a
+                            href={link}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={`victim tx ${victim} — view on the block explorer`}
+                            style={{color: "#22d3ee", textDecoration: "none"}}
+                          >
+                            {shortHash(victim, 4)} ↗
+                          </a>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
+                      <td className={s.success ? "pos" : "muted"}>
+                        {s.success ? "profitable" : s.revertReason ?? "no edge"}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!filteredSims.length && (
                   <tr>
-                    <td colSpan={7} className="muted" style={{textAlign: "center", padding: 16}}>
+                    <td colSpan={8} className="muted" style={{textAlign: "center", padding: 16}}>
                       no simulations yet
                     </td>
                   </tr>
@@ -330,23 +362,58 @@ export default function Console() {
                 </tr>
               </thead>
               <tbody>
-                {opps.map((o) => (
-                  <tr key={o.id}>
-                    <td className="muted">{ago(o.createdAtMs)}</td>
-                    <td style={{color: STRATEGY_COLOR[o.strategy]}}>{o.strategy}</td>
-                    <td style={{textAlign: "right"}}>{weiToEth(o.expectedWei, 5)}</td>
-                    <td style={{textAlign: "right"}}>{weiToEth(o.notionalWei, 3)}</td>
-                    <td className="muted">{o.targetBlock}</td>
-                    <td className="muted">{o.victims ? shortHash(o.victims.split(",")[0]) : "—"}</td>
-                    <td
-                      className="muted"
-                      style={{maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis"}}
-                      title={o.notes}
-                    >
-                      {o.notes}
-                    </td>
-                  </tr>
-                ))}
+                {opps.map((o) => {
+                  const victim = o.victims ? o.victims.split(",")[0] : null;
+                  const victimLink = txUrl(chainId, victim);
+                  const blockLink = blockUrl(chainId, o.targetBlock);
+                  return (
+                    <tr key={o.id}>
+                      <td className="muted">{ago(o.createdAtMs)}</td>
+                      <td style={{color: STRATEGY_COLOR[o.strategy]}}>{o.strategy}</td>
+                      <td style={{textAlign: "right"}}>{weiToEth(o.expectedWei, 5)}</td>
+                      <td style={{textAlign: "right"}}>{weiToEth(o.notionalWei, 3)}</td>
+                      <td className="muted">
+                        {blockLink ? (
+                          <a
+                            href={blockLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="view this block on the explorer"
+                            style={{color: undefined}}
+                          >
+                            {o.targetBlock}
+                          </a>
+                        ) : (
+                          o.targetBlock
+                        )}
+                      </td>
+                      <td className="muted">
+                        {victimLink && victim ? (
+                          <a
+                            href={victimLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={`victim tx ${victim}`}
+                            style={{color: "#22d3ee", textDecoration: "none"}}
+                          >
+                            {shortHash(victim)} ↗
+                          </a>
+                        ) : o.victims ? (
+                          shortHash(victim)
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td
+                        className="muted"
+                        style={{maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis"}}
+                        title={o.notes}
+                      >
+                        {o.notes}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {!opps.length && (
                   <tr>
                     <td colSpan={7} className="muted" style={{textAlign: "center", padding: 16}}>
@@ -395,12 +462,15 @@ export default function Console() {
       </section>
 
       {/* bloXroute Max Profit relay — delivered blocks + their transactions */}
-      <RelayBlocksPanel />
+      <RelayBlocksPanel chainId={chainId} />
 
       {/* strategy funnel — answers "why no opportunities?" with data */}
       <FunnelPanel
         funnel={status?.stats.funnel ?? null}
         funnelReplay={status?.stats.funnelReplay ?? null}
+        pendingSeen={status?.stats.pendingSeen ?? 0}
+        hintsSeen={status?.stats.hintsSeen ?? 0}
+        startedAtMs={status?.stats.startedAtMs}
       />
 
       {/* risk & strategy controls */}
@@ -418,7 +488,7 @@ export default function Console() {
           <span>MevExecutor — on-chain control</span>
           <span className="muted">{status ? shortHash(status.executor, 8) : "—"}</span>
         </div>
-        <ContractPanel executor={status?.executor ?? ""} rpcUrl={process.env.NEXT_PUBLIC_RPC_URL} />
+        <ContractPanel executor={status?.executor ?? ""} chainId={chainId} />
       </section>
 
       <footer className="muted" style={{padding: "4px 2px 20px", fontSize: 11}}>

@@ -3,6 +3,7 @@
 import {useCallback, useEffect, useState} from "react";
 import type {RelayBlockRow, RelayBlockTxRow} from "@/lib/types";
 import {shortHash, weiToEth} from "@/lib/format";
+import {addressUrl, blockUrl, txUrl} from "@/lib/explorer";
 
 /**
  * bloXroute Max Profit relay — delivered blocks and their transactions.
@@ -11,8 +12,9 @@ import {shortHash, weiToEth} from "@/lib/format";
  * blocks the winning builder delivered and how much they paid (`valueWei`).
  * The bot fetches each delivered block's transactions, stores them, and scores
  * them for extractable value; this panel is the read side of that data.
+ * Every block number, transaction hash and recipient links to the explorer.
  */
-export default function RelayBlocksPanel() {
+export default function RelayBlocksPanel({chainId}: {chainId?: number}) {
   const [blocks, setBlocks] = useState<RelayBlockRow[]>([]);
   const [expanded, setExpanded] = useState<number | null>(null);
   const [txs, setTxs] = useState<RelayBlockTxRow[]>([]);
@@ -91,6 +93,7 @@ export default function RelayBlocksPanel() {
                   key={`${b.relay}-${b.slot}`}
                   block={b}
                   open={open}
+                  chainId={chainId}
                   onToggle={() => setExpanded(open ? null : b.blockNumber)}
                 />
               );
@@ -125,20 +128,49 @@ export default function RelayBlocksPanel() {
                     </td>
                   </tr>
                 )}
-                {txs.map((t) => (
-                  <tr key={`${t.hash}-${t.txIndex}`}>
-                    <td className="muted">{t.txIndex}</td>
-                    <td className="muted" title={t.hash}>
-                      {shortHash(t.hash, 10)}
-                    </td>
-                    <td className="muted">{shortHash(t.to, 8)}</td>
-                    <td className="muted">{t.selector ?? "—"}</td>
-                    <td style={{textAlign: "right"}}>{weiToEth(t.valueWei, 4)}</td>
-                    <td style={{textAlign: "right"}} className="muted">
-                      {t.gas.toLocaleString()}
-                    </td>
-                  </tr>
-                ))}
+                {txs.map((t) => {
+                  const hashLink = txUrl(chainId, t.hash);
+                  const toLink = addressUrl(chainId, t.to);
+                  return (
+                    <tr key={`${t.hash}-${t.txIndex}`}>
+                      <td className="muted">{t.txIndex}</td>
+                      <td className="muted" title={t.hash}>
+                        {hashLink ? (
+                          <a
+                            href={hashLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            title={`${t.hash} — view on the explorer`}
+                            style={{color: "#22d3ee", textDecoration: "none"}}
+                          >
+                            {shortHash(t.hash, 10)} ↗
+                          </a>
+                        ) : (
+                          shortHash(t.hash, 10)
+                        )}
+                      </td>
+                      <td className="muted" title={t.to ?? undefined}>
+                        {toLink ? (
+                          <a
+                            href={toLink}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={{color: undefined, textDecoration: "none"}}
+                          >
+                            {shortHash(t.to, 8)}
+                          </a>
+                        ) : (
+                          shortHash(t.to, 8)
+                        )}
+                      </td>
+                      <td className="muted">{t.selector ?? "—"}</td>
+                      <td style={{textAlign: "right"}}>{weiToEth(t.valueWei, 4)}</td>
+                      <td style={{textAlign: "right"}} className="muted">
+                        {t.gas.toLocaleString()}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -151,12 +183,15 @@ export default function RelayBlocksPanel() {
 function BlockRow({
   block,
   open,
+  chainId,
   onToggle,
 }: {
   block: RelayBlockRow;
   open: boolean;
+  chainId?: number;
   onToggle: () => void;
 }) {
+  const url = blockUrl(chainId, block.blockNumber);
   return (
     <tr
       onClick={onToggle}
@@ -164,7 +199,20 @@ function BlockRow({
       title="click to list the transactions that landed in this block"
     >
       <td>
-        <span style={{color: "var(--cyan)"}}>#{block.blockNumber}</span>
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            style={{color: "var(--cyan)"}}
+            title="view this block on the explorer"
+          >
+            #{block.blockNumber} ↗
+          </a>
+        ) : (
+          <span style={{color: "var(--cyan)"}}>#{block.blockNumber}</span>
+        )}
       </td>
       <td className="muted">{block.slot}</td>
       <td style={{textAlign: "right"}} className="pos">

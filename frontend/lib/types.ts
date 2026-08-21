@@ -4,6 +4,13 @@ export interface StatusResponse {
   chain: {id: number; name: string};
   head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number};
   mode: "simulation" | "live";
+  /**
+   * Boot-time arming: `LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`
+   * at process start. When false the runtime mode switch is refused by the
+   * bot (409 with instructions); the dashboard shows the arming steps
+   * instead of a toggle it cannot honour.
+   */
+  liveArmed?: boolean;
   strategies: Strategy[];
   risk: {
     minNetProfitWei: string;
@@ -165,6 +172,22 @@ export interface SimulationRow {
   latencyMs: number;
   createdAtMs: number;
   notes: string;
+  /**
+   * Comma-separated victim transaction hashes from the parent opportunity.
+   * Each simulation links to the transaction it reacted to on the explorer.
+   * Empty string when the opportunity row is gone or had no victims.
+   */
+  victims?: string;
+}
+
+/** `/api/mode` — effective + boot-time-armed execution mode. */
+export interface ModeResponse {
+  mode: "simulation" | "live";
+  liveArmed: boolean;
+  ok?: boolean;
+  error?: string;
+  hint?: string;
+  demo?: boolean;
 }
 
 export interface OpportunityRow {

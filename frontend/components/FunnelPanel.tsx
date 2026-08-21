@@ -27,6 +27,12 @@ interface Props {
    * is available without diluting the live numbers.
    */
   funnelReplay?: Partial<Record<Strategy, FunnelCounters>> | null | undefined;
+  /** Live-lane mempool volume — the denominator of the W6 gap reading. */
+  pendingSeen?: number;
+  /** MEV-Share hints seen (private flow, undecodable by definition). */
+  hintsSeen?: number;
+  /** Engine start time — the W6 gate wants a full week of funnel data. */
+  startedAtMs?: number;
 }
 
 const ALL_STRATEGIES: Strategy[] = [
@@ -62,7 +68,7 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-export default function FunnelPanel({funnel, funnelReplay}: Props) {
+export default function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, startedAtMs}: Props) {
   // Which lane is on screen. Live is the default: it is the one that answers
   // "should I change something?". Replay answers "what did we miss?".
   const [lane, setLane] = useState<"live" | "replay">("live");
@@ -81,18 +87,21 @@ export default function FunnelPanel({funnel, funnelReplay}: Props) {
 
   if (!active) {
     return (
-      <div className="panel" style={{padding: 14, color: "var(--muted)", fontSize: 12}}>
-        {lane === "live"
-          ? "Funnel data not yet populated. The bot emits the first counters on its first strategy tick."
-          : "No replay data yet. Delivered-block scoring populates this once RELAY_TX_INGEST has pulled a block."}
-        {lane === "replay" ? (
-          <button
-            onClick={() => setLane("live")}
-            style={{marginLeft: 8, fontSize: 11, cursor: "pointer"}}
-          >
-            back to live
-          </button>
-        ) : null}
+      <div className="panel" style={{padding: 14, display: "grid", gap: 14}}>
+        <div style={{color: "var(--muted)", fontSize: 12}}>
+          {lane === "live"
+            ? "Funnel data not yet populated. The bot emits the first counters on its first strategy tick."
+            : "No replay data yet. Delivered-block scoring populates this once RELAY_TX_INGEST has pulled a block."}
+          {lane === "replay" ? (
+            <button
+              onClick={() => setLane("live")}
+              style={{marginLeft: 8, fontSize: 11, cursor: "pointer"}}
+            >
+              back to live
+            </button>
+          ) : null}
+        </div>
+        <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />
       </div>
     );
   }
@@ -303,6 +312,125 @@ export default function FunnelPanel({funnel, funnelReplay}: Props) {
         <code>cand.</code> with all zeros in <code>sim ✓</code> is either
         risk-gating too tightly or simulator failures.
       </p>
+
+      <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />
+    </div>
+  );
+}
+
+/**
+ * W6 go/no-go: is there a public-mempool gap worth decoding UniversalRouter
+ * calldata for?
+ *
+ * `PHASE_2_HANDOFF.md` W6 stays off until a *written* memo justifies flipping
+ * `DECODE_UNIVERSAL_ROUTER`, and the handoff names the exact signal: live
+ * sandwich + JIT `invocationsEmpty` against mempool `pendingSeen`. This card
+ * computes that reading from the funnel the panel already has and shows
+ * whether enough data exists to make the call (the gate wants a full week).
+ * It deliberately renders numbers, not a verdict — and no toggle: flipping
+ * W6 stays an operator env change gated on the written memo.
+ */
+function W6GapCard({
+  funnel,
+  pendingSeen,
+  hintsSeen,
+  startedAtMs,
+}: {
+  funnel: Partial<Record<Strategy, FunnelCounters>> | null | undefined;
+  pendingSeen: number;
+  hintsSeen: number;
+  startedAtMs?: number;
+}) {
+  const [copied, setCopied] = useState(false);
+  const live = funnel ?? {};
+  const emptyOf = (s: Strategy) => live[s]?.invocationsEmpty ?? 0;
+  const callsOf = (s: Strategy) => {
+    const f = live[s];
+    return f ? f.invocationsWithOutput + f.invocationsEmpty : 0;
+  };
+  const candOf = (s: Strategy) => live[s]?.candidatesEmitted ?? 0;
+  const watch: Strategy[] = ["sandwich", "sandwich_v3", "jit"];
+  const emptySum = watch.reduce((a, s) => a + emptyOf(s), 0);
+  const candSum = watch.reduce((a, s) => a + candOf(s), 0);
+  const callsSum = watch.reduce((a, s) => a + callsOf(s), 0);
+  const uptimeDays = startedAtMs ? (Date.now() - startedAtMs) / 86_400_000 : 0;
+  const sampleReady = uptimeDays >= 7 && pendingSeen > 0;
+
+  const memo = `# W6 public-mempool gap memo
+
+Auto-filled from the funnel card on ${new Date().toISOString().slice(0, 10)}.
+Uptime: ${uptimeDays.toFixed(2)} days (${sampleReady ? "sample complete" : "COLLECTING — gate wants ≥ 7 days"}).
+
+| Signal | Value |
+| --- | --- |
+| pendingSeen (public mempool txs seen) | ${pendingSeen.toLocaleString()} |
+| hintsSeen (MEV-Share, undecodable) | ${hintsSeen.toLocaleString()} |
+| sandwich+jit invocationsEmpty (live lane) | ${emptySum.toLocaleString()} |
+| sandwich+jit calls (live lane) | ${callsSum.toLocaleString()} |
+| sandwich+jit candidatesEmitted (live lane) | ${candSum.toLocaleString()} |
+
+## Decision
+
+- [ ] The gap is real: high pendingSeen with near-zero decoded victims across a
+      full week → flip DECODE_UNIVERSAL_ROUTER=true and re-read for another week.
+- [ ] The gap is not real: flow is thin or already decodable → W6 stays off;
+      1inch v6 / 0x v2 stay closed.
+`;
+
+  return (
+    <div
+      style={{
+        border: "1px solid var(--line)",
+        borderRadius: 4,
+        padding: 12,
+        background: "var(--panel-2)",
+        display: "grid",
+        gap: 8,
+      }}
+    >
+      <div style={{display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap"}}>
+        <span style={{fontSize: 12, fontWeight: 700, color: "var(--cyan)"}}>
+          W6 go/no-go — public-mempool gap reading
+        </span>
+        <span className="badge" style={{color: sampleReady ? "var(--green)" : "var(--amber)"}}>
+          {sampleReady ? "sample complete — write the memo" : `collecting (${uptimeDays.toFixed(1)}/7 days)`}
+        </span>
+      </div>
+      <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8}}>
+        <SummaryStat label="pendingSeen (mempool)" value={fmt(pendingSeen)} color="var(--cyan)" />
+        <SummaryStat label="hints (private flow)" value={fmt(hintsSeen)} color="var(--muted)" />
+        <SummaryStat label="sandwich+jit empty calls" value={fmt(emptySum)} color="var(--amber)" />
+        <SummaryStat label="sandwich+jit candidates" value={fmt(candSum)} color="var(--green)" />
+      </div>
+      <p className="muted" style={{fontSize: 11, lineHeight: 1.5, margin: 0}}>
+        The handoff gates <code>DECODE_UNIVERSAL_ROUTER</code> on a written memo of exactly these
+        numbers: a week of heavy <code>pendingSeen</code> with sandwich/JIT unable to decode victims
+        (<code>empty</code> dominating <code>candidates</code>) means the public flow is there but
+        rides routers we do not parse — that is W6&apos;s upside. If pendingSeen itself is thin,
+        the flow is already in private orderflow and a decoder will not help. Template:{" "}
+        <code>docs/W6_MEMO.md</code>.
+      </p>
+      <div>
+        <button
+          onClick={() => {
+            void navigator.clipboard.writeText(memo);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          }}
+          style={{
+            background: "var(--panel)",
+            border: "1px solid var(--line)",
+            borderRadius: 4,
+            color: "var(--cyan)",
+            padding: "4px 10px",
+            cursor: "pointer",
+            fontFamily: "inherit",
+            fontSize: 11,
+          }}
+        >
+          {copied ? "memo copied ✓" : "copy memo with current numbers"}
+        </button>
+      </div>
     </div>
   );
 }
