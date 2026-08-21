@@ -42,6 +42,8 @@ pub struct Config {
     pub strategies: StrategyToggles,
     pub sim: SimConfig,
     pub api: ApiConfig,
+    /// Whether the V2 pool-discovery scan runs each block.
+    pub pool_discovery: bool,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -255,6 +257,8 @@ impl Config {
                 db_path: env_or("DB_PATH", "data/mev.sqlite"),
                 feed_capacity: env_u64("FEED_CAPACITY", 2_000) as usize,
             },
+            // Infrastructure toggle (not a strategy): scan PairCreated each block.
+            pool_discovery: env_bool("POOL_DISCOVERY", true),
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
@@ -263,13 +267,14 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
             !self.endpoints.mev_share_sse.is_empty(),
             self.sim.use_call_bundle,
             self.strategies.enabled_names().join(","),
+            self.pool_discovery,
             self.live_execution
         )
     }

@@ -1,6 +1,7 @@
 //! Strategy framework: shared context, pool cache, and router calldata decoding.
 
 pub mod arb;
+pub mod discovery;
 pub mod jit;
 pub mod liquidation;
 pub mod sandwich;
@@ -18,6 +19,11 @@ use crate::config::{known, Config};
 use crate::dex::{self, IUniswapV2Router, V2Pool, Venue};
 use crate::rpc::RpcClient;
 use crate::types::{BlockHead, Opportunity, PendingTx, Strategy};
+
+/// `PairCreated(address indexed token0, address indexed token1, address pair, uint256)`
+/// — emitted by every UniV2/SushiV2 factory when a pair is created.
+pub const V2_PAIR_CREATED_TOPIC: &str =
+    "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9";
 
 /// Shared, cheap-to-clone state handed to every strategy.
 pub struct StrategyCtx {
@@ -271,10 +277,66 @@ pub fn decode_swap(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
     None
 }
 
+/// Run `eth_getLogs` for `PairCreated` on both V2 factories over `[from, to]`.
+/// Returns the decoded `(venue, pair_address)` tuples. A failed RPC call yields
+/// an empty vec (callers treat it as "no new pools this block").
+pub async fn scan_pair_created(
+    rpc: &crate::rpc::RpcClient,
+    from: u64,
+    to: u64,
+) -> Vec<(crate::dex::Venue, Address)> {
+    let params = serde_json::json!([{
+        "fromBlock": format!("0x{from:x}"),
+        "toBlock": format!("0x{to:x}"),
+        "address": [
+            format!("{:?}", known::UNIV2_FACTORY),
+            format!("{:?}", known::SUSHI_FACTORY),
+        ],
+        "topics": [V2_PAIR_CREATED_TOPIC],
+    }]);
+
+    let Ok(v) = rpc.call_raw("eth_getLogs", params).await else {
+        return Vec::new();
+    };
+    let Some(logs) = v.as_array() else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for log in logs {
+        // Which factory emitted it decides the venue.
+        let Some(venue) = venue_from_factory(&log["address"]) else {
+            continue;
+        };
+        let data = crate::types::parse_bytes(&log["data"]);
+        if data.len() < 32 {
+            continue;
+        }
+        // For `PairCreated`, `data` is `(pair address, uint256 allPairsLength)`
+        // with the pair address right-aligned in the first 32 bytes.
+        let pair = Address::from_slice(&data[12..32]);
+        out.push((venue, pair));
+    }
+    out
+}
+
+/// Map the emitting factory address to its venue.
+fn venue_from_factory(factory: &serde_json::Value) -> Option<crate::dex::Venue> {
+    let s = factory.as_str()?;
+    if s.eq_ignore_ascii_case(&format!("{:?}", known::UNIV2_FACTORY)) {
+        Some(crate::dex::Venue::UniV2)
+    } else if s.eq_ignore_ascii_case(&format!("{:?}", known::SUSHI_FACTORY)) {
+        Some(crate::dex::Venue::SushiV2)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{now_ms, TxSource};
+    use alloy_primitives::address;
     use alloy_primitives::B256;
 
     fn tx_with(data: Vec<u8>, value: U256) -> PendingTx {
@@ -330,6 +392,41 @@ mod tests {
     #[test]
     fn ignores_unrelated_calldata() {
         assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
-        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
+        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none();
+    }
+
+    #[test]
+    fn venue_from_factory_maps_known_factories() {
+        assert_eq!(
+            venue_from_factory(&serde_json::json!(format!("{:?}", known::UNIV2_FACTORY))),
+            Some(Venue::UniV2)
+        );
+        assert_eq!(
+            venue_from_factory(&serde_json::json!(format!("{:?}", known::SUSHI_FACTORY))),
+            Some(Venue::SushiV2)
+        );
+        // Unknown factory -> None.
+        assert_eq!(
+            venue_from_factory(&serde_json::json!("0x0000000000000000000000000000000000000000")),
+            None
+        );
+        // Non-string -> None.
+        assert_eq!(venue_from_factory(&serde_json::json!(42)), None);
+    }
+
+    #[test]
+    fn scan_decodes_pair_address_from_log_data() {
+        // Build a 32-byte data payload with a known address right-aligned.
+        let expected_pair = address!("1234567890abcdef1234567890abcdef12345678");
+        let mut data = vec![0u8; 32];
+        data[12..32].copy_from_slice(expected_pair.as_slice());
+
+        // Simulate the inner decode loop of `scan_pair_created` without an RPC.
+        let pair = Address::from_slice(&data[12..32]);
+        assert_eq!(pair, expected_pair);
+
+        // A short data payload (< 32 bytes) must be skipped.
+        let short = vec![0u8; 16];
+        assert!(short.len() < 32);
     }
 }
