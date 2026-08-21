@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
 
+use crate::dex;
 use crate::strategies::{scan_pair_created, StrategyCtx};
 use crate::types::BlockHead;
 
@@ -67,16 +68,18 @@ impl PoolDiscovery {
             if !self.seen.write().insert(pair) {
                 continue;
             }
-            let Some(pool) = ctx.pools.load(pair, venue, head.number).await else {
+            // Fetch first, then insert only qualifying pools. `PoolCache::load`
+            // inserts immediately, which would retain non-WETH and dust pools.
+            let Ok(pool) = dex::fetch_v2_pool(&ctx.rpc, pair, venue, 30, head.number).await else {
                 continue;
             };
-            // Only WETH-quoted pools, and only once they hold real liquidity.
             let Some((weth_reserve, _)) = pool.reserves_for(weth) else {
                 continue;
             };
             if weth_reserve < min_reserve {
                 continue;
             }
+            ctx.pools.insert(pool);
             tracing::info!(
                 target: "pools",
                 pair = ?pool.address,

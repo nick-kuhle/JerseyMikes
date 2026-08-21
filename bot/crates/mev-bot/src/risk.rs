@@ -209,6 +209,7 @@ mod tests {
                 db_path: ":memory:".into(),
                 feed_capacity: 10,
             },
+            pool_discovery: true,
             live_execution: false,
         })
     }

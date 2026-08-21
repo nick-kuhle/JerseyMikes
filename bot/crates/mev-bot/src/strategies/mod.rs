@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn ignores_unrelated_calldata() {
         assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
-        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none();
+        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
     }
 
     #[test]
