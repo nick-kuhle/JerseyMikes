@@ -84,8 +84,16 @@ hash (which includes absolute source paths) into `MevExecutor.runtime.hex`, so
 the artifact only reproduced in the sandbox where it was generated. Fixed by
 disabling that hash (`bytecode_hash = "none"`, matching `foundry.toml`) and
 regenerating the artifact; a fresh checkout now reproduces it byte-for-byte.
-`bot (rust)` still fails on `cargo test --all` (exit 101) and needs diagnosis on
-a Rust-capable environment. Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
+The `bot (rust)` job's `cargo test --all` failure (exit 101) is also fixed:
+it was a deterministic wrong assertion in
+`competition::tests::half_the_bid_is_unlikely` (expected `p ∈ (0.05, 0.20)`
+but the shipped `LOGISTIC_K = 2.2` gives `p = σ(-1.1) ≈ 0.2497` at half the
+winning bid), corrected against the model, plus a hardening of the dense-graph
+budget test's wall-clock ceiling against slow shared runners. **All four CI
+jobs are green** (`cargo test --all` 117/117, Rust 1.98.0). The one step left
+for W0 is administrative: a maintainer with admin access must mark the
+workflow **required** on PRs to `main`. Details in
+[`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 
 ## Phase 3 — going live (opt-in, separate PR)
 
