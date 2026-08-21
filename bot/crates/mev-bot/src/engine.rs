@@ -28,6 +28,64 @@ use crate::types::{
     now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, RelayTxSummary, Strategy, TxSource,
 };
 
+/// Runtime execution-mode switch.
+///
+/// The boot-time arming (`LIVE_EXECUTION=true` **and**
+/// `I_UNDERSTAND_LIVE_RISK=yes`, read once in `Config::from_env`) is what
+/// makes live execution possible at all; it cannot be granted after the fact.
+/// This type holds the operator's *runtime* decision on top of that arming:
+/// an armed bot can be paused back to simulation and resumed from the
+/// dashboard (`POST /api/mode`) without a restart, and an unarmed bot
+/// refuses the switch with the reason.
+///
+/// The invariant from `docs/RISK.md` is preserved structurally:
+/// `live() == armed && runtime`, so the runtime switch can only ever *narrow*
+/// what the environment already allowed — never widen it.
+#[derive(Debug)]
+pub struct LiveMode {
+    /// Arming as of process start (`cfg.live_execution`). Immutable.
+    armed: bool,
+    /// Operator's runtime choice. Starts as `armed` (the environment already
+    /// expresses intent), can be toggled while running.
+    runtime: std::sync::atomic::AtomicBool,
+}
+
+impl LiveMode {
+    pub fn armed_at_boot(armed: bool) -> Self {
+        Self {
+            armed,
+            runtime: std::sync::atomic::AtomicBool::new(armed),
+        }
+    }
+
+    /// True only when the process was armed for live execution at boot *and*
+    /// the runtime switch is on. This is the single decision input for
+    /// whether a profitable bundle is marked submitted.
+    pub fn live(&self) -> bool {
+        self.armed && self.runtime.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the environment armed this process at boot.
+    pub fn armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Flip the runtime switch. Returns the effective mode, or a
+    /// human-readable reason when live execution was requested on a process
+    /// that was never armed (the two-key switch is boot-time only by design).
+    pub fn set_live(&self, on: bool) -> Result<bool, &'static str> {
+        if on && !self.armed {
+            return Err(
+                "this bot was not started with live execution armed; set LIVE_EXECUTION=true and \
+                 I_UNDERSTAND_LIVE_RISK=yes in .env and restart — POST /api/mode can never arm a \
+                 process after the fact",
+            );
+        }
+        self.runtime.store(on, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.live())
+    }
+}
+
 pub struct Engine {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
@@ -36,6 +94,9 @@ pub struct Engine {
     pub ctx: Arc<StrategyCtx>,
     pub feed: broadcast::Sender<FeedEvent>,
     pub stats: Arc<Stats>,
+    /// Execution mode: boot-time arming + the runtime simulation/live switch
+    /// exposed to the dashboard. See [`LiveMode`].
+    pub mode: LiveMode,
     strategies: Vec<Arc<dyn StrategyImpl>>,
     pool_discovery: PoolDiscovery,
     http: RpcClient,
@@ -376,6 +437,7 @@ impl Engine {
             ctx,
             feed,
             stats,
+            mode: LiveMode::armed_at_boot(cfg.live_execution),
             strategies,
             pool_discovery,
             http,
@@ -798,12 +860,14 @@ impl Engine {
                 net_wei = outcome.primary.net_profit_wei,
                 gas = outcome.primary.gas_used,
                 block = opp.target_block,
-                "PROFITABLE bundle (simulation only — not submitted)"
+                live = self.mode.live(),
+                "PROFITABLE bundle"
             );
-            // `submitted` stays false: this build never broadcasts. Flipping it
-            // requires LIVE_EXECUTION=true *and* I_UNDERSTAND_LIVE_RISK=yes, which
-            // `Config::from_env` refuses to set together with the default profile.
-            bundle.submitted = self.cfg.live_execution;
+            // Whether the bundle is marked submitted follows the effective
+            // mode (boot-time arming && runtime switch). Flipping either of
+            // the env keys requires a restart by design — the runtime switch
+            // can only narrow what the environment allowed, never widen it.
+            bundle.submitted = self.mode.live();
         }
         let _ = self.store.record_bundle(&bundle);
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
@@ -904,6 +968,30 @@ pub fn enabled_strategies(cfg: &Config) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_mode_can_never_arm_an_unarmed_process() {
+        let m = LiveMode::armed_at_boot(false);
+        assert!(!m.live());
+        assert!(!m.armed());
+        // The runtime switch cannot grant what the environment did not.
+        let err = m.set_live(true).unwrap_err();
+        assert!(err.contains("LIVE_EXECUTION"));
+        assert!(!m.live());
+        // Switching an unarmed bot "off" is a harmless no-op that succeeds.
+        assert!(!m.set_live(false).unwrap());
+    }
+
+    #[test]
+    fn live_mode_toggles_at_runtime_when_armed_at_boot() {
+        let m = LiveMode::armed_at_boot(true);
+        assert!(m.armed());
+        assert!(m.live(), "an armed boot starts live");
+        assert!(!m.set_live(false).unwrap(), "operator pauses to simulation");
+        assert!(m.set_live(false).is_ok());
+        assert!(m.set_live(true).unwrap(), "operator resumes live");
+        assert!(m.live());
+    }
 
     #[test]
     fn funnel_starts_empty() {
