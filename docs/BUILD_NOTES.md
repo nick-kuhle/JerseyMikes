@@ -2,38 +2,49 @@
 
 ## What CI verifies
 
-`.github/workflows/ci.yml` runs three independent jobs:
+The intended GitHub Actions pipeline is
+[`ci/github-actions-ci.yml`](../ci/github-actions-ci.yml). It remains parked
+outside `.github/workflows/` until a maintainer with GitHub `workflows`
+permission enables it.
 
 | Job | Commands |
 | --- | --- |
-| `contracts` | `forge fmt --check`, `forge build --sizes`, `forge test -vvv` |
-| `bot` | `cargo fmt --check`, `cargo clippy`, `cargo test` |
+| `contracts` | `forge fmt --check`, `forge build --sizes`, `forge test -vvv` (`forge fmt --check` is currently advisory) |
+| `artifact-drift` | recompiles with solc-js and fails if `bot/crates/mev-bot/artifacts` or `contracts/abi` drifted from the sources |
+| `bot` | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test --all` (`cargo fmt --check` is currently advisory) |
 | `frontend` | `npm ci`, `tsc --noEmit`, `next build` |
 
-## What was verified in the authoring sandbox
+## Verification status for the Phase 2 handoff
 
-The sandbox this PR was written in has no access to `crates.io`,
-`static.rust-lang.org` or the Foundry release artifacts, so:
+The maintainer reports the following local commands passing on 2026-08-21:
 
-| Component | Status |
-| --- | --- |
-| Solidity (`src`, `test`, `script`) | **compiled** with solc 0.8.26 via `node contracts/script/compile-check.js` — 0 errors, `MevExecutor` runtime 9,618 bytes |
-| Frontend | **built and run** — `tsc --noEmit` clean, `next build` succeeds, dev server serving the console with live SSE |
-| Rust crate | **not compiled** — no toolchain available. `cargo fmt/clippy/test` run in CI on the first push |
+```bash
+make bot-check
+make bot-test
+make contracts
+```
 
-For Rust changes the sandbox falls back to a syntax-only check: every `.rs`
-file is parsed with a tree-sitter Rust grammar and any `ERROR`/`MISSING` node
-fails the check. That catches malformed syntax and nothing else — no type
-checking, no borrow checking, no trait resolution. Event-signature constants
-(`PairCreated`, `PoolCreated` topic0) are derived with keccak256 rather than
-recalled, and the derivation is validated by reproducing the constant already
-in the repo.
+The frontend checks were also run in the authoring sandbox:
 
-If `cargo check` reports anything on the first CI run it will be small and
-mechanical (an import, a trait bound); the logic and the tests are written to be
-read and re-run. `contracts/script/compile-check.js` is kept in the repo because
-it is genuinely useful for a fast Solidity type-check without Foundry, and
-because it generates the runtime bytecode artifact the Rust simulator embeds.
+```bash
+cd frontend && npx tsc --noEmit && npm run build
+```
+
+The authoring sandbox itself still has no Rust or Foundry binaries, so it could
+not independently reproduce the maintainer's Rust and Forge runs. Remote CI is
+not yet available because the GitHub App push is rejected without the
+`workflows` permission. Treat the local results as verification of the current
+W1–W4 implementation, not as a substitute for a required green PR check.
+
+The contracts-only fallback is independently reproducible here:
+
+```bash
+cd contracts && node script/compile-check.js
+```
+
+It compiled 28 sources with zero errors and confirmed the embedded
+`MevExecutor` runtime at 9,618 bytes. Solc reports the existing transient-storage
+and test-contract-size warnings; those are warnings, not compile failures.
 
 ## Regenerating the embedded artifacts
 
