@@ -37,6 +37,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/opportunities", get(opportunities))
         .route("/api/simulations", get(simulations))
         .route("/api/relay-bids", get(relay_bids))
+        .route("/api/funnel", get(funnel))
         .route("/api/stream", get(stream))
         .layer(
             CorsLayer::new()
@@ -150,6 +151,13 @@ async fn relay_bids(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> i
         Ok(rows) => Json(json!(rows)),
         Err(e) => Json(json!({"error": e.to_string()})),
     }
+}
+
+/// Per-strategy funnel counters. See `engine::FunnelCounters` for the
+/// semantics of each field. The dashboard consumes this to draw the
+/// "where did my opportunities die?" panel.
+async fn funnel(State(s): State<ApiState>) -> impl IntoResponse {
+    Json(s.engine.stats.snapshot())
 }
 
 fn parse_strategy(s: &str) -> Option<Strategy> {

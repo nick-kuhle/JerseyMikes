@@ -45,6 +45,47 @@ pub struct Stats {
     pub submittable: std::sync::atomic::AtomicU64,
     pub rejected: std::sync::atomic::AtomicU64,
     pub started_at_ms: std::sync::atomic::AtomicU64,
+    /// Per-strategy funnel: how many candidates each strategy *saw*, how
+    /// many it *emitted* (i.e. built an `Opportunity` for), how many were
+    /// *gated by risk*, and how many *simulated successfully*. The point
+    /// of this counter is to make the funnel visible: if the bot is
+    /// seeing opportunities but not submitting any, the question "where
+    /// did they die?" gets an immediate answer.
+    pub funnel: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FunnelCounters {
+    /// Total `on_pending` / `on_block` calls that produced at least one
+    /// `Opportunity`. This is the strategy's "output" rate.
+    pub candidates_emitted: u64,
+    /// Total `on_pending` / `on_block` calls that returned zero
+    /// `Opportunity`s. Split from `candidates_emitted` so the user can
+    /// see the proportion of "saw but emitted nothing" — typically
+    /// caused by min-notional filters, victim-revert pre-checks, or
+    /// pool-cache misses.
+    pub candidates_skipped: u64,
+    /// `Opportunity`s rejected by `RiskEngine::check`. The reject
+    /// reason is recorded elsewhere; this counter is just the count.
+    pub gated_by_risk: u64,
+    /// `Opportunity`s rejected because the victim's raw signed
+    /// transaction could not be fetched (so the simulation cannot
+    /// replay the victim's calldata faithfully).
+    pub missing_victim_raw: u64,
+    /// Simulations that returned `success = true`. Subset of
+    /// `simulations`; useful for the "revert rate" calculation.
+    pub simulations_succeeded: u64,
+    /// Simulations that returned `success = false` (revert, gas
+    /// overshoot, or zero net output).
+    pub simulations_reverted: u64,
+    /// Simulations that the `Simulator` itself failed to run (RPC
+    /// timeout, anvil fork died, etc.). Distinct from
+    /// `simulations_reverted` because the failure happened before
+    /// any state was executed.
+    pub simulations_failed: u64,
+    /// `submittable` opportunities: the simulations cleared the
+    /// net-profit and gas-cap gates.
+    pub submittable: u64,
 }
 
 impl Stats {
@@ -52,8 +93,37 @@ impl Stats {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Bump a per-strategy funnel counter. This is the only path
+    /// through which funnel counters should be incremented, so the
+    /// funnel-stats update is in one place.
+    pub fn record_funnel(&self, strategy: Strategy, f: impl FnOnce(&mut FunnelCounters)) {
+        let mut guard = self.funnel.write();
+        let entry = guard.entry(strategy).or_default();
+        f(entry);
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering::Relaxed;
+        let funnel = self
+            .funnel
+            .read()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    serde_json::json!({
+                        "candidatesEmitted": v.candidates_emitted,
+                        "candidatesSkipped": v.candidates_skipped,
+                        "gatedByRisk": v.gated_by_risk,
+                        "missingVictimRaw": v.missing_victim_raw,
+                        "simulationsSucceeded": v.simulations_succeeded,
+                        "simulationsReverted": v.simulations_reverted,
+                        "simulationsFailed": v.simulations_failed,
+                        "submittable": v.submittable,
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         serde_json::json!({
             "pendingSeen": self.pending_seen.load(Relaxed),
             "hintsSeen": self.hints_seen.load(Relaxed),
@@ -63,6 +133,7 @@ impl Stats {
             "submittable": self.submittable.load(Relaxed),
             "rejected": self.rejected.load(Relaxed),
             "startedAtMs": self.started_at_ms.load(Relaxed),
+            "funnel": funnel,
         })
     }
 }
@@ -206,8 +277,16 @@ impl Engine {
             let strat = s.clone();
             let this = self.clone();
             let head = head.clone();
+            let kind = s.kind();
             tokio::spawn(async move {
                 let opps = strat.on_block(&this.ctx, &head).await;
+                this.stats.record_funnel(kind, |f| {
+                    if opps.is_empty() {
+                        f.candidates_skipped += 1;
+                    } else {
+                        f.candidates_emitted += 1;
+                    }
+                });
                 for opp in opps {
                     this.clone().consider(opp, Vec::new()).await;
                 }
@@ -232,8 +311,16 @@ impl Engine {
             let strat = s.clone();
             let this = self.clone();
             let tx = tx.clone();
+            let kind = s.kind();
             tokio::spawn(async move {
                 let opps = strat.on_pending(&this.ctx, &tx).await;
+                this.stats.record_funnel(kind, |f| {
+                    if opps.is_empty() {
+                        f.candidates_skipped += 1;
+                    } else {
+                        f.candidates_emitted += 1;
+                    }
+                });
                 if opps.is_empty() {
                     return;
                 }
@@ -254,13 +341,18 @@ impl Engine {
     /// Risk-gate, simulate, record.
     async fn consider(self: Arc<Self>, opp: Opportunity, victims_raw: Vec<Vec<u8>>) {
         let head = self.ctx.head();
+        let kind = opp.strategy;
         if let Err(reject) = self.risk.check(&opp, head.base_fee_per_gas) {
             Stats::bump(&self.stats.rejected);
+            self.stats
+                .record_funnel(kind, |f| f.gated_by_risk += 1);
             tracing::debug!(target: "engine", strategy = opp.strategy.as_str(), reason = reject.as_str(), "rejected");
             return;
         }
         // A sandwich or JIT without the victim's bytes cannot be simulated faithfully.
         if !opp.victim_hashes.is_empty() && victims_raw.is_empty() {
+            self.stats
+                .record_funnel(kind, |f| f.missing_victim_raw += 1);
             tracing::debug!(target: "engine", "skipping: victim raw transaction unavailable");
             return;
         }
@@ -280,6 +372,8 @@ impl Engine {
             Ok(o) => o,
             Err(e) => {
                 tracing::debug!(target: "engine", error = %e, "simulation failed");
+                self.stats
+                    .record_funnel(kind, |f| f.simulations_failed += 1);
                 return;
             }
         };
@@ -293,9 +387,19 @@ impl Engine {
             let _ = self.feed.send(FeedEvent::Simulation(relay.clone()));
         }
 
+        if outcome.primary.success {
+            self.stats
+                .record_funnel(kind, |f| f.simulations_succeeded += 1);
+        } else {
+            self.stats
+                .record_funnel(kind, |f| f.simulations_reverted += 1);
+        }
+
         let mut bundle = outcome.bundle;
         if self.risk.submittable(&outcome.primary) {
             Stats::bump(&self.stats.submittable);
+            self.stats
+                .record_funnel(kind, |f| f.submittable += 1);
             tracing::info!(
                 target: "engine",
                 strategy = opp.strategy.as_str(),
@@ -367,4 +471,70 @@ pub fn enabled_strategies(cfg: &Config) -> Vec<&'static str> {
         })
         .map(|s| s.as_str())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn funnel_starts_empty() {
+        let s = Stats::default();
+        let snap = s.snapshot();
+        // The funnel map is empty until a strategy has had at least one
+        // record_funnel call; the snapshot must serialise without panicking
+        // even when no strategies have been observed.
+        let funnel = snap.get("funnel").expect("funnel key present");
+        assert!(funnel.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_funnel_bumps_the_right_strategy() {
+        let s = Stats::default();
+        s.record_funnel(Strategy::Sandwich, |f| f.candidates_emitted += 3);
+        s.record_funnel(Strategy::Sandwich, |f| f.gated_by_risk += 1);
+        s.record_funnel(Strategy::AtomicArb, |f| f.candidates_emitted += 7);
+        s.record_funnel(Strategy::AtomicArb, |f| f.simulations_succeeded += 2);
+        let snap = s.snapshot();
+        let funnel = snap.get("funnel").unwrap().as_object().unwrap();
+        let sandwich = funnel.get("sandwich").unwrap();
+        assert_eq!(sandwich["candidatesEmitted"], 3);
+        assert_eq!(sandwich["gatedByRisk"], 1);
+        let arb = funnel.get("atomic_arb").unwrap();
+        assert_eq!(arb["candidatesEmitted"], 7);
+        assert_eq!(arb["simulationsSucceeded"], 2);
+    }
+
+    #[test]
+    fn funnel_counters_default_to_zero() {
+        // Strategy never recorded: entry is created on first record_funnel
+        // with all fields at zero. Important: a strategy that has been
+        // recorded but for which no fields have been bumped should still
+        // appear in the snapshot with zeros, so the dashboard always has
+        // a row for every enabled strategy.
+        let s = Stats::default();
+        s.record_funnel(Strategy::Jit, |_| {});
+        let snap = s.snapshot();
+        let jit = snap["funnel"]["jit"].clone();
+        assert_eq!(jit["candidatesEmitted"], 0);
+        assert_eq!(jit["candidatesSkipped"], 0);
+        assert_eq!(jit["gatedByRisk"], 0);
+        assert_eq!(jit["submittable"], 0);
+    }
+
+    #[test]
+    fn global_counters_are_independent_of_funnel() {
+        // The pre-existing pending/blocks/opportunities counters must
+        // continue to work after the funnel refactor. This is a regression
+        // guard.
+        let s = Stats::default();
+        Stats::bump(&s.pending_seen);
+        Stats::bump(&s.pending_seen);
+        Stats::bump(&s.blocks_seen);
+        let snap = s.snapshot();
+        assert_eq!(snap["pendingSeen"], 2);
+        assert_eq!(snap["blocksSeen"], 1);
+        // Funnel untouched.
+        assert!(snap["funnel"].as_object().unwrap().is_empty());
+    }
 }
