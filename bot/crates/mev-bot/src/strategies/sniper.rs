@@ -19,7 +19,6 @@ use alloy_primitives::{Address, U256};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::config::known;
 use crate::dex::{self, Venue};
 use crate::strategies::sandwich::build_leg;
 use crate::strategies::{scan_pair_created, StrategyCtx, StrategyImpl};
