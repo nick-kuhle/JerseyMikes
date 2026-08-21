@@ -73,7 +73,13 @@ tightening order once there is data:
   on those.
 - **Liquidation sizing assumes a USDC debt leg and a 5% bonus.** Correct
   per-reserve configuration lookup is a to-do.
-- **No re-org handling.** A re-orged block's simulations stay in the database.
+- **Re-orgs are marked, not replayed.** A parent-hash mismatch or rewind
+  flags simulations in the discarded range (`reorged = 1`) and drops them
+  from P/L. The bot does not re-simulate the new canonical chain for those
+  blocks; the next heads and the delivered-block backfill pick up from there.
+- **Inclusion probability is a ranking, not a forecast.** `inclusion_p` is
+  a logistic of our bribe versus the realised builder payment. It does not
+  model other searchers, builder preference, or relay connectivity.
 
 ## Operational notes
 

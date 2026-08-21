@@ -27,6 +27,7 @@ export interface StatusResponse {
     simulations: number;
     submittable: number;
     rejected: number;
+    reorgsSeen?: number;
     startedAtMs: number;
     /**
      * Per-strategy funnel counters. The keys match `Strategy`.
@@ -46,7 +47,71 @@ export interface StatusResponse {
     funnelReplay?: Partial<Record<Strategy, FunnelCounters>>;
   };
   simBackends: {anvilFork: boolean; relayCallBundle: boolean};
+  inventory?: {
+    nonce: number;
+    ethWei: string;
+    wethWei: string;
+    availableWei: string;
+    gate: boolean;
+  };
+  latency?: LatencySnapshot;
   demo?: boolean;
+}
+
+export interface HistogramSnapshot {
+  count: number;
+  meanMs: number;
+  minMs: number;
+  maxMs: number;
+  p50Ms: number;
+  p95Ms: number;
+  p99Ms: number;
+}
+
+export interface LatencySnapshot {
+  budgetMs: number;
+  withinBudget: boolean;
+  stages: Record<string, HistogramSnapshot>;
+}
+
+export interface ReconciliationRow {
+  blockNumber: number;
+  opportunityId: string;
+  strategy: string;
+  simNetWei: number;
+  ourBribeWei: string;
+  winningBidWei: string;
+  victimLanded: boolean;
+  wouldOutbid: boolean;
+  inclusionP: number;
+  truePositive: boolean;
+  falsePositive: boolean;
+  reorged: boolean;
+  createdAtMs: number;
+}
+
+export interface CompetitionSummary {
+  rows: number;
+  truePositives: number;
+  falsePositives: number;
+  wouldOutbid: number;
+  victimsLanded: number;
+  meanInclusionP: number;
+}
+
+export interface CompetitionResponse {
+  summary: CompetitionSummary;
+  recent: ReconciliationRow[];
+  demo?: boolean;
+}
+
+export interface ReorgRow {
+  fromBlock: number;
+  toBlock: number;
+  depth: number;
+  oldHash: string;
+  newHash: string;
+  seenAtMs: number;
 }
 
 export interface FunnelCounters {
@@ -202,4 +267,13 @@ export type FeedEvent =
     }
   | {kind: "bundle"; id: string; strategy: Strategy; target_block: number; submitted: boolean}
   | {kind: "relay"; relay: string; slot: number; builder: string; value_wei: string; seen_at_ms: number}
-  | {kind: "relay_block"; block: RelayBlock; tx_count: number; txs: RelayTxSummary[]};
+  | {kind: "relay_block"; block: RelayBlock; tx_count: number; txs: RelayTxSummary[]}
+  | {
+      kind: "reorg";
+      from_block: number;
+      to_block: number;
+      depth: number;
+      old_hash: string;
+      new_hash: string;
+      seen_at_ms: number;
+    };

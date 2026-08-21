@@ -12,7 +12,22 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 
-use crate::types::{BundleRecord, Opportunity, SimulationResult, Strategy};
+use crate::types::{now_ms, BundleRecord, Opportunity, SimulationResult, Strategy};
+
+/// One stored anvil-fork simulation, joined to its opportunity, ready for the
+/// replay harness to rank against relay bid traces.
+#[derive(Clone, Debug)]
+pub struct ReplayCandidate {
+    pub opportunity_id: String,
+    pub strategy: String,
+    pub success: bool,
+    pub net_wei: i64,
+    pub bribe_wei: String,
+    pub block_number: u64,
+    /// Comma-separated `0x…` hashes; empty means the opportunity had no victim
+    /// (arb / liquidation / sniper).
+    pub victims: String,
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -105,10 +120,40 @@ impl Store {
             CREATE TABLE IF NOT EXISTS blocks (
                 number        INTEGER PRIMARY KEY,
                 hash          TEXT NOT NULL,
+                parent_hash   TEXT NOT NULL DEFAULT '',
+                canonical     INTEGER NOT NULL DEFAULT 1,
                 base_fee_wei  TEXT NOT NULL,
                 gas_used      INTEGER NOT NULL,
                 timestamp     INTEGER NOT NULL,
                 seen_at_ms    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reorgs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_block    INTEGER NOT NULL,
+                to_block      INTEGER NOT NULL,
+                depth         INTEGER NOT NULL,
+                old_hash      TEXT NOT NULL,
+                new_hash      TEXT NOT NULL,
+                seen_at_ms    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reconciliations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_number    INTEGER NOT NULL,
+                opportunity_id  TEXT NOT NULL,
+                strategy        TEXT NOT NULL,
+                sim_net_wei     INTEGER NOT NULL,
+                our_bribe_wei   TEXT NOT NULL,
+                winning_bid_wei TEXT NOT NULL,
+                victim_landed   INTEGER NOT NULL,
+                would_outbid    INTEGER NOT NULL,
+                inclusion_p     REAL NOT NULL,
+                true_positive   INTEGER NOT NULL,
+                false_positive  INTEGER NOT NULL,
+                reorged         INTEGER NOT NULL DEFAULT 0,
+                created_at_ms   INTEGER NOT NULL,
+                UNIQUE(opportunity_id, block_number)
             );
 
             CREATE TABLE IF NOT EXISTS relay_bids (
@@ -154,9 +199,26 @@ impl Store {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_slot ON relay_bids(relay, slot);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_block_slot ON relay_blocks(relay, slot);
             CREATE INDEX IF NOT EXISTS idx_relay_block_txs_block ON relay_block_txs(block_number);
+            CREATE INDEX IF NOT EXISTS idx_recon_block ON reconciliations(block_number);
             "#,
         )?;
+        // Additive columns for databases created before Phase 1. SQLite has no
+        // IF NOT EXISTS for columns; a duplicate-column error is the success
+        // case on a second boot.
+        self.add_column("blocks", "parent_hash", "TEXT NOT NULL DEFAULT ''");
+        self.add_column("blocks", "canonical", "INTEGER NOT NULL DEFAULT 1");
+        self.add_column("simulations", "reorged", "INTEGER NOT NULL DEFAULT 0");
         Ok(())
+    }
+
+    fn add_column(&self, table: &str, column: &str, decl: &str) {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+        if let Err(e) = self.conn.lock().execute(&sql, []) {
+            let msg = e.to_string().to_ascii_lowercase();
+            if !msg.contains("duplicate column") {
+                tracing::debug!(table, column, error = %e, "alter column skipped");
+            }
+        }
     }
 
     pub fn record_opportunity(&self, o: &Opportunity) -> Result<()> {
@@ -229,18 +291,252 @@ impl Store {
 
     pub fn record_block(&self, head: &crate::types::BlockHead) -> Result<()> {
         self.conn.lock().execute(
-            "INSERT OR REPLACE INTO blocks (number, hash, base_fee_wei, gas_used, timestamp, seen_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT OR REPLACE INTO blocks
+             (number, hash, parent_hash, canonical, base_fee_wei, gas_used, timestamp, seen_at_ms)
+             VALUES (?1,?2,?3,1,?4,?5,?6,?7)",
             params![
                 head.number as i64,
                 format!("{:?}", head.hash),
+                format!("{:?}", head.parent_hash),
                 head.base_fee_per_gas.to_string(),
                 head.gas_used as i64,
                 head.timestamp as i64,
-                crate::types::now_ms() as i64,
+                now_ms() as i64,
             ],
         )?;
         Ok(())
+    }
+
+    /// Mark simulations (and reconciliations) in `[from_block, to_block]` as
+    /// belonging to a discarded fork, and log the re-org.
+    pub fn record_reorg(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        old_hash: &str,
+        new_hash: &str,
+    ) -> Result<()> {
+        let depth = to_block.saturating_sub(from_block).saturating_add(1);
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE simulations SET reorged = 1
+             WHERE target_block >= ?1 AND target_block <= ?2 AND COALESCE(reorged, 0) = 0",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE reconciliations SET reorged = 1
+             WHERE block_number >= ?1 AND block_number <= ?2 AND COALESCE(reorged, 0) = 0",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE blocks SET canonical = 0 WHERE number >= ?1 AND number <= ?2",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "INSERT INTO reorgs (from_block, to_block, depth, old_hash, new_hash, seen_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                from_block as i64,
+                to_block as i64,
+                depth as i64,
+                old_hash,
+                new_hash,
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_reorgs(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT from_block, to_block, depth, old_hash, new_hash, seen_at_ms
+             FROM reorgs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(serde_json::json!({
+                "fromBlock": row.get::<_, i64>(0)?,
+                "toBlock": row.get::<_, i64>(1)?,
+                "depth": row.get::<_, i64>(2)?,
+                "oldHash": row.get::<_, String>(3)?,
+                "newHash": row.get::<_, String>(4)?,
+                "seenAtMs": row.get::<_, i64>(5)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Realised builder payment for a block, if any relay has reported one.
+    /// When several relays delivered the same number we take the highest bid:
+    /// that is the market-clearing price the competition model ranks against.
+    pub fn winning_bid_for_block(&self, block_number: u64) -> Result<Option<U256>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT value_wei FROM relay_blocks
+             WHERE block_number = ?1
+             ORDER BY length(value_wei) DESC, value_wei DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![block_number as i64])?;
+        if let Some(row) = rows.next()? {
+            let s: String = row.get(0)?;
+            Ok(s.parse::<U256>().ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// True if any of the comma-separated victim hashes landed in `block_number`.
+    pub fn any_victim_landed(&self, block_number: u64, victims: &str) -> Result<bool> {
+        let hashes: Vec<&str> = victims
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if hashes.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        for h in hashes {
+            let found: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM relay_block_txs WHERE block_number = ?1 AND hash = ?2",
+                params![block_number as i64, h],
+                |r| r.get(0),
+            )?;
+            if found > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Anvil-fork simulations in a block window, newest first. Re-orged rows
+    /// are excluded so a discarded fork cannot inflate the true-positive rate.
+    pub fn replay_candidates(
+        &self,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        limit: i64,
+    ) -> Result<Vec<ReplayCandidate>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.opportunity_id, s.strategy, s.success, s.net_wei, s.bribe_wei,
+                    s.target_block, COALESCE(o.victims, '')
+             FROM simulations s
+             LEFT JOIN opportunities o ON o.id = s.opportunity_id
+             WHERE s.backend = 'anvil_fork'
+               AND COALESCE(s.reorged, 0) = 0
+               AND (?1 IS NULL OR s.target_block >= ?1)
+               AND (?2 IS NULL OR s.target_block <= ?2)
+             ORDER BY s.target_block DESC, s.id DESC
+             LIMIT ?3",
+        )?;
+        let from = from_block.map(|n| n as i64);
+        let to = to_block.map(|n| n as i64);
+        let rows = stmt.query_map(params![from, to, limit], |row| {
+            Ok(ReplayCandidate {
+                opportunity_id: row.get(0)?,
+                strategy: row.get(1)?,
+                success: row.get::<_, i64>(2)? == 1,
+                net_wei: row.get(3)?,
+                bribe_wei: row.get(4)?,
+                block_number: row.get::<_, i64>(5)? as u64,
+                victims: row.get(6)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_reconciliation(
+        &self,
+        block_number: u64,
+        opportunity_id: &str,
+        strategy: &str,
+        sim_net_wei: i64,
+        our_bribe_wei: &str,
+        winning_bid_wei: &str,
+        victim_landed: bool,
+        would_outbid: bool,
+        inclusion_p: f64,
+        true_positive: bool,
+        false_positive: bool,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO reconciliations
+             (block_number, opportunity_id, strategy, sim_net_wei, our_bribe_wei, winning_bid_wei,
+              victim_landed, would_outbid, inclusion_p, true_positive, false_positive, reorged, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12)",
+            params![
+                block_number as i64,
+                opportunity_id,
+                strategy,
+                sim_net_wei,
+                our_bribe_wei,
+                winning_bid_wei,
+                victim_landed as i32,
+                would_outbid as i32,
+                inclusion_p,
+                true_positive as i32,
+                false_positive as i32,
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_reconciliations(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT block_number, opportunity_id, strategy, sim_net_wei, our_bribe_wei, winning_bid_wei,
+                    victim_landed, would_outbid, inclusion_p, true_positive, false_positive, reorged, created_at_ms
+             FROM reconciliations
+             WHERE COALESCE(reorged, 0) = 0
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(serde_json::json!({
+                "blockNumber": row.get::<_, i64>(0)?,
+                "opportunityId": row.get::<_, String>(1)?,
+                "strategy": row.get::<_, String>(2)?,
+                "simNetWei": row.get::<_, i64>(3)?,
+                "ourBribeWei": row.get::<_, String>(4)?,
+                "winningBidWei": row.get::<_, String>(5)?,
+                "victimLanded": row.get::<_, i64>(6)? == 1,
+                "wouldOutbid": row.get::<_, i64>(7)? == 1,
+                "inclusionP": row.get::<_, f64>(8)?,
+                "truePositive": row.get::<_, i64>(9)? == 1,
+                "falsePositive": row.get::<_, i64>(10)? == 1,
+                "reorged": row.get::<_, i64>(11)? == 1,
+                "createdAtMs": row.get::<_, i64>(12)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Aggregate inclusion stats across canonical reconciliations.
+    pub fn competition_summary(&self) -> Result<serde_json::Value> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(true_positive), 0),
+                    COALESCE(SUM(false_positive), 0),
+                    COALESCE(SUM(would_outbid), 0),
+                    COALESCE(SUM(victim_landed), 0),
+                    COALESCE(AVG(inclusion_p), 0)
+             FROM reconciliations WHERE COALESCE(reorged, 0) = 0",
+            [],
+            |r| {
+                Ok(serde_json::json!({
+                    "rows": r.get::<_, i64>(0)?,
+                    "truePositives": r.get::<_, i64>(1)?,
+                    "falsePositives": r.get::<_, i64>(2)?,
+                    "wouldOutbid": r.get::<_, i64>(3)?,
+                    "victimsLanded": r.get::<_, i64>(4)?,
+                    "meanInclusionP": r.get::<_, f64>(5)?,
+                }))
+            },
+        )
+        .map_err(Into::into)
     }
 
     pub fn record_relay_bid(&self, relay: &str, slot: u64, builder: &str, value: U256) -> Result<()> {
@@ -323,7 +619,7 @@ impl Store {
                     COALESCE(MIN(net_wei), 0),
                     COALESCE(AVG(latency_ms), 0)
              FROM simulations
-             WHERE backend = 'anvil_fork'
+             WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0
              GROUP BY strategy",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -347,7 +643,7 @@ impl Store {
     pub fn cumulative_net(&self) -> Result<i64> {
         let conn = self.conn.lock();
         let v: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(net_wei), 0) FROM simulations WHERE backend = 'anvil_fork'",
+            "SELECT COALESCE(SUM(net_wei), 0) FROM simulations WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0",
             [],
             |r| r.get(0),
         )?;
@@ -413,7 +709,7 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT target_block, SUM(net_wei), COUNT(*)
-             FROM simulations WHERE backend = 'anvil_fork'
+             FROM simulations WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0
              GROUP BY target_block ORDER BY target_block DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -641,5 +937,42 @@ mod tests {
 
         // Unknown block number → empty result.
         assert!(s.relay_block_txs(Some(1), 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reorged_simulations_drop_out_of_pnl() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_simulation(&sim(Strategy::Sandwich, 500)).unwrap();
+        s.record_simulation(&sim(Strategy::Sandwich, 200)).unwrap();
+        s.record_reorg(100, 100, "0xold", "0xnew").unwrap();
+        assert_eq!(s.cumulative_net().unwrap(), 0);
+        assert!(s.pnl().unwrap().is_empty());
+        let reorgs = s.recent_reorgs(10).unwrap();
+        assert_eq!(reorgs.len(), 1);
+        assert_eq!(reorgs[0]["depth"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn winning_bid_picks_the_highest_relay() {
+        use crate::types::RelayBlock;
+        use alloy_primitives::B256;
+        let s = Store::open_in_memory().unwrap();
+        let mut a = RelayBlock {
+            relay: "a".into(),
+            slot: 1,
+            block_number: 50,
+            block_hash: B256::from([1u8; 32]),
+            builder: "x".into(),
+            value_wei: U256::from(10u64),
+            gas_used: 1,
+            num_tx: 0,
+        };
+        s.record_relay_block(&a).unwrap();
+        a.relay = "b".into();
+        a.slot = 2;
+        a.value_wei = U256::from(99u64);
+        s.record_relay_block(&a).unwrap();
+        assert_eq!(s.winning_bid_for_block(50).unwrap(), Some(U256::from(99u64)));
+        assert_eq!(s.winning_bid_for_block(1).unwrap(), None);
     }
 }

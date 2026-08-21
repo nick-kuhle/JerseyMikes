@@ -251,6 +251,7 @@ is mainnet (`chain id` should be `1`), that raw-tx access is supported
 | Contracts build + test | `make contracts` |
 | Bot build / test | `make bot-build` / `make bot-test` |
 | Run searcher + API (`:8080`) | `make bot-run` |
+| Replay stored sims vs relay traces | `make replay` |
 | Run console (`:3000`) | `make front-dev` |
 | Simulate a deployment against a fork | `make deploy-dry` |
 | No-Foundry contracts check | `make contracts-check` |

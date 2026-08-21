@@ -40,6 +40,9 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/relay-blocks", get(relay_blocks))
         .route("/api/relay-txs", get(relay_txs))
         .route("/api/funnel", get(funnel))
+        .route("/api/latency", get(latency))
+        .route("/api/competition", get(competition))
+        .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
         .layer(
             CorsLayer::new()
@@ -86,6 +89,8 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
             "anvilFork": e.sim.fork.is_some(),
             "relayCallBundle": e.sim.relay.is_some(),
         },
+        "inventory": e.inventory.snapshot(),
+        "latency": e.latency.snapshot(),
     }))
 }
 
@@ -187,6 +192,29 @@ async fn relay_txs(State(s): State<ApiState>, Query(q): Query<RelayTxsQuery>) ->
 /// "where did my opportunities die?" panel.
 async fn funnel(State(s): State<ApiState>) -> impl IntoResponse {
     Json(s.engine.stats.snapshot())
+}
+
+async fn latency(State(s): State<ApiState>) -> impl IntoResponse {
+    Json(s.engine.latency.snapshot())
+}
+
+async fn competition(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let summary = s.engine.store.competition_summary().unwrap_or_else(|_| json!({}));
+    let rows = s
+        .engine
+        .store
+        .recent_reconciliations(limit)
+        .unwrap_or_default();
+    Json(json!({"summary": summary, "recent": rows}))
+}
+
+async fn reorgs(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    match s.engine.store.recent_reorgs(limit) {
+        Ok(rows) => Json(json!(rows)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
 }
 
 fn parse_strategy(s: &str) -> Option<Strategy> {

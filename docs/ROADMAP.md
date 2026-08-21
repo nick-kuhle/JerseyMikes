@@ -16,14 +16,24 @@ before the next is started.
 
 ## Phase 1 — make the numbers trustworthy (Ethereum)
 
-- [ ] Replay harness: re-simulate historical blocks from the database and
+- [x] Replay harness: re-simulate historical blocks from the database and
       compare against what actually landed on chain (from relay bid traces)
-- [ ] Model competition: rank our bundle against the block's realised builder
+      — `mev-bot replay` plus online reconciliation on every new head /
+      delivered block (`bot/crates/mev-bot/src/replay.rs`)
+- [x] Model competition: rank our bundle against the block's realised builder
       payment to estimate true inclusion probability
-- [ ] Latency budget: per-stage timing histograms; the mempool→bundle path
-      needs to be under ~150 ms to matter
-- [ ] Nonce/inventory manager (currently the bundle nonce is a placeholder)
-- [ ] Re-org handling and per-block reconciliation
+      (`competition.rs`; logistic of bribe / winning bid, persisted on
+      `reconciliations`)
+- [x] Latency budget: per-stage timing histograms; the mempool→bundle path
+      needs to be under ~150 ms to matter (`latency.rs`, `/api/latency`)
+- [x] Nonce/inventory manager (currently the bundle nonce is a placeholder)
+      — searcher nonce is read from chain each block and used to sign both
+      legs; ETH/WETH balances tracked; gating opt-in via `INVENTORY_GATE`
+      (`inventory.rs`)
+- [x] Re-org handling and per-block reconciliation
+      — parent-hash mismatch / rewind marks simulations non-canonical and
+      drops them from P/L; each confirmed block is ranked against relay
+      traces
 
 ## Phase 2 — coverage
 
