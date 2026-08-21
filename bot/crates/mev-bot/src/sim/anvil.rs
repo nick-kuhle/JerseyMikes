@@ -168,6 +168,11 @@ impl AnvilSim {
     /// would rewind it under the mempool path, so it belongs to the dedicated
     /// replay instance.
     pub async fn ensure_fork_exact(&self, block: u64) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        self.ensure_fork_exact_locked(block).await
+    }
+
+    async fn ensure_fork_exact_locked(&self, block: u64) -> Result<()> {
         let mut at = self.forked_at.lock().await;
         if *at == block {
             return Ok(());
@@ -217,9 +222,32 @@ impl AnvilSim {
         victim_sender_nonce: Option<(Address, u64)>,
         base_fee: U256,
     ) -> Result<SimulationResult> {
-        let _guard = self.lock.lock().await;
-        let started = Instant::now();
+        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee).await
+    }
 
+    /// Pin and simulate while holding the same mutex. This prevents a reset
+    /// from invalidating the snapshot between pinning and execution.
+    pub async fn simulate_at(
+        &self,
+        block: u64,
+        opp: &Opportunity,
+        victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(Address, u64)>,
+        base_fee: U256,
+    ) -> Result<SimulationResult> {
+        let _guard = self.lock.lock().await;
+        self.ensure_fork_exact_locked(block).await?;
+        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee).await
+    }
+
+    async fn simulate_locked(
+        &self,
+        opp: &Opportunity,
+        victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(Address, u64)>,
+        base_fee: U256,
+    ) -> Result<SimulationResult> {
+        let started = Instant::now();
         let snapshot: Value = self.rpc.call_raw("evm_snapshot", json!([])).await?;
         let result = self
             .simulate_inner(opp, victims_raw, victim_sender_nonce, base_fee, started)

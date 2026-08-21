@@ -36,6 +36,8 @@ pub struct Engine {
     strategies: Vec<Arc<dyn StrategyImpl>>,
     pool_discovery: PoolDiscovery,
     http: RpcClient,
+    /// Prevent replay blocks from resetting the shared replay lane concurrently.
+    replay_gate: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
@@ -350,6 +352,7 @@ impl Engine {
             strategies,
             pool_discovery,
             http,
+            replay_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -452,16 +455,24 @@ impl Engine {
         // which starves the live mempool path and gets the bot rate limited off
         // its provider. `RELAY_TX_CONCURRENCY` caps how many are in flight; the
         // work still completes, it just does not stampede.
+        // Hold one permit until every transaction in this block has finished.
+        // Otherwise the per-transaction semaphore only limits a block, while
+        // delivered blocks can still reset the replay fork over one another.
+        let _block_guard = self.replay_gate.clone().acquire_owned().await.ok();
         let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.relay_tx_concurrency));
+        let mut tasks = Vec::with_capacity(txs.len());
         for t in txs {
             let Ok(permit) = permits.clone().acquire_owned().await else {
-                break; // semaphore closed — shutting down
+                break;
             };
             let this = self.clone();
-            tokio::spawn(async move {
+            tasks.push(tokio::spawn(async move {
                 let _permit = permit;
                 this.evaluate_awaited(t).await;
-            });
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
         }
     }
 
