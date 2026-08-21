@@ -4,6 +4,7 @@ import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import EquityChart from "./EquityChart";
 import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
+import RiskPanel from "./RiskPanel";
 import type {
   FeedEvent,
   OpportunityRow,
@@ -363,6 +364,15 @@ export default function Console() {
             </table>
           </div>
         </div>
+      </section>
+
+      {/* risk & strategy controls */}
+      <section className="panel" style={{padding: 12}}>
+        <div className="panel-head" style={{marginBottom: 12}}>
+          <span>Risk Management & Searcher Tuning</span>
+          <span className="muted">Live Parameters & Diagnostics</span>
+        </div>
+        <RiskPanel status={status} />
       </section>
 
       {/* contract */}
