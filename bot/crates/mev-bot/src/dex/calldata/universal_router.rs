@@ -37,6 +37,17 @@ fn contract_balance() -> U256 {
     U256::from(1u8) << 255
 }
 
+/// A decoded UniversalRouter swap, before it is lifted into `SwapIntent`.
+#[derive(Clone, Debug)]
+pub struct UrSwap {
+    pub token_in: Address,
+    pub token_out: Address,
+    pub amount_in: U256,
+    pub min_out: U256,
+    pub path: Vec<Address>,
+    pub native_in: bool,
+}
+
 /// Decode one UniversalRouter transaction into a swap. `None` on anything
 /// we do not understand — never panics on malformed input.
 pub fn decode(to: Address, input: &[u8], value: U256, weth: Address) -> Option<UrSwap> {

@@ -140,8 +140,14 @@ impl StrategyImpl for SandwichV3Strategy {
         // One pool per victim (the fee is in the calldata). The candidate
         // cap is here so a future multi-fee expansion cannot blow the
         // pending-path budget by accident.
-        let Some(sizing) =
-            size_v3_sandwich(&quoter, &intent, ctx.max_position(), MAX_QUOTES_PER_CANDIDATE).await
+        debug_assert!(1 <= MAX_CANDIDATES_PER_TX);
+        let Some(sizing) = size_v3_sandwich(
+            &quoter,
+            &intent,
+            ctx.max_position(),
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await
         else {
             return Vec::new();
         };
@@ -204,11 +210,7 @@ impl StrategyImpl for SandwichV3Strategy {
 ///
 /// Extracted so the "no cache → no RPC" contract is unit-testable without a
 /// `StrategyCtx`.
-pub fn accept_victim(
-    intent: &V3SwapIntent,
-    weth: Address,
-    cache: &V3PoolCache,
-) -> Option<V3Pool> {
+pub fn accept_victim(intent: &V3SwapIntent, weth: Address, cache: &V3PoolCache) -> Option<V3Pool> {
     if intent.amount_in.is_zero() || intent.token_in == intent.token_out {
         return None;
     }
@@ -331,10 +333,7 @@ impl<Q: V3Quoter> BudgetQuoter<'_, Q> {
 fn grid_sizes(max_in: U256, bps: &[u32]) -> Vec<U256> {
     bps.iter()
         .filter_map(|&b| {
-            let x = max_in
-                .checked_mul(U256::from(b))
-                .unwrap_or(U256::MAX)
-                / U256::from(10_000u32);
+            let x = max_in.checked_mul(U256::from(b)).unwrap_or(U256::MAX) / U256::from(10_000u32);
             if x.is_zero() {
                 None
             } else {
@@ -377,9 +376,7 @@ async fn evaluate_size<Q: V3Quoter>(
     intent: &V3SwapIntent,
     x: U256,
 ) -> Option<V3SandwichSizing> {
-    let front_out = quoter
-        .quote(intent.token_in, intent.token_out, x)
-        .await?;
+    let front_out = quoter.quote(intent.token_in, intent.token_out, x).await?;
     let both_in = x.saturating_add(intent.amount_in);
     let both_out = quoter
         .quote(intent.token_in, intent.token_out, both_in)
@@ -396,7 +393,8 @@ async fn evaluate_size<Q: V3Quoter>(
     }
 
     let fee_bps = v3_fee_to_bps(intent.fee).max(1);
-    let (back_out, profit) = rank_with_implied_cp(x, front_out, both_in, both_out, victim_out, fee_bps)?;
+    let (back_out, profit) =
+        rank_with_implied_cp(x, front_out, both_in, both_out, victim_out, fee_bps)?;
     if profit.is_zero() {
         return None;
     }
@@ -484,9 +482,8 @@ pub fn implied_reserves(
     if den_out.is_zero() || r_in.is_zero() {
         return None;
     }
-    let r_out = o1
-        .checked_mul(r_in.checked_mul(ten_k)?.checked_add(a1.checked_mul(f)?)?)?
-        / den_out;
+    let r_out =
+        o1.checked_mul(r_in.checked_mul(ten_k)?.checked_add(a1.checked_mul(f)?)?)? / den_out;
     if r_in.is_zero() || r_out.is_zero() {
         return None;
     }
@@ -618,10 +615,7 @@ mod tests {
     #[tokio::test]
     async fn a_large_victim_on_a_deep_pool_is_sandwichable() {
         let q = FakeQuoter {
-            pool: pool(
-                1_000_000 * 10u128.pow(18),
-                1_000_000 * 10u128.pow(18),
-            ),
+            pool: pool(1_000_000 * 10u128.pow(18), 1_000_000 * 10u128.pow(18)),
             calls: AtomicU32::new(0),
         };
         let victim = U256::from(50_000u128) * U256::from(10u128.pow(18));
@@ -639,10 +633,7 @@ mod tests {
     async fn a_zero_slippage_victim_produces_nothing() {
         // Victim demands the unsandwiched output: every positive front-run
         // pushes them below amountOutMinimum, so the trap must fire.
-        let p = pool(
-            1_000_000 * 10u128.pow(18),
-            1_000_000 * 10u128.pow(18),
-        );
+        let p = pool(1_000_000 * 10u128.pow(18), 1_000_000 * 10u128.pow(18));
         let victim = U256::from(50_000u128) * U256::from(10u128.pow(18));
         let strict_min = p.amount_out(weth(), victim).unwrap();
         let q = FakeQuoter {
@@ -650,8 +641,9 @@ mod tests {
             calls: AtomicU32::new(0),
         };
         let max_in = U256::from(100_000u128) * U256::from(10u128.pow(18));
-        let res = size_v3_sandwich(&q, &intent(victim, strict_min), max_in, MAX_QUOTES_PER_CANDIDATE)
-            .await;
+        let res =
+            size_v3_sandwich(&q, &intent(victim, strict_min), max_in, MAX_QUOTES_PER_CANDIDATE)
+                .await;
         assert!(res.is_none(), "must not sandwich a zero-slippage victim");
         assert!(q.calls.load(Ordering::Relaxed) <= MAX_QUOTES_PER_CANDIDATE);
     }
@@ -668,18 +660,25 @@ mod tests {
             calls: AtomicU32::new(0),
         };
         let deep = FakeQuoter {
-            pool: pool(
-                2_000_000 * 10u128.pow(18),
-                2_000_000 * 10u128.pow(18),
-            ),
+            pool: pool(2_000_000 * 10u128.pow(18), 2_000_000 * 10u128.pow(18)),
             calls: AtomicU32::new(0),
         };
         let victim = U256::from(20_000u128) * U256::from(10u128.pow(18));
         let max_in = U256::from(80_000u128) * U256::from(10u128.pow(18));
-        let a = size_v3_sandwich(&shallow, &intent(victim, U256::ZERO), max_in, MAX_QUOTES_PER_CANDIDATE)
-            .await;
-        let b = size_v3_sandwich(&deep, &intent(victim, U256::ZERO), max_in, MAX_QUOTES_PER_CANDIDATE)
-            .await;
+        let a = size_v3_sandwich(
+            &shallow,
+            &intent(victim, U256::ZERO),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await;
+        let b = size_v3_sandwich(
+            &deep,
+            &intent(victim, U256::ZERO),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await;
         // Both pools are deep enough for a sandwich; the shallower one has
         // more impact so its profit is the larger of the two.
         let a = a.expect("shallow pool sandwiches");
@@ -694,10 +693,7 @@ mod tests {
     #[tokio::test]
     async fn the_quote_budget_is_a_hard_cap() {
         let q = FakeQuoter {
-            pool: pool(
-                1_000_000 * 10u128.pow(18),
-                1_000_000 * 10u128.pow(18),
-            ),
+            pool: pool(1_000_000 * 10u128.pow(18), 1_000_000 * 10u128.pow(18)),
             calls: AtomicU32::new(0),
         };
         let victim = U256::from(40_000u128) * U256::from(10u128.pow(18));
