@@ -60,6 +60,7 @@ Requirements (install walkthrough + troubleshooting in
 | Flashbots **MEV-Share** SSE | private orderflow hints; acted on when calldata is present |
 | `newHeads` | block cadence, base fee, pool-cache refresh |
 | Relay **data API** (`proposer_payload_delivered`) | what the winning builder actually paid — the market price of each block's MEV, and our benchmark |
+| **bloXroute Max Profit relay** delivered blocks | the winning block's transactions are fetched, stored and scored for extractable value |
 | Third-party mempool streams (bloXroute / Blocknative) | optional, comma-separated in `EXTRA_MEMPOOL_WS` |
 | L2 sequencer / preconfirmation feed | wired and idle until chain #2 |
 
@@ -131,6 +132,14 @@ src/
   api.rs         REST + SSE
   engine.rs      the loop that ties it together
 ```
+
+The bloXroute Max Profit relay integration (`RELAY_TX_INGEST=true`, on by
+default) polls `proposer_payload_delivered`, fetches each delivered block's
+transactions via `eth_getBlockByHash`, persists them to SQLite
+(`relay_blocks` / `relay_block_txs`), and routes every transaction through the
+same strategy → risk → simulation funnel as a mempool transaction so the bot
+records whether value was extractable. See
+[`docs/BLOXROUTE_RELAY.md`](docs/BLOXROUTE_RELAY.md).
 
 ```bash
 cd bot

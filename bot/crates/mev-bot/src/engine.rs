@@ -21,7 +21,9 @@ use crate::strategies::{
     arb::AtomicArbStrategy, discovery::PoolDiscovery, jit::JitStrategy, liquidation::LiquidationStrategy,
     sandwich::SandwichStrategy, sniper::SniperStrategy, StrategyCtx, StrategyImpl,
 };
-use crate::types::{now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, Strategy, TxSource};
+use crate::types::{
+    now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, RelayTxSummary, Strategy, TxSource,
+};
 
 pub struct Engine {
     pub cfg: Arc<Config>,
@@ -41,6 +43,11 @@ pub struct Stats {
     pub pending_seen: std::sync::atomic::AtomicU64,
     pub hints_seen: std::sync::atomic::AtomicU64,
     pub blocks_seen: std::sync::atomic::AtomicU64,
+    /// Delivered blocks ingested from the bloXroute Max Profit relay.
+    pub relay_blocks_seen: std::sync::atomic::AtomicU64,
+    /// Transactions inside those delivered blocks, routed through the strategy
+    /// funnel for extractable-value scoring.
+    pub relay_txs_seen: std::sync::atomic::AtomicU64,
     pub opportunities: std::sync::atomic::AtomicU64,
     pub simulations: std::sync::atomic::AtomicU64,
     pub submittable: std::sync::atomic::AtomicU64,
@@ -129,6 +136,8 @@ impl Stats {
             "pendingSeen": self.pending_seen.load(Relaxed),
             "hintsSeen": self.hints_seen.load(Relaxed),
             "blocksSeen": self.blocks_seen.load(Relaxed),
+            "relayBlocksSeen": self.relay_blocks_seen.load(Relaxed),
+            "relayTxsSeen": self.relay_txs_seen.load(Relaxed),
             "opportunities": self.opportunities.load(Relaxed),
             "simulations": self.simulations.load(Relaxed),
             "submittable": self.submittable.load(Relaxed),
@@ -266,9 +275,58 @@ impl Engine {
                         seen_at_ms: now_ms(),
                     });
                 }
+                IngestEvent::RelayBlock { block, txs } => {
+                    self.clone().on_relay_block(block, txs).await;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Ingest a delivered block and its transactions: persist both, push a feed
+    /// event, and score every transaction for extractable value through the same
+    /// strategy → risk → simulation funnel as a mempool transaction.
+    async fn on_relay_block(
+        self: Arc<Self>,
+        block: crate::types::RelayBlock,
+        txs: Vec<PendingTx>,
+    ) {
+        Stats::bump(&self.stats.relay_blocks_seen);
+        self.stats
+            .relay_txs_seen
+            .fetch_add(txs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let _ = self.store.record_relay_block(&block);
+        for (i, t) in txs.iter().enumerate() {
+            let _ = self.store.record_relay_block_tx(&block, t, i);
+        }
+
+        // A compact summary goes to the live feed; the full records (calldata
+        // included) are queryable from `/api/relay-txs`.
+        let summaries: Vec<RelayTxSummary> = txs
+            .iter()
+            .take(8)
+            .map(|t| RelayTxSummary {
+                hash: t.hash,
+                from: t.from,
+                to: t.to,
+                value: t.value,
+                selector: t.selector().map(|s| format!("0x{}", hex::encode(s))),
+            })
+            .collect();
+        let _ = self.feed.send(FeedEvent::RelayBlock {
+            block,
+            tx_count: txs.len(),
+            txs: summaries,
+        });
+
+        // Score each transaction: strategies propose opportunities (sandwich,
+        // back-run, liquidation, sniper) and the simulator decides whether value
+        // was extractable. Relay transactions are already mined, so the fork
+        // replay is a post-mortem of what *could* have been captured.
+        for t in txs {
+            self.clone().evaluate(t).await;
+        }
     }
 
     async fn on_block(self: Arc<Self>, head: BlockHead) {
@@ -321,6 +379,14 @@ impl Engine {
             seen_at_ms: tx.seen_at_ms,
         });
 
+        self.evaluate(tx).await;
+    }
+
+    /// Run one observed transaction through every strategy, then risk-gate,
+    /// simulate and record whatever they propose. Shared by the live mempool path
+    /// (`on_pending`) and the relay-delivered-block backfill path, so both are
+    /// scored identically.
+    async fn evaluate(self: Arc<Self>, tx: PendingTx) {
         for s in &self.strategies {
             let strat = s.clone();
             let this = self.clone();

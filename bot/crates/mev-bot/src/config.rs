@@ -44,6 +44,10 @@ pub struct Config {
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
+    /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
+    /// their transactions ingested + scored. On by default; this is read-only
+    /// (polling a public data API + the execution node), never a submission.
+    pub relay_tx_ingest: bool,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -69,6 +73,9 @@ pub struct Endpoints {
     pub relay_url: String,
     /// Additional relays for data queries (bid traces / payloads delivered).
     pub relay_data_urls: Vec<String>,
+    /// The bloXroute Max Profit relay used to pull delivered blocks and their
+    /// transactions (see `RELAY_TX_INGEST`).
+    pub bloxroute_relay_url: String,
     /// Optional L2 sequencer / preconfirmation feed (websocket).
     pub sequencer_feed: Option<String>,
     /// Optional Blocknative / Blockstream-style mempool stream.
@@ -217,6 +224,10 @@ impl Config {
                         v
                     }
                 },
+                bloxroute_relay_url: env_or(
+                    "BLOXROUTE_MAX_PROFIT_URL",
+                    "https://bloxroute.max-profit.blxrbdn.com",
+                ),
                 sequencer_feed: env_opt("SEQUENCER_FEED_URL"),
                 extra_mempool_ws: env_list("EXTRA_MEMPOOL_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
@@ -259,6 +270,9 @@ impl Config {
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
+            // Infrastructure toggle: pull delivered blocks + transactions from the
+            // bloXroute Max Profit relay and score them for extractable value.
+            relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
@@ -267,7 +281,7 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={} bloxroute_txs={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -275,6 +289,7 @@ impl Config {
             self.sim.use_call_bundle,
             self.strategies.enabled_names().join(","),
             self.pool_discovery,
+            self.relay_tx_ingest,
             self.live_execution
         )
     }

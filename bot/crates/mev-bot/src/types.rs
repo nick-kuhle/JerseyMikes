@@ -43,6 +43,10 @@ pub enum TxSource {
     Sequencer,
     /// Third-party mempool stream (bloXroute, Blocknative, ...).
     ExternalStream,
+    /// Delivered inside a winning MEV-Boost block, discovered via a relay's
+    /// `proposer_payload_delivered` bid traces (the bloXroute Max Profit relay).
+    /// Already mined; used for post-mortem / back-run replay analysis.
+    RelayDelivered,
     /// Already mined; used for backfill and post-mortem analysis.
     Mined,
 }
@@ -54,6 +58,7 @@ impl TxSource {
             TxSource::MevShare => "mev_share",
             TxSource::Sequencer => "sequencer",
             TxSource::ExternalStream => "external_stream",
+            TxSource::RelayDelivered => "bloxroute_relay",
             TxSource::Mined => "mined",
         }
     }
@@ -68,6 +73,37 @@ pub struct BlockHead {
     pub base_fee_per_gas: U256,
     pub gas_used: u64,
     pub gas_limit: u64,
+}
+
+/// A block delivered through a MEV-Boost relay, as reported by the relay's
+/// `proposer_payload_delivered` data API. The bloXroute **Max Profit** relay
+/// (`https://bloxroute.max-profit.blxrbdn.com`) is the canonical source.
+///
+/// `value_wei` is what the winning builder paid the proposer — the market price
+/// of that block's MEV, and the benchmark our simulated bundles are scored
+/// against. The block's transactions themselves are fetched separately from the
+/// execution node (`eth_getBlockByHash`) and stored next to this record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayBlock {
+    pub relay: String,
+    pub slot: u64,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub builder: String,
+    pub value_wei: U256,
+    pub gas_used: u64,
+    pub num_tx: u64,
+}
+
+/// Trimmed summary of one transaction inside a delivered [`RelayBlock`], for the
+/// live feed. The full record (with calldata) lives in SQLite behind the API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayTxSummary {
+    pub hash: B256,
+    pub from: Option<Address>,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub selector: Option<String>,
 }
 
 /// One EVM call in a bundle, matching `MevExecutor.Call`.
@@ -250,6 +286,12 @@ pub enum FeedEvent {
         builder: String,
         value_wei: U256,
         seen_at_ms: u64,
+    },
+    /// A delivered block plus the (trimmed) transactions that landed in it.
+    RelayBlock {
+        block: RelayBlock,
+        tx_count: usize,
+        txs: Vec<RelayTxSummary>,
     },
     Log {
         level: String,
