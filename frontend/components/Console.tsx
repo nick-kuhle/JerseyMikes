@@ -6,6 +6,7 @@ import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
 import RiskPanel from "./RiskPanel";
 import FunnelPanel from "./FunnelPanel";
+import RelayBlocksPanel from "./RelayBlocksPanel";
 import type {
   FeedEvent,
   OpportunityRow,
@@ -160,6 +161,11 @@ export default function Console() {
           value={`${status?.simBackends.anvilFork ? "fork" : "—"} / ${status?.simBackends.relayCallBundle ? "relay" : "—"}`}
           sub="anvil / eth_callBundle"
         />
+        <Card
+          title="bloxroute blocks"
+          value={(status?.stats.relayBlocksSeen ?? 0).toLocaleString()}
+          sub={`${(status?.stats.relayTxsSeen ?? 0).toLocaleString()} delivered txs`}
+        />
       </section>
 
       {/* equity + strategies */}
@@ -219,7 +225,17 @@ export default function Console() {
           <div className="panel-head">
             <span>live data feed</span>
             <select value={feedFilter} onChange={(e) => setFeedFilter(e.target.value)} style={selectStyle}>
-              {["all", "pending", "block", "mev_share_hint", "opportunity", "simulation", "bundle", "relay"].map((k) => (
+              {[
+                "all",
+                "pending",
+                "block",
+                "mev_share_hint",
+                "opportunity",
+                "simulation",
+                "bundle",
+                "relay",
+                "relay_block",
+              ].map((k) => (
                 <option key={k} value={k}>
                   {k}
                 </option>
@@ -366,6 +382,9 @@ export default function Console() {
           </div>
         </div>
       </section>
+
+      {/* bloXroute Max Profit relay — delivered blocks + their transactions */}
+      <RelayBlocksPanel />
 
       {/* strategy funnel — answers "why no opportunities?" with data */}
       <FunnelPanel funnel={status?.stats.funnel ?? null} />

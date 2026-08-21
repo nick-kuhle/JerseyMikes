@@ -5,6 +5,8 @@ import {
   demoOpportunities,
   demoPnl,
   demoRelayBids,
+  demoRelayBlocks,
+  demoRelayTxs,
   demoSeries,
   demoSimulations,
   demoStatus,
@@ -31,6 +33,12 @@ function demoFor(path: string, search: URLSearchParams): unknown {
     }
     case "relay-bids":
       return demoRelayBids(limit);
+    case "relay-blocks":
+      return demoRelayBlocks(limit);
+    case "relay-txs": {
+      const blockNumber = search.get("blockNumber");
+      return demoRelayTxs(blockNumber ? Number(blockNumber) : undefined, limit);
+    }
     case "config":
       return {chainId: 1, executor: demoStatus().executor, liveExecution: false, demo: true};
     case "funnel":

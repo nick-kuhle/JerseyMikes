@@ -19,6 +19,10 @@ export interface StatusResponse {
     pendingSeen: number;
     hintsSeen: number;
     blocksSeen: number;
+    /** Delivered blocks ingested from the bloXroute Max Profit relay. */
+    relayBlocksSeen?: number;
+    /** Transactions inside those blocks, scored for extractable value. */
+    relayTxsSeen?: number;
     opportunities: number;
     simulations: number;
     submittable: number;
@@ -111,6 +115,54 @@ export interface RelayBid {
   seenAtMs: number;
 }
 
+/** A block delivered through a MEV-Boost relay (feed shape, snake_case). */
+export interface RelayBlock {
+  relay: string;
+  slot: number;
+  block_number: number;
+  block_hash: string;
+  builder: string;
+  value_wei: string;
+  gas_used: number;
+  num_tx: number;
+}
+
+/** Trimmed transaction summary inside a delivered block (feed shape). */
+export interface RelayTxSummary {
+  hash: string;
+  from: string | null;
+  to: string | null;
+  value: string;
+  selector: string | null;
+}
+
+/** A delivered block row from `/api/relay-blocks` (camelCase). */
+export interface RelayBlockRow {
+  relay: string;
+  slot: number;
+  blockNumber: number;
+  blockHash: string;
+  builder: string;
+  valueWei: string;
+  gasUsed: number;
+  numTx: number;
+  seenAtMs: number;
+}
+
+/** A delivered-block transaction from `/api/relay-txs` (calldata included). */
+export interface RelayBlockTxRow {
+  blockNumber: number;
+  txIndex: number;
+  hash: string;
+  from: string | null;
+  to: string | null;
+  valueWei: string;
+  nonce: number;
+  gas: number;
+  selector: string | null;
+  input: string;
+}
+
 export type FeedEvent =
   | {kind: "block"; number: number; hash: string; base_fee_per_gas: string; gas_used: number; timestamp: number}
   | {
@@ -138,4 +190,5 @@ export type FeedEvent =
       revert_reason: string | null;
     }
   | {kind: "bundle"; id: string; strategy: Strategy; target_block: number; submitted: boolean}
-  | {kind: "relay"; relay: string; slot: number; builder: string; value_wei: string; seen_at_ms: number};
+  | {kind: "relay"; relay: string; slot: number; builder: string; value_wei: string; seen_at_ms: number}
+  | {kind: "relay_block"; block: RelayBlock; tx_count: number; txs: RelayTxSummary[]};

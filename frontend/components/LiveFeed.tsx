@@ -60,7 +60,14 @@ function eventTime(e: FeedEvent): number {
 }
 
 function label(e: FeedEvent): string {
-  return e.kind === "mev_share_hint" ? "mev-share" : e.kind;
+  switch (e.kind) {
+    case "mev_share_hint":
+      return "mev-share";
+    case "relay_block":
+      return "bloxroute";
+    default:
+      return e.kind;
+  }
 }
 
 function kindColor(e: FeedEvent): string {
@@ -78,6 +85,8 @@ function kindColor(e: FeedEvent): string {
     case "bundle":
       return "#f5b544";
     case "relay":
+      return "#4f8bff";
+    case "relay_block":
       return "#4f8bff";
   }
 }
@@ -133,6 +142,18 @@ function detail(e: FeedEvent) {
       return (
         <span>
           slot {e.slot} · {weiToEth(e.value_wei, 4)} ETH paid to proposer · {new URL(e.relay).hostname}
+        </span>
+      );
+    case "relay_block":
+      return (
+        <span>
+          #{e.block.block_number} · {e.tx_count} txs · {weiToEth(e.block.value_wei, 4)} ETH builder bid ·{" "}
+          <span className="muted">
+            {e.txs
+              .slice(0, 3)
+              .map((t) => `${shortHash(t.hash)}:${t.selector ?? "—"}`)
+              .join(" ")}
+          </span>
         </span>
       );
   }
