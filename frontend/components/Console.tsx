@@ -260,7 +260,7 @@ export default function Console() {
           <div className="panel-head">
             <span>simulated transaction history</span>
             <select value={strategyFilter} onChange={(e) => setStrategyFilter(e.target.value)} style={selectStyle}>
-              {["all", "sandwich", "jit", "atomic_arb", "liquidation", "sniper"].map((k) => (
+              {["all", "sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"].map((k) => (
                 <option key={k} value={k}>
                   {k}
                 </option>

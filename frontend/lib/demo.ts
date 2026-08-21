@@ -20,7 +20,7 @@ import type {
   Strategy,
 } from "./types";
 
-const STRATEGIES: Strategy[] = ["sandwich", "jit", "atomic_arb", "liquidation", "sniper"];
+const STRATEGIES: Strategy[] = ["sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"];
 const START_BLOCK = 23_180_000;
 
 // Deterministic PRNG so server and client stay consistent within a run.
@@ -190,6 +190,11 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       simulationsFailed: 0,
       submittable: 4,
     }),
+    sandwich_v3: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 0,
+      candidatesEmitted: 0,
+    }),
     jit: f({
       invocationsWithOutput: 0,
       invocationsEmpty: 184_223,
@@ -265,6 +270,7 @@ export function demoFunnelReplay(): Record<Strategy, FunnelCounters> {
       simulationsFailed: 12,
       submittable: 96,
     }),
+    sandwich_v3: f({invocationsEmpty: 124_000}),
     jit: f({invocationsEmpty: 124_000}),
     atomic_arb: f({
       invocationsWithOutput: 1_204,
@@ -322,6 +328,8 @@ function demoNote(s: Strategy): string {
   switch (s) {
     case "sandwich":
       return "sandwich WETH/PEPE on univ2 pair 0x9f3…: victim in 4.2 WETH min_out 0 -> front 1.81 WETH";
+    case "sandwich_v3":
+      return "sandwich_v3 USDC fee 500 pool 0x88e…: victim in 12 WETH min_out 0 -> front 2.4 WETH";
     case "jit":
       return "jit 0x88e…(USDC/WETH 500) ticks [201360, 201480] L 4.2e21 victim_in 42 WETH";
     case "atomic_arb":

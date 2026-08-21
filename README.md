@@ -15,7 +15,7 @@ bot (Rust)                contracts (Foundry)          frontend (Next.js)
 ──────────                ───────────────────          ──────────────────
 mempool + MEV-Share  ──▶  MevExecutor.execute()   ──▶  P/L + equity curve
 relay + block feeds       profit-or-revert guard       simulated tx history
-5 strategies              Balancer flash loans         live mempool tape
+5 strategies + V3 sandwich Balancer flash loans         live mempool tape
 anvil fork simulation     V3 JIT mint callback         contract control panel
 SQLite + REST/SSE         coinbase bribe               (viem, injected wallet)
 ```

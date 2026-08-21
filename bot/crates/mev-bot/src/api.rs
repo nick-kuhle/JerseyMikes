@@ -84,6 +84,7 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         },
         "executor": format!("{:?}", e.ctx.executor),
         "pools": e.ctx.pools.len(),
+        "poolsV3": e.ctx.pools_v3.len(),
         "stats": e.stats.snapshot(),
         "simBackends": {
             "anvilFork": e.sim.fork.is_some(),
@@ -220,6 +221,7 @@ async fn reorgs(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl 
 fn parse_strategy(s: &str) -> Option<Strategy> {
     match s {
         "sandwich" => Some(Strategy::Sandwich),
+        "sandwich_v3" => Some(Strategy::SandwichV3),
         "jit" => Some(Strategy::Jit),
         "atomic_arb" => Some(Strategy::AtomicArb),
         "liquidation" => Some(Strategy::Liquidation),

@@ -25,6 +25,12 @@ pub mod known {
     pub const UNIV3_FACTORY: Address = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
     pub const UNIV3_QUOTER_V2: Address = address!("61fFE014bA17989E743c5F6cB21bF9697530B21e");
     pub const UNIV3_NPM: Address = address!("C36442b4a4522E871399CD717aBDD847Ab11FE88");
+    /// Original SwapRouter (`exactInputSingle` with a deadline). Selector `0x414bf389`.
+    pub const UNIV3_SWAP_ROUTER: Address = address!("E592427A0AEce92De3Edee1F18E0157C05861564");
+    /// SwapRouter02 (`exactInputSingle` without a deadline). Selector `0x04e45aaf`.
+    pub const UNIV3_SWAP_ROUTER_02: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
+    /// UniversalRouter. `execute(commands, inputs)` selector `0x3593564c`.
+    pub const UNIVERSAL_ROUTER: Address = address!("3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD");
     pub const SUSHI_FACTORY: Address = address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac");
 
     pub const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
@@ -48,6 +54,11 @@ pub struct Config {
     /// default: it only earns its `eth_getLogs` once a strategy consumes the
     /// V3 cache.
     pub pool_discovery_v3: bool,
+    /// Decode Uniswap UniversalRouter `execute` calldata on the pending path.
+    /// Off by default: Phase 2 W6 is gated on a week of funnel data showing a
+    /// public-mempool gap, and turning this on expands the V2 sandwich / arb
+    /// surface. The decoder itself is pure calldata parsing.
+    pub decode_universal_router: bool,
     /// Longest cycle the atomic-arb search will consider, in legs.
     ///
     /// 2 reproduces the original pair-to-pair search exactly and is the
@@ -139,6 +150,10 @@ pub struct RiskConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StrategyToggles {
     pub sandwich: bool,
+    /// V3 sandwich via QuoterV2. Off by default until the funnel week is
+    /// read and `POOL_DISCOVERY_V3` is on so the V3 cache has something
+    /// to match against.
+    pub sandwich_v3: bool,
     pub jit: bool,
     pub atomic_arb: bool,
     pub liquidation: bool,
@@ -282,6 +297,7 @@ impl Config {
             },
             strategies: StrategyToggles {
                 sandwich: env_bool("STRATEGY_SANDWICH", true),
+                sandwich_v3: env_bool("STRATEGY_SANDWICH_V3", false),
                 jit: env_bool("STRATEGY_JIT", true),
                 atomic_arb: env_bool("STRATEGY_ATOMIC_ARB", true),
                 liquidation: env_bool("STRATEGY_LIQUIDATION", true),
@@ -316,6 +332,7 @@ impl Config {
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
             pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", false),
+            decode_universal_router: env_bool("DECODE_UNIVERSAL_ROUTER", false),
             // Clamped to the enumerator's hard ceiling: config cannot talk the
             // search into an unbounded walk.
             arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
@@ -337,7 +354,7 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} arb_legs={} bloxroute_txs={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} ur={} arb_legs={} bloxroute_txs={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -346,6 +363,7 @@ impl Config {
             self.strategies.enabled_names().join(","),
             self.pool_discovery,
             self.pool_discovery_v3,
+            self.decode_universal_router,
             self.arb_max_cycle_len,
             self.relay_tx_ingest,
             self.live_execution
@@ -358,6 +376,9 @@ impl StrategyToggles {
         let mut v = Vec::new();
         if self.sandwich {
             v.push("sandwich");
+        }
+        if self.sandwich_v3 {
+            v.push("sandwich_v3");
         }
         if self.jit {
             v.push("jit");

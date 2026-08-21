@@ -31,6 +31,7 @@ interface Props {
 
 const ALL_STRATEGIES: Strategy[] = [
   "sandwich",
+  "sandwich_v3",
   "jit",
   "atomic_arb",
   "liquidation",

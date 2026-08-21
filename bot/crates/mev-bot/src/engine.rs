@@ -21,7 +21,8 @@ use crate::signer::Signer;
 use crate::store::Store;
 use crate::strategies::{
     arb::AtomicArbStrategy, discovery::PoolDiscovery, jit::JitStrategy, liquidation::LiquidationStrategy,
-    sandwich::SandwichStrategy, sniper::SniperStrategy, StrategyCtx, StrategyImpl,
+    sandwich::SandwichStrategy, sandwich_v3::SandwichV3Strategy, sniper::SniperStrategy, StrategyCtx,
+    StrategyImpl,
 };
 use crate::types::{
     now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, RelayTxSummary, Strategy, TxSource,
@@ -326,6 +327,15 @@ impl Engine {
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
             strategies.push(Arc::new(SandwichStrategy));
+        }
+        if cfg.strategies.sandwich_v3 {
+            if !cfg.pool_discovery_v3 {
+                tracing::warn!(
+                    target: "engine",
+                    "STRATEGY_SANDWICH_V3 is on but POOL_DISCOVERY_V3 is off — the V3 cache will stay empty and the strategy will emit nothing"
+                );
+            }
+            strategies.push(Arc::new(SandwichV3Strategy));
         }
         if cfg.strategies.jit {
             strategies.push(Arc::new(JitStrategy));
@@ -881,6 +891,7 @@ pub fn enabled_strategies(cfg: &Config) -> Vec<&'static str> {
         .iter()
         .filter(|s| match s {
             Strategy::Sandwich => cfg.strategies.sandwich,
+            Strategy::SandwichV3 => cfg.strategies.sandwich_v3,
             Strategy::Jit => cfg.strategies.jit,
             Strategy::AtomicArb => cfg.strategies.atomic_arb,
             Strategy::Liquidation => cfg.strategies.liquidation,

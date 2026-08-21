@@ -1,4 +1,4 @@
-export type Strategy = "sandwich" | "jit" | "atomic_arb" | "liquidation" | "sniper";
+export type Strategy = "sandwich" | "sandwich_v3" | "jit" | "atomic_arb" | "liquidation" | "sniper";
 
 export interface StatusResponse {
   chain: {id: number; name: string};
@@ -15,6 +15,8 @@ export interface StatusResponse {
   };
   executor: string;
   pools: number;
+  /** UniswapV3 pools in the disjoint V3 cache. Absent on older bots. */
+  poolsV3?: number;
   stats: {
     pendingSeen: number;
     hintsSeen: number;

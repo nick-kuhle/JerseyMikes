@@ -65,6 +65,7 @@ impl RiskEngine {
         let t = &self.cfg.strategies;
         match s {
             Strategy::Sandwich => t.sandwich,
+            Strategy::SandwichV3 => t.sandwich_v3,
             Strategy::Jit => t.jit,
             Strategy::AtomicArb => t.atomic_arb,
             Strategy::Liquidation => t.liquidation,
@@ -192,6 +193,7 @@ mod tests {
             },
             strategies: crate::config::StrategyToggles {
                 sandwich: true,
+                sandwich_v3: false,
                 jit: false,
                 atomic_arb: true,
                 liquidation: true,
@@ -214,6 +216,7 @@ mod tests {
             },
             pool_discovery: true,
             pool_discovery_v3: false,
+            decode_universal_router: false,
             arb_max_cycle_len: 2,
             relay_tx_ingest: false,
             relay_tx_concurrency: 4,
@@ -263,6 +266,11 @@ mod tests {
     fn rejects_disabled_strategies() {
         let r = RiskEngine::new(cfg());
         assert_eq!(r.check(&opp(Strategy::Jit, 10), U256::ZERO), Err(Reject::Disabled));
+        assert_eq!(
+            r.check(&opp(Strategy::SandwichV3, 10), U256::ZERO),
+            Err(Reject::Disabled),
+            "sandwich_v3 stays off unless the operator flips the toggle"
+        );
         assert!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO).is_ok());
     }
 

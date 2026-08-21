@@ -197,6 +197,9 @@ impl Call {
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
     Sandwich,
+    /// V3 sandwich via QuoterV2 sizing. Separate variant so the funnel can
+    /// tell V2 and V3 sandwich outcomes apart (Phase 2 W5).
+    SandwichV3,
     Jit,
     AtomicArb,
     Liquidation,
@@ -207,6 +210,7 @@ impl Strategy {
     pub fn as_str(&self) -> &'static str {
         match self {
             Strategy::Sandwich => "sandwich",
+            Strategy::SandwichV3 => "sandwich_v3",
             Strategy::Jit => "jit",
             Strategy::AtomicArb => "atomic_arb",
             Strategy::Liquidation => "liquidation",
@@ -214,9 +218,10 @@ impl Strategy {
         }
     }
 
-    pub fn all() -> [Strategy; 5] {
+    pub fn all() -> [Strategy; 6] {
         [
             Strategy::Sandwich,
+            Strategy::SandwichV3,
             Strategy::Jit,
             Strategy::AtomicArb,
             Strategy::Liquidation,
@@ -553,6 +558,16 @@ mod tests {
         for offset in [0u64, 1, 2, 5] {
             assert_eq!(tx.target_block(&head, offset), 4_000);
         }
+    }
+
+    #[test]
+    fn strategy_all_includes_the_v3_sandwich_row() {
+        // The funnel distinguishes V2 from V3 sandwiches by variant. Dropping
+        // SandwichV3 from `all()` would hide it from /api/status.strategies
+        // and from the dashboard even when the toggle is on.
+        assert_eq!(Strategy::all().len(), 6);
+        assert_eq!(Strategy::SandwichV3.as_str(), "sandwich_v3");
+        assert!(Strategy::all().contains(&Strategy::SandwichV3));
     }
 
     #[test]

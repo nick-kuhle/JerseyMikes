@@ -184,12 +184,15 @@ impl StrategyImpl for JitStrategy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct V3SwapIntent {
     pub token_in: Address,
     pub token_out: Address,
     pub fee: u32,
     pub amount_in: U256,
+    /// Victim's `amountOutMinimum`. The V3 sandwich trap scores any
+    /// front-run that would push the victim below this as zero profit.
+    pub amount_out_min: U256,
     pub zero_for_one: bool,
 }
 
@@ -199,18 +202,36 @@ pub fn decode_v3_swap(tx: &PendingTx) -> Option<V3SwapIntent> {
         return None;
     }
     let sel: [u8; 4] = [data[0], data[1], data[2], data[3]];
-    if sel != ISwapRouter::exactInputSingleCall::SELECTOR {
-        return None;
+
+    // SwapRouter02 — no deadline. Selector 0x04e45aaf. This is the
+    // majority of current ISwapRouter02 / UniversalRouter-adjacent flow.
+    if sel == crate::dex::ISwapRouter02::exactInputSingleCall::SELECTOR {
+        let c = crate::dex::ISwapRouter02::exactInputSingleCall::abi_decode(data, false).ok()?;
+        let p = c.params;
+        return Some(V3SwapIntent {
+            token_in: p.tokenIn,
+            token_out: p.tokenOut,
+            fee: p.fee.to::<u32>(),
+            amount_in: if p.amountIn.is_zero() { tx.value } else { p.amountIn },
+            amount_out_min: p.amountOutMinimum,
+            zero_for_one: p.tokenIn < p.tokenOut,
+        });
     }
-    let c = ISwapRouter::exactInputSingleCall::abi_decode(data, false).ok()?;
-    let p = c.params;
-    Some(V3SwapIntent {
-        token_in: p.tokenIn,
-        token_out: p.tokenOut,
-        fee: p.fee.to::<u32>(),
-        amount_in: if p.amountIn.is_zero() { tx.value } else { p.amountIn },
-        zero_for_one: p.tokenIn < p.tokenOut,
-    })
+
+    // Original SwapRouter — includes a deadline. Selector 0x414bf389.
+    if sel == ISwapRouter::exactInputSingleCall::SELECTOR {
+        let c = ISwapRouter::exactInputSingleCall::abi_decode(data, false).ok()?;
+        let p = c.params;
+        return Some(V3SwapIntent {
+            token_in: p.tokenIn,
+            token_out: p.tokenOut,
+            fee: p.fee.to::<u32>(),
+            amount_in: if p.amountIn.is_zero() { tx.value } else { p.amountIn },
+            amount_out_min: p.amountOutMinimum,
+            zero_for_one: p.tokenIn < p.tokenOut,
+        });
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -442,5 +463,83 @@ mod tests {
         let mut word = [0xffu8; 32];
         word[31] = 0xfe; // -2
         assert_eq!(i256_word_to_i32(&word), -2);
+    }
+
+    fn pending(data: Vec<u8>, value: U256) -> PendingTx {
+        use crate::types::{now_ms, TxSource};
+        PendingTx {
+            hash: alloy_primitives::B256::ZERO,
+            from: None,
+            to: Some(known::UNIV3_SWAP_ROUTER_02),
+            value,
+            gas: 200_000,
+            max_fee_per_gas: U256::from(20_000_000_000u64),
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+            nonce: 0,
+            input: data,
+            raw: None,
+            source: TxSource::PublicMempool,
+            mined_at: None,
+            seen_at_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn decodes_swap_router_02_exact_input_single() {
+        // Captured-shape fixture: SwapRouter02 has no deadline field.
+        // Selector must be 0x04e45aaf — verified against the sol! definition.
+        assert_eq!(
+            crate::dex::ISwapRouter02::exactInputSingleCall::SELECTOR,
+            [0x04, 0xe4, 0x5a, 0xaf]
+        );
+        let data = crate::dex::ISwapRouter02::exactInputSingleCall {
+            params: crate::dex::ISwapRouter02::ExactInputSingleParams {
+                tokenIn: known::WETH,
+                tokenOut: known::USDC,
+                fee: alloy_primitives::aliases::U24::from(500u32),
+                recipient: Address::with_last_byte(9),
+                amountIn: U256::from(10u128.pow(18)),
+                amountOutMinimum: U256::from(1_234u64),
+                sqrtPriceLimitX96: alloy_primitives::aliases::U160::ZERO,
+            },
+        }
+        .abi_encode();
+        let intent = decode_v3_swap(&pending(data, U256::ZERO)).expect("SwapRouter02 decodes");
+        assert_eq!(intent.token_in, known::WETH);
+        assert_eq!(intent.token_out, known::USDC);
+        assert_eq!(intent.fee, 500);
+        assert_eq!(intent.amount_in, U256::from(10u128.pow(18)));
+        assert_eq!(intent.amount_out_min, U256::from(1_234u64));
+    }
+
+    #[test]
+    fn decodes_original_swap_router_exact_input_single() {
+        assert_eq!(
+            ISwapRouter::exactInputSingleCall::SELECTOR,
+            [0x41, 0x4b, 0xf3, 0x89]
+        );
+        let data = ISwapRouter::exactInputSingleCall {
+            params: ISwapRouter::ExactInputSingleParams {
+                tokenIn: known::WETH,
+                tokenOut: known::USDC,
+                fee: alloy_primitives::aliases::U24::from(3_000u32),
+                recipient: Address::with_last_byte(9),
+                deadline: U256::from(1_900_000_000u64),
+                amountIn: U256::from(2u128.pow(18)),
+                amountOutMinimum: U256::from(99u64),
+                sqrtPriceLimitX96: alloy_primitives::aliases::U160::ZERO,
+            },
+        }
+        .abi_encode();
+        let intent = decode_v3_swap(&pending(data, U256::ZERO)).expect("SwapRouter decodes");
+        assert_eq!(intent.fee, 3_000);
+        assert_eq!(intent.amount_out_min, U256::from(99u64));
+        assert_eq!(intent.amount_in, U256::from(2u128.pow(18)));
+    }
+
+    #[test]
+    fn ignores_unrelated_v3_calldata() {
+        assert!(decode_v3_swap(&pending(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO)).is_none());
+        assert!(decode_v3_swap(&pending(vec![], U256::ZERO)).is_none());
     }
 }

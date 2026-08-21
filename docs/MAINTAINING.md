@@ -74,7 +74,7 @@ Things that look like over-engineering but aren't:
   early-return at the per-candidate level, not per-tx. The flat
   pattern is intentional.
 - **The `sol!` macro blocks scattered through `dex.rs`, `jit.rs`,
-  `v3_quote.rs`** are *the* ABI definitions. The router's exact
+  `dex/calldata/universal_router.rs`** are *the* ABI definitions. The router's exact
   parameter order, the `int24` packing, the `uint160` for
   `sqrtPriceLimitX96` — every byte matters. If you change one, you
   break every call site that uses it.
@@ -244,6 +244,12 @@ each. Don't reintroduce them.
   the fork on a 1-in-1000 swap; the unit tests will pass, the
   dashboard will lie, the bundles will revert in production.
 
+- **Don't ternary-search QuoterV2.** `size_v3_sandwich` is a coarse
+  grid then one refine, capped at 12 `eth_call`s per candidate.
+  A 120-iteration ternary over `quote_v3` will get the bot
+  rate-limited off its provider and stall the pending path. The
+  cap is an acceptance criterion, not a hint.
+
 - **Don't add a new `sol!` interface without verifying the
   selector.** The `sol!` macro generates a 4-byte selector from
   the function signature. If you reorder parameters, rename
@@ -409,13 +415,11 @@ For the team taking this over, the practical order is:
 
 1. **Read the funnel for a week.** Don't change any code yet.
    The funnel tells you where opportunities are dying, and that
-   determines the next move. Note that until the fix in
-   `docs/PHASE_2_HANDOFF.md` W1 lands, the first-stage counters
-   are per *invocation* and the rest are per *opportunity*, so
-   don't read a conversion rate across that boundary. If the
-   funnel shows the strategies are doing their job, the next
-   move is not "more strategies" but "more pools in the cache"
-   or "faster mempool feed".
+   determines the next move. W1 has landed: `invocations_*` are
+   per call and `candidatesEmitted` is per opportunity — do not
+   divide one into the other. If the funnel shows the strategies
+   are doing their job, the next move is not "more strategies"
+   but "more pools in the cache" or "faster mempool feed".
 
 2. **Add pool discovery.** The `PairCreated` log scan in the
    sniper is the seed of this work. Pull it out into a shared
@@ -430,13 +434,15 @@ For the team taking this over, the practical order is:
    strategy that has the most simulation signal on a typical
    mainnet day.
 
-4. **Add the V3 sandwich trigger.** The spec is in
-   `docs/PHASE_2_HANDOFF.md` W5. The approach (QuoterV2 for
-   sizing, not hand-rolled Q64.96 math) is documented there with
-   the trade-off and the RPC budget. This is the strategy that
-   expands the bot's *visible* surface — it sees the large
-   router-routed swaps that the existing V2-only sandwich
-   ignores.
+4. **Add the V3 sandwich trigger.** Implemented behind
+   `STRATEGY_SANDWICH_V3` (default off) in
+   `strategies/sandwich_v3.rs`. The approach (QuoterV2 for
+   sizing, not hand-rolled Q64.96 math) and the RPC budget
+   (≤ 12 `eth_call`s per candidate, ≤ 4 candidates per pending
+   tx) are durable rules: do not replace the quoter with a
+   TickMath port, and do not raise those caps to chase volume.
+   Flip the toggle only after a week of funnel baseline, and
+   only together with `POOL_DISCOVERY_V3`.
 
 5. **Replay validation.** Shipped in Phase 1 (`mev-bot replay`,
    `/api/competition`). The true-positive rate — simulations that

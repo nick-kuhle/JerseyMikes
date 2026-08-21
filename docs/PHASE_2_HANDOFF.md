@@ -20,14 +20,14 @@ Profit relay delivered-block ingestion. That integration routes already-mined
 transactions through the strategy funnel, which interacts directly with W1 —
 see §1.7.
 
-**Continuation status (2026-08-21):** The maintainer reports that
-`make bot-check`, `make bot-test`, and `make contracts` pass locally. The
-frontend type/build checks and the solc artifact check also pass in the
-authoring sandbox. The continuation fixes in commit `4d5ac8c` make the sniper's
-factory scan retry-safe, add the V3 pool creation block to `V3Pool`, and make
-both event decoders validate topic0. These results update verification status;
-they do not waive the one-week funnel gates for W4/W5 or the evidence gate for
-W6. Remote Actions still needs a maintainer with GitHub `workflows` permission.
+**Continuation status (2026-08-21):** W5 (V3 sandwich) and W6 (UniversalRouter
+decoder) are now implemented behind default-off toggles
+(`STRATEGY_SANDWICH_V3`, `DECODE_UNIVERSAL_ROUTER`). A default checkout is
+still the W1–W4 measurement instrument. The one-week funnel gates for
+turning those toggles on, and for raising W4 to 3–5 legs, are not waived.
+The maintainer reports that `make bot-check`, `make bot-test`, and
+`make contracts` pass locally on the W1–W4 baseline; this session could not
+run Rust independently. Frontend `tsc --noEmit` is clean.
 
 A follow-up automation session (the same day) re-ran the checks it can run —
 contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
@@ -276,8 +276,8 @@ state.
 | **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented and locally verified** (including sniper retry fix) |
 | **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented and locally verified** (shipped off) |
 | **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation locally verified, shipped at 2 legs** (`ARB_MAX_CYCLE_LEN=2`) |
-| **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | ⬜ not started |
-| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | ⬜ not started |
+| **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | **✅ implementation locally written, shipped off** (`STRATEGY_SANDWICH_V3=false`). Do not flip until the funnel week is read and `POOL_DISCOVERY_V3` is on. |
+| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation locally written, shipped off** (`DECODE_UNIVERSAL_ROUTER=false`). Do not flip until the funnel shows a public-mempool gap. |
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
@@ -654,6 +654,16 @@ the 25 ms budget holds. Put the number in the PR description.
 
 ## W5 — V3 sandwich via QuoterV2
 
+> **Status: implemented, shipped off.** `strategies/sandwich_v3.rs` sizes
+> via a `V3Quoter` trait (production = QuoterV2, tests = fake CP pool).
+> `STRATEGY_SANDWICH_V3` defaults to `false`; the strategy is not
+> constructed when the toggle is off, so it adds zero RPC. The pool must
+> already sit in the W3 V3 cache (`POOL_DISCOVERY_V3`). Funnel row is the
+> new `Strategy::SandwichV3` variant (`sandwich_v3`). Victim-revert trap,
+> 12-call budget, router-routed legs with `amountOutMinimum = 0` on the
+> back-run, and selector tests for both SwapRouter and SwapRouter02 are
+> in the crate. **Do not flip the toggle until the funnel week is read.**
+
 **Gate: after W1 and W3.** Ship behind a config toggle (`STRATEGY_SANDWICH_V3`,
 default off), as the review requires.
 
@@ -728,6 +738,15 @@ quoter, no network); toggle off means zero added RPC calls.
 
 ## W6 — UniversalRouter decoding
 
+> **Status: implemented, shipped off.** `dex/calldata/universal_router.rs`
+> decodes `execute(commands, inputs)` and the deadline overload for
+> `V3_SWAP_EXACT_IN` / `V2_SWAP_EXACT_IN`, including a preceding
+> `WRAP_ETH`. `decode_router(tx, weth, universal)` is the single entry
+> point sandwich and arb consume; when `DECODE_UNIVERSAL_ROUTER` is
+> false (the default) it is exactly `decode_swap`. Fixture tests cover
+> five well-formed shapes plus malformed inputs that must return `None`.
+> **Do not flip the toggle until the funnel shows a public-mempool gap.**
+
 **Gate: only after a week of funnel data shows a meaningful public-mempool gap.**
 Both source documents agree on this, and the review is explicit that 1inch and
 0x wait for evidence.
@@ -784,11 +803,12 @@ Phase 2 is complete when all of these hold:
    reflect the shipped state. Every new toggle is documented.
 8. `live_execution` is still false and the two-key switch is untouched.
 
-**Progress at this handoff update:** items W1–W4 have implementation and local
-verification; W0's remote workflow enablement is still pending. W4 remains at
-its compatibility default of two legs until the funnel baseline is read for a
-week. W5 has not started, and W6 remains gated on evidence of a meaningful
-public-mempool gap.
+**Progress at this handoff update:** items W1–W6 have implementation. W0's
+remote workflow is green; making it a required PR check is the remaining
+administrative step. W4 remains at its compatibility default of two legs,
+W5 is behind `STRATEGY_SANDWICH_V3=false`, and W6 is behind
+`DECODE_UNIVERSAL_ROUTER=false`, until the funnel baseline is read for a
+week (and, for W6, shows a public-mempool gap).
 
 ---
 
@@ -846,8 +866,9 @@ new strategy becomes unobservable.
 | Var | Default | Notes |
 | --- | --- | --- |
 | `POOL_DISCOVERY` | `true` | V2 discovery per block (`config.rs:261`) |
-| `POOL_DISCOVERY_V3` | *(new in W3)* `false` | keep off until W5 consumes it |
-| `STRATEGY_SANDWICH_V3` | *(new in W5)* `false` | |
+| `POOL_DISCOVERY_V3` | *(new in W3)* `false` | turn on together with `STRATEGY_SANDWICH_V3` |
+| `STRATEGY_SANDWICH_V3` | *(new in W5)* `false` | V3 sandwich; adds a `sandwich_v3` funnel row |
+| `DECODE_UNIVERSAL_ROUTER` | *(new in W6)* `false` | expands V2 sandwich / arb surface when on |
 | `MIN_NET_PROFIT_WEI` | `1` | do not move to chase funnel numbers |
 | `MAX_POSITION_WEI` | `100e18` | notional gate |
 | `MAX_BASE_FEE_WEI` | `500 gwei` | |
