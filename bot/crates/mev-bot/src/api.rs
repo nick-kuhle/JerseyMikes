@@ -37,6 +37,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/opportunities", get(opportunities))
         .route("/api/simulations", get(simulations))
         .route("/api/relay-bids", get(relay_bids))
+        .route("/api/relay-blocks", get(relay_blocks))
+        .route("/api/relay-txs", get(relay_txs))
         .route("/api/funnel", get(funnel))
         .route("/api/stream", get(stream))
         .layer(
@@ -101,6 +103,10 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
             "sequencerFeed": e.cfg.endpoints.sequencer_feed.is_some(),
             "externalMempools": e.cfg.endpoints.extra_mempool_ws.len(),
         },
+        "bloxrouteRelay": {
+            "url": e.cfg.endpoints.bloxroute_relay_url,
+            "txIngest": e.cfg.relay_tx_ingest,
+        },
     }))
 }
 
@@ -148,6 +154,29 @@ async fn simulations(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> 
 async fn relay_bids(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     match s.engine.store.recent_relay_bids(limit) {
+        Ok(rows) => Json(json!(rows)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn relay_blocks(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    match s.engine.store.recent_relay_blocks(limit) {
+        Ok(rows) => Json(json!(rows)),
+        Err(e) => Json(json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(Deserialize)]
+struct RelayTxsQuery {
+    limit: Option<i64>,
+    #[serde(rename = "blockNumber")]
+    block_number: Option<u64>,
+}
+
+async fn relay_txs(State(s): State<ApiState>, Query(q): Query<RelayTxsQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(500).clamp(1, 2_000);
+    match s.engine.store.relay_block_txs(q.block_number, limit) {
         Ok(rows) => Json(json!(rows)),
         Err(e) => Json(json!({"error": e.to_string()})),
     }

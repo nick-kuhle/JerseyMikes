@@ -21,6 +21,12 @@ interface Props {
    * populates this lazily (only after the first record_funnel call).
    */
   funnel: Partial<Record<Strategy, FunnelCounters>> | null | undefined;
+  /**
+   * Post-mortem lane: the same counters for already-mined transactions
+   * replayed from bloXroute delivered blocks. Rendered behind a toggle so it
+   * is available without diluting the live numbers.
+   */
+  funnelReplay?: Partial<Record<Strategy, FunnelCounters>> | null | undefined;
 }
 
 const ALL_STRATEGIES: Strategy[] = [
@@ -55,7 +61,10 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-export default function FunnelPanel({funnel}: Props) {
+export default function FunnelPanel({funnel, funnelReplay}: Props) {
+  // Which lane is on screen. Live is the default: it is the one that answers
+  // "should I change something?". Replay answers "what did we miss?".
+  const [lane, setLane] = useState<"live" | "replay">("live");
   // Auto-refresh every 5s. The funnel counter is monotonically
   // increasing, so the dashboard just shows the latest values; the user
   // can spot deltas visually.
@@ -67,18 +76,29 @@ export default function FunnelPanel({funnel}: Props) {
   // Touch `tick` so React registers the dependency.
   void tick;
 
-  if (!funnel) {
+  const active = lane === "live" ? funnel : funnelReplay;
+
+  if (!active) {
     return (
       <div className="panel" style={{padding: 14, color: "var(--muted)", fontSize: 12}}>
-        Funnel data not yet populated. The bot emits the first counters on its
-        first strategy tick.
+        {lane === "live"
+          ? "Funnel data not yet populated. The bot emits the first counters on its first strategy tick."
+          : "No replay data yet. Delivered-block scoring populates this once RELAY_TX_INGEST has pulled a block."}
+        {lane === "replay" ? (
+          <button
+            onClick={() => setLane("live")}
+            style={{marginLeft: 8, fontSize: 11, cursor: "pointer"}}
+          >
+            back to live
+          </button>
+        ) : null}
       </div>
     );
   }
 
   // Per-strategy table.
   const rows = ALL_STRATEGIES.map((s) => {
-    const f = row(funnel[s] ?? ZERO);
+    const f = row(active[s] ?? ZERO);
     const seen = f.invocationsWithOutput + f.invocationsEmpty;
     const simulated = f.simulationsSucceeded + f.simulationsReverted;
     const revertRate = simulated > 0 ? f.simulationsReverted / simulated : 0;
@@ -116,10 +136,47 @@ export default function FunnelPanel({funnel}: Props) {
         <span style={{fontSize: 13, fontWeight: "bold", color: "var(--amber)"}}>
           🎯 Strategy Funnel — Where Do Opportunities Die?
         </span>
-        <span className="muted" style={{fontSize: 10}}>
-          Live counters from <code>/api/funnel</code>. Refreshes every 5s.
-        </span>
+        <div style={{display: "flex", gap: 6, alignItems: "center"}}>
+          {(["live", "replay"] as const).map((l) => (
+            <button
+              key={l}
+              onClick={() => setLane(l)}
+              title={
+                l === "live"
+                  ? "Flow the bot could have acted on: mempool, MEV-Share, external streams, block-cadence strategies"
+                  : "Post-mortem scoring of already-mined transactions from bloXroute delivered blocks"
+              }
+              style={{
+                fontSize: 10,
+                padding: "2px 8px",
+                borderRadius: 3,
+                cursor: "pointer",
+                border: `1px solid ${lane === l ? "var(--cyan)" : "var(--panel-2)"}`,
+                background: lane === l ? "var(--panel-2)" : "transparent",
+                color: lane === l ? "var(--cyan)" : "var(--muted)",
+              }}
+            >
+              {l === "live" ? "live" : "replay (mined)"}
+            </button>
+          ))}
+          <span className="muted" style={{fontSize: 10}}>
+            <code>/api/funnel</code> · 5s
+          </span>
+        </div>
       </div>
+
+      {lane === "replay" ? (
+        <p
+          className="muted"
+          style={{fontSize: 11, lineHeight: 1.5, margin: 0, color: "var(--amber)"}}
+        >
+          <strong>Post-mortem lane.</strong> These transactions were already
+          mined when the bot scored them, so nothing here was ever winnable in
+          real time. Read it as "what was extractable from the blocks that
+          landed", not as missed opportunities — and never mix it into the live
+          conversion rates.
+        </p>
+      ) : null}
 
       <p className="muted" style={{fontSize: 12, lineHeight: 1.5, margin: 0}}>
         If the simulation tape is empty, this is the first place to look.{" "}

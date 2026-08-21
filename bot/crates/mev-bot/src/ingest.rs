@@ -26,7 +26,8 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::rpc::{sse_stream, RpcClient, WsSubscription};
 use crate::types::{
-    now_ms, parse_address, parse_b256, parse_bytes, parse_u256, parse_u64, BlockHead, PendingTx, TxSource,
+    now_ms, parse_address, parse_b256, parse_bytes, parse_u256, parse_u64, BlockHead, PendingTx,
+    RelayBlock, TxSource,
 };
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,12 @@ pub enum IngestEvent {
         slot: u64,
         builder: String,
         value_wei: U256,
+    },
+    /// A block delivered through the bloXroute Max Profit relay, with the
+    /// transactions that actually landed in it (fetched from the execution node).
+    RelayBlock {
+        block: RelayBlock,
+        txs: Vec<PendingTx>,
     },
 }
 
@@ -81,6 +88,15 @@ impl Ingest {
 
         for relay in cfg.endpoints.relay_data_urls.clone() {
             spawn_relay_data(relay, cfg.chain.block_time_ms, tx.clone());
+        }
+
+        if cfg.relay_tx_ingest && !cfg.endpoints.bloxroute_relay_url.is_empty() {
+            spawn_relay_blocks(
+                cfg.endpoints.bloxroute_relay_url.clone(),
+                http.clone(),
+                cfg.chain.block_time_ms,
+                tx.clone(),
+            );
         }
 
         Self { rx }
@@ -370,6 +386,118 @@ fn spawn_relay_data(base: String, block_time_ms: u64, tx: mpsc::Sender<IngestEve
             tokio::time::sleep(Duration::from_millis(block_time_ms.max(4_000))).await;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// bloXroute Max Profit relay — delivered blocks + transactions
+// ---------------------------------------------------------------------------
+
+/// Poll the bloXroute Max Profit relay's `proposer_payload_delivered` bid traces
+/// and, for every newly delivered block, fetch its full transaction list from the
+/// execution node.
+///
+/// One `RelayBlock` event leaves this task per block, carrying the block metadata
+/// plus a `PendingTx` (source `RelayDelivered`) for every transaction that
+/// landed. The engine persists all of it and scores each transaction for
+/// extractable value exactly like a mempool transaction.
+fn spawn_relay_blocks(
+    base: String,
+    http: RpcClient,
+    block_time_ms: u64,
+    tx: mpsc::Sender<IngestEvent>,
+) {
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let url = format!(
+            "{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=20",
+            base.trim_end_matches('/')
+        );
+        let mut last_block = 0u64;
+        loop {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(items) = resp.json::<Vec<Value>>().await {
+                        // Newest first; process oldest → newest so the high-water
+                        // mark only advances once everything before it is done.
+                        for item in items.iter().rev() {
+                            let block_number = decimal_u64(&item["block_number"]);
+                            if block_number == 0 || block_number <= last_block {
+                                continue;
+                            }
+                            last_block = block_number;
+                            let Some(block_hash) =
+                                item.get("block_hash").and_then(parse_b256)
+                            else {
+                                continue;
+                            };
+                            let block = RelayBlock {
+                                relay: base.clone(),
+                                slot: decimal_u64(&item["slot"]),
+                                block_number,
+                                block_hash,
+                                builder: item
+                                    .get("builder_pubkey")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                value_wei: item
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|v| v.parse::<U256>().ok())
+                                    .unwrap_or(U256::ZERO),
+                                gas_used: decimal_u64(&item["gas_used"]),
+                                num_tx: decimal_u64(&item["num_tx"]),
+                            };
+                            let txs = fetch_block_txs(&http, block_hash).await;
+                            if tx.send(IngestEvent::RelayBlock { block, txs }).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!(
+                    target: "ingest",
+                    relay = %base,
+                    error = %e,
+                    "relay block poll failed"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(block_time_ms.max(4_000))).await;
+        }
+    });
+}
+
+/// Fetch the full transaction list of a delivered block. Missing or partial
+/// blocks (pruned node, reorg race) yield an empty vec: the block metadata is
+/// still recorded, only its transaction backfill is skipped.
+async fn fetch_block_txs(http: &RpcClient, block_hash: alloy_primitives::B256) -> Vec<PendingTx> {
+    let Ok(v) = http
+        .call_raw("eth_getBlockByHash", json!([format!("{block_hash:?}"), true]))
+        .await
+    else {
+        return Vec::new();
+    };
+    let Some(txs) = v.get("transactions").and_then(|t| t.as_array()) else {
+        return Vec::new();
+    };
+    txs.iter()
+        .filter_map(|t| parse_tx_object(t, TxSource::RelayDelivered))
+        .collect()
+}
+
+/// Relay data APIs encode integers as *decimal* strings (`"123"`), unlike the
+/// hex quantities used everywhere else on the JSON-RPC wire.
+fn decimal_u64(v: &Value) -> u64 {
+    v.as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| v.as_u64())
+        .unwrap_or(0)
 }
 
 /// Fetch the raw signed bytes of a pending transaction so it can be replayed

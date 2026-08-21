@@ -120,10 +120,40 @@ impl Store {
                 seen_at_ms    INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS relay_blocks (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay         TEXT NOT NULL,
+                slot          INTEGER NOT NULL,
+                block_number  INTEGER NOT NULL,
+                block_hash    TEXT NOT NULL,
+                builder       TEXT NOT NULL,
+                value_wei     TEXT NOT NULL,
+                gas_used      INTEGER NOT NULL,
+                num_tx        INTEGER NOT NULL,
+                seen_at_ms    INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS relay_block_txs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_number  INTEGER NOT NULL,
+                tx_index      INTEGER NOT NULL,
+                hash          TEXT NOT NULL,
+                from_addr     TEXT,
+                to_addr       TEXT,
+                value_wei     TEXT NOT NULL,
+                nonce         INTEGER NOT NULL,
+                gas           INTEGER NOT NULL,
+                selector      TEXT,
+                input         TEXT NOT NULL,
+                UNIQUE(block_number, hash)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sim_strategy ON simulations(strategy);
             CREATE INDEX IF NOT EXISTS idx_sim_created ON simulations(created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_opp_created ON opportunities(created_at_ms);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_slot ON relay_bids(relay, slot);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_block_slot ON relay_blocks(relay, slot);
+            CREATE INDEX IF NOT EXISTS idx_relay_block_txs_block ON relay_block_txs(block_number);
             "#,
         )?;
         Ok(())
@@ -223,6 +253,55 @@ impl Store {
                 builder,
                 value.to_string(),
                 crate::types::now_ms() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a delivered block (deduplicated per relay + slot).
+    pub fn record_relay_block(&self, b: &crate::types::RelayBlock) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO relay_blocks
+             (relay, slot, block_number, block_hash, builder, value_wei, gas_used, num_tx, seen_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                b.relay,
+                b.slot as i64,
+                b.block_number as i64,
+                format!("{:?}", b.block_hash),
+                b.builder,
+                b.value_wei.to_string(),
+                b.gas_used as i64,
+                b.num_tx as i64,
+                crate::types::now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record one transaction inside a delivered block. `index` is the
+    /// transaction's position within the block, preserved for replay ordering.
+    pub fn record_relay_block_tx(
+        &self,
+        b: &crate::types::RelayBlock,
+        tx: &crate::types::PendingTx,
+        index: usize,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO relay_block_txs
+             (block_number, tx_index, hash, from_addr, to_addr, value_wei, nonce, gas, selector, input)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                b.block_number as i64,
+                index as i64,
+                format!("{:?}", tx.hash),
+                tx.from.map(|a| format!("{a:?}")),
+                tx.to.map(|a| format!("{a:?}")),
+                tx.value.to_string(),
+                tx.nonce as i64,
+                tx.gas as i64,
+                tx.selector().map(|s| format!("0x{}", hex::encode(s))),
+                format!("0x{}", hex::encode(&tx.input)),
             ],
         )?;
         Ok(())
@@ -365,6 +444,62 @@ impl Store {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+
+    /// Delivered blocks ingested from the bloXroute Max Profit relay, newest first.
+    pub fn recent_relay_blocks(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relay, slot, block_number, block_hash, builder, value_wei, gas_used, num_tx, seen_at_ms
+             FROM relay_blocks ORDER BY block_number DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(serde_json::json!({
+                "relay": row.get::<_, String>(0)?,
+                "slot": row.get::<_, i64>(1)?,
+                "blockNumber": row.get::<_, i64>(2)?,
+                "blockHash": row.get::<_, String>(3)?,
+                "builder": row.get::<_, String>(4)?,
+                "valueWei": row.get::<_, String>(5)?,
+                "gasUsed": row.get::<_, i64>(6)?,
+                "numTx": row.get::<_, i64>(7)?,
+                "seenAtMs": row.get::<_, i64>(8)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Transactions stored for delivered blocks. When `block_number` is given,
+    /// only that block's transactions are returned; otherwise the newest across
+    /// all blocks are returned.
+    pub fn relay_block_txs(
+        &self,
+        block_number: Option<u64>,
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT block_number, tx_index, hash, from_addr, to_addr, value_wei, nonce, gas, selector, input
+             FROM relay_block_txs
+             WHERE (?1 IS NULL OR block_number = ?1)
+             ORDER BY block_number DESC, tx_index ASC LIMIT ?2",
+        )?;
+        let bn = block_number.map(|n| n as i64);
+        let rows = stmt.query_map(params![bn, limit], |row| {
+            Ok(serde_json::json!({
+                "blockNumber": row.get::<_, i64>(0)?,
+                "txIndex": row.get::<_, i64>(1)?,
+                "hash": row.get::<_, String>(2)?,
+                "from": row.get::<_, Option<String>>(3)?,
+                "to": row.get::<_, Option<String>>(4)?,
+                "valueWei": row.get::<_, String>(5)?,
+                "nonce": row.get::<_, i64>(6)?,
+                "gas": row.get::<_, i64>(7)?,
+                "selector": row.get::<_, Option<String>>(8)?,
+                "input": row.get::<_, String>(9)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
 }
 
 fn clamp_i64(v: i128) -> i64 {
@@ -450,5 +585,60 @@ mod tests {
         s.record_relay_bid("r", 1, "b", U256::from(5u8)).unwrap();
         s.record_relay_bid("r", 1, "b", U256::from(5u8)).unwrap();
         assert_eq!(s.recent_relay_bids(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn relay_blocks_and_txs_round_trip() {
+        use alloy_primitives::B256;
+        use crate::types::{PendingTx, RelayBlock, TxSource};
+
+        let s = Store::open_in_memory().unwrap();
+        let block = RelayBlock {
+            relay: "https://bloxroute.max-profit.blxrbdn.com".into(),
+            slot: 9_812_400,
+            block_number: 21_000_000,
+            block_hash: B256::from([7u8; 32]),
+            builder: "0xbeef".into(),
+            value_wei: U256::from(123u64),
+            gas_used: 15_000_000,
+            num_tx: 2,
+        };
+        let tx = PendingTx {
+            hash: B256::from([9u8; 32]),
+            from: Some(Address::with_last_byte(1)),
+            to: Some(Address::with_last_byte(2)),
+            value: U256::from(5u64),
+            gas: 210_000,
+            max_fee_per_gas: U256::from(20_000_000_000u64),
+            max_priority_fee_per_gas: U256::from(1_000_000_000u64),
+            nonce: 3,
+            input: vec![0xde, 0xad, 0xbe, 0xef],
+            raw: None,
+            source: TxSource::RelayDelivered,
+            seen_at_ms: now_ms(),
+        };
+
+        // Blocks dedup per (relay, slot); txs dedup per (block, hash).
+        s.record_relay_block(&block).unwrap();
+        s.record_relay_block(&block).unwrap();
+        s.record_relay_block_tx(&block, &tx, 0).unwrap();
+        s.record_relay_block_tx(&block, &tx, 0).unwrap();
+
+        let blocks = s.recent_relay_blocks(10).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["blockNumber"], serde_json::json!(21_000_000));
+        assert_eq!(blocks[0]["numTx"], serde_json::json!(2));
+        assert_eq!(blocks[0]["valueWei"], serde_json::json!("123"));
+
+        let txs = s.relay_block_txs(Some(21_000_000), 100).unwrap();
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["selector"], serde_json::json!("0xdeadbeef"));
+        assert_eq!(
+            txs[0]["from"],
+            serde_json::json!(format!("{:?}", Address::with_last_byte(1)))
+        );
+
+        // Unknown block number → empty result.
+        assert!(s.relay_block_txs(Some(1), 100).unwrap().is_empty());
     }
 }

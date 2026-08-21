@@ -137,6 +137,13 @@ other:**
 A single call can emit many candidates — that is exactly what widening a search
 (multi-leg arb, V3 victims) does — so `candidatesEmitted / invocationsWithOutput`
 is a search-width signal, while `submittable / candidatesEmitted` is the
-conversion rate that matters. Before this split the first stage counted calls
+conversion rate that matters.
+
+The funnel is also split by **provenance**. `stats.funnel` counts flow the bot
+could have acted on; `stats.funnelReplay` counts already-mined transactions
+replayed from bloXroute delivered blocks (`docs/BLOXROUTE_RELAY.md`). Never
+read a rate across the two: the replay population is roughly 150 transactions
+per block that were never winnable in real time, and folding it in would bury
+the live signal completely. Before this split the first stage counted calls
 and everything after it counted opportunities, which made the implied
 conversion rate meaningless.

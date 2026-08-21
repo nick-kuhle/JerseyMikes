@@ -15,6 +15,10 @@ before writing code; this work order references specific sections rather than
 restating them.
 **Scope:** everything below is simulation-only. Nothing in Phase 2 touches the
 live-execution path.
+**Baseline:** merged with `main` at `cd42422`, which added the bloXroute Max
+Profit relay delivered-block ingestion. That integration routes already-mined
+transactions through the strategy funnel, which interacts directly with W1 —
+see §1.7.
 
 ---
 
@@ -86,7 +90,9 @@ reviewers check the code against — and each now opens with what exists.
 | Discovery | `strategies/discovery.rs` | rewritten behind a `DiscoverySource` trait; retry-safe accept/reject sets; reorg overlap; span cap; V3 scan; 11 tests, none touching the network |
 | Cycle search | `dex/graph.rs` (new) | `build_edges`, `adjacency`, `enumerate_cycles`, `evaluate`, `optimal_cycle_in`, `search`, budgets, 13 tests |
 | Arb wiring | `strategies/arb.rs` | `on_block` now runs the cycle search; `build_cycle_opportunity` builds N-leg call sequences; back-run path untouched; 2 equivalence tests |
-| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5) |
+| Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle in the dashboard; 3 new tests (§1.7) |
+| Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore bounds the delivered-block fan-out (§1.7) |
+| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16) |
 
 Two deliberate defaults: **V3 discovery is off** (nothing consumes the V3 cache
 until W5) and **`ARB_MAX_CYCLE_LEN` is 2**, which makes the new search
@@ -118,7 +124,13 @@ implementing:
 | Frontend | **Fully verified.** `npx tsc --noEmit` clean, `npm run build` succeeds, dev server renders the reworked panel |
 | Rust | **Parsed, not compiled.** Every `.rs` file parses clean under a tree-sitter Rust grammar (syntax only — no type checking, no borrow checking, no trait resolution) |
 | Event topics | **Computed, not guessed.** `PoolCreated` topic0 was derived with keccak256 and the same method reproduces the repo's existing `PairCreated` constant exactly |
-| Rust tests | **Written, never executed** — 30 new tests across `engine.rs`, `strategies/mod.rs`, `discovery.rs`, `dex/graph.rs`, `arb.rs` |
+| Rust tests | **Written, never executed** — 33 new tests across `engine.rs`, `strategies/mod.rs`, `discovery.rs`, `dex/graph.rs`, `arb.rs` |
+
+One real compile error has already been found and fixed this way: the `Config`
+literal in `risk.rs`'s test module needs every new config field, and the first
+pass missed `pool_discovery_v3` / `arb_max_cycle_len`. Syntax checking cannot
+see that class of error — merging against `main`, which touched the same
+literal, is what surfaced it. Assume there are more.
 
 The sandbox this was written in cannot reach `crates.io` or
 `static.rust-lang.org`, so there is no toolchain and no way to run `cargo`.
@@ -126,6 +138,43 @@ Expect the first CI run after W0 to surface mechanical errors — an import, a
 trait bound, a lifetime. The logic and tests are written to be read; the
 compiler has not had its turn. **Do not merge W1–W4 on the strength of this
 document — merge it on a green CI run.**
+
+## 1.7 Interaction with the bloXroute delivered-block ingestion
+
+`main` now polls the bloXroute Max Profit relay for delivered blocks, fetches
+each block's transactions, and routes **every one of them** through the same
+`strategy → risk → simulation` path as a mempool transaction
+(`TxSource::RelayDelivered`, `engine::evaluate`). As a source of Phase 1 replay
+data that is exactly right. It creates two problems for Phase 2, both fixed on
+this branch.
+
+**1. It would have destroyed the funnel as a live instrument.** A mainnet block
+delivers ~150 already-mined transactions every 12 seconds. Counted in the same
+`FunnelCounters` as live mempool flow, replay traffic outnumbers it by an order
+of magnitude, and every ratio the dashboard shows — and every before/after
+comparison W4 and W5 are judged by — becomes a measurement of the backfill
+instead. That is the W1 defect again, arriving through a different door.
+
+The fix is a provenance split, not a switch: `FunnelLane::{Live, Replay}`,
+chosen by `TxSource`, with two parallel counter maps. `/api/funnel` and
+`/api/status` return `funnel` (live, unchanged shape) alongside `funnelReplay`,
+and the dashboard has a lane toggle with the post-mortem lane clearly marked.
+Both teams get what they wanted: relay transactions are scored and visible,
+the live signal stays clean.
+
+**2. It queues ~1000 tasks per block.** `on_relay_block` spawned one task per
+strategy for every transaction with nothing between it and the runtime — a
+structural version of the spawn-budget footgun in `MAINTAINING.md` §5, firing
+every block rather than on a burst. `max_inflight_per_strategy` only bounds
+simulations, so the strategy bodies and their RPC calls ran unbounded, which
+would starve the latency-critical mempool path and trip provider rate limits.
+
+Delivered blocks are already mined, so replay has no deadline and can trade
+latency for footprint. `evaluate` now has two forms — a fan-out form for live
+flow (unchanged, still returns immediately) and an awaited form for replay —
+and the relay path runs the awaited form behind a `RELAY_TX_CONCURRENCY`
+semaphore (default 16). Every transaction is still scored; they just no longer
+arrive all at once.
 
 ## 2. Workstream summary
 
@@ -230,7 +279,10 @@ accepted gap (`MAINTAINING.md` §4).
 
 > **Status: implemented.** `engine.rs` (`FunnelCounters`, `record_invocation`,
 > `snapshot`), `api.rs` inherits the new keys via `snapshot()`, and the
-> dashboard is updated and verified. Rust is uncompiled; the frontend is not.
+> dashboard is updated and verified. Counters are additionally split by
+> provenance into a live and a replay lane so the bloXroute delivered-block
+> backfill cannot dilute them — see §1.7. Rust is uncompiled; the frontend is
+> not.
 
 **The defect** (raised in the review, located here). `engine.rs:295-303` and
 `engine.rs:329-337` bump `candidates_emitted` / `candidates_skipped` **once per

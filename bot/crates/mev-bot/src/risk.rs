@@ -173,6 +173,7 @@ mod tests {
                 mev_share_sse: String::new(),
                 relay_url: String::new(),
                 relay_data_urls: vec![],
+                bloxroute_relay_url: String::new(),
                 sequencer_feed: None,
                 extra_mempool_ws: vec![],
                 flashbots_signer_key: None,
@@ -210,6 +211,10 @@ mod tests {
                 feed_capacity: 10,
             },
             pool_discovery: true,
+            pool_discovery_v3: false,
+            arb_max_cycle_len: 2,
+            relay_tx_ingest: false,
+            relay_tx_concurrency: 4,
             live_execution: false,
         })
     }

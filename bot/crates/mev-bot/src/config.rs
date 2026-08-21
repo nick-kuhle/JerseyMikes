@@ -55,6 +55,19 @@ pub struct Config {
     /// baseline to compare against. Every additional leg costs ~120k gas and
     /// widens the search, so this is a measured change, not a free win.
     pub arb_max_cycle_len: usize,
+    /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
+    /// their transactions ingested + scored. On by default; this is read-only
+    /// (polling a public data API + the execution node), never a submission.
+    pub relay_tx_ingest: bool,
+    /// How many delivered-block transactions are scored concurrently.
+    ///
+    /// A mainnet block carries ~150–200 transactions and each one fans out to
+    /// one task per strategy, so an unbounded backfill queues ~1000 tasks and a
+    /// matching burst of RPC per block — enough to get the bot rate limited off
+    /// its provider and starve the live mempool path. Replay work is never
+    /// latency-critical (the block is already mined), so it runs behind this
+    /// bound.
+    pub relay_tx_concurrency: usize,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -80,6 +93,9 @@ pub struct Endpoints {
     pub relay_url: String,
     /// Additional relays for data queries (bid traces / payloads delivered).
     pub relay_data_urls: Vec<String>,
+    /// The bloXroute Max Profit relay used to pull delivered blocks and their
+    /// transactions (see `RELAY_TX_INGEST`).
+    pub bloxroute_relay_url: String,
     /// Optional L2 sequencer / preconfirmation feed (websocket).
     pub sequencer_feed: Option<String>,
     /// Optional Blocknative / Blockstream-style mempool stream.
@@ -228,6 +244,10 @@ impl Config {
                         v
                     }
                 },
+                bloxroute_relay_url: env_or(
+                    "BLOXROUTE_MAX_PROFIT_URL",
+                    "https://bloxroute.max-profit.blxrbdn.com",
+                ),
                 sequencer_feed: env_opt("SEQUENCER_FEED_URL"),
                 extra_mempool_ws: env_list("EXTRA_MEMPOOL_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
@@ -275,6 +295,10 @@ impl Config {
             // search into an unbounded walk.
             arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
                 .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
+            // Infrastructure toggle: pull delivered blocks + transactions from the
+            // bloXroute Max Profit relay and score them for extractable value.
+            relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
+            relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
@@ -283,7 +307,7 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} arb_legs={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} arb_legs={} bloxroute_txs={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -293,6 +317,7 @@ impl Config {
             self.pool_discovery,
             self.pool_discovery_v3,
             self.arb_max_cycle_len,
+            self.relay_tx_ingest,
             self.live_execution
         )
     }

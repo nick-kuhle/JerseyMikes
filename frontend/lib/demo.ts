@@ -12,6 +12,8 @@ import type {
   OpportunityRow,
   PnlResponse,
   RelayBid,
+  RelayBlockRow,
+  RelayBlockTxRow,
   SeriesPoint,
   SimulationRow,
   StatusResponse,
@@ -76,6 +78,7 @@ export function demoStatus(): StatusResponse {
       rejected: 5_512,
       startedAtMs: Date.now() - 1000 * 60 * 84,
       funnel: demoFunnel(),
+      funnelReplay: demoFunnelReplay(),
     },
     simBackends: {anvilFork: true, relayCallBundle: true},
     demo: true,
@@ -154,6 +157,61 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       simulationsFailed: 0,
       submittable: 0,
     }),
+  };
+}
+
+/**
+ * The replay lane: bloXroute delivered-block transactions scored after the
+ * fact. Volumes are an order of magnitude above the live lane because every
+ * delivered block contributes ~150 already-mined transactions — which is
+ * exactly why the two lanes are counted separately.
+ */
+export function demoFunnelReplay(): Record<Strategy, FunnelCounters> {
+  const f = (n: Partial<FunnelCounters>): FunnelCounters => ({
+    invocationsWithOutput: 0,
+    invocationsEmpty: 0,
+    candidatesEmitted: 0,
+    gatedByRisk: 0,
+    missingVictimRaw: 0,
+    simulationsSucceeded: 0,
+    simulationsReverted: 0,
+    simulationsFailed: 0,
+    submittable: 0,
+    ...n,
+  });
+  return {
+    sandwich: f({
+      invocationsWithOutput: 2_940,
+      invocationsEmpty: 121_060,
+      candidatesEmitted: 3_512,
+      gatedByRisk: 2_701,
+      missingVictimRaw: 402,
+      simulationsSucceeded: 118,
+      simulationsReverted: 291,
+      simulationsFailed: 12,
+      submittable: 96,
+    }),
+    jit: f({invocationsEmpty: 124_000}),
+    atomic_arb: f({
+      invocationsWithOutput: 1_204,
+      invocationsEmpty: 122_796,
+      candidatesEmitted: 6_880,
+      gatedByRisk: 5_910,
+      simulationsSucceeded: 402,
+      simulationsReverted: 511,
+      simulationsFailed: 57,
+      submittable: 288,
+    }),
+    liquidation: f({
+      invocationsWithOutput: 42,
+      invocationsEmpty: 123_958,
+      candidatesEmitted: 42,
+      simulationsSucceeded: 19,
+      simulationsReverted: 21,
+      simulationsFailed: 2,
+      submittable: 17,
+    }),
+    sniper: f({invocationsEmpty: 123_806, invocationsWithOutput: 194, candidatesEmitted: 194}),
   };
 }
 
@@ -271,6 +329,54 @@ export function demoRelayBids(limit = 30): RelayBid[] {
   return out;
 }
 
+const BLOXROUTE_RELAY = "https://bloxroute.max-profit.blxrbdn.com";
+
+export function demoRelayBlocks(limit = 25): RelayBlockRow[] {
+  const out: RelayBlockRow[] = [];
+  for (let i = 0; i < limit; i++) {
+    out.push({
+      relay: BLOXROUTE_RELAY,
+      slot: 9_812_400 - i,
+      blockNumber: START_BLOCK + 420 - i,
+      blockHash: hash(9000 + i),
+      builder: "0x" + (0x94aa + i).toString(16).repeat(12).slice(0, 96),
+      valueWei: String(Math.floor(rand() * 3e17 + 8e15)),
+      gasUsed: 12_000_000 + Math.floor(rand() * 18_000_000),
+      numTx: 200 + Math.floor(rand() * 250),
+      seenAtMs: Date.now() - i * 12_000,
+    });
+  }
+  return out;
+}
+
+export function demoRelayTxs(blockNumber?: number, limit = 200): RelayBlockTxRow[] {
+  const base = blockNumber ?? START_BLOCK + 420;
+  const out: RelayBlockTxRow[] = [];
+  const selectors = ["0x38ed1739", "0x7ff36ab5", "0x04e45aaf", "0x3593564c", "0xa9059cbb", null];
+  for (let i = 0; i < limit; i++) {
+    const sel = pick(selectors);
+    out.push({
+      blockNumber: base,
+      txIndex: i,
+      hash: hash(7000 + i),
+      from: addr(i + 31),
+      to: sel
+        ? pick([
+            "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+            "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+            "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD",
+          ])
+        : addr(i + 77),
+      valueWei: sel ? "0" : String(Math.floor(rand() * 1e18)),
+      nonce: i,
+      gas: 120_000 + Math.floor(rand() * 400_000),
+      selector: sel,
+      input: sel ? "0x" + sel.slice(2) + "0".repeat(500) : "0x",
+    });
+  }
+  return out;
+}
+
 /** One synthetic feed event, used by the demo SSE stream. */
 export function demoEvent(i: number): FeedEvent {
   const r = rand();
@@ -318,6 +424,30 @@ export function demoEvent(i: number): FeedEvent {
       logs: Math.floor(rand() * 5),
       functions: [pick(["0x38ed1739", "0x7ff36ab5", "0x04e45aaf", "0x3593564c"])],
       seen_at_ms: Date.now(),
+    };
+  }
+  if (r < 0.26) {
+    const blocks = demoRelayBlocks(1);
+    return {
+      kind: "relay_block",
+      block: {
+        relay: blocks[0].relay,
+        slot: blocks[0].slot,
+        block_number: blocks[0].blockNumber,
+        block_hash: blocks[0].blockHash,
+        builder: blocks[0].builder,
+        value_wei: blocks[0].valueWei,
+        gas_used: blocks[0].gasUsed,
+        num_tx: blocks[0].numTx,
+      },
+      tx_count: blocks[0].numTx,
+      txs: demoRelayTxs(blocks[0].blockNumber, 3).map((t) => ({
+        hash: t.hash,
+        from: t.from,
+        to: t.to,
+        value: t.valueWei,
+        selector: t.selector,
+      })),
     };
   }
   return {
