@@ -19,7 +19,7 @@ export default function RiskPanel({status}: Props) {
   const [maxGas, setMaxGas] = useState(3000000);
   const [enabledStrats, setEnabledStrats] = useState<Record<Strategy, boolean>>({
     sandwich: true,
-    sandwich_v3: false,
+    sandwich_v3: true,
     jit: true,
     atomic_arb: true,
     liquidation: true,
@@ -347,12 +347,13 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
 
             <div style={{background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 4, padding: 10}}>
               <div style={{color: "var(--cyan)", fontWeight: "bold", marginBottom: 4}}>
-                4. V3 sandwich is shipped off
+                4. V3 sandwich cache is empty
               </div>
               <div className="muted" style={{fontSize: 11, lineHeight: 1.5}}>
-                `STRATEGY_SANDWICH_V3` and `POOL_DISCOVERY_V3` both default to false. The V3 sandwich
-                only quotes pools already in the V3 cache, so flipping the strategy on without
-                discovery is a no-op. Turn both on together after a week of funnel baseline.
+                `STRATEGY_SANDWICH_V3` and `POOL_DISCOVERY_V3` default on as a pair. The strategy
+                only quotes pools already in the V3 cache, so a cold start (or discovery off)
+                emits nothing until `PoolCreated` logs have been scanned. Watch the live
+                `sandwich_v3` funnel row and `/api/latency` stage `strategy` p95.
               </div>
             </div>
 

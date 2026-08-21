@@ -51,9 +51,10 @@ pub struct Config {
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
-    /// Whether the UniswapV3 `PoolCreated` scan runs each block. Off by
-    /// default: it only earns its `eth_getLogs` once a strategy consumes the
-    /// V3 cache.
+    /// Whether the UniswapV3 `PoolCreated` scan runs each block. On with
+    /// `STRATEGY_SANDWICH_V3`: discovery without the strategy wastes an
+    /// `eth_getLogs` per block; the strategy without discovery sees an empty
+    /// `V3PoolCache` and emits nothing.
     pub pool_discovery_v3: bool,
     /// Decode Uniswap UniversalRouter `execute` calldata on the pending path.
     /// Off by default: Phase 2 W6 is gated on a week of funnel data showing a
@@ -62,10 +63,10 @@ pub struct Config {
     pub decode_universal_router: bool,
     /// Longest cycle the atomic-arb search will consider, in legs.
     ///
-    /// 2 reproduces the original pair-to-pair search exactly and is the
-    /// default; raise it (up to `MAX_CYCLE_LEN`) once the funnel has a
-    /// baseline to compare against. Every additional leg costs ~120k gas and
-    /// widens the search, so this is a measured change, not a free win.
+    /// Default is 3 (the first post-funnel-week raise). 2 reproduces the
+    /// original pair-to-pair search exactly. Raise further (up to
+    /// `MAX_CYCLE_LEN`) only after live `atomic_arb.candidatesEmitted` on
+    /// the same feed moves at 3. Every additional leg costs ~120k gas.
     pub arb_max_cycle_len: usize,
     /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
     /// their transactions ingested + scored. On by default; this is read-only
@@ -151,9 +152,8 @@ pub struct RiskConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StrategyToggles {
     pub sandwich: bool,
-    /// V3 sandwich via QuoterV2. Off by default until the funnel week is
-    /// read and `POOL_DISCOVERY_V3` is on so the V3 cache has something
-    /// to match against.
+    /// V3 sandwich via QuoterV2. On by default after the funnel week,
+    /// paired with `POOL_DISCOVERY_V3`.
     pub sandwich_v3: bool,
     pub jit: bool,
     pub atomic_arb: bool,
@@ -298,7 +298,7 @@ impl Config {
             },
             strategies: StrategyToggles {
                 sandwich: env_bool("STRATEGY_SANDWICH", true),
-                sandwich_v3: env_bool("STRATEGY_SANDWICH_V3", false),
+                sandwich_v3: env_bool("STRATEGY_SANDWICH_V3", true),
                 jit: env_bool("STRATEGY_JIT", true),
                 atomic_arb: env_bool("STRATEGY_ATOMIC_ARB", true),
                 liquidation: env_bool("STRATEGY_LIQUIDATION", true),
@@ -332,11 +332,11 @@ impl Config {
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
-            pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", false),
+            pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", true),
             decode_universal_router: env_bool("DECODE_UNIVERSAL_ROUTER", false),
             // Clamped to the enumerator's hard ceiling: config cannot talk the
             // search into an unbounded walk.
-            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
+            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 3) as usize)
                 .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
             // Infrastructure toggle: pull delivered blocks + transactions from the
             // bloXroute Max Profit relay and score them for extractable value.

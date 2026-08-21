@@ -20,14 +20,9 @@ Profit relay delivered-block ingestion. That integration routes already-mined
 transactions through the strategy funnel, which interacts directly with W1 —
 see §1.7.
 
-**Continuation status (2026-08-21):** W5 (V3 sandwich) and W6 (UniversalRouter
-decoder) are now implemented behind default-off toggles
-(`STRATEGY_SANDWICH_V3`, `DECODE_UNIVERSAL_ROUTER`). A default checkout is
-still the W1–W4 measurement instrument. The one-week funnel gates for
-turning those toggles on, and for raising W4 to 3–5 legs, are not waived.
-The maintainer reports that `make bot-check`, `make bot-test`, and
-`make contracts` pass locally on the W1–W4 baseline; this session could not
-run Rust independently. Frontend `tsc --noEmit` is clean.
+**Continuation status (2026-08-21):** Funnel week is done. W4 default is
+3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off until a
+written public-mempool gap memo exists. W0 is required on PRs to `main`.
 
 A follow-up automation session (the same day) re-ran the checks it can run —
 contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
@@ -131,13 +126,11 @@ reviewers check the code against — and each now opens with what exists.
 | Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle in the dashboard; 3 new tests (§1.7) |
 | Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore bounds the delivered-block fan-out (§1.7) |
 | Parent-block replay | `types.rs`, `ingest.rs`, `strategies/*`, `engine.rs`, `sim/*` | `MinedAt` tagging, `state_block`/`target_block`/`base_fee` routing, uncached historical pool reads, dedicated replay fork (§1.8) |
-| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
+| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default on with W5), `ARB_MAX_CYCLE_LEN` (default 3, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
 
-Two deliberate defaults: **V3 discovery is off** (nothing consumes the V3 cache
-until W5) and **`ARB_MAX_CYCLE_LEN` is 2**, which makes the new search
-reproduce the old pair-to-pair behaviour exactly. Nothing in this branch
-changes what the bot does until someone flips a toggle, which is what the
-"measure first" gate requires.
+Post-funnel-week defaults: **V3 discovery is on** with W5, and
+**`ARB_MAX_CYCLE_LEN` is 3**. W6 stays off. The enumerator still
+reproduces the old pair-to-pair behaviour when `ARB_MAX_CYCLE_LEN=2`.
 
 Beyond the specs as written, three problems were found and fixed while
 implementing:
@@ -271,31 +264,23 @@ state.
 
 | ID | Workstream | Depends on | Size | Gate to start | Status |
 | --- | --- | --- | --- | --- | --- |
-| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **🟡 all four CI jobs green, incl. `bot (rust)` (117/117 on `cargo test --all`); only remaining step: make the workflow a *required* PR check (maintainer with admin — branch protection is not settable by the automation token)** |
+| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **✅ all four CI jobs green and required on PRs to `main`** |
 | **W1** | Fix funnel counter semantics + labels | W0 | S | none | **✅ implemented and locally verified** |
 | **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented and locally verified** (including sniper retry fix) |
-| **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented and locally verified** (shipped off) |
-| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation locally verified, shipped at 2 legs** (`ARB_MAX_CYCLE_LEN=2`) |
-| **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | **✅ implementation locally written, shipped off** (`STRATEGY_SANDWICH_V3=false`). Do not flip until the funnel week is read and `POOL_DISCOVERY_V3` is on. |
-| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation locally written, shipped off** (`DECODE_UNIVERSAL_ROUTER=false`). Do not flip until the funnel shows a public-mempool gap. |
+| **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented; on with W5** (`POOL_DISCOVERY_V3=true`) |
+| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation shipped; default raised to 3 legs** (`ARB_MAX_CYCLE_LEN=3`). Do not raise to 4–5 until live `atomic_arb.candidatesEmitted` on the same feed moves at 3. |
+| **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | **✅ on after the funnel week** (`STRATEGY_SANDWICH_V3=true` with `POOL_DISCOVERY_V3=true`). Watch `sandwich_v3` live funnel + strategy p95. |
+| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation shipped, still off** (`DECODE_UNIVERSAL_ROUTER=false`). Flip only with a written public-mempool gap memo. |
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
-### The one thing to do now
+### What remains after the funnel week
 
-**W0's remaining step is administrative: make the workflow required.** All
-four CI jobs — `contracts (foundry)`, `frontend (next.js)`,
-`embedded bytecode is current`, and `bot (rust)` — are green on the working
-branch. The artifact-drift job's original failure (checkout-path-dependent
-bytecode from solc's IPFS metadata hash) is fixed, and the `bot (rust)`
-`cargo test --all` failure turned out to be a deterministic wrong assertion
-in `competition::tests::half_the_bid_is_unlikely` (expected `p ∈ (0.05,
-0.20)`; the shipped `LOGISTIC_K = 2.2` gives `p = σ(-1.1) ≈ 0.2497` at half
-the winning bid) — now corrected, with the dense-graph budget test's
-wall-clock ceiling also hardened against slow shared runners. The next step
-is for a maintainer with admin access to mark the CI checks required on PRs
-to `main` (branch protection is neither readable nor settable by the
-automation token); until then W0 stays open.
+W0 is required. W4's default is 3 legs. W5 is on as a pair with V3
+discovery. Next is a W6 go/no-go from live sandwich + JIT
+`invocationsEmpty` vs mempool `pendingSeen`. Do not raise W4 past 3
+until the live `atomic_arb.candidatesEmitted` delta at 3 is written
+down. Do not flip W6 without that memo.
 
 This ordering is the review's recommended sequence, made concrete: measure
 first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
@@ -511,11 +496,11 @@ covered by the network-free discovery tests.
 
 ## W3 — V3 pool discovery
 
-> **Status: implemented, locally verified, shipped off.** `dex::V3Pool` (now
-> including its creation block), `strategies::V3PoolCache`, topic-validated
+> **Status: implemented; on with W5.** `dex::V3Pool` (including its
+> creation block), `strategies::V3PoolCache`, topic-validated
 > `decode_pool_created`, `try_scan_pool_created`, and
 > `PoolDiscovery::discover_v3_with` are behind `POOL_DISCOVERY_V3` (default
-> `false`). Turn it on when W5 needs it.
+> `true`, paired with `STRATEGY_SANDWICH_V3`).
 
 **Hard constraint: V2 and V3 pools do not share a cache or a type.** `PoolCache`
 (`strategies/mod.rs:90`) stores `V2Pool`, whose `reserve0`/`reserve1` model is
@@ -562,12 +547,12 @@ available mistake in Phase 2.
 
 ## W4 — Multi-leg V2 atomic arb
 
-> **Status: implementation locally verified, shipped at 2 legs.** `dex/graph.rs`
-> plus `arb.rs::build_cycle_opportunity` are wired into `on_block` with the
-> documented budgets. `ARB_MAX_CYCLE_LEN` defaults to `2`, which reproduces the
-> previous pair-to-pair behaviour through the new code path — an equivalence
-> test pins that. Raise it to 3–5 only after the funnel week, and record the
-> before/after candidate volume.
+> **Status: implementation shipped; default raised to 3 legs after the
+> funnel week.** `dex/graph.rs` plus `arb.rs::build_cycle_opportunity` are
+> wired into `on_block` with the documented budgets. `ARB_MAX_CYCLE_LEN`
+> defaults to `3`. Set it to `2` to reproduce the previous pair-to-pair
+> behaviour (an equivalence test still pins that path). Raise to 4–5 only
+> after live `atomic_arb.candidatesEmitted` on the same feed moves at 3.
 
 **Gate: do not start until the funnel (W1) has a week of data and W2 has grown
 the pool cache.** A 5-leg cycle search over 8 pools is pointless; the same
@@ -654,15 +639,14 @@ the 25 ms budget holds. Put the number in the PR description.
 
 ## W5 — V3 sandwich via QuoterV2
 
-> **Status: implemented, shipped off.** `strategies/sandwich_v3.rs` sizes
-> via a `V3Quoter` trait (production = QuoterV2, tests = fake CP pool).
-> `STRATEGY_SANDWICH_V3` defaults to `false`; the strategy is not
-> constructed when the toggle is off, so it adds zero RPC. The pool must
-> already sit in the W3 V3 cache (`POOL_DISCOVERY_V3`). Funnel row is the
-> new `Strategy::SandwichV3` variant (`sandwich_v3`). Victim-revert trap,
-> 12-call budget, router-routed legs with `amountOutMinimum = 0` on the
-> back-run, and selector tests for both SwapRouter and SwapRouter02 are
-> in the crate. **Do not flip the toggle until the funnel week is read.**
+> **Status: on after the funnel week, paired with V3 discovery.**
+> `strategies/sandwich_v3.rs` sizes via a `V3Quoter` trait (production =
+> QuoterV2, tests = fake CP pool). `STRATEGY_SANDWICH_V3` and
+> `POOL_DISCOVERY_V3` default **on** together. The strategy is not
+> constructed when the toggle is off, so it adds zero RPC. Funnel row is
+> `Strategy::SandwichV3` (`sandwich_v3`). Victim-revert trap, 12-call
+> budget, router-routed legs with `amountOutMinimum = 0` on the back-run.
+> Revert the pair if strategy p95 blows the pending-path budget.
 
 **Gate: after W1 and W3.** Ship behind a config toggle (`STRATEGY_SANDWICH_V3`,
 default off), as the review requires.
@@ -803,12 +787,10 @@ Phase 2 is complete when all of these hold:
    reflect the shipped state. Every new toggle is documented.
 8. `live_execution` is still false and the two-key switch is untouched.
 
-**Progress at this handoff update:** items W1–W6 have implementation. W0's
-remote workflow is green; making it a required PR check is the remaining
-administrative step. W4 remains at its compatibility default of two legs,
-W5 is behind `STRATEGY_SANDWICH_V3=false`, and W6 is behind
-`DECODE_UNIVERSAL_ROUTER=false`, until the funnel baseline is read for a
-week (and, for W6, shows a public-mempool gap).
+**Progress at this handoff update:** W0 is required. W4 default is 3
+legs. W5 is on with `POOL_DISCOVERY_V3`. W6 stays behind
+`DECODE_UNIVERSAL_ROUTER=false` until a written public-mempool gap memo
+exists. Phase 2 is not closed.
 
 ---
 
@@ -866,9 +848,9 @@ new strategy becomes unobservable.
 | Var | Default | Notes |
 | --- | --- | --- |
 | `POOL_DISCOVERY` | `true` | V2 discovery per block (`config.rs:261`) |
-| `POOL_DISCOVERY_V3` | *(new in W3)* `false` | turn on together with `STRATEGY_SANDWICH_V3` |
-| `STRATEGY_SANDWICH_V3` | *(new in W5)* `false` | V3 sandwich; adds a `sandwich_v3` funnel row |
-| `DECODE_UNIVERSAL_ROUTER` | *(new in W6)* `false` | expands V2 sandwich / arb surface when on |
+| `POOL_DISCOVERY_V3` | `true` | paired with `STRATEGY_SANDWICH_V3` |
+| `STRATEGY_SANDWICH_V3` | `true` | V3 sandwich; adds a `sandwich_v3` funnel row |
+| `DECODE_UNIVERSAL_ROUTER` | `false` | still off; flip only with a public-mempool gap memo |
 | `MIN_NET_PROFIT_WEI` | `1` | do not move to chase funnel numbers |
 | `MAX_POSITION_WEI` | `100e18` | notional gate |
 | `MAX_BASE_FEE_WEI` | `500 gwei` | |

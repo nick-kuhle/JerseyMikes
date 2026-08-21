@@ -40,10 +40,11 @@ funnel can tell the two surfaces apart.
 SwapRouter02 (`0x04e45aaf`) in the mempool, WETH on the input side, whose
 `(token, fee)` pool is already in the V3 cache.
 
-**Toggle.** `STRATEGY_SANDWICH_V3` (default **off**). The strategy is not
-constructed when the toggle is off, so it adds zero RPC to the pending path.
-It also no-ops if `POOL_DISCOVERY_V3` is off: the cache is empty, the
-pre-filter returns before any quote.
+**Toggle.** `STRATEGY_SANDWICH_V3` (default **on**, paired with
+`POOL_DISCOVERY_V3`). The strategy is not constructed when the toggle is
+off, so it adds zero RPC to the pending path. It also no-ops if
+`POOL_DISCOVERY_V3` is off: the cache is empty, the pre-filter returns
+before any quote, and the engine logs a warning at boot.
 
 **Sizing.** QuoterV2, not hand-rolled Q64.96. A coarse grid of four front-run
 sizes, then a one-step refine, each size costing two `eth_call`s
@@ -96,12 +97,14 @@ anchored on WETH: every simple cycle up to `ARB_MAX_CYCLE_LEN` legs that starts
 and ends in WETH, with each pool used at most once. Optimal input is solved by
 ternary search over the composed curves.
 
-`ARB_MAX_CYCLE_LEN` defaults to **2**, which reproduces the original
-two-venue WETH → token → WETH scan. Raising it to 3–5 widens the search to
-multi-hop cycles such as WETH → USDC → WBTC → WETH, which only exist once pool
-discovery has loaded the cross pairs. The search is bounded on four axes
-regardless of configuration: 5 legs, 200 pools, 32 candidates and a 25 ms
-wall-clock budget per block, and it makes no RPC calls of its own.
+`ARB_MAX_CYCLE_LEN` defaults to **3**, the first post-funnel-week raise.
+Set it back to 2 to reproduce the original two-venue WETH → token → WETH
+scan. 3-leg cycles such as WETH → USDC → WBTC → WETH only exist once pool
+discovery has loaded the cross pairs. Raise to 4–5 only after live
+`atomic_arb.candidatesEmitted` on the same feed moves at 3. The search is
+bounded on four axes regardless of configuration: 5 legs, 200 pools, 32
+candidates and a 25 ms wall-clock budget per block, and it makes no RPC
+calls of its own.
 
 Anchoring on WETH alone is not a limitation: any cycle touching WETH can be
 rotated to start there. Cycles that never touch WETH are skipped on purpose —
