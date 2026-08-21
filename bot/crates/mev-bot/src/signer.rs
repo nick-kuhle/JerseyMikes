@@ -12,10 +12,7 @@
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use anyhow::{anyhow, Result};
-use k256::{
-    ecdsa::{hazmat::SignPrimitive, RecoveryId, Signature as EcdsaSignature, SigningKey},
-    elliptic_curve::sec1::ToEncodedPoint,
-};
+use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey};
 
 use crate::rlp;
 
