@@ -5,6 +5,7 @@ import EquityChart from "./EquityChart";
 import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
 import RiskPanel from "./RiskPanel";
+import FunnelPanel from "./FunnelPanel";
 import type {
   FeedEvent,
   OpportunityRow,
@@ -365,6 +366,9 @@ export default function Console() {
           </div>
         </div>
       </section>
+
+      {/* strategy funnel — answers "why no opportunities?" with data */}
+      <FunnelPanel funnel={status?.stats.funnel ?? null} />
 
       {/* risk & strategy controls */}
       <section className="panel" style={{padding: 12}}>

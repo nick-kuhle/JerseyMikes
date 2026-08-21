@@ -8,6 +8,7 @@
  */
 import type {
   FeedEvent,
+  FunnelCounters,
   OpportunityRow,
   PnlResponse,
   RelayBid,
@@ -74,9 +75,79 @@ export function demoStatus(): StatusResponse {
       submittable: 96,
       rejected: 5_512,
       startedAtMs: Date.now() - 1000 * 60 * 84,
+      funnel: demoFunnel(),
     },
     simBackends: {anvilFork: true, relayCallBundle: true},
     demo: true,
+  };
+}
+
+/**
+ * Synthesise plausible per-strategy funnel counters for the demo.
+ * The numbers are designed to tell a story: sandwich sees a lot of
+ * candidates but most get gated by risk; jit sees nothing because the
+ * victim-notional floor is high; atomic_arb has the deepest funnel.
+ */
+export function demoFunnel(): Record<Strategy, FunnelCounters> {
+  const f = (n: Partial<FunnelCounters>): FunnelCounters => ({
+    candidatesEmitted: 0,
+    candidatesSkipped: 0,
+    gatedByRisk: 0,
+    missingVictimRaw: 0,
+    simulationsSucceeded: 0,
+    simulationsReverted: 0,
+    simulationsFailed: 0,
+    submittable: 0,
+    ...n,
+  });
+  return {
+    sandwich: f({
+      candidatesEmitted: 184,
+      candidatesSkipped: 12_104,
+      gatedByRisk: 142,
+      missingVictimRaw: 31,
+      simulationsSucceeded: 4,
+      simulationsReverted: 7,
+      simulationsFailed: 0,
+      submittable: 4,
+    }),
+    jit: f({
+      candidatesEmitted: 0,
+      candidatesSkipped: 184_223,
+      gatedByRisk: 0,
+      missingVictimRaw: 0,
+      simulationsSucceeded: 0,
+      simulationsReverted: 0,
+      simulationsFailed: 0,
+      submittable: 0,
+    }),
+    atomic_arb: f({
+      candidatesEmitted: 76,
+      candidatesSkipped: 0,
+      gatedByRisk: 12,
+      simulationsSucceeded: 18,
+      simulationsReverted: 41,
+      simulationsFailed: 5,
+      submittable: 14,
+    }),
+    liquidation: f({
+      candidatesEmitted: 11,
+      candidatesSkipped: 0,
+      gatedByRisk: 0,
+      simulationsSucceeded: 6,
+      simulationsReverted: 4,
+      simulationsFailed: 1,
+      submittable: 5,
+    }),
+    sniper: f({
+      candidatesEmitted: 0,
+      candidatesSkipped: 47,
+      gatedByRisk: 0,
+      simulationsSucceeded: 0,
+      simulationsReverted: 0,
+      simulationsFailed: 0,
+      submittable: 0,
+    }),
   };
 }
 

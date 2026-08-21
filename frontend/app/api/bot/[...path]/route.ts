@@ -33,6 +33,12 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return demoRelayBids(limit);
     case "config":
       return {chainId: 1, executor: demoStatus().executor, liveExecution: false, demo: true};
+    case "funnel":
+      // The funnel is also embedded in `/api/bot/status` under `stats.funnel`,
+      // but exposing it as a standalone endpoint makes polling cheaper for
+      // dashboards that want to refresh the funnel separately from the rest
+      // of the status.
+      return {funnel: demoStatus().stats.funnel};
     default:
       return {error: `unknown endpoint ${path}`};
   }

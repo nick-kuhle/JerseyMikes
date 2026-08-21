@@ -24,9 +24,29 @@ export interface StatusResponse {
     submittable: number;
     rejected: number;
     startedAtMs: number;
+    /**
+     * Per-strategy funnel counters. The keys match `Strategy`. The values
+     * make it possible to see exactly *where* opportunities are being
+     * filtered out — e.g. if `gatedByRisk` is high, the risk filter is
+     * too tight; if `candidatesSkipped` is high, the strategy is seeing
+     * the right shape of transaction but rejecting them at the
+     * decode / pre-filter stage.
+     */
+    funnel?: Partial<Record<Strategy, FunnelCounters>>;
   };
   simBackends: {anvilFork: boolean; relayCallBundle: boolean};
   demo?: boolean;
+}
+
+export interface FunnelCounters {
+  candidatesEmitted: number;
+  candidatesSkipped: number;
+  gatedByRisk: number;
+  missingVictimRaw: number;
+  simulationsSucceeded: number;
+  simulationsReverted: number;
+  simulationsFailed: number;
+  submittable: number;
 }
 
 export interface PnlRow {
