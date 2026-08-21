@@ -62,11 +62,20 @@ out in the handoff.
 
 Remaining Phase 2 coverage:
 
-- [ ] UniswapV3 sandwiches and V3 legs in the arb search (W5)
-- [ ] UniversalRouter calldata decoding (W6). 1inch v6, 0x v2, and CoW Swap
-      decoders are explicitly out of scope for this phase.
+- [x] W5 implementation: V3 sandwich sizing via QuoterV2, shipped behind
+      `STRATEGY_SANDWICH_V3=false`. Victim-revert trap, 12-call / 4-candidate
+      budgets, router-routed legs, separate `sandwich_v3` funnel row.
+- [x] W6 implementation: UniversalRouter `execute` decoder
+      (`V2_SWAP_EXACT_IN` / `V3_SWAP_EXACT_IN`) behind
+      `DECODE_UNIVERSAL_ROUTER=false`. 1inch v6, 0x v2, and CoW Swap
+      decoders remain out of scope.
 - [ ] Raise W4 to 3–5 legs after the funnel week and report the before/after
       candidate-volume delta.
+- [ ] Turn W5 on after the funnel week (requires `POOL_DISCOVERY_V3=true`)
+      and report the live `sandwich_v3` candidate-volume delta.
+- [ ] Turn W6 on only if the funnel shows a public-mempool gap, and report
+      what it did after a week. If the answer is "nothing", 1inch/0x stay
+      closed.
 - [ ] Curve / Balancer / Maverick pool math (out of scope for this phase)
 - [ ] Compound V3, Morpho and Maker liquidations; oracle-update front-running
       (out of scope for this phase)

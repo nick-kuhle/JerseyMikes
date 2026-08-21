@@ -19,6 +19,8 @@ use crate::rpc::RpcClient;
 
 /// Multi-leg cycle search over the pool graph.
 pub mod graph;
+/// Router calldata decoders (V2, UniversalRouter).
+pub mod calldata;
 
 sol! {
     interface IUniswapV2Factory {
@@ -69,6 +71,19 @@ sol! {
         function decimals() external view returns (uint8);
         function symbol() external view returns (string memory);
         function totalSupply() external view returns (uint256);
+    }
+
+    interface ISwapRouter02 {
+        struct ExactInputSingleParams {
+            address tokenIn;
+            address tokenOut;
+            uint24 fee;
+            address recipient;
+            uint256 amountIn;
+            uint256 amountOutMinimum;
+            uint160 sqrtPriceLimitX96;
+        }
+        function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
     }
 
     interface IQuoterV2 {
@@ -495,6 +510,11 @@ pub async fn get_pair(
 }
 
 /// Price an exact-in UniswapV3 swap using the on-chain QuoterV2.
+///
+/// `block` is a JSON-RPC block tag (`"latest"` or `"0x…"`). Replay must pin
+/// this to the victim's parent; quoting `"latest"` for a mined transaction
+/// is the same state-divergence bug the rest of the pending path already
+/// avoids.
 pub async fn quote_v3(
     rpc: &RpcClient,
     quoter: Address,
@@ -502,6 +522,7 @@ pub async fn quote_v3(
     token_out: Address,
     fee: u32,
     amount_in: U256,
+    block: &str,
 ) -> Result<U256> {
     let data = IQuoterV2::quoteExactInputSingleCall {
         params: IQuoterV2::QuoteExactInputSingleParams {
@@ -514,13 +535,19 @@ pub async fn quote_v3(
     }
     .abi_encode();
     let out: String = rpc
-        .call("eth_call", eth_call_params(quoter, data, "latest"))
+        .call("eth_call", eth_call_params(quoter, data, block))
         .await?;
     let raw = hex::decode(out.strip_prefix("0x").unwrap_or(&out))?;
     if raw.len() < 32 {
         return Ok(U256::ZERO);
     }
     Ok(U256::from_be_slice(&raw[0..32]))
+}
+
+/// UniswapV3 fee (hundredths of a bip) → V2-style basis points.
+/// 500 → 5, 3000 → 30, 10000 → 100.
+pub fn v3_fee_to_bps(fee: u32) -> u32 {
+    fee / 100
 }
 
 #[cfg(test)]
@@ -606,6 +633,13 @@ mod tests {
         let flat_a = pool(1_000_000e18 as u128, 1_000_000e18 as u128);
         let flat_b = pool(1_000_000e18 as u128, 1_000_000e18 as u128);
         assert!(optimal_two_leg_arb(&flat_a, &flat_b, flat_a.token0, max).is_none());
+    }
+
+    #[test]
+    fn v3_fee_converts_to_v2_bps() {
+        assert_eq!(v3_fee_to_bps(500), 5);
+        assert_eq!(v3_fee_to_bps(3_000), 30);
+        assert_eq!(v3_fee_to_bps(10_000), 100);
     }
 
     #[test]

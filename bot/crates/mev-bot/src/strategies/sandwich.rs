@@ -14,7 +14,7 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 
 use crate::dex::{self, Venue};
-use crate::strategies::{decode_swap, StrategyCtx, StrategyImpl};
+use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, Call, Opportunity, PendingTx, Strategy};
 
 pub struct SandwichStrategy;
@@ -27,7 +27,7 @@ impl StrategyImpl for SandwichStrategy {
 
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
-        let Some(intent) = decode_swap(tx, weth) else {
+        let Some(intent) = decode_router(tx, weth, ctx.cfg.decode_universal_router) else {
             return Vec::new();
         };
         // Only single-hop paths for now: multi-hop sandwiches need the whole

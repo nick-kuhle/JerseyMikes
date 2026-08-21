@@ -9,7 +9,7 @@ interface Props {
   status: StatusResponse | null;
 }
 
-const ALL_STRATEGIES: Strategy[] = ["sandwich", "jit", "atomic_arb", "liquidation", "sniper"];
+const ALL_STRATEGIES: Strategy[] = ["sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"];
 
 export default function RiskPanel({status}: Props) {
   const [minProfitEth, setMinProfitEth] = useState("0.002");
@@ -19,6 +19,7 @@ export default function RiskPanel({status}: Props) {
   const [maxGas, setMaxGas] = useState(3000000);
   const [enabledStrats, setEnabledStrats] = useState<Record<Strategy, boolean>>({
     sandwich: true,
+    sandwich_v3: false,
     jit: true,
     atomic_arb: true,
     liquidation: true,
@@ -42,6 +43,7 @@ export default function RiskPanel({status}: Props) {
       const current = status.strategies;
       setEnabledStrats({
         sandwich: current.includes("sandwich"),
+        sandwich_v3: current.includes("sandwich_v3"),
         jit: current.includes("jit"),
         atomic_arb: current.includes("atomic_arb"),
         liquidation: current.includes("liquidation"),
@@ -73,6 +75,7 @@ BRIBE_BPS=${bribeBps} # (${(bribeBps / 100).toFixed(1)}% to builder)
 MAX_GAS_PER_BUNDLE=${maxGas}
 
 STRATEGY_SANDWICH=${enabledStrats.sandwich}
+STRATEGY_SANDWICH_V3=${enabledStrats.sandwich_v3}
 STRATEGY_JIT=${enabledStrats.jit}
 STRATEGY_ATOMIC_ARB=${enabledStrats.atomic_arb}
 STRATEGY_LIQUIDATION=${enabledStrats.liquidation}
@@ -344,7 +347,18 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
 
             <div style={{background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 4, padding: 10}}>
               <div style={{color: "var(--cyan)", fontWeight: "bold", marginBottom: 4}}>
-                4. Arbitrage Efficiency on L1 Mainnet
+                4. V3 sandwich is shipped off
+              </div>
+              <div className="muted" style={{fontSize: 11, lineHeight: 1.5}}>
+                `STRATEGY_SANDWICH_V3` and `POOL_DISCOVERY_V3` both default to false. The V3 sandwich
+                only quotes pools already in the V3 cache, so flipping the strategy on without
+                discovery is a no-op. Turn both on together after a week of funnel baseline.
+              </div>
+            </div>
+
+            <div style={{background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 4, padding: 10}}>
+              <div style={{color: "var(--cyan)", fontWeight: "bold", marginBottom: 4}}>
+                5. Arbitrage Efficiency on L1 Mainnet
               </div>
               <div className="muted" style={{fontSize: 11, lineHeight: 1.5}}>
                 Major pools (WETH/USDC, WETH/USDT) on Uniswap and SushiSwap are kept tightly synchronized within 0.1% by institutional searchers. Since Uniswap V2 charges 0.3% fee per swap (0.6% round trip), pure cyclic arbitrage only triggers immediately after a large unbalanced swap lands.

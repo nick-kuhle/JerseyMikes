@@ -42,6 +42,7 @@ export function clock(ms: number): string {
 
 export const STRATEGY_LABEL: Record<string, string> = {
   sandwich: "Sandwich",
+  sandwich_v3: "Sandwich V3",
   jit: "JIT liquidity",
   atomic_arb: "Atomic arb",
   liquidation: "Liquidation",
@@ -50,6 +51,7 @@ export const STRATEGY_LABEL: Record<string, string> = {
 
 export const STRATEGY_COLOR: Record<string, string> = {
   sandwich: "#f97316",
+  sandwich_v3: "#fb7185",
   jit: "#a855f7",
   atomic_arb: "#22d3ee",
   liquidation: "#ef4444",

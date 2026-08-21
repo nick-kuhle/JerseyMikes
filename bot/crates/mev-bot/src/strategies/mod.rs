@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod jit;
 pub mod liquidation;
 pub mod sandwich;
+pub mod sandwich_v3;
 pub mod sniper;
 
 use std::collections::HashMap;
@@ -335,6 +336,13 @@ impl V3PoolCache {
             .copied()
             .collect()
     }
+
+    /// The cached pool for `(a, b, fee)`, if discovery has loaded it.
+    pub fn for_pair(&self, a: Address, b: Address, fee: u32) -> Option<crate::dex::V3Pool> {
+        self.inner.read().values().copied().find(|p| {
+            p.fee == fee && ((p.token0 == a && p.token1 == b) || (p.token0 == b && p.token1 == a))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +411,38 @@ pub fn decode_swap(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
         });
     }
     None
+}
+
+/// Combined decoder: V2 routers first, then UniversalRouter.
+///
+/// Strategies that already consume [`SwapIntent`] should call this (or
+/// [`decode_router`]) rather than growing a second decode path.
+pub fn decode_any_router(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
+    decode_swap(tx, weth).or_else(|| {
+        let to = tx.to?;
+        crate::dex::calldata::decode_universal_router(to, &tx.input, tx.value, weth).map(|u| {
+            SwapIntent {
+                token_in: u.token_in,
+                token_out: u.token_out,
+                amount_in: u.amount_in,
+                min_out: u.min_out,
+                path: u.path,
+                router: to,
+                native_in: u.native_in,
+            }
+        })
+    })
+}
+
+/// Pick the decoder the operator asked for. When UniversalRouter is off this
+/// is exactly [`decode_swap`], so a default-off checkout is behaviour-identical
+/// to the code that collected the funnel baseline.
+pub fn decode_router(tx: &PendingTx, weth: Address, universal: bool) -> Option<SwapIntent> {
+    if universal {
+        decode_any_router(tx, weth)
+    } else {
+        decode_swap(tx, weth)
+    }
 }
 
 /// Run `eth_getLogs` for `PairCreated` on both V2 factories over `[from, to]`.
@@ -620,6 +660,34 @@ mod tests {
     fn ignores_unrelated_calldata() {
         assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
         assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
+    }
+
+    #[test]
+    fn decode_router_off_does_not_see_universal_router() {
+        // Default-off must be behaviour-identical to decode_swap: a
+        // UniversalRouter execute is invisible until the operator flips
+        // DECODE_UNIVERSAL_ROUTER. Otherwise the funnel baseline is polluted.
+        use alloy_sol_types::SolValue;
+        let path = vec![known::WETH, known::USDC];
+        let input = (
+            Address::with_last_byte(9),
+            U256::from(1_000u64),
+            U256::from(1u64),
+            path,
+            true,
+        )
+            .abi_encode();
+        let data = crate::dex::calldata::universal_router::encode_execute(
+            vec![crate::dex::calldata::universal_router::CMD_V2_SWAP_EXACT_IN],
+            vec![input],
+        );
+        let mut tx = tx_with(data, U256::ZERO);
+        tx.to = Some(known::UNIVERSAL_ROUTER);
+        assert!(decode_router(&tx, known::WETH, false).is_none());
+        let got = decode_router(&tx, known::WETH, true).expect("UR decodes when enabled");
+        assert_eq!(got.token_in, known::WETH);
+        assert_eq!(got.token_out, known::USDC);
+        assert_eq!(got.amount_in, U256::from(1_000u64));
     }
 
     #[test]

@@ -27,8 +27,42 @@ any such `x` as zero profit, so the search never selects one. Covered by
 through the router: ~40k gas cheaper, and the router's slippage checks are
 redundant when the executor enforces profit atomically.
 
-**Not yet.** Multi-hop paths, V3 victims, aggregator calldata (1inch, 0x,
-UniversalRouter).
+**V3 victims** live in a separate strategy (`sandwich_v3`, see below) so the
+funnel can tell the two surfaces apart.
+
+**Not yet.** Multi-hop paths. Aggregator calldata other than UniversalRouter
+(1inch v6, 0x v2) — UniversalRouter decoding is implemented behind
+`DECODE_UNIVERSAL_ROUTER` (default off); see §7.
+
+## 1b. V3 sandwich — `strategies/sandwich_v3.rs`
+
+**Trigger.** An `exactInputSingle` on SwapRouter (`0x414bf389`) or
+SwapRouter02 (`0x04e45aaf`) in the mempool, WETH on the input side, whose
+`(token, fee)` pool is already in the V3 cache.
+
+**Toggle.** `STRATEGY_SANDWICH_V3` (default **off**). The strategy is not
+constructed when the toggle is off, so it adds zero RPC to the pending path.
+It also no-ops if `POOL_DISCOVERY_V3` is off: the cache is empty, the
+pre-filter returns before any quote.
+
+**Sizing.** QuoterV2, not hand-rolled Q64.96. A coarse grid of four front-run
+sizes, then a one-step refine, each size costing two `eth_call`s
+(`quote(x)` and `quote(x + victim)`). Hard cap of 12 quotes per candidate
+and 4 candidates per pending tx. A naive ternary search over the quoter
+would be ~120 calls and would get the bot rate-limited off its provider.
+
+**The victim-revert trap.** Same rule as V2: any size whose implied victim
+output (`quote(x + victim) − quote(x)`) falls below `amountOutMinimum`
+scores zero. Covered by `a_zero_slippage_victim_produces_nothing`.
+
+**Legs.** Routed through SwapRouter02 (`approve` + `exactInputSingle`),
+`sqrtPriceLimitX96 = 0`. The back-run is issued with `amountOutMinimum = 0`
+— the quoter prices current state, not post-front-run state, so we refuse
+to invent a min-out and let the executor's profit guard catch a misprice.
+The two-quote post-state approximation is a follow-up.
+
+**Not yet.** Pool-direct swaps (saves ~20k gas, needs a callback), quoting
+the back-run against post-victim state, multi-hop V3 victims.
 
 ## 2. JIT liquidity — `strategies/jit.rs`
 
@@ -77,7 +111,7 @@ their profit is denominated in a token the gas model cannot price.
 inventory: `flashExecute` borrows, swaps twice, repays, and the executor
 verifies the leftover is ≥ `minProfit`.
 
-**Not yet.** V3 legs, Curve/Balancer pools as legs. A negative-cycle
+**Not yet.** V3 legs in the cycle search, Curve/Balancer pools as legs. A negative-cycle
 (Bellman–Ford) search was considered and rejected: on log-rate weights a
 fixed-point `log_e` cheap enough to run per block reports false cycles, and the
 precise version is a research port. See `docs/PHASE_2_HANDOFF.md` W4.
@@ -138,6 +172,26 @@ A single call can emit many candidates — that is exactly what widening a searc
 (multi-leg arb, V3 victims) does — so `candidatesEmitted / invocationsWithOutput`
 is a search-width signal, while `submittable / candidatesEmitted` is the
 conversion rate that matters.
+
+V2 and V3 sandwiches are **separate funnel rows** (`sandwich` vs
+`sandwich_v3`). Do not add them together and call it "the sandwich conversion
+rate" — they have different RPC costs, different victim populations and
+different revert modes.
+
+## 7. UniversalRouter decoding — `dex/calldata/universal_router.rs`
+
+**Toggle.** `DECODE_UNIVERSAL_ROUTER` (default **off**). When off,
+`decode_router` is exactly the existing V2-router decoder, so a default
+checkout is behaviour-identical to the funnel baseline.
+
+**Scope.** The single mainnet UniversalRouter at
+`0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD`. Walks `execute(commands, inputs)`
+(and the deadline overload) and emits a `SwapIntent` for the first
+`V3_SWAP_EXACT_IN` or `V2_SWAP_EXACT_IN`. `WRAP_ETH` immediately before a
+zero-amount swap is treated as native in. 1inch v6 and 0x v2 are out of
+scope.
+
+**Cost.** Pure calldata parsing, well under 1 ms per pending tx. No RPC.
 
 The funnel is also split by **provenance**. `stats.funnel` counts flow the bot
 could have acted on; `stats.funnelReplay` counts already-mined transactions

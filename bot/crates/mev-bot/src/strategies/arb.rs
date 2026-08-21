@@ -18,7 +18,7 @@ use crate::config::known;
 use crate::dex::graph::{self, CycleCandidate, DirectedEdge};
 use crate::dex::{self, V2Pool, Venue};
 use crate::strategies::sandwich::build_leg;
-use crate::strategies::{decode_swap, StrategyCtx, StrategyImpl};
+use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
 
 /// Tokens we always keep pools loaded for. Everything else is discovered from
@@ -71,7 +71,7 @@ impl StrategyImpl for AtomicArbStrategy {
     /// victim will leave behind.
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
-        let Some(intent) = decode_swap(tx, weth) else {
+        let Some(intent) = decode_router(tx, weth, ctx.cfg.decode_universal_router) else {
             return Vec::new();
         };
         if intent.path.len() != 2 {
