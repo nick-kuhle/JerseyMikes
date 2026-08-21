@@ -29,6 +29,26 @@ both event decoders validate topic0. These results update verification status;
 they do not waive the one-week funnel gates for W4/W5 or the evidence gate for
 W6. Remote Actions still needs a maintainer with GitHub `workflows` permission.
 
+A follow-up automation session (the same day) re-ran the checks it can run —
+contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
+artifact drift) and the frontend (`tsc --noEmit`, `npm run build`) — and both
+are clean, and bumped the frontend's `next`/`react` to patched versions for
+CVE-2025-66478 (CVSS 10.0 RSC RCE). It also re-attempted the W0 workflow push
+and confirmed it is still rejected without `workflows` permission. Full details
+in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md). None of this changes the gates.
+
+Once the GitHub `workflows` permission was granted and the workflow was enabled,
+CI started running and surfaced two failures that had never been exercised:
+the `embedded bytecode is current` (artifact-drift) job failed because
+`compile-check.js` embedded solc's default IPFS metadata hash (which includes
+each source file's absolute path) into `MevExecutor.runtime.hex`, so the checked-in
+artifact only reproduced in the sandbox where it was generated. Fixed by passing
+`metadata: {bytecodeHash: "none", useLiteralContent: true}` (matching
+`foundry.toml`), regenerating the artifact (runtime 9,618 → 9,577 B), and
+verifying a fresh checkout now reproduces it byte-for-byte. See
+`docs/BUILD_NOTES.md`. The `bot (rust)` job also fails on `cargo test --all`
+(exit 101); that still needs diagnosis on a Rust-capable environment.
+
 ---
 
 ## 0. The three rules for this phase
@@ -159,6 +179,17 @@ maintainer's Rust and Forge runs. The local checks are a meaningful verification
 of W1–W4, but they are not a substitute for required PR checks. **Do not mark
 W0 complete until the workflow is enabled and green on the working branch.**
 
+An automation session re-ran the parts it can run and recorded clean results:
+the contracts solc-only artifact check (28 sources, `MevExecutor` runtime
+9,618 B, `git diff --exit-code` on `bot/crates/mev-bot/artifacts` and
+`contracts/abi` shows no drift) and the frontend (`npx tsc --noEmit`,
+`npm run build`). (The runtime is now 9,577 B after the deterministic-artifact
+fix described above.) It also bumped the frontend to `next@15.5.7` /
+`react@19.1.2` to patch **CVE-2025-66478** (a CVSS 10.0 RSC RCE affecting the
+previous `next@15.5.4` App-Router build) — see `docs/BUILD_NOTES.md`. These
+re-verifications update the evidence for W1–W4; they do not enable remote CI,
+which is still blocked as W0 describes.
+
 The W1–W4 logic and tests have now had a compiler and test runner turn through
 them locally. Any future CI failure should be treated as a real regression or
 environment difference, not as an unverified baseline assumption.
@@ -233,7 +264,7 @@ state.
 
 | ID | Workstream | Depends on | Size | Gate to start | Status |
 | --- | --- | --- | --- | --- | --- |
-| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **🟡 local checks pass; remote CI enablement pending a human** |
+| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **🟡 enabled & running; `contracts`/`frontend` pass, `artifact-drift` fixed, `bot` still failing (`cargo test` exit 101)** |
 | **W1** | Fix funnel counter semantics + labels | W0 | S | none | **✅ implemented and locally verified** |
 | **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented and locally verified** (including sniper retry fix) |
 | **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented and locally verified** (shipped off) |
@@ -243,22 +274,16 @@ state.
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
-### The one thing to do first
+### The one thing to do now
 
-**The code and local checks for W0 are now complete; remote enablement still
-needs a human.** The maintainer reports green `make bot-check`, `make bot-test`,
-and `make contracts` runs. Pushing `.github/workflows/ci.yml` is still rejected
-with `refusing to allow a GitHub App to create or update workflow ... without
-workflows permission`, which is the same constraint that parked the file in
-`ci/` originally. A human with push rights runs one command:
-
-```bash
-mkdir -p .github/workflows && git mv ci/github-actions-ci.yml .github/workflows/ci.yml
-git commit -m "ci: enable GitHub Actions" && git push
-```
-
-Until that lands, **remote CI has not verified the repository**, even though
-the maintainer has now run the Rust and Forge checks locally. See §1.6.
+**W0's enablement is done; the remaining blocker is a red `bot (rust)` job.**
+The `workflows` permission was granted, the workflow was moved into
+`.github/workflows/ci.yml`, and CI is running. `contracts (foundry)` and
+`frontend (next.js)` are green, and the `artifact-drift` job's first failure
+(a checkout-path-dependent bytecode from solc's IPFS metadata hash) is fixed in
+this branch. `bot (rust)` fails on `cargo test --all` (exit 101); it needs a
+Rust-capable environment to reproduce and fix. The next step is to get that job
+green and then mark the workflow required on PRs to `main`.
 
 This ordering is the review's recommended sequence, made concrete: measure
 first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
@@ -286,11 +311,17 @@ mapping — read the referenced section before starting the ticket:
 
 ## W0 — Make the build verifiable
 
-**Status: local checks pass; remote CI enablement is pending a human.** The
-maintainer reports passing `make bot-check`, `make bot-test`, and
-`make contracts`. The workflow file still cannot be pushed by this automation
-without the GitHub `workflows` permission, so the remote required-check gate
-remains open.
+**Status: enabled and running; three of four jobs green.** The maintainer
+granted GitHub `workflows` permission on 2026-08-21, so the workflow was moved
+into `.github/workflows/ci.yml` and CI now runs on every push and PR. Results:
+`contracts (foundry)` and `frontend (next.js)` pass; `embedded bytecode is
+current` (artifact-drift) **failed on first enable** because `compile-check.js`
+embedded solc's IPFS metadata hash (which includes absolute source paths) into
+`MevExecutor.runtime.hex` — fixed by passing `bytecode_hash: "none"` and
+regenerating the artifact (see `docs/BUILD_NOTES.md`). `bot (rust)` still fails
+on `cargo test --all` (exit 101); that needs diagnosis on a Rust-capable
+environment. W0 is **not** complete until `bot (rust)` is green and the workflow
+is required on PRs to `main`.
 
 **Why first.** Remote CI is still the source of truth for required PR checks,
 clippy, and the exact test environment. The local maintainer run substantially
