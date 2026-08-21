@@ -22,6 +22,9 @@ contracts-check: ## solc-only compile check (no foundry needed); regenerates art
 bot-build: ## cargo build --release
 	cd bot && cargo build --release
 
+bot-check: ## fast Rust type-check (all targets)
+	cd bot && cargo check --all-targets
+
 bot-test: ## cargo test
 	cd bot && cargo test --all
 
