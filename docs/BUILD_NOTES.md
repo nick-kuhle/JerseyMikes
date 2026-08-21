@@ -3,7 +3,7 @@
 ## Session 2026-08-21 (console + mode-switch pass)
 
 An automation session added the operator surface for Phase 3 and the W6 gate
-measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
+measurement (see the Phase 2 work log below for the change list). Verification:
 
 - **Frontend: fully verified in the sandbox.** `npx tsc --noEmit` clean,
   `npm run build` succeeds, and the dev server was exercised end-to-end in
@@ -29,6 +29,88 @@ measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
   unarmed bot returns the restart instructions (surfaced as `409`), pinned
   by `live_mode_can_never_arm_an_unarmed_process`. See `docs/RISK.md`.
 
+## Phase 2 work log (W0–W6)
+
+Condensed 2026-08-21 from `PHASE_2_HANDOFF.md` when that document was slimmed
+to open work only. The full ticket specs, the pre-branch baseline table and
+the interim continuation narratives live in git history: the two source
+documents (`PHASE_2_DESIGN.md` / `PHASE_2_REVIEW.md`) at commit `e62bbc2`,
+and the pre-cleanup handoff at the commit preceding the cleanup.
+
+### Completed workstreams
+
+| ID | Result |
+| --- | --- |
+| W0 | CI live at `.github/workflows/ci.yml` (4 jobs, green since PR #15; `cargo test --all` 117/117 on Rust 1.98.0). The artifact-drift job caught solc's IPFS metadata hash embedding absolute paths — fixed with `bytecodeHash: "none"` (runtime 9,618 → 9,577 B, reproducible across checkouts). One deterministic test bug (`half_the_bid_is_unlikely`) corrected to the shipped `LOGISTIC_K = 2.2`; the dense-graph budget test's wall-clock assert relaxed to a 2 s catch-unbounded ceiling. **Still open:** the human admin step of making the workflow a *required* check on PRs to `main`. |
+| W1 | Funnel counters split into per-invocation (`invocationsWithOutput`, `invocationsEmpty`) and per-opportunity (`candidatesEmitted`) units; `Stats::record_invocation`; labelled in the dashboard; documented in `STRATEGIES.md`. |
+| W2 | V2 discovery rewritten behind a `DiscoverySource` trait (11 network-free tests); retry-safe cursor/`seen` handling; 12-block reorg overlap; 500-block scan span cap; shared `scan_factory_logs` used by discovery and the sniper (the sniper's equivalent cursor bug fixed with it). |
+| W3 | V3 `PoolCreated` discovery with keccak-derived topic0, topic-validated decoders, and a `V3PoolCache` disjoint from `PoolCache` (asserted by test). On by default with W5. |
+| W4 | Direct cycle enumeration (`dex/graph.rs`, 13 tests) wired into `on_block`; equivalence test pins the 2-leg path (`ARB_MAX_CYCLE_LEN=2`); default raised to 3 after the funnel week; budgets enforced (5 legs / 32 candidates / 25 ms / 200 pools / zero extra RPC). |
+| W5 | V3 sandwich (`sandwich_v3.rs`) sized via a `V3Quoter` trait (production QuoterV2, fake CP pool in tests); victim-revert trap tested; 12-call / 4-candidate budgets; on by default with `POOL_DISCOVERY_V3`. |
+| W6 | UniversalRouter `execute`/`executeWithDeadline` decoder (V2/V3 `*_SWAP_EXACT_IN` + `WRAP_ETH`), fixture-tested incl. malformed inputs; shipped **off** behind `DECODE_UNIVERSAL_ROUTER=false`; the go/no-go measurement (funnel card + `W6_MEMO.md`) shipped with the console session above. |
+
+### Files touched by W1–W6 (as landed)
+
+| Area | File | What changed |
+| --- | --- | --- |
+| Funnel units | `engine.rs` | `FunnelCounters` split per-invocation/per-opportunity; `record_invocation`; 4 tests |
+| Funnel UI | `frontend/lib/types.ts`, `FunnelPanel.tsx`, `demo.ts` | new columns, unit labels, two-units explainer, split summary cards |
+| Log scanning | `strategies/mod.rs` | generic `scan_factory_logs` + `decode_pair_created`/`decode_pool_created`; `try_scan_*` return `Option` (failed RPC ≠ empty range); 4 fixture tests |
+| V3 metadata | `dex.rs`, `strategies/mod.rs` | `V3Pool` (incl. creation block) + `V3PoolCache`, sharing nothing with `PoolCache` |
+| Discovery | `strategies/discovery.rs` | `DiscoverySource` trait; retry-safe sets; reorg overlap; span cap; 11 network-free tests |
+| Cycle search | `dex/graph.rs` (new) | `build_edges`, `adjacency`, `enumerate_cycles`, `evaluate`, `search`, budgets, 13 tests |
+| Arb wiring | `strategies/arb.rs` | `on_block` runs the cycle search; `build_cycle_opportunity`; back-run path untouched; 2 equivalence tests |
+| Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle |
+| Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore |
+| Parent-block replay | `types.rs`, `ingest.rs`, `strategies/*`, `engine.rs`, `sim/*` | `MinedAt` tagging, `state_block`/`target_block`/`base_fee` routing, uncached historical pool reads, dedicated replay fork |
+| Sniper hardening | `strategies/sniper.rs` | fallible shared scan, bounded/reorg-overlapping window, cursor advances only on success; pool marked seen only after metadata read succeeds |
+| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3`, `ARB_MAX_CYCLE_LEN` (2–5 clamp), `RELAY_TX_CONCURRENCY`, `REPLAY_FORK`, `ANVIL_REPLAY_PORT` |
+
+### Problems found and fixed while implementing (beyond the specs)
+
+- A failed `eth_getLogs` used to advance the scan cursor — a single failed
+  scan silently skipped those blocks forever. Now an error is distinguishable
+  from an empty range.
+- Dust pairs were re-read every block, forever. Non-WETH pairs are now
+  rejected permanently, dust pairs re-checked every 50 blocks, and only
+  genuine RPC failures retry immediately.
+- Reorgs left a hole: a monotonic cursor stepped over a rewound range. The
+  scan re-covers a 12-block overlap; duplicate logs are idempotent, missing
+  ones are not.
+- The sniper had the same failed-scan cursor bug as discovery (fixed with
+  W2's shared scan).
+- V3 metadata and event boundaries are explicit: `PairCreated` and
+  `PoolCreated` decoders reject each other's topic0.
+
+### Design notes that outlived their tickets
+
+- **Why two funnel lanes** (`FunnelLane::{Live,Replay}`): a mainnet block
+  delivers ~150 already-mined transactions every 12 seconds via the bloXroute
+  delivered-block backfill. Counted in the same counters as live mempool
+  flow, replay traffic outnumbers it by an order of magnitude and every
+  before/after comparison becomes a measurement of the backfill instead. Two
+  ledgers, same code path; the dashboard lane toggle keeps them separable.
+- **Why replay runs bounded and awaited**: unbounded, `on_relay_block` would
+  queue ~1000 tasks per block and trip provider rate limits while starving
+  the latency-critical mempool path. Delivered blocks are already mined, so
+  replay has no deadline: it runs behind `RELAY_TX_CONCURRENCY` (16).
+- **Why parent-block routing**: scoring already-mined transactions against
+  the *current* head mis-scores them (reserves, oracles and the victim's own
+  nonce have moved on — the historical nonce-too-low failures). Replay reads
+  pools at `B-1` uncached, pins V3 `eth_call`s at the parent, forks a
+  dedicated anvil (`ANVIL_REPLAY_PORT`) with bidirectional reset, and skips
+  with a stated reason rather than mis-scoring when the replay fork is off.
+
+### Verification history
+
+- Frontend: `tsc --noEmit` + `next build` verified in the authoring sandbox
+  at every step (the sandbox has never had a Rust/Foundry toolchain).
+- Contracts: `make contracts` (maintainer) + solc-only artifact check
+  (sandbox) green; artifact now byte-reproducible from a fresh checkout.
+- Rust: maintainer-local `make bot-check` / `make bot-test` green, then
+  CI-verified (`cargo fmt --check` advisory, `clippy`, `cargo test --all`
+  117/117 at PR #15; 119 with the two `LiveMode` tests at PR #18).
+
 ## What CI verifies
 
 CI is enabled and lives at
@@ -43,9 +125,10 @@ including `bot (rust)`.
 | `bot` | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test --all` (`cargo fmt --check` is currently advisory) |
 | `frontend` | `npm ci`, `tsc --noEmit`, `next build` |
 
-## Verification status for the Phase 2 handoff
+## Verification status for the Phase 2 handoff (historical)
 
-The maintainer reports the following local commands passing on 2026-08-21:
+Superseded by CI — kept as a dated record of what was true when W1–W4
+landed. The maintainer reported these local commands passing on 2026-08-21:
 
 ```bash
 make bot-check
@@ -59,11 +142,14 @@ The frontend checks were also run in the authoring sandbox:
 cd frontend && npx tsc --noEmit && npm run build
 ```
 
-The authoring sandbox itself still has no Rust or Foundry binaries, so it could
-not independently reproduce the maintainer's Rust and Forge runs. Remote CI is
-not yet available because the GitHub App push is rejected without the
-`workflows` permission. Treat the local results as verification of the current
-W1–W4 implementation, not as a substitute for a required green PR check.
+At that point the authoring sandbox had no Rust or Foundry binaries and
+remote CI was not yet enabled (the GitHub App push was rejected without the
+`workflows` permission), so the local results stood in for required PR
+checks. Both limitations are history: the sandbox *still* has no Rust or
+Foundry binaries (see the console-session note above for how that is
+handled now), but CI has run every check on every push since the
+`workflows` permission was granted — see "What CI verifies" and the bot
+(rust) sections below.
 
 The contracts-only fallback is independently reproducible here:
 

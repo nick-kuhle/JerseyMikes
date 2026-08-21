@@ -112,6 +112,14 @@ strategies propose opportunities against exactly the transactions that actually
 landed, and the simulator records whether value was extractable. See
 [`BLOXROUTE_RELAY.md`](BLOXROUTE_RELAY.md).
 
+Three properties of that path are deliberate (rationale in the Phase 2 work
+log in [`BUILD_NOTES.md`](BUILD_NOTES.md)): replay traffic is counted in its
+**own funnel lane** (`FunnelLane::Replay`) so ~150 post-mortem transactions per
+block cannot drown the live signal; the fan-out runs **awaited and bounded**
+(`RELAY_TX_CONCURRENCY`) because replay has no deadline; and every replayed
+transaction is scored against **its own block's parent state** (`B - 1`,
+uncached reads + a dedicated replay fork) rather than the current head.
+
 ## Adding the second chain
 
 `ChainConfig` already carries chain id, WETH, stable, and block time; the
