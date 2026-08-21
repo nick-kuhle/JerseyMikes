@@ -29,6 +29,14 @@ both event decoders validate topic0. These results update verification status;
 they do not waive the one-week funnel gates for W4/W5 or the evidence gate for
 W6. Remote Actions still needs a maintainer with GitHub `workflows` permission.
 
+A follow-up automation session (the same day) re-ran the checks it can run —
+contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
+artifact drift) and the frontend (`tsc --noEmit`, `npm run build`) — and both
+are clean, and bumped the frontend's `next`/`react` to patched versions for
+CVE-2025-66478 (CVSS 10.0 RSC RCE). It also re-attempted the W0 workflow push
+and confirmed it is still rejected without `workflows` permission. Full details
+in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md). None of this changes the gates.
+
 ---
 
 ## 0. The three rules for this phase
@@ -158,6 +166,16 @@ The authoring sandbox still cannot reach the Rust distribution hosts and has no
 maintainer's Rust and Forge runs. The local checks are a meaningful verification
 of W1–W4, but they are not a substitute for required PR checks. **Do not mark
 W0 complete until the workflow is enabled and green on the working branch.**
+
+An automation session re-ran the parts it can run and recorded clean results:
+the contracts solc-only artifact check (28 sources, `MevExecutor` runtime
+9,618 B, `git diff --exit-code` on `bot/crates/mev-bot/artifacts` and
+`contracts/abi` shows no drift) and the frontend (`npx tsc --noEmit`,
+`npm run build`). It also bumped the frontend to `next@15.5.7` /
+`react@19.1.2` to patch **CVE-2025-66478** (a CVSS 10.0 RSC RCE affecting the
+previous `next@15.5.4` App-Router build) — see `docs/BUILD_NOTES.md`. These
+re-verifications update the evidence for W1–W4; they do not enable remote CI,
+which is still blocked as W0 describes.
 
 The W1–W4 logic and tests have now had a compiler and test runner turn through
 them locally. Any future CI failure should be treated as a real regression or
@@ -290,7 +308,9 @@ mapping — read the referenced section before starting the ticket:
 maintainer reports passing `make bot-check`, `make bot-test`, and
 `make contracts`. The workflow file still cannot be pushed by this automation
 without the GitHub `workflows` permission, so the remote required-check gate
-remains open.
+remains open. This was re-confirmed empirically on 2026-08-21: pushing
+`.github/workflows/ci.yml` is rejected with `refusing to allow a GitHub App to
+create or update workflow ... without workflows permission`.
 
 **Why first.** Remote CI is still the source of truth for required PR checks,
 clippy, and the exact test environment. The local maintainer run substantially

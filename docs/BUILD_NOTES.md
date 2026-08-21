@@ -46,6 +46,37 @@ It compiled 28 sources with zero errors and confirmed the embedded
 `MevExecutor` runtime at 9,618 bytes. Solc reports the existing transient-storage
 and test-contract-size warnings; those are warnings, not compile failures.
 
+## Independent re-verification + security hardening (automation session, 2026-08-21)
+
+An automation session (this PR) re-ran the checks it can run — the sandbox still
+has no Rust/Foundry binaries, so the bot and forge runs remain
+maintainer-verified only — and recorded clean results:
+
+```bash
+cd contracts && node script/compile-check.js   # 28 sources, 5 deployables, MevExecutor runtime 9,618 B
+git diff --exit-code -- bot/crates/mev-bot/artifacts contracts/abi   # artifact-drift step: no drift
+cd frontend && npx tsc --noEmit && npm run build   # clean
+```
+
+Two findings came out of that pass, one of which is a code change:
+
+- **Frontend dependency security bump.** `npm install` reported that
+  `next@15.5.4` (App Router) is vulnerable to **CVE-2025-66478** — a CVSS 10.0
+  remote-code-execution via the React Server Components protocol, with public
+  PoCs. Bumped `next` to `15.5.7` and `react`/`react-dom` to `19.1.2` (the
+  patched versions for this release line per the advisory). `tsc --noEmit` and
+  `npm run build` are green after the bump. A long tail of lower-severity
+  Next/PostCSS/sharp advisories remains (mostly DoS/SSRF in image-optimizer,
+  middleware and server-action paths this dashboard does not use); clearing
+  those needs `next@15.5.23`+ and was deliberately left out of this PR to keep
+  the bump minimal and reviewable.
+- **CI (W0) re-confirmed blocked.** The exact enable step
+  (`git mv ci/github-actions-ci.yml .github/workflows/ci.yml`) was attempted and
+  the push was rejected again with:
+  `refusing to allow a GitHub App to create or update workflow
+  '.github/workflows/ci.yml' without 'workflows' permission`. Remote CI still
+  requires a human with GitHub `workflows` permission.
+
 ## Regenerating the embedded artifacts
 
 `bot/crates/mev-bot/artifacts/MevExecutor.runtime.hex` is injected into the

@@ -73,6 +73,14 @@ Remaining Phase 2 coverage:
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
       (out of scope for this phase)
 
+**Status note (2026-08-21):** No new Phase 2 box is ticked in this session —
+W5/W6 remain gated on funnel data, raising W4 to 3–5 legs waits for the same
+baseline, and W0 needs a human with GitHub `workflows` permission (re-confirmed
+this day). What this session did do is independently re-verify the parts it can
+run (contracts solc compile-check — no artifact drift — and the frontend
+`tsc --noEmit` + `npm run build`) and patch the frontend's `next`/`react` for
+CVE-2025-66478 (CVSS 10.0 RSC RCE). Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
+
 ## Phase 3 — going live (opt-in, separate PR)
 
 - [ ] Multi-relay submission with per-relay inclusion stats
