@@ -28,6 +28,7 @@ const READ_METHODS = new Set([
   "eth_getTransactionReceipt",
   "eth_getTransactionCount",
   "eth_gasPrice",
+  "eth_estimateGas",
   "eth_getBlockByNumber",
   "eth_getBlockByHash",
   "net_version",

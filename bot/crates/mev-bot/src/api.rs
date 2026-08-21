@@ -106,6 +106,10 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         "chainId": e.cfg.chain.chain_id,
         "weth": format!("{:?}", e.cfg.chain.weth),
         "executor": format!("{:?}", e.ctx.executor),
+        // The EOA the bot signs bundles from — the address that must be in the
+        // executor's `searchers` allowlist before live execution. Surfaced so
+        // the console's go-live checklist can prefill `setSearcher`.
+        "searcher": format!("{:?}", e.cfg.endpoints.searcher_address),
         "liveExecution": e.mode.live(),
         "liveArmed": e.mode.armed(),
         "endpoints": {

@@ -51,6 +51,7 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return {
         chainId: 1,
         executor: demoStatus().executor,
+        searcher: "0x00000000000000000000000000000000000f0000",
         liveExecution: demoLive,
         liveArmed: true,
         demo: true,
