@@ -10,6 +10,7 @@ import RelayBlocksPanel from "./RelayBlocksPanel";
 import Phase1Panel from "./Phase1Panel";
 import ModeSwitch from "./ModeSwitch";
 import WalletButton from "./WalletButton";
+import DeployPanel from "./DeployPanel";
 import type {
   CompetitionResponse,
   FeedEvent,
@@ -480,6 +481,15 @@ export default function Console() {
           <span className="muted">Live Parameters & Diagnostics</span>
         </div>
         <RiskPanel status={status} />
+      </section>
+
+      {/* go-live: executor deployment checklist */}
+      <section className="panel">
+        <div className="panel-head">
+          <span>Go live — deploy MevExecutor to mainnet</span>
+          <span className="muted">6-step checklist · deploy first, arm much later · docs/GO_LIVE.md</span>
+        </div>
+        <DeployPanel chainId={chainId} />
       </section>
 
       {/* contract */}

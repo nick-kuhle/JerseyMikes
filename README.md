@@ -174,6 +174,11 @@ cargo run --release --bin mev-bot    # run
 - **Block-explorer links** on every transaction, block and address the console
   renders — victim txs in the simulation history, opportunities, the live
   tape, delivered-block transactions, and the executor's addresses
+- **Go-live checklist**: deploy `MevExecutor` to mainnet from the browser —
+  wallet/chain check, gas estimate, one-click deploy with receipt following,
+  executor funding, searcher allowlisting (prefilled from the bot's config),
+  and the generated `EXECUTOR_ADDRESS` env snippet. Walkthrough:
+  [`docs/GO_LIVE.md`](docs/GO_LIVE.md)
 - **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
   (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
   7-day sample gate) that decides whether UniversalRouter decoding gets
@@ -200,6 +205,7 @@ to measure what is reachable, not to be profitable. See
 | Document | Contents |
 | --- | --- |
 | [`docs/SETUP.md`](docs/SETUP.md) | Install walkthrough for all three toolchains, `.env`, `make doctor`, troubleshooting |
+| [`docs/GO_LIVE.md`](docs/GO_LIVE.md) | Beginner's guide: deploying `MevExecutor` to mainnet, funding, searcher allowlist, and what arming actually does |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Wiring, data flow, repo layout, how to add a chain |
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
 | [`docs/RISK.md`](docs/RISK.md) | Why nothing can be broadcast, every guard, known limitations |

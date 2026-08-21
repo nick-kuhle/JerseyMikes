@@ -1,5 +1,25 @@
 # Local build & sandbox notes
 
+## Session 2026-08-21 (go-live checklist + deploy wizard)
+
+Added the beginner's deployment path: `docs/GO_LIVE.md` and a console
+**Go live** checklist (`DeployPanel`) that deploys `MevExecutor` from a
+connected wallet. Verification:
+
+- **Frontend**: `tsc --noEmit` clean, `next build` clean; dev server
+  exercised: `/api/bot/config` demo fallback carries `searcher`, the panel
+  renders, and `eth_estimateGas` passes the `/api/eth` allowlist.
+- **Deploy encoding proven against mainnet**: `encodeDeployData` over the
+  embedded creation bytecode + `(vault, weth)` yields 9,944 bytes that
+  extend the artifact bytecode exactly, and a live
+  `eth_estimateGas` through the proxy returns **2,181,288 gas** for the
+  deployment (≈ 0.002 ETH at ~1 gwei — the number `GO_LIVE.md` quotes).
+- **Rust**: one line added to `/api/config` (`searcher`), CI-verified on the
+  PR.
+- `frontend/lib/MevExecutor.creation.ts` mirrors the bot's
+  `MevExecutor.creation.hex`; regenerate both after any contract change (the
+  artifact-drift job keeps the bot copy honest, this one is manual).
+
 ## Session 2026-08-21 (console + mode-switch pass)
 
 An automation session added the operator surface for Phase 3 and the W6 gate
