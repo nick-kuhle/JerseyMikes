@@ -18,8 +18,8 @@ use crate::sim::Simulator;
 use crate::signer::Signer;
 use crate::store::Store;
 use crate::strategies::{
-    arb::AtomicArbStrategy, jit::JitStrategy, liquidation::LiquidationStrategy, sandwich::SandwichStrategy,
-    sniper::SniperStrategy, StrategyCtx, StrategyImpl,
+    arb::AtomicArbStrategy, discovery::PoolDiscovery, jit::JitStrategy, liquidation::LiquidationStrategy,
+    sandwich::SandwichStrategy, sniper::SniperStrategy, StrategyCtx, StrategyImpl,
 };
 use crate::types::{now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, Strategy, TxSource};
 
@@ -32,6 +32,7 @@ pub struct Engine {
     pub feed: broadcast::Sender<FeedEvent>,
     pub stats: Arc<Stats>,
     strategies: Vec<Arc<dyn StrategyImpl>>,
+    pool_discovery: PoolDiscovery,
     http: RpcClient,
 }
 
@@ -206,6 +207,8 @@ impl Engine {
             .started_at_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 
+        let pool_discovery = PoolDiscovery::new();
+
         Ok(Self {
             cfg,
             store,
@@ -215,6 +218,7 @@ impl Engine {
             feed,
             stats,
             strategies,
+            pool_discovery,
             http,
         })
     }
@@ -272,6 +276,16 @@ impl Engine {
         self.ctx.set_head(head.clone());
         let _ = self.store.record_block(&head);
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
+
+        if self.cfg.pool_discovery {
+            let discovery = &self.pool_discovery;
+            let ctx = self.ctx.clone();
+            let head = head.clone();
+            // Discovery is a single eth_getLogs + a few pool loads; run it on the
+            // block task before strategies spawn. It feeds the cache that all
+            // strategies read on their next tick.
+            let _new_pools = discovery.discover(&ctx, &head).await;
+        }
 
         for s in &self.strategies {
             let strat = s.clone();

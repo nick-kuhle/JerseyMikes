@@ -18,16 +18,12 @@ use std::collections::HashSet;
 use alloy_primitives::{Address, U256};
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use serde_json::json;
 
 use crate::config::known;
 use crate::dex::{self, Venue};
 use crate::strategies::sandwich::build_leg;
-use crate::strategies::{StrategyCtx, StrategyImpl};
+use crate::strategies::{scan_pair_created, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
-
-/// `PairCreated(address indexed token0, address indexed token1, address pair, uint256)`
-const PAIR_CREATED_TOPIC: &str = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9";
 
 /// Selectors that typically flip a token from "untradable" to "tradable".
 const GO_LIVE_SELECTORS: [&str; 6] = [
@@ -108,32 +104,14 @@ impl StrategyImpl for SniperStrategy {
         };
         *self.last_log_block.write() = head.number;
 
-        let params = json!([{
-            "fromBlock": format!("0x{from:x}"),
-            "toBlock": format!("0x{:x}", head.number),
-            "address": [format!("{:?}", known::UNIV2_FACTORY), format!("{:?}", known::SUSHI_FACTORY)],
-            "topics": [PAIR_CREATED_TOPIC],
-        }]);
-
-        let Ok(v) = ctx.rpc.call_raw("eth_getLogs", params).await else {
-            return Vec::new();
-        };
-        let Some(logs) = v.as_array() else {
-            return Vec::new();
-        };
-
         let weth = ctx.cfg.chain.weth;
         let mut out = Vec::new();
-        for log in logs {
-            let data = crate::types::parse_bytes(&log["data"]);
-            if data.len() < 32 {
-                continue;
-            }
-            let pair = Address::from_slice(&data[12..32]);
+        for (venue, pair) in scan_pair_created(&ctx.rpc, from, head.number).await {
             if !self.seen_pairs.write().insert(pair) {
                 continue;
             }
-            let Some(pool) = ctx.pools.load(pair, Venue::UniV2, head.number).await else {
+            // NOTE: use `venue` (correct per-factory) instead of hardcoded UniV2.
+            let Some(pool) = ctx.pools.load(pair, venue, head.number).await else {
                 continue;
             };
             // Only WETH-quoted pools, and only once they actually hold liquidity.
