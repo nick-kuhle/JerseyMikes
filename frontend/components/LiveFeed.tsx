@@ -3,12 +3,23 @@
 import {useEffect, useRef} from "react";
 import type {FeedEvent} from "@/lib/types";
 import {clock, shortHash, STRATEGY_COLOR, weiToEth} from "@/lib/format";
+import {blockUrl, txUrl} from "@/lib/explorer";
 
 /**
  * The live tape: every mempool transaction, MEV-Share hint, block, opportunity
- * and simulation the bot sees, newest first.
+ * and simulation the bot sees, newest first. Every hash that exists on chain
+ * links out to the explorer.
  */
-export default function LiveFeed({events, filter}: {events: FeedEvent[]; filter: string}) {
+export default function LiveFeed({
+  events,
+  filter,
+  chainId,
+}: {
+  events: FeedEvent[];
+  filter: string;
+  /** Chain the bot follows; drives explorer links. */
+  chainId?: number;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (ref.current) ref.current.scrollTop = 0;
@@ -43,7 +54,7 @@ export default function LiveFeed({events, filter}: {events: FeedEvent[]; filter:
                 </span>
               </td>
               <td style={{whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 620}}>
-                {detail(e)}
+                {detail(e, chainId)}
               </td>
             </tr>
           ))}
@@ -93,26 +104,50 @@ function kindColor(e: FeedEvent): string {
   }
 }
 
-function detail(e: FeedEvent) {
+function detail(e: FeedEvent, chainId?: number) {
+  const txLink = (hash: string, label?: string) => {
+    const url = txUrl(chainId, hash);
+    if (!url)
+      return (
+        <span title={hash} style={{cursor: "default"}}>
+          {label ?? shortHash(hash)}
+        </span>
+      );
+    return (
+      <a href={url} target="_blank" rel="noreferrer" title={`${hash} — view on the explorer`} style={{color: "#22d3ee", textDecoration: "none"}}>
+        {label ?? shortHash(hash)} ↗
+      </a>
+    );
+  };
   switch (e.kind) {
     case "block":
       return (
         <span>
-          #{e.number} · base fee {(Number(e.base_fee_per_gas) / 1e9).toFixed(2)} gwei · gas{" "}
+          {(() => {
+            const url = blockUrl(chainId, e.number);
+            return url ? (
+              <a href={url} target="_blank" rel="noreferrer" style={{color: "var(--cyan)", textDecoration: "none"}}>
+                #{e.number} ↗
+              </a>
+            ) : (
+              `#${e.number}`
+            );
+          })()}{" "}
+          · base fee {(Number(e.base_fee_per_gas) / 1e9).toFixed(2)} gwei · gas{" "}
           {(e.gas_used / 1e6).toFixed(2)}M · {shortHash(e.hash)}
         </span>
       );
     case "pending":
       return (
         <span>
-          {shortHash(e.hash)} → {shortHash(e.to)} · {weiToEth(e.value, 4)} ETH · {e.selector ?? "—"} ·{" "}
+          {txLink(e.hash)} → {shortHash(e.to)} · {weiToEth(e.value, 4)} ETH · {e.selector ?? "—"} ·{" "}
           <span className="muted">{e.source}</span>
         </span>
       );
     case "mev_share_hint":
       return (
         <span>
-          {shortHash(e.hash)} · {e.logs} logs · fns [{e.functions.join(", ") || "redacted"}]
+          {txLink(e.hash)} · {e.logs} logs · fns [{e.functions.join(", ") || "redacted"}]
         </span>
       );
     case "opportunity":
@@ -149,12 +184,23 @@ function detail(e: FeedEvent) {
     case "relay_block":
       return (
         <span>
-          #{e.block.block_number} · {e.tx_count} txs · {weiToEth(e.block.value_wei, 4)} ETH builder bid ·{" "}
+          {(() => {
+            const url = blockUrl(chainId, e.block.block_number);
+            return url ? (
+              <a href={url} target="_blank" rel="noreferrer" style={{color: "var(--cyan)", textDecoration: "none"}}>
+                #{e.block.block_number} ↗
+              </a>
+            ) : (
+              `#${e.block.block_number}`
+            );
+          })()}{" "}
+          · {e.tx_count} txs · {weiToEth(e.block.value_wei, 4)} ETH builder bid ·{" "}
           <span className="muted">
             {e.txs
               .slice(0, 3)
-              .map((t) => `${shortHash(t.hash)}:${t.selector ?? "—"}`)
-              .join(" ")}
+              .map((t) => (
+                <span key={t.hash}>{txLink(t.hash, shortHash(t.hash, 4))}:{t.selector ?? "—"} </span>
+              ))}
           </span>
         </span>
       );
@@ -162,7 +208,7 @@ function detail(e: FeedEvent) {
       return (
         <span>
           depth {e.depth} · discarded #{e.from_block}
-          {e.to_block !== e.from_block ? `–${e.to_block}` : ""} · {shortHash(e.old_hash)} → {shortHash(e.new_hash)}
+          {e.to_block !== e.from_block ? `–${e.to_block}` : ""} · {txLink(e.old_hash)} → {txLink(e.new_hash)}
         </span>
       );
   }

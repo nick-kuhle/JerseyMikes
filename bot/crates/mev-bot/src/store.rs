@@ -654,7 +654,7 @@ impl Store {
         let conn = self.conn.lock();
         let sql = "SELECT s.opportunity_id, s.strategy, s.backend, s.success, s.gross_wei, s.gas_used,
                           s.gas_cost_wei, s.bribe_wei, s.net_wei, s.revert_reason, s.target_block,
-                          s.latency_ms, s.created_at_ms, COALESCE(o.notes, '')
+                          s.latency_ms, s.created_at_ms, COALESCE(o.notes, ''), COALESCE(o.victims, '')
                    FROM simulations s
                    LEFT JOIN opportunities o ON o.id = s.opportunity_id
                    WHERE (?1 IS NULL OR s.strategy = ?1)
@@ -677,6 +677,11 @@ impl Store {
                 "latencyMs": row.get::<_, i64>(11)?,
                 "createdAtMs": row.get::<_, i64>(12)?,
                 "notes": row.get::<_, String>(13)?,
+                // Comma-separated victim tx hashes from the parent opportunity.
+                // The dashboard links each simulation to the transaction it
+                // reacted to on the block explorer. Empty when the
+                // opportunity is gone (older rows, strategy-less sims).
+                "victims": row.get::<_, String>(14)?,
             }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

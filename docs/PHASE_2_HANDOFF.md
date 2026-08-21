@@ -20,9 +20,20 @@ Profit relay delivered-block ingestion. That integration routes already-mined
 transactions through the strategy funnel, which interacts directly with W1 —
 see §1.7.
 
-**Continuation status (2026-08-21):** Funnel week is done. W4 default is
-3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off until a
-written public-mempool gap memo exists. W0 is required on PRs to `main`.
+**Continuation status (2026-08-21, later session):** Funnel week is done. W4
+default is 3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off
+until a written public-mempool gap memo exists — the funnel panel now renders
+the exact go/no-go reading W6 is gated on (live sandwich+JIT `invocationsEmpty`
+vs mempool `pendingSeen`, sample-age against the 7-day gate) and
+[`docs/W6_MEMO.md`](W6_MEMO.md) is the decision record to fill from it. W0 is
+required on PRs to `main`. The dashboard also gained the operator surface for
+Phase 3: a runtime simulation ⇄ live switch backed by `GET/POST /api/mode`
+(boot-time two-key arming unchanged — see `docs/RISK.md` "two layers"), a
+fully functional EIP-6963 wallet connection driving the executor panel, and
+explorer links on every transaction/block/address the console renders.
+Rust-side, `LiveMode` (engine.rs) carries the runtime switch and
+`recent_simulations` now joins the victim hashes so each simulated tx links
+to the tx it reacted to.
 
 A follow-up automation session (the same day) re-ran the checks it can run —
 contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
@@ -126,6 +137,10 @@ reviewers check the code against — and each now opens with what exists.
 | Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle in the dashboard; 3 new tests (§1.7) |
 | Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore bounds the delivered-block fan-out (§1.7) |
 | Parent-block replay | `types.rs`, `ingest.rs`, `strategies/*`, `engine.rs`, `sim/*` | `MinedAt` tagging, `state_block`/`target_block`/`base_fee` routing, uncached historical pool reads, dedicated replay fork (§1.8) |
+| Runtime mode switch | `engine.rs` (`LiveMode`), `api.rs` (`GET/POST /api/mode`), `ModeSwitch.tsx`, proxy route | boot-time two-key arming + runtime toggle; `409` with restart instructions on an unarmed process; 2 new engine tests; documented in `docs/RISK.md` |
+| Console wallet + executor control | `lib/wallet.tsx` (EIP-6963 store), `WalletButton.tsx`, `ContractPanel.tsx`, `app/api/eth/route.ts` | multi-wallet picker, eager reconnect, account/chain/balance state, chain-switch prompting, real `setSearcher`/`sweep` with receipt following; reads ride a server-side read-only RPC proxy |
+| Explorer links | `lib/explorer.ts`, `Console.tsx`, `LiveFeed.tsx`, `RelayBlocksPanel.tsx`, `ContractPanel.tsx`, `store.rs` | every tx/block/address links to its chain's explorer; `recent_simulations` joins `opportunities.victims` so each simulated tx links to the victim tx on chain |
+| W6 gate measurement | `FunnelPanel.tsx`, `docs/W6_MEMO.md` | the go/no-go reading (live sandwich+JIT `invocationsEmpty` vs `pendingSeen`, 7-day sample age) rendered from real funnel data; memo template as the decision record — no UI toggle for W6 itself |
 | Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default on with W5), `ARB_MAX_CYCLE_LEN` (default 3, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
 
 Post-funnel-week defaults: **V3 discovery is on** with W5, and
@@ -734,6 +749,14 @@ quoter, no network); toggle off means zero added RPC calls.
 **Gate: only after a week of funnel data shows a meaningful public-mempool gap.**
 Both source documents agree on this, and the review is explicit that 1inch and
 0x wait for evidence.
+
+**Measuring the gate (added):** the dashboard's funnel panel renders a
+**W6 go/no-go** card with exactly this reading — `pendingSeen` vs the live
+lane's sandwich/JIT `invocationsEmpty` and `candidatesEmitted`, plus sample age
+against the 7-day gate — and copies a pre-filled
+[`W6_MEMO.md`](W6_MEMO.md). The memo is the deliverable; the card only produces
+its numbers. No toggle exists in the UI: flipping `DECODE_UNIVERSAL_ROUTER`
+stays an operator env change gated on the written memo.
 
 Be honest about the payoff. A large share of big-swap flow on mainnet is
 deliberately *not* in the public mempool — Flashbots Protect, MEV-Blocker, CoW

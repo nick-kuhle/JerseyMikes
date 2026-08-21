@@ -89,13 +89,20 @@ Remaining Phase 2 coverage:
 `POOL_DISCOVERY_V3` default on as a pair. W6 (`DECODE_UNIVERSAL_ROUTER`)
 stays off until a written public-mempool gap memo exists — if
 `pendingSeen` is thin the flow is already in Flashbots Protect /
-MEV-Blocker / CoW / UniswapX and a public decoder will not help. W0 is
+MEV-Blocker / CoW / UniswapX and a public decoder will not help. The
+funnel panel now renders that exact go/no-go reading from live data and
+[`W6_MEMO.md`](W6_MEMO.md) is the decision record to fill. W0 is
 required on PRs to `main`. Phase 2 is **not** closed: W6 is still open,
 W4 is not raised past 3, and the handoff stays until those reports exist.
 Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 
 ## Phase 3 — going live (opt-in, separate PR)
 
+- [x] Console control surface: runtime simulation ⇄ live switch
+      (`GET/POST /api/mode`, `engine.rs::LiveMode`) layered strictly on top of
+      the boot-time two-key arming — an unarmed process refuses the switch
+      with the restart instructions; an armed one can pause/resume without a
+      restart. See `docs/RISK.md`.
 - [ ] Multi-relay submission with per-relay inclusion stats
 - [ ] Bundle merging and cancellation
 - [ ] Hot-wallet inventory management, WETH top-ups, profit sweeping

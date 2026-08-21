@@ -17,12 +17,17 @@ import {
 
 export const dynamic = "force-dynamic";
 
+/** Demo runtime mode. Flipped by POST /api/bot/mode in demo mode only. */
+let demoLive = false;
+
 /** Fallbacks keyed by the bot's own route names. */
 function demoFor(path: string, search: URLSearchParams): unknown {
   const limit = Number(search.get("limit") ?? 100);
   switch (path) {
     case "status":
-      return demoStatus();
+      return {...demoStatus(), mode: demoLive ? "live" : "simulation", liveArmed: true};
+    case "mode":
+      return {mode: demoLive ? "live" : "simulation", liveArmed: true, demo: true};
     case "pnl":
       return demoPnl();
     case "pnl/series":
@@ -43,7 +48,13 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return demoRelayTxs(blockNumber ? Number(blockNumber) : undefined, limit);
     }
     case "config":
-      return {chainId: 1, executor: demoStatus().executor, liveExecution: false, demo: true};
+      return {
+        chainId: 1,
+        executor: demoStatus().executor,
+        liveExecution: demoLive,
+        liveArmed: true,
+        demo: true,
+      };
     case "funnel":
       // The funnel is also embedded in `/api/bot/status` under `stats.funnel`,
       // but exposing it as a standalone endpoint makes polling cheaper for
@@ -81,6 +92,55 @@ export async function GET(req: NextRequest, {params}: {params: Promise<{path: st
   const upstream = await botFetch(`/api/${route}${qs ? `?${qs}` : ""}`);
   if (upstream.ok) return jsonResponse(upstream.data, false);
   return jsonResponse(demoFor(route, search), true);
+}
+
+/**
+ * Mutating bot endpoints. Only `/api/mode` (the simulation ⇄ live switch) is
+ * proxied; when the bot is unreachable the demo mode state flips instead so
+ * the dashboard's switch flow is exercisable without a running bot — always
+ * flagged with `demo: true` so nobody mistakes it for a real mode change.
+ */
+export async function POST(req: NextRequest, {params}: {params: Promise<{path: string[]}>}) {
+  const {path} = await params;
+  const route = path.join("/");
+  if (route !== "mode") {
+    return jsonResponse({error: `unknown endpoint ${route}`}, true);
+  }
+
+  let body: {live?: boolean} = {};
+  try {
+    body = (await req.json()) as {live?: boolean};
+  } catch {
+    return jsonResponse({error: "invalid JSON body"}, true);
+  }
+  if (typeof body.live !== "boolean") {
+    return jsonResponse({error: "body must be {live: boolean}"}, true);
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const upstream = await fetch(`${BOT_API_URL}/api/mode`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({live: body.live}),
+    });
+    clearTimeout(timer);
+    if (upstream.ok || upstream.status === 409) {
+      const data = (await upstream.json()) as Record<string, unknown>;
+      return jsonResponse({...data, ok: upstream.ok}, false);
+    }
+  } catch {
+    /* fall through to demo */
+  }
+
+  // Demo fallback: the bot is unreachable, so this cannot touch anything real.
+  demoLive = body.live;
+  return jsonResponse(
+    {ok: true, mode: demoLive ? "live" : "simulation", liveArmed: true, demo: true},
+    true
+  );
 }
 
 /**

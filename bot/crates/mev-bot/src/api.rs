@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use futures_util::stream::Stream;
@@ -44,6 +45,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/competition", get(competition))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
+        .route("/api/mode", get(mode).post(set_mode))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -72,7 +74,10 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
             "gasUsed": head.gas_used,
             "timestamp": head.timestamp,
         },
-        "mode": if e.cfg.live_execution { "live" } else { "simulation" },
+        "mode": if e.mode.live() { "live" } else { "simulation" },
+        // Boot-time arming (`LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`).
+        // The runtime switch can only narrow this, never widen it.
+        "liveArmed": e.mode.armed(),
         "strategies": crate::engine::enabled_strategies(&e.cfg),
         "risk": {
             "minNetProfitWei": e.cfg.risk.min_net_profit_wei.to_string(),
@@ -101,7 +106,8 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         "chainId": e.cfg.chain.chain_id,
         "weth": format!("{:?}", e.cfg.chain.weth),
         "executor": format!("{:?}", e.ctx.executor),
-        "liveExecution": e.cfg.live_execution,
+        "liveExecution": e.mode.live(),
+        "liveArmed": e.mode.armed(),
         "endpoints": {
             "ws": e.cfg.endpoints.ws_url.is_some(),
             "mevShare": !e.cfg.endpoints.mev_share_sse.is_empty(),
@@ -227,6 +233,51 @@ fn parse_strategy(s: &str) -> Option<Strategy> {
         "liquidation" => Some(Strategy::Liquidation),
         "sniper" => Some(Strategy::Sniper),
         _ => None,
+    }
+}
+
+/// Read the execution mode: `{"mode": "simulation"|"live", "liveArmed": bool}`.
+///
+/// `liveArmed` is the boot-time two-key switch (`LIVE_EXECUTION=true` +
+/// `I_UNDERSTAND_LIVE_RISK=yes`); `mode` is what the engine actually does
+/// right now (armed && runtime switch).
+async fn mode(State(s): State<ApiState>) -> impl IntoResponse {
+    Json(json!({
+        "mode": if s.engine.mode.live() { "live" } else { "simulation" },
+        "liveArmed": s.engine.mode.armed(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ModeRequest {
+    live: bool,
+}
+
+/// Flip the runtime simulation/live switch.
+///
+/// `POST /api/mode {"live": true}` arms nothing on its own: live execution
+/// requires the process to have been started with both env keys set, and
+/// that decision is read exactly once at boot. An unarmed process gets a
+/// 409 with the restart instructions rather than a silent mode change.
+async fn set_mode(State(s): State<ApiState>, Json(body): Json<ModeRequest>) -> Response {
+    match s.engine.mode.set_live(body.live) {
+        Ok(live) => Json(json!({
+            "ok": true,
+            "mode": if live { "live" } else { "simulation" },
+            "liveArmed": s.engine.mode.armed(),
+        }))
+        .into_response(),
+        Err(hint) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "live execution is not armed for this process",
+                "hint": hint,
+                "mode": "simulation",
+                "liveArmed": false,
+            })),
+        )
+            .into_response(),
     }
 }
 

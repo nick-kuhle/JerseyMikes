@@ -1,5 +1,34 @@
 # Local build & sandbox notes
 
+## Session 2026-08-21 (console + mode-switch pass)
+
+An automation session added the operator surface for Phase 3 and the W6 gate
+measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
+
+- **Frontend: fully verified in the sandbox.** `npx tsc --noEmit` clean,
+  `npm run build` succeeds, and the dev server was exercised end-to-end in
+  demo mode: `GET/POST /api/bot/mode` (flip to live and back, invalid-body
+  rejection), the `/api/eth` read-only RPC proxy (live `eth_chainId` /
+  `eth_getBalance` through it; `eth_sendTransaction` / `personal_sign`
+  refused by the allowlist), and demo rows carrying `victims` for the
+  explorer links.
+- **Rust: edited in the sandbox; CI is its compiler.** The sandbox has no
+  Rust toolchain (unchanged from every earlier session). CI's first run
+  caught exactly one error — an `E0382` borrow-after-move in
+  `Engine::new` (the struct literal moves `cfg`, so the new `mode:` field
+  could not read `cfg.live_execution` after it) — fixed by building
+  `LiveMode` before the literal ([PR
+  #18](https://github.com/nick-kuhle/JerseyMikes/pull/18) commit
+  `345decc`). The follow-up run is green: `cargo clippy --all-targets`
+  and `cargo test --all` (the two new `LiveMode` tests included) pass
+  alongside `contracts (foundry)`, `frontend (next.js)` and the
+  artifact-drift job. This is the W0 process working as designed: treat a
+  CI failure on un-sandbox-compilable code as a real regression, fix, and
+  re-run.
+- The mode API cannot arm a process: `LiveMode::set_live(true)` on an
+  unarmed bot returns the restart instructions (surfaced as `409`), pinned
+  by `live_mode_can_never_arm_an_unarmed_process`. See `docs/RISK.md`.
+
 ## What CI verifies
 
 CI is enabled and lives at

@@ -319,6 +319,7 @@ export function demoSimulations(limit = 60): SimulationRow[] {
       latencyMs: 40 + Math.floor(rand() * 260),
       createdAtMs: Date.now() - i * 9_000,
       notes: demoNote(strategy),
+      victims: hash(5000 + i),
     });
   }
   return out;
