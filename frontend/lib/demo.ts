@@ -76,13 +76,87 @@ export function demoStatus(): StatusResponse {
       simulations: 1_246,
       submittable: 96,
       rejected: 5_512,
+      reorgsSeen: 1,
       startedAtMs: Date.now() - 1000 * 60 * 84,
       funnel: demoFunnel(),
       funnelReplay: demoFunnelReplay(),
     },
     simBackends: {anvilFork: true, relayCallBundle: true},
+    inventory: {
+      nonce: 17,
+      ethWei: "2500000000000000000",
+      wethWei: "12000000000000000000",
+      availableWei: "14500000000000000000",
+      gate: false,
+    },
+    latency: demoLatency(),
     demo: true,
   };
+}
+
+export function demoLatency(): import("./types").LatencySnapshot {
+  const hist = (count: number, p50: number, p95: number, p99: number) => ({
+    count,
+    meanMs: p50 + 8,
+    minMs: 1,
+    maxMs: p99 + 40,
+    p50Ms: p50,
+    p95Ms: p95,
+    p99Ms: p99,
+  });
+  return {
+    budgetMs: 150,
+    withinBudget: true,
+    stages: {
+      ingest_to_strategy: hist(184_223, 8, 20, 50),
+      strategy: hist(12_400, 4, 12, 25),
+      risk: hist(1_284, 0, 1, 2),
+      simulation: hist(1_246, 40, 90, 140),
+      total: hist(1_246, 55, 120, 180),
+    },
+  };
+}
+
+export function demoCompetition(): import("./types").CompetitionResponse {
+  return {
+    summary: {
+      rows: 42,
+      truePositives: 11,
+      falsePositives: 6,
+      wouldOutbid: 4,
+      victimsLanded: 18,
+      meanInclusionP: 0.31,
+    },
+    recent: demoSimulations(8).map((s, i) => ({
+      blockNumber: s.targetBlock,
+      opportunityId: s.opportunityId,
+      strategy: s.strategy,
+      simNetWei: s.netWei,
+      ourBribeWei: s.bribeWei,
+      winningBidWei: String(Math.floor(Number(s.bribeWei) * (0.7 + rand()))),
+      victimLanded: i % 3 !== 0,
+      wouldOutbid: i % 5 === 0,
+      inclusionP: Math.min(0.99, 0.12 + i * 0.07),
+      truePositive: s.success && i % 3 !== 0,
+      falsePositive: s.success && i % 3 === 0,
+      reorged: false,
+      createdAtMs: s.createdAtMs,
+    })),
+    demo: true,
+  };
+}
+
+export function demoReorgs(): import("./types").ReorgRow[] {
+  return [
+    {
+      fromBlock: START_BLOCK + 390,
+      toBlock: START_BLOCK + 391,
+      depth: 2,
+      oldHash: hash(42),
+      newHash: hash(43),
+      seenAtMs: Date.now() - 3_600_000,
+    },
+  ];
 }
 
 /**

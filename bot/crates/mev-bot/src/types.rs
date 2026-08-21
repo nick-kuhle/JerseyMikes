@@ -353,6 +353,16 @@ pub enum FeedEvent {
         tx_count: usize,
         txs: Vec<RelayTxSummary>,
     },
+    /// The canonical chain rewound; simulations in `[from_block, to_block]`
+    /// have been marked re-orged and dropped from P/L.
+    Reorg {
+        from_block: u64,
+        to_block: u64,
+        depth: u64,
+        old_hash: B256,
+        new_hash: B256,
+        seen_at_ms: u64,
+    },
     Log {
         level: String,
         message: String,

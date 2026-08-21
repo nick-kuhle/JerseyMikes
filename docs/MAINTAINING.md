@@ -438,14 +438,12 @@ For the team taking this over, the practical order is:
    router-routed swaps that the existing V2-only sandwich
    ignores.
 
-5. **Replay validation.** This is the Phase 1 work the roadmap
-   calls for and is the prerequisite for going live. It is also
-   the most research-intensive: re-simulate historical blocks
-   from the bot's database against the actual builder payment
-   data from the relay bid traces. The output is a
-   "true-positive rate" for the simulation pipeline, which is
-   the only number that matters when you flip
-   `LIVE_EXECUTION=true`.
+5. **Replay validation.** Shipped in Phase 1 (`mev-bot replay`,
+   `/api/competition`). The true-positive rate — simulations that
+   succeeded *and* whose victim actually landed — is the number
+   that matters before flipping `LIVE_EXECUTION=true`. Read it
+   for a week before going live; don't treat a single-run TPR as
+   a licence to broadcast.
 
 6. **New chains.** Only after the above. The roadmap's Phase 4
    order (Base → Arbitrum → BNB → Solana) is correct; Solana

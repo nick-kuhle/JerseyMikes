@@ -34,6 +34,9 @@ bot-run: ## run the searcher + API
 doctor: ## check every configured endpoint
 	cd bot && cargo run --release --bin mev-bot -- --env-file ../.env doctor
 
+replay: ## compare stored simulations against relay bid traces
+	cd bot && cargo run --release --bin mev-bot -- --env-file ../.env replay
+
 front-build: ## next build
 	cd frontend && npm run build
 
@@ -47,4 +50,4 @@ fmt: ## format everything
 	cd contracts && forge fmt
 	cd bot && cargo fmt --all
 
-.PHONY: help setup build contracts contracts-check bot-build bot-test bot-run doctor front-build front-dev deploy-dry fmt
+.PHONY: help setup build contracts contracts-check bot-build bot-test bot-run doctor replay front-build front-dev deploy-dry fmt

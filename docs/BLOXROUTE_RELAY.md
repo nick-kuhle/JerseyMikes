@@ -79,6 +79,8 @@ polls of the same endpoint; the per-block cost is two tiny GETs.
   *Parent-block replay routing* below.
 - **Reorgs.** A re-org can replace the block at a given slot after it was
   recorded. Rows are keyed by `(relay, slot)`, so the first-seen block wins.
+  The engine's per-block reconciliation separately marks simulations on the
+  discarded fork (`reorged = 1`) so they drop out of P/L.
 - **Node requirements.** `eth_getBlockByHash(…, true)` and
   `eth_getRawTransactionByHash` are needed for full fidelity; on providers that
   do not expose raw transactions the sandwich/JIT legs are skipped (the
