@@ -126,6 +126,8 @@ pub struct V3Pool {
     /// Fee in hundredths of a bip (500 == 0.05%, 3000 == 0.30%).
     pub fee: u32,
     pub tick_spacing: i32,
+    /// Block in which the factory created the pool.
+    pub block: u64,
 }
 
 impl V3Pool {

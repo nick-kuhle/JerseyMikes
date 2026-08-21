@@ -20,8 +20,9 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::dex::{self, Venue};
+use crate::strategies::discovery::PoolDiscovery;
 use crate::strategies::sandwich::build_leg;
-use crate::strategies::{scan_pair_created, StrategyCtx, StrategyImpl};
+use crate::strategies::{try_scan_pair_created, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
 
 /// Selectors that typically flip a token from "untradable" to "tradable".
@@ -91,28 +92,40 @@ impl StrategyImpl for SniperStrategy {
     }
 
     async fn on_block(&self, ctx: &StrategyCtx, head: &BlockHead) -> Vec<Opportunity> {
-        let from = {
-            let last = *self.last_log_block.read();
-            if last == 0 {
-                head.number.saturating_sub(50)
-            } else if head.number <= last {
-                return Vec::new();
-            } else {
-                last + 1
-            }
+        // Use the same bounded, reorg-overlapping window as pool discovery. The
+        // cursor must advance only after a successful eth_getLogs call: an empty
+        // result means "no pairs", while `None` means the provider failed and
+        // this range must be retried on the next block.
+        let cursor = *self.last_log_block.read();
+        let (from, to) = PoolDiscovery::window(cursor, head.number);
+        let Some(pairs) = try_scan_pair_created(&ctx.rpc, from, to).await else {
+            tracing::debug!(
+                target: "strategy::sniper",
+                from,
+                to,
+                "pair-created scan failed; retaining cursor for retry"
+            );
+            return Vec::new();
         };
-        *self.last_log_block.write() = head.number;
+        *self.last_log_block.write() = to;
 
         let weth = ctx.cfg.chain.weth;
         let mut out = Vec::new();
-        for (venue, pair) in scan_pair_created(&ctx.rpc, from, head.number).await {
-            if !self.seen_pairs.write().insert(pair) {
+        for (venue, pair) in pairs {
+            if self.seen_pairs.read().contains(&pair) {
                 continue;
             }
             // NOTE: use `venue` (correct per-factory) instead of hardcoded UniV2.
             let Some(pool) = ctx.pools.load(pair, venue, head.number).await else {
+                // A transient pool read must remain retryable, just like the
+                // shared discovery path. Marking it seen before this await would
+                // permanently lose a newly-created pool during rate limiting.
                 continue;
             };
+            // The pair metadata was read successfully. Remember it now so the
+            // overlap scan does not refetch the same pool every block. Dust is
+            // handled by PoolDiscovery, which periodically rechecks liquidity.
+            self.seen_pairs.write().insert(pair);
             // Only WETH-quoted pools, and only once they actually hold liquidity.
             let Some(token) = pool.other_token(weth) else { continue };
             if self.is_blacklisted(token) {
