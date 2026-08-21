@@ -429,6 +429,9 @@ impl Engine {
             tracing::debug!(target: "engine", error = %e, "inventory refresh failed at boot");
         }
 
+        // Built before the struct literal below moves `cfg`.
+        let mode = LiveMode::armed_at_boot(cfg.live_execution);
+
         Ok(Self {
             cfg,
             store,
@@ -437,7 +440,7 @@ impl Engine {
             ctx,
             feed,
             stats,
-            mode: LiveMode::armed_at_boot(cfg.live_execution),
+            mode,
             strategies,
             pool_discovery,
             http,
