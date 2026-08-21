@@ -88,6 +88,8 @@ function kindColor(e: FeedEvent): string {
       return "#4f8bff";
     case "relay_block":
       return "#4f8bff";
+    case "reorg":
+      return "#ff5c5c";
   }
 }
 
@@ -154,6 +156,13 @@ function detail(e: FeedEvent) {
               .map((t) => `${shortHash(t.hash)}:${t.selector ?? "—"}`)
               .join(" ")}
           </span>
+        </span>
+      );
+    case "reorg":
+      return (
+        <span>
+          depth {e.depth} · discarded #{e.from_block}
+          {e.to_block !== e.from_block ? `–${e.to_block}` : ""} · {shortHash(e.old_hash)} → {shortHash(e.new_hash)}
         </span>
       );
   }

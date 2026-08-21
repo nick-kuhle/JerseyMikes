@@ -26,6 +26,20 @@ enum Command {
     Api,
     /// Check that every configured endpoint answers, then exit.
     Doctor,
+    /// Replay harness: compare stored simulations against relay bid traces.
+    Replay {
+        /// Inclusive lower bound (block number).
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Inclusive upper bound (block number).
+        #[arg(long)]
+        to_block: Option<u64>,
+        #[arg(long, default_value_t = 200)]
+        limit: i64,
+        /// Write the comparison into the `reconciliations` table.
+        #[arg(long, default_value_t = true)]
+        persist: bool,
+    },
 }
 
 #[tokio::main]
@@ -48,6 +62,12 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Doctor => doctor(cfg).await,
+        Command::Replay {
+            from_block,
+            to_block,
+            limit,
+            persist,
+        } => replay(cfg, from_block, to_block, limit, persist),
         Command::Api => {
             let engine = Arc::new(Engine::new(cfg.clone()).await?);
             api::serve(engine, &cfg.api.bind).await
@@ -163,5 +183,23 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
     }
 
     println!("\nmode: {}", if cfg.live_execution { "LIVE" } else { "simulation" });
+    Ok(())
+}
+
+/// Offline Phase 1 harness: join stored simulations to relay bid traces.
+fn replay(
+    cfg: Arc<Config>,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    limit: i64,
+    persist: bool,
+) -> Result<()> {
+    let store = mev_bot::store::Store::open(&cfg.api.db_path)?;
+    let rows = mev_bot::replay::compare(&store, from_block, to_block, limit)?;
+    print!("{}", mev_bot::replay::render(&rows));
+    if persist {
+        let n = mev_bot::replay::persist(&store, &rows)?;
+        println!("persisted {n} reconciliation rows");
+    }
     Ok(())
 }

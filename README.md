@@ -190,10 +190,13 @@ to measure what is reachable, not to be profitable. See
 
 ## Status
 
-Phase 0 of [the roadmap](docs/ROADMAP.md): the full pipeline exists end to end
-and is simulation-only. Before this is worth trusting with real money it needs
-the Phase 1 work — replay validation against blocks that actually landed,
-competition modelling, and a latency budget.
+Phase 1 of [the roadmap](docs/ROADMAP.md): the pipeline is simulation-only
+**and** the numbers it produces can be checked. Historical simulations are
+replayed against relay bid traces (`mev-bot replay`), each bundle is ranked
+against the block's realised builder payment, per-stage latency histograms
+watch the 150 ms mempool→bundle budget, the searcher nonce is no longer a
+placeholder, and re-orged blocks are dropped from P/L. Going live is still
+Phase 3.
 
 ⚠️ Sandwich attacks extract value from other users. This repository is a
 research tool; deploying it against live users is your decision and your

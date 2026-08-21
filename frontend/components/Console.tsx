@@ -7,11 +7,14 @@ import ContractPanel from "./ContractPanel";
 import RiskPanel from "./RiskPanel";
 import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
+import Phase1Panel from "./Phase1Panel";
 import type {
+  CompetitionResponse,
   FeedEvent,
   OpportunityRow,
   PnlResponse,
   RelayBid,
+  ReorgRow,
   SeriesPoint,
   SimulationRow,
   StatusResponse,
@@ -28,6 +31,8 @@ export default function Console() {
   const [sims, setSims] = useState<SimulationRow[]>([]);
   const [opps, setOpps] = useState<OpportunityRow[]>([]);
   const [bids, setBids] = useState<RelayBid[]>([]);
+  const [competition, setCompetition] = useState<CompetitionResponse | null>(null);
+  const [reorgs, setReorgs] = useState<ReorgRow[]>([]);
   const [events, setEvents] = useState<FeedEvent[]>([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [strategyFilter, setStrategyFilter] = useState("all");
@@ -43,13 +48,15 @@ export default function Console() {
         return fallback;
       }
     };
-    const [s, p, se, si, op, rb] = await Promise.all([
+    const [s, p, se, si, op, rb, comp, rg] = await Promise.all([
       get<StatusResponse | null>("status", null),
       get<PnlResponse | null>("pnl", null),
       get<SeriesPoint[]>("pnl/series?limit=250", []),
       get<SimulationRow[]>("simulations?limit=120", []),
       get<OpportunityRow[]>("opportunities?limit=60", []),
       get<RelayBid[]>("relay-bids?limit=25", []),
+      get<CompetitionResponse | null>("competition?limit=25", null),
+      get<ReorgRow[]>("reorgs?limit=15", []),
     ]);
     if (s) setStatus(s);
     if (p) setPnl(p);
@@ -57,6 +64,8 @@ export default function Console() {
     setSims(Array.isArray(si) ? si : []);
     setOpps(Array.isArray(op) ? op : []);
     setBids(Array.isArray(rb) ? rb : []);
+    if (comp) setCompetition(comp);
+    setReorgs(Array.isArray(rg) ? rg : []);
   }, []);
 
   useEffect(() => {
@@ -123,6 +132,7 @@ export default function Console() {
           <HeadStat label="block" value={status ? `#${status.head.number}` : "—"} />
           <HeadStat label="base fee" value={status ? `${gwei(status.head.baseFeeWei)} gwei` : "—"} />
           <HeadStat label="pools" value={status ? String(status.pools) : "—"} />
+          <HeadStat label="nonce" value={status?.inventory ? String(status.inventory.nonce) : "—"} />
           <HeadStat
             label="kill switch"
             value={status?.risk.killSwitchTripped ? "TRIPPED" : "armed"}
@@ -235,6 +245,7 @@ export default function Console() {
                 "bundle",
                 "relay",
                 "relay_block",
+                "reorg",
               ].map((k) => (
                 <option key={k} value={k}>
                   {k}

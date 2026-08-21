@@ -68,6 +68,10 @@ pub struct Config {
     /// latency-critical (the block is already mined), so it runs behind this
     /// bound.
     pub relay_tx_concurrency: usize,
+    /// When true, opportunities whose notional exceeds the searcher's ETH+WETH
+    /// balance are skipped. Off by default so a dummy searcher in simulation
+    /// mode does not silence the tape; forced on when live execution is on.
+    pub inventory_gate: bool,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -320,6 +324,11 @@ impl Config {
             // bloXroute Max Profit relay and score them for extractable value.
             relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
             relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
+            inventory_gate: {
+                let live = env_bool("LIVE_EXECUTION", false)
+                    && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes";
+                env_bool("INVENTORY_GATE", false) || live
+            },
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",

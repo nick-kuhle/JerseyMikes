@@ -12,6 +12,8 @@ use tokio::sync::broadcast;
 
 use crate::config::Config;
 use crate::ingest::{self, Ingest, IngestEvent};
+use crate::inventory::Inventory;
+use crate::latency::{Latency, Stage};
 use crate::risk::RiskEngine;
 use crate::rpc::RpcClient;
 use crate::sim::Simulator;
@@ -38,6 +40,9 @@ pub struct Engine {
     http: RpcClient,
     /// Prevent replay blocks from resetting the shared replay lane concurrently.
     replay_gate: Arc<tokio::sync::Semaphore>,
+    pub latency: Arc<Latency>,
+    pub inventory: Arc<Inventory>,
+    last_head: parking_lot::Mutex<Option<BlockHead>>,
 }
 
 #[derive(Default)]
@@ -54,6 +59,7 @@ pub struct Stats {
     pub simulations: std::sync::atomic::AtomicU64,
     pub submittable: std::sync::atomic::AtomicU64,
     pub rejected: std::sync::atomic::AtomicU64,
+    pub reorgs_seen: std::sync::atomic::AtomicU64,
     pub started_at_ms: std::sync::atomic::AtomicU64,
     /// Per-strategy funnel for **live** flow: how many candidates each
     /// strategy emitted, how many were gated by risk, and how many
@@ -229,6 +235,7 @@ impl Stats {
             "simulations": self.simulations.load(Relaxed),
             "submittable": self.submittable.load(Relaxed),
             "rejected": self.rejected.load(Relaxed),
+            "reorgsSeen": self.reorgs_seen.load(Relaxed),
             "startedAtMs": self.started_at_ms.load(Relaxed),
             // Live flow only. Post-mortem scoring of already-mined relay
             // transactions is counted separately so it cannot inflate this.
@@ -314,7 +321,7 @@ impl Engine {
             .unwrap_or(crate::sim::anvil::SIM_EXECUTOR);
 
         let sim = Arc::new(Simulator::new(cfg.clone(), fork, replay_fork, relay, signer));
-        let ctx = Arc::new(StrategyCtx::new(cfg.clone(), http.clone(), executor, head));
+        let ctx = Arc::new(StrategyCtx::new(cfg.clone(), http.clone(), executor, head.clone()));
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
@@ -340,6 +347,16 @@ impl Engine {
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 
         let pool_discovery = PoolDiscovery::new();
+        let inventory = Arc::new(Inventory::new(cfg.inventory_gate));
+        // Best-effort: a dummy searcher will read as nonce 0 / zero balances,
+        // which is the honest picture of mainnet and does not gate unless
+        // `INVENTORY_GATE` is on.
+        if let Err(e) = inventory
+            .refresh(&http, cfg.endpoints.searcher_address, cfg.chain.weth)
+            .await
+        {
+            tracing::debug!(target: "engine", error = %e, "inventory refresh failed at boot");
+        }
 
         Ok(Self {
             cfg,
@@ -353,6 +370,9 @@ impl Engine {
             pool_discovery,
             http,
             replay_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            latency: Arc::new(Latency::default()),
+            inventory,
+            last_head: parking_lot::Mutex::new(Some(head)),
         })
     }
 
@@ -438,6 +458,7 @@ impl Engine {
                 selector: t.selector().map(|s| format!("0x{}", hex::encode(s))),
             })
             .collect();
+        let block_number = block.block_number;
         let _ = self.feed.send(FeedEvent::RelayBlock {
             block,
             tx_count: txs.len(),
@@ -474,10 +495,58 @@ impl Engine {
         for task in tasks {
             let _ = task.await;
         }
+        // Scoring is done: we now have simulations for this block sitting next
+        // to the relay's realised builder payment. Reconcile them.
+        self.reconcile_block(block_number);
     }
 
     async fn on_block(self: Arc<Self>, head: BlockHead) {
         Stats::bump(&self.stats.blocks_seen);
+
+        let prev = self.last_head.lock().clone();
+        if let Some(prev) = prev {
+            if let Some((from, to)) = detect_reorg(&prev, &head) {
+                Stats::bump(&self.stats.reorgs_seen);
+                let old_hash = prev.hash;
+                let _ = self.store.record_reorg(
+                    from,
+                    to,
+                    &format!("{old_hash:?}"),
+                    &format!("{:?}", head.hash),
+                );
+                let _ = self.feed.send(FeedEvent::Reorg {
+                    from_block: from,
+                    to_block: to,
+                    depth: to.saturating_sub(from).saturating_add(1),
+                    old_hash,
+                    new_hash: head.hash,
+                    seen_at_ms: now_ms(),
+                });
+                tracing::warn!(
+                    target: "engine",
+                    from,
+                    to,
+                    old = %format!("{old_hash:?}"),
+                    new = %format!("{:?}", head.hash),
+                    "re-org detected — simulations in range marked non-canonical"
+                );
+            } else if head.number == prev.number + 1 {
+                // The parent just gained a child, so it is as confirmed as a
+                // single new head can make it. Reconcile it against relay traces.
+                let this = self.clone();
+                let n = prev.number;
+                tokio::spawn(async move {
+                    this.reconcile_block(n);
+                });
+            }
+        }
+        *self.last_head.lock() = Some(head.clone());
+
+        let _ = self
+            .inventory
+            .refresh(&self.http, self.cfg.endpoints.searcher_address, self.cfg.chain.weth)
+            .await;
+
         self.ctx.set_head(head.clone());
         let _ = self.store.record_block(&head);
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
@@ -509,6 +578,7 @@ impl Engine {
                             Vec::new(),
                             None,
                             head.base_fee_per_gas,
+                            now_ms(),
                         )
                         .await;
                 }
@@ -518,6 +588,10 @@ impl Engine {
 
     async fn on_pending(self: Arc<Self>, tx: PendingTx) {
         Stats::bump(&self.stats.pending_seen);
+        self.latency.observe(
+            Stage::IngestToStrategy,
+            now_ms().saturating_sub(tx.seen_at_ms),
+        );
         let _ = self.feed.send(FeedEvent::Pending {
             hash: tx.hash,
             from: tx.from,
@@ -579,7 +653,10 @@ impl Engine {
         tx: PendingTx,
         lane: FunnelLane,
     ) {
+        let started = std::time::Instant::now();
         let opps = strat.on_pending(&self.ctx, &tx).await;
+        self.latency
+            .observe(Stage::Strategy, started.elapsed().as_millis() as u64);
         self.stats.record_invocation(lane, kind, opps.len());
         if opps.is_empty() {
             return;
@@ -600,6 +677,7 @@ impl Engine {
                     victims.clone(),
                     tx.from.map(|from| (from, tx.nonce)),
                     base_fee,
+                    tx.seen_at_ms,
                 )
                 .await;
         }
@@ -613,16 +691,31 @@ impl Engine {
         victims_raw: Vec<Vec<u8>>,
         victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
         base_fee: U256,
+        seen_at_ms: u64,
     ) {
         let kind = opp.strategy;
         // `base_fee` is the head's for live flow and the victim's own block's
         // for a replay. Gating a historical bundle on today's gas price, in
         // either direction, invents a result.
+        let risk_started = std::time::Instant::now();
         if let Err(reject) = self.risk.check(&opp, base_fee) {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
             tracing::debug!(target: "engine", strategy = opp.strategy.as_str(), reason = reject.as_str(), "rejected");
+            return;
+        }
+        self.latency
+            .observe(Stage::Risk, risk_started.elapsed().as_millis() as u64);
+        if !self.inventory.can_fund(&opp) {
+            Stats::bump(&self.stats.rejected);
+            self.stats
+                .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
+            tracing::debug!(
+                target: "engine",
+                strategy = opp.strategy.as_str(),
+                "rejected: insufficient inventory"
+            );
             return;
         }
         // A sandwich or JIT without the victim's bytes cannot be simulated faithfully.
@@ -645,7 +738,7 @@ impl Engine {
                 &victims_raw,
                 victim_sender_nonce,
                 base_fee,
-                0,
+                self.inventory.nonce_for(&opp),
                 lane == FunnelLane::Replay,
             )
             .await;
@@ -662,6 +755,12 @@ impl Engine {
         };
 
         Stats::bump(&self.stats.simulations);
+        self.latency
+            .observe(Stage::Simulation, outcome.primary.sim_latency_ms);
+        if seen_at_ms > 0 {
+            self.latency
+                .observe(Stage::Total, now_ms().saturating_sub(seen_at_ms));
+        }
         self.risk.observe(&outcome.primary);
         let _ = self.store.record_simulation(&outcome.primary);
         let _ = self.feed.send(FeedEvent::Simulation(outcome.primary.clone()));
@@ -698,6 +797,40 @@ impl Engine {
         }
         let _ = self.store.record_bundle(&bundle);
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
+    }
+
+    /// Compare stored simulations for `block` against relay bid traces and
+    /// landed transactions, and persist the result. Synchronous on the store;
+    /// safe to call from a spawned task.
+    fn reconcile_block(&self, block: u64) {
+        match crate::replay::compare(&self.store, Some(block), Some(block), 500) {
+            Ok(rows) if !rows.is_empty() => {
+                if let Err(e) = crate::replay::persist(&self.store, &rows) {
+                    tracing::debug!(target: "engine", error = %e, block, "reconciliation persist failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(target: "engine", error = %e, block, "reconciliation failed"),
+        }
+    }
+}
+
+/// Inclusive range of blocks that are no longer canonical, given the previous
+/// head and the newly observed one. `None` means the chain advanced (or this
+/// is a duplicate of the same head).
+pub fn detect_reorg(prev: &BlockHead, head: &BlockHead) -> Option<(u64, u64)> {
+    if head.number < prev.number {
+        // Rewind: the new head is behind the one we had. Everything from the
+        // new height through the old tip was on a discarded fork.
+        Some((head.number, prev.number))
+    } else if head.number == prev.number && head.hash != prev.hash {
+        Some((head.number, head.number))
+    } else if head.number == prev.number + 1 && head.parent_hash != prev.hash {
+        // The new block does not build on the head we stored. That head is
+        // the one that got re-orged out.
+        Some((prev.number, prev.number))
+    } else {
+        None
     }
 }
 
@@ -920,5 +1053,45 @@ mod tests {
         // Both funnel lanes untouched.
         assert!(snap["funnel"].as_object().unwrap().is_empty());
         assert!(snap["funnelReplay"].as_object().unwrap().is_empty());
+    }
+
+    fn head(number: u64, hash: u8, parent: u8) -> BlockHead {
+        BlockHead {
+            number,
+            hash: alloy_primitives::B256::from([hash; 32]),
+            parent_hash: alloy_primitives::B256::from([parent; 32]),
+            timestamp: 0,
+            base_fee_per_gas: U256::ZERO,
+            gas_used: 0,
+            gas_limit: 30_000_000,
+        }
+    }
+
+    #[test]
+    fn a_child_of_the_stored_head_is_not_a_reorg() {
+        let prev = head(10, 1, 0);
+        let next = head(11, 2, 1);
+        assert_eq!(detect_reorg(&prev, &next), None);
+    }
+
+    #[test]
+    fn a_parent_mismatch_reorgs_the_previous_head() {
+        let prev = head(10, 1, 0);
+        let next = head(11, 2, 9); // parent is not 1
+        assert_eq!(detect_reorg(&prev, &next), Some((10, 10)));
+    }
+
+    #[test]
+    fn a_rewind_marks_the_whole_abandoned_range() {
+        let prev = head(15, 5, 4);
+        let next = head(12, 9, 8);
+        assert_eq!(detect_reorg(&prev, &next), Some((12, 15)));
+    }
+
+    #[test]
+    fn same_height_different_hash_is_a_reorg() {
+        let prev = head(10, 1, 0);
+        let next = head(10, 2, 0);
+        assert_eq!(detect_reorg(&prev, &next), Some((10, 10)));
     }
 }

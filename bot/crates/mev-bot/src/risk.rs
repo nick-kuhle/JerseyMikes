@@ -217,6 +217,7 @@ mod tests {
             arb_max_cycle_len: 2,
             relay_tx_ingest: false,
             relay_tx_concurrency: 4,
+            inventory_gate: false,
             live_execution: false,
         })
     }

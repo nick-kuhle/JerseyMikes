@@ -17,10 +17,14 @@
 
 pub mod api;
 pub mod bundle;
+pub mod competition;
 pub mod config;
 pub mod dex;
 pub mod engine;
 pub mod ingest;
+pub mod inventory;
+pub mod latency;
+pub mod replay;
 pub mod risk;
 pub mod rlp;
 pub mod rpc;

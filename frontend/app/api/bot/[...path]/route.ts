@@ -1,12 +1,15 @@
 import {NextRequest} from "next/server";
 import {botFetch, BOT_API_URL} from "@/lib/bot";
 import {
+  demoCompetition,
   demoEvent,
+  demoLatency,
   demoOpportunities,
   demoPnl,
   demoRelayBids,
   demoRelayBlocks,
   demoRelayTxs,
+  demoReorgs,
   demoSeries,
   demoSimulations,
   demoStatus,
@@ -47,6 +50,12 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       // dashboards that want to refresh the funnel separately from the rest
       // of the status.
       return {funnel: demoStatus().stats.funnel};
+    case "latency":
+      return demoLatency();
+    case "competition":
+      return demoCompetition();
+    case "reorgs":
+      return demoReorgs();
     default:
       return {error: `unknown endpoint ${path}`};
   }
