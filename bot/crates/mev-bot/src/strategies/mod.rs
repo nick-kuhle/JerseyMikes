@@ -71,6 +71,27 @@ impl StrategyCtx {
         self.head().number + self.cfg.sim.target_block_offset
     }
 
+    /// JSON-RPC block tag for a state read: `"latest"` at the head, an explicit
+    /// height for historical (replay) reads.
+    pub fn block_tag(&self, block: u64) -> String {
+        block_tag_for(block, self.head().number)
+    }
+
+    /// Read a pool at `block`, using the shared cache only when `block` is the
+    /// head.
+    ///
+    /// This is the single entry point strategies should use on the pending
+    /// path, because it is what keeps live and replay evaluation from
+    /// contaminating each other: live reads hit (and populate) the cache as
+    /// before, historical reads go straight to the node and are discarded.
+    pub async fn pool_at(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool> {
+        if block >= self.head().number {
+            self.pools.load(pair, venue, block).await
+        } else {
+            self.pools.read_at(pair, venue, block).await
+        }
+    }
+
     /// Capital the bot is willing to commit to a single bundle.
     pub fn max_position(&self) -> U256 {
         self.cfg.risk.max_position_wei
@@ -175,6 +196,29 @@ impl PoolCache {
         }
     }
 
+    /// Read a pool's state **at a specific historical block**, bypassing the
+    /// cache entirely.
+    ///
+    /// The cache holds one snapshot per pool and `refresh_all` keeps those at
+    /// the head, so writing a historical snapshot into it would hand stale
+    /// reserves to every live strategy — `graph::search` prices the whole
+    /// cache in one pass, so a single polluted entry silently corrupts the
+    /// block-cadence arb search. Replay reads therefore cost an RPC each and
+    /// leave no trace.
+    pub async fn read_at(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool> {
+        let fee = match venue {
+            Venue::SushiV2 => 30,
+            _ => 30,
+        };
+        match dex::fetch_v2_pool(&self.rpc, pair, venue, fee, block).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!(target: "pools", pair = ?pair, block, error = %e, "historical pool read failed");
+                None
+            }
+        }
+    }
+
     /// Refresh every cached pool's reserves for `block` in one batch.
     pub async fn refresh_all(&self, block: u64) {
         let pairs: Vec<(Address, Venue, u32)> = self
@@ -219,6 +263,20 @@ impl PoolCache {
                 }
             }
         }
+    }
+}
+
+/// JSON-RPC block tag for reading state at `block` when the chain head is at
+/// `head`.
+///
+/// Anything at or ahead of the head reads `"latest"`; anything behind it is
+/// pinned to an explicit height. Getting this backwards is how a replay ends
+/// up silently priced against the present.
+pub fn block_tag_for(block: u64, head: u64) -> String {
+    if block >= head {
+        "latest".to_string()
+    } else {
+        format!("0x{block:x}")
     }
 }
 
@@ -510,6 +568,7 @@ mod tests {
             input: data,
             raw: None,
             source: TxSource::PublicMempool,
+            mined_at: None,
             seen_at_ms: now_ms(),
         }
     }
@@ -665,6 +724,15 @@ mod tests {
             decode_pair_created(&v3).is_none(),
             "a PoolCreated log comes from the V3 factory, which maps to no V2 venue"
         );
+    }
+
+    #[test]
+    fn block_tag_is_latest_only_at_or_ahead_of_the_head() {
+        assert_eq!(block_tag_for(1_000, 1_000), "latest");
+        assert_eq!(block_tag_for(1_001, 1_000), "latest");
+        // Historical reads must be pinned, and pinned in hex.
+        assert_eq!(block_tag_for(999, 1_000), "0x3e7");
+        assert_eq!(block_tag_for(0, 1_000), "0x0");
     }
 
     #[test]

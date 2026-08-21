@@ -266,6 +266,39 @@ impl Engine {
                 None
             }
         };
+        // Second fork, dedicated to replaying delivered blocks. Only worth its
+        // memory when there is a backfill to score, and only correct as a
+        // separate instance: it pins to historical parents while the live fork
+        // tracks the head.
+        let replay_fork = if cfg.relay_tx_ingest && cfg.sim.replay_fork {
+            match crate::sim::anvil::AnvilSim::spawn_on(
+                cfg.clone(),
+                head.number,
+                cfg.sim.anvil_replay_port,
+            )
+            .await
+            {
+                Ok(f) => {
+                    tracing::info!(
+                        target: "engine",
+                        port = cfg.sim.anvil_replay_port,
+                        "replay fork ready — delivered blocks scored at their parent state"
+                    );
+                    Some(Arc::new(f))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "engine",
+                        error = %e,
+                        "replay fork unavailable — delivered-block scoring will be skipped rather than mis-scored against head state"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let relay = if cfg.sim.use_call_bundle {
             crate::sim::relay::RelaySim::new(&cfg, signer.clone()).ok()
         } else {
@@ -278,7 +311,7 @@ impl Engine {
             .or(cfg.endpoints.executor)
             .unwrap_or(crate::sim::anvil::SIM_EXECUTOR);
 
-        let sim = Arc::new(Simulator::new(cfg.clone(), fork, relay, signer));
+        let sim = Arc::new(Simulator::new(cfg.clone(), fork, replay_fork, relay, signer));
         let ctx = Arc::new(StrategyCtx::new(cfg.clone(), http.clone(), executor, head));
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
@@ -459,7 +492,13 @@ impl Engine {
                     .record_invocation(FunnelLane::Live, kind, opps.len());
                 for opp in opps {
                     this.clone()
-                        .consider(FunnelLane::Live, opp, Vec::new(), None)
+                        .consider(
+                            FunnelLane::Live,
+                            opp,
+                            Vec::new(),
+                            None,
+                            head.base_fee_per_gas,
+                        )
                         .await;
                 }
             });
@@ -541,6 +580,7 @@ impl Engine {
             None => ingest::fetch_raw_tx(&self.http, tx.hash).await,
         };
         let victims = raw.map(|r| vec![r]).unwrap_or_default();
+        let base_fee = tx.base_fee(&self.ctx.head());
         for opp in opps {
             self.clone()
                 .consider(
@@ -548,6 +588,7 @@ impl Engine {
                     opp,
                     victims.clone(),
                     tx.from.map(|from| (from, tx.nonce)),
+                    base_fee,
                 )
                 .await;
         }
@@ -560,10 +601,13 @@ impl Engine {
         opp: Opportunity,
         victims_raw: Vec<Vec<u8>>,
         victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
+        base_fee: U256,
     ) {
-        let head = self.ctx.head();
         let kind = opp.strategy;
-        if let Err(reject) = self.risk.check(&opp, head.base_fee_per_gas) {
+        // `base_fee` is the head's for live flow and the victim's own block's
+        // for a replay. Gating a historical bundle on today's gas price, in
+        // either direction, invents a result.
+        if let Err(reject) = self.risk.check(&opp, base_fee) {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
@@ -589,8 +633,9 @@ impl Engine {
                 &opp,
                 &victims_raw,
                 victim_sender_nonce,
-                head.base_fee_per_gas,
+                base_fee,
                 0,
+                lane == FunnelLane::Replay,
             )
             .await;
         self.risk.end(opp.strategy);
@@ -681,6 +726,7 @@ fn hint_to_pending(raw: &serde_json::Value, hash: alloy_primitives::B256, to: Op
         input: calldata,
         raw: None,
         source: TxSource::MevShare,
+        mined_at: None,
         seen_at_ms: now_ms(),
     })
 }

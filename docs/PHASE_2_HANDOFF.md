@@ -92,7 +92,8 @@ reviewers check the code against — and each now opens with what exists.
 | Arb wiring | `strategies/arb.rs` | `on_block` now runs the cycle search; `build_cycle_opportunity` builds N-leg call sequences; back-run path untouched; 2 equivalence tests |
 | Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle in the dashboard; 3 new tests (§1.7) |
 | Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore bounds the delivered-block fan-out (§1.7) |
-| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16) |
+| Parent-block replay | `types.rs`, `ingest.rs`, `strategies/*`, `engine.rs`, `sim/*` | `MinedAt` tagging, `state_block`/`target_block`/`base_fee` routing, uncached historical pool reads, dedicated replay fork (§1.8) |
+| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
 
 Two deliberate defaults: **V3 discovery is off** (nothing consumes the V3 cache
 until W5) and **`ARB_MAX_CYCLE_LEN` is 2**, which makes the new search
@@ -124,7 +125,7 @@ implementing:
 | Frontend | **Fully verified.** `npx tsc --noEmit` clean, `npm run build` succeeds, dev server renders the reworked panel |
 | Rust | **Parsed, not compiled.** Every `.rs` file parses clean under a tree-sitter Rust grammar (syntax only — no type checking, no borrow checking, no trait resolution) |
 | Event topics | **Computed, not guessed.** `PoolCreated` topic0 was derived with keccak256 and the same method reproduces the repo's existing `PairCreated` constant exactly |
-| Rust tests | **Written, never executed** — 33 new tests across `engine.rs`, `strategies/mod.rs`, `discovery.rs`, `dex/graph.rs`, `arb.rs` |
+| Rust tests | **Written, never executed** — 38 new tests across `engine.rs`, `types.rs`, `strategies/mod.rs`, `discovery.rs`, `dex/graph.rs`, `arb.rs` |
 
 One real compile error has already been found and fixed this way: the `Config`
 literal in `risk.rs`'s test module needs every new config field, and the first
@@ -175,6 +176,35 @@ flow (unchanged, still returns immediately) and an awaited form for replay —
 and the relay path runs the awaited form behind a `RELAY_TX_CONCURRENCY`
 semaphore (default 16). Every transaction is still scored; they just no longer
 arrive all at once.
+
+## 1.8 Parent-block replay routing
+
+The delivered-block backfill scored already-mined transactions against the
+**current head**. That is not a rounding error — pool reserves, oracle prices
+and the victim's own nonce have all moved on, which is why
+`docs/BLOXROUTE_RELAY.md` originally listed nonce failures as a known
+limitation. Every stage now routes to the transaction's own block:
+
+1. **Tagging.** `MinedAt { block_number, base_fee_per_gas }` is stamped onto
+   each delivered transaction from the block response that already carries it.
+   `PendingTx::{state_block, target_block, base_fee}` derive the rest, and live
+   flow is unchanged (`mined_at: None` → head).
+2. **Historical reads.** `ctx.pool_at()` reads V2 pools at `B - 1` **without
+   caching them** — the shared cache is head-shaped and `graph::search` prices
+   all of it at once, so one historical entry would corrupt the live arb
+   search. V3 state reads pin `eth_call` with `ctx.block_tag()`.
+3. **Target routing.** `opp.target_block = B` reaches `consider` (risk-gated
+   and costed at `B`'s base fee, not today's) and `Simulator::run`, which forks
+   at `B - 1` and pins the relay cross-check to the same parent.
+4. **Fork isolation.** Replay gets its own anvil on `ANVIL_REPLAY_PORT`,
+   pinned with `ensure_fork_exact` (resets either direction). The live fork
+   keeps its forward-only `ensure_fork_at`. Sharing one instance would
+   `anvil_reset` in both directions on every alternating simulation, with the
+   mempool path blocked behind the same mutex.
+
+With `REPLAY_FORK=false` or anvil missing, delivered-block opportunities are
+recorded and skipped with a stated reason rather than mis-scored against head
+state.
 
 ## 2. Workstream summary
 

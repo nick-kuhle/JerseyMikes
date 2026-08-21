@@ -41,9 +41,18 @@ pub struct AnvilSim {
 }
 
 impl AnvilSim {
-    /// Start a local anvil forked at `block`.
+    /// Start a local anvil forked at `block` on the configured primary port.
     pub async fn spawn(cfg: Arc<Config>, block: u64) -> Result<Self> {
         let port = cfg.sim.anvil_port;
+        Self::spawn_on(cfg, block, port).await
+    }
+
+    /// Start a local anvil forked at `block` on an explicit port.
+    ///
+    /// A second instance on a second port is what keeps replay work off the
+    /// live fork: the two pin to different heights and would otherwise reset
+    /// each other on every alternating simulation.
+    pub async fn spawn_on(cfg: Arc<Config>, block: u64, port: u16) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(&cfg.sim.anvil_bin);
         cmd.arg("--fork-url")
             .arg(&cfg.endpoints.http_url)
@@ -150,6 +159,36 @@ impl AnvilSim {
     }
 
     /// Re-fork at `block` if we have drifted.
+    /// Pin the fork to exactly `block`, resetting in **either** direction.
+    ///
+    /// [`ensure_fork_at`] only ever moves forward, which is right for the live
+    /// fork — it should track the head and never rewind. Replay needs the
+    /// opposite: it must land on the parent of a specific historical block,
+    /// which is almost always behind the head. Calling this on the live fork
+    /// would rewind it under the mempool path, so it belongs to the dedicated
+    /// replay instance.
+    pub async fn ensure_fork_exact(&self, block: u64) -> Result<()> {
+        let mut at = self.forked_at.lock().await;
+        if *at == block {
+            return Ok(());
+        }
+        self.rpc
+            .call_raw(
+                "anvil_reset",
+                json!([{"forking": {"jsonRpcUrl": self.cfg.endpoints.http_url, "blockNumber": block}}]),
+            )
+            .await
+            .context("anvil_reset (replay)")?;
+        *at = block;
+        drop(at);
+        self.prepare_state().await
+    }
+
+    /// The block this fork is currently pinned to.
+    pub async fn forked_at(&self) -> u64 {
+        *self.forked_at.lock().await
+    }
+
     pub async fn ensure_fork_at(&self, block: u64) -> Result<()> {
         let mut at = self.forked_at.lock().await;
         if block <= *at || block - *at < self.cfg.sim.refork_every_blocks {

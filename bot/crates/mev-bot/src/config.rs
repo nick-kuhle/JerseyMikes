@@ -147,6 +147,14 @@ pub struct SimConfig {
     pub anvil_bin: String,
     /// Port anvil listens on.
     pub anvil_port: u16,
+    /// Port for the second anvil used to replay delivered blocks. Must differ
+    /// from `anvil_port`: the two forks pin to different heights on purpose.
+    pub anvil_replay_port: u16,
+    /// Whether to spawn that second fork at all. Without it, delivered-block
+    /// opportunities are recorded but not simulated — which is the honest
+    /// outcome, since scoring them on the live fork would measure them against
+    /// a state they never executed in.
+    pub replay_fork: bool,
     /// Re-fork the simulator every N blocks.
     pub refork_every_blocks: u64,
     /// Also cross-check with the relay's `eth_callBundle`.
@@ -278,6 +286,19 @@ impl Config {
             sim: SimConfig {
                 anvil_bin: env_or("ANVIL_BIN", "anvil"),
                 anvil_port: env_u64("ANVIL_PORT", 8548) as u16,
+                anvil_replay_port: {
+                    // Two anvils cannot share a port. A misconfigured pair
+                    // would fail at spawn time with a confusing bind error, so
+                    // nudge it here instead.
+                    let live = env_u64("ANVIL_PORT", 8548) as u16;
+                    let replay = env_u64("ANVIL_REPLAY_PORT", 8549) as u16;
+                    if replay == live {
+                        live.saturating_add(1)
+                    } else {
+                        replay
+                    }
+                },
+                replay_fork: env_bool("REPLAY_FORK", true),
                 refork_every_blocks: env_u64("REFORK_EVERY_BLOCKS", 1),
                 use_call_bundle: env_bool("USE_CALL_BUNDLE", true),
                 target_block_offset: env_u64("TARGET_BLOCK_OFFSET", 1),

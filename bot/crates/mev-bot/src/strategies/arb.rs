@@ -78,11 +78,14 @@ impl StrategyImpl for AtomicArbStrategy {
             return Vec::new();
         }
         let head = ctx.head();
+        // Back-running a mined transaction means back-running the state its own
+        // block started from, not the state a hundred blocks later.
+        let state_block = tx.state_block(&head);
 
         let Some(victim_pair) = ctx.pools.pair_for(intent.token_in, intent.token_out, Venue::UniV2).await else {
             return Vec::new();
         };
-        let Some(victim_pool) = ctx.pools.load(victim_pair, Venue::UniV2, head.number).await else {
+        let Some(victim_pool) = ctx.pool_at(victim_pair, Venue::UniV2, state_block).await else {
             return Vec::new();
         };
         let Some((after, _)) = victim_pool.with_swap(intent.token_in, intent.amount_in) else {
@@ -96,13 +99,21 @@ impl StrategyImpl for AtomicArbStrategy {
         else {
             return Vec::new();
         };
-        let Some(other) = ctx.pools.load(other_pair, Venue::SushiV2, head.number).await else {
+        let Some(other) = ctx.pool_at(other_pair, Venue::SushiV2, state_block).await else {
             return Vec::new();
         };
 
+        // `try_cycle` costs gas and stamps the target block from this head; for a
+        // replay that must be the victim's own block, at its own base fee.
+        let mut ctx_head = head.clone();
+        ctx_head.number = tx
+            .target_block(&head, ctx.cfg.sim.target_block_offset)
+            .saturating_sub(ctx.cfg.sim.target_block_offset);
+        ctx_head.base_fee_per_gas = tx.base_fee(&head);
+
         let mut opps = Vec::new();
         for (a, b) in [(&after, &other), (&other, &after)] {
-            if let Some(mut opp) = try_cycle(ctx, a, b, weth, &head) {
+            if let Some(mut opp) = try_cycle(ctx, a, b, weth, &ctx_head) {
                 opp.victim_hashes = vec![tx.hash];
                 // Back-run only: nothing goes in front of the victim.
                 opp.back_calls = std::mem::take(&mut opp.front_calls);

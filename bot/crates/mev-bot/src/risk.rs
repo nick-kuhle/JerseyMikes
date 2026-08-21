@@ -200,6 +200,8 @@ mod tests {
             sim: crate::config::SimConfig {
                 anvil_bin: "anvil".into(),
                 anvil_port: 8548,
+                anvil_replay_port: 8549,
+                replay_fork: false,
                 refork_every_blocks: 1,
                 use_call_bundle: false,
                 target_block_offset: 1,

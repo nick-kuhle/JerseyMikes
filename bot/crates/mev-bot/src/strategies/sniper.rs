@@ -185,7 +185,9 @@ impl StrategyImpl for SniperStrategy {
         let Some(pair) = ctx.pools.pair_for(weth, token, Venue::UniV2).await else {
             return Vec::new();
         };
-        let Some(pool) = ctx.pools.load(pair, Venue::UniV2, head.number).await else {
+        // A replayed go-live transaction is scored against the pool as it stood
+        // at the start of its own block, not as it stands now.
+        let Some(pool) = ctx.pool_at(pair, Venue::UniV2, tx.state_block(&head)).await else {
             return Vec::new();
         };
         let Some((weth_reserve, _)) = pool.reserves_for(weth) else {
@@ -212,7 +214,7 @@ impl StrategyImpl for SniperStrategy {
             profit_token: weth,
             expected_profit_wei: U256::ZERO,
             notional_wei: size,
-            target_block: ctx.target_block(),
+            target_block: tx.target_block(&head, ctx.cfg.sim.target_block_offset),
             created_at_ms: now_ms(),
             notes: format!("go-live {sel_hex} on {target:?}; snipe probe for token {token:?} via pair {pair:?}"),
         }]
