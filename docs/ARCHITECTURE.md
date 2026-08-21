@@ -75,8 +75,8 @@ the victim replay was not faithful.
 | `bot/crates/mev-bot/src/competition.rs` | Inclusion probability from our bribe vs realised builder payment |
 | `bot/crates/mev-bot/src/latency.rs` | Per-stage histograms; 150 ms mempool→bundle budget |
 | `bot/crates/mev-bot/src/inventory.rs` | Searcher nonce + ETH/WETH balances |
-| `bot/crates/mev-bot/src/api.rs` | REST + SSE for the dashboard |
-| `frontend/` | Next.js console |
+| `bot/crates/mev-bot/src/api.rs` | REST + SSE for the dashboard; `GET/POST /api/mode` is the runtime simulation ⇄ live switch (see `docs/RISK.md`) |
+| `frontend/` | Next.js console (`/api/bot/*` proxies the bot; `/api/eth` is a server-side read-only RPC proxy for contract reads) |
 
 ## The execution path, end to end
 

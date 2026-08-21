@@ -1,5 +1,29 @@
 # Local build & sandbox notes
 
+## Session 2026-08-21 (console + mode-switch pass)
+
+An automation session added the operator surface for Phase 3 and the W6 gate
+measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
+
+- **Frontend: fully verified in the sandbox.** `npx tsc --noEmit` clean,
+  `npm run build` succeeds, and the dev server was exercised end-to-end in
+  demo mode: `GET/POST /api/bot/mode` (flip to live and back, invalid-body
+  rejection), the `/api/eth` read-only RPC proxy (live `eth_chainId` /
+  `eth_getBalance` through it; `eth_sendTransaction` / `personal_sign`
+  refused by the allowlist), and demo rows carrying `victims` for the
+  explorer links.
+- **Rust: edited in the sandbox, compiled only by CI.** The sandbox has no
+  Rust toolchain (unchanged from every earlier session). The changes are
+  small and surgical — `LiveMode` in `engine.rs` (+2 unit tests), the
+  `GET/POST /api/mode` handlers and `mode`/`liveArmed` fields in `api.rs`,
+  and one extra `COALESCE(o.victims, '')` column on the existing LEFT JOIN
+  in `store.rs::recent_simulations` — but treat the PR's CI run
+  (`cargo clippy`, `cargo test`) as their first real compile, exactly as
+  W0's process prescribes.
+- The mode API cannot arm a process: `LiveMode::set_live(true)` on an
+  unarmed bot returns the restart instructions (surfaced as `409`), pinned
+  by `live_mode_can_never_arm_an_unarmed_process`. See `docs/RISK.md`.
+
 ## What CI verifies
 
 CI is enabled and lives at

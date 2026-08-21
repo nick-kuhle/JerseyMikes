@@ -159,11 +159,29 @@ cargo run --release --bin mev-bot    # run
 - Live tape: mempool transactions, MEV-Share hints, blocks, opportunities,
   simulations, bundles, relay payloads — filterable
 - Relay payload-delivered table: what MEV actually sold for, block by block
-- `MevExecutor` control panel: read `owner`/`searchers`/balance with a plain
-  RPC, and `setSearcher`/`sweep` with an injected wallet (viem)
+- `MevExecutor` control panel: read `owner`/`searchers`/balance through the
+  dashboard's own read-only RPC proxy (`/api/eth`), and write `setSearcher`/
+  `sweep` with a connected wallet (viem) — transaction receipts followed live
+- **Wallet**: EIP-6963 multi-wallet discovery (pick between installed
+  wallets), eager reconnect, account/chain/balance state, and a one-click
+  switch to the bot's chain when the wallet sits elsewhere
+- **Execution-mode switch**: the SIMULATION ONLY / LIVE EXECUTION badge is a
+  real switch backed by `GET/POST /api/mode`. It can only *narrow* what the
+  environment allowed — a bot not started with `LIVE_EXECUTION=true` **and**
+  `I_UNDERSTAND_LIVE_RISK=yes` refuses the switch with the arming steps
+  (see [`docs/RISK.md`](docs/RISK.md)); an armed bot can pause/resume live
+  mode without a restart
+- **Block-explorer links** on every transaction, block and address the console
+  renders — victim txs in the simulation history, opportunities, the live
+  tape, delivered-block transactions, and the executor's addresses
+- **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
+  (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
+  7-day sample gate) that decides whether UniversalRouter decoding gets
+  flipped — see [`docs/W6_MEMO.md`](docs/W6_MEMO.md)
 
 The browser only ever talks to `/api/bot/*`, which the Next server proxies to
-`BOT_API_URL`.
+`BOT_API_URL`; contract reads go through `/api/eth`, a server-side
+read-only RPC proxy (uses the bot's `ETH_HTTP_URL` when set).
 
 ---
 
@@ -188,14 +206,18 @@ to measure what is reachable, not to be profitable. See
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased plan through going live and chains 2–5 |
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
+| [`docs/W6_MEMO.md`](docs/W6_MEMO.md) | The public-mempool gap memo that gates UniversalRouter decoding — template + decision record |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
 
 ## Status
 
 Phase 2 of [the roadmap](docs/ROADMAP.md) is in measurement: W0–W5 are on
 (`ARB_MAX_CYCLE_LEN=3`, V3 sandwich + V3 discovery paired). UniversalRouter
-decoding stays off until a public-mempool gap is written down. The pipeline
-is still simulation-only. Going live is Phase 3 and is a separate decision.
+decoding stays off until a public-mempool gap is written down (the funnel
+panel now measures that gap and [`docs/W6_MEMO.md`](docs/W6_MEMO.md) records
+the decision). The pipeline is still simulation-only: the dashboard's mode
+switch is layered strictly on top of the boot-time two-key arming and can
+never arm an unarmed bot. Going live is Phase 3 and is a separate decision.
 
 ⚠️ Sandwich attacks extract value from other users. This repository is a
 research tool; deploying it against live users is your decision and your

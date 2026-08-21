@@ -14,6 +14,34 @@
    process bound to `127.0.0.1`; every simulation RPC goes there, not to
    mainnet.
 
+## The two layers of the execution mode (boot arming vs runtime switch)
+
+The mode the dashboard's simulation ⇄ live switch moves has **two** inputs,
+deliberately split so the runtime switch can only ever *narrow* what the
+operator's environment allowed:
+
+| Layer | Where it is decided | Who can change it | When |
+| --- | --- | --- | --- |
+| **Arming** — `LiveMode::armed()` | `LIVE_EXECUTION=true` **and** `I_UNDERSTAND_LIVE_RISK=yes`, read once by `Config::from_env` | the operator, by editing the bot's env and **restarting** | process start |
+| **Runtime switch** — `LiveMode::live() == armed && runtime` | `POST /api/mode {"live": bool}` (the dashboard switch) or `GET /api/mode` to read | anyone with API access, **but only within what arming allows** | any time |
+
+Consequences, all enforced in code (`engine.rs::LiveMode`, unit-tested):
+
+- A process started unarmed **cannot** be switched live through the API —
+  `set_live(true)` returns an error with the restart instructions, and the API
+  surfaces it as `409 Conflict`. There is no runtime path that grants arming.
+- A process started armed boots **live** (the environment already expressed
+  intent); the runtime switch exists to pause back to simulation and resume
+  without a restart.
+- When arming is false (the default, and the only state Phase 2 allows), the
+  runtime switch is a no-op on the engine: nothing is ever marked submitted,
+  exactly as before this endpoint existed.
+
+Note that even an armed + live process in this build only *marks* profitable
+bundles as submitted — the actual `eth_sendBundle` transport is Phase 3 of the
+roadmap (`ROADMAP.md`) and does not exist in this tree. The switch is the
+control surface Phase 3 will drive; it changes what the engine records today.
+
 ## Why a failed opportunity costs nothing
 
 `MevExecutor` measures the balance of the profit token before and after the
