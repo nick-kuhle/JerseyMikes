@@ -192,13 +192,10 @@ to measure what is reachable, not to be profitable. See
 
 ## Status
 
-Phase 1 of [the roadmap](docs/ROADMAP.md): the pipeline is simulation-only
-**and** the numbers it produces can be checked. Historical simulations are
-replayed against relay bid traces (`mev-bot replay`), each bundle is ranked
-against the block's realised builder payment, per-stage latency histograms
-watch the 150 ms mempool→bundle budget, the searcher nonce is no longer a
-placeholder, and re-orged blocks are dropped from P/L. Going live is still
-Phase 3.
+Phase 2 of [the roadmap](docs/ROADMAP.md) is in measurement: W0–W5 are on
+(`ARB_MAX_CYCLE_LEN=3`, V3 sandwich + V3 discovery paired). UniversalRouter
+decoding stays off until a public-mempool gap is written down. The pipeline
+is still simulation-only. Going live is Phase 3 and is a separate decision.
 
 ⚠️ Sandwich attacks extract value from other users. This repository is a
 research tool; deploying it against live users is your decision and your

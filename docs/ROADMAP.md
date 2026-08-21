@@ -60,9 +60,9 @@ out in the handoff.
 
 Remaining Phase 2 coverage:
 
-- [x] W5 implementation: V3 sandwich sizing via QuoterV2, shipped behind
-      `STRATEGY_SANDWICH_V3=false`. Victim-revert trap, 12-call / 4-candidate
-      budgets, router-routed legs, separate `sandwich_v3` funnel row.
+- [x] W5 implementation: V3 sandwich sizing via QuoterV2. Victim-revert
+      trap, 12-call / 4-candidate budgets, router-routed legs, separate
+      `sandwich_v3` funnel row.
 - [x] W6 implementation: UniversalRouter `execute` decoder
       (`V2_SWAP_EXACT_IN` / `V3_SWAP_EXACT_IN`) behind
       `DECODE_UNIVERSAL_ROUTER=false`. 1inch v6, 0x v2, and CoW Swap
@@ -70,8 +70,11 @@ Remaining Phase 2 coverage:
 - [x] Raise W4 to 3 legs after the funnel week (`ARB_MAX_CYCLE_LEN=3`).
       Leave at 3 until live `atomic_arb.candidatesEmitted` on the same feed
       is compared against the 2-leg baseline; only then consider 4–5.
-- [ ] Turn W5 on after the funnel week (requires `POOL_DISCOVERY_V3=true`)
-      and report the live `sandwich_v3` candidate-volume delta.
+- [x] Turn W5 on after the funnel week (`STRATEGY_SANDWICH_V3=true` with
+      `POOL_DISCOVERY_V3=true`). Watch live `sandwich_v3.candidatesEmitted`
+      / `submittable` and `/api/latency` stage `strategy` p95. Revert the
+      pair if the pending-path p95 blows the 150 ms budget or the provider
+      rate-limits.
 - [ ] Turn W6 on only if the funnel shows a public-mempool gap, and report
       what it did after a week. If the answer is "nothing", 1inch/0x stay
       closed.
@@ -81,27 +84,15 @@ Remaining Phase 2 coverage:
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
       (out of scope for this phase)
 
-**Status note (2026-08-21):** No new Phase 2 strategy box is ticked in this
-session — W5/W6 remain gated on funnel data and raising W4 to 3–5 legs waits
-for the same baseline. However, **W0's remote CI is now enabled**: the
-maintainer granted GitHub `workflows` permission, the workflow was moved into
-`.github/workflows/ci.yml`, and GitHub Actions is running on every push and PR.
-CI passes `contracts (foundry)` and `frontend (next.js)`. It surfaced a real
-bug the artifact-drift job — `compile-check.js` embedded solc's IPFS metadata
-hash (which includes absolute source paths) into `MevExecutor.runtime.hex`, so
-the artifact only reproduced in the sandbox where it was generated. Fixed by
-disabling that hash (`bytecode_hash = "none"`, matching `foundry.toml`) and
-regenerating the artifact; a fresh checkout now reproduces it byte-for-byte.
-The `bot (rust)` job's `cargo test --all` failure (exit 101) is also fixed:
-it was a deterministic wrong assertion in
-`competition::tests::half_the_bid_is_unlikely` (expected `p ∈ (0.05, 0.20)`
-but the shipped `LOGISTIC_K = 2.2` gives `p = σ(-1.1) ≈ 0.2497` at half the
-winning bid), corrected against the model, plus a hardening of the dense-graph
-budget test's wall-clock ceiling against slow shared runners. **All four CI
-jobs are green** (`cargo test --all` 117/117, Rust 1.98.0). The one step left
-for W0 is administrative: a maintainer with admin access must mark the
-workflow **required** on PRs to `main`. Details in
-[`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
+**Status note (2026-08-21):** Funnel-week gates for W4 and W5 are flipped.
+`ARB_MAX_CYCLE_LEN` defaults to 3; `STRATEGY_SANDWICH_V3` and
+`POOL_DISCOVERY_V3` default on as a pair. W6 (`DECODE_UNIVERSAL_ROUTER`)
+stays off until a written public-mempool gap memo exists — if
+`pendingSeen` is thin the flow is already in Flashbots Protect /
+MEV-Blocker / CoW / UniswapX and a public decoder will not help. W0 is
+required on PRs to `main`. Phase 2 is **not** closed: W6 is still open,
+W4 is not raised past 3, and the handoff stays until those reports exist.
+Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 
 ## Phase 3 — going live (opt-in, separate PR)
 

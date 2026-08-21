@@ -40,10 +40,11 @@ funnel can tell the two surfaces apart.
 SwapRouter02 (`0x04e45aaf`) in the mempool, WETH on the input side, whose
 `(token, fee)` pool is already in the V3 cache.
 
-**Toggle.** `STRATEGY_SANDWICH_V3` (default **off**). The strategy is not
-constructed when the toggle is off, so it adds zero RPC to the pending path.
-It also no-ops if `POOL_DISCOVERY_V3` is off: the cache is empty, the
-pre-filter returns before any quote.
+**Toggle.** `STRATEGY_SANDWICH_V3` (default **on**, paired with
+`POOL_DISCOVERY_V3`). The strategy is not constructed when the toggle is
+off, so it adds zero RPC to the pending path. It also no-ops if
+`POOL_DISCOVERY_V3` is off: the cache is empty, the pre-filter returns
+before any quote, and the engine logs a warning at boot.
 
 **Sizing.** QuoterV2, not hand-rolled Q64.96. A coarse grid of four front-run
 sizes, then a one-step refine, each size costing two `eth_call`s

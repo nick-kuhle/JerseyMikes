@@ -434,15 +434,14 @@ For the team taking this over, the practical order is:
    strategy that has the most simulation signal on a typical
    mainnet day.
 
-4. **Add the V3 sandwich trigger.** Implemented behind
-   `STRATEGY_SANDWICH_V3` (default off) in
-   `strategies/sandwich_v3.rs`. The approach (QuoterV2 for
-   sizing, not hand-rolled Q64.96 math) and the RPC budget
-   (≤ 12 `eth_call`s per candidate, ≤ 4 candidates per pending
-   tx) are durable rules: do not replace the quoter with a
-   TickMath port, and do not raise those caps to chase volume.
-   Flip the toggle only after a week of funnel baseline, and
-   only together with `POOL_DISCOVERY_V3`.
+4. **Add the V3 sandwich trigger.** Implemented in
+   `strategies/sandwich_v3.rs` and on by default after the
+   funnel week, paired with `POOL_DISCOVERY_V3`. The approach
+   (QuoterV2 for sizing, not hand-rolled Q64.96 math) and the
+   RPC budget (≤ 12 `eth_call`s per candidate, ≤ 4 candidates
+   per pending tx) are durable rules: do not replace the quoter
+   with a TickMath port, and do not raise those caps to chase
+   volume.
 
 5. **Replay validation.** Shipped in Phase 1 (`mev-bot replay`,
    `/api/competition`). The true-positive rate — simulations that
