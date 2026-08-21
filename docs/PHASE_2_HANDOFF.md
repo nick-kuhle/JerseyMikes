@@ -20,6 +20,15 @@ Profit relay delivered-block ingestion. That integration routes already-mined
 transactions through the strategy funnel, which interacts directly with W1 —
 see §1.7.
 
+**Continuation status (2026-08-21):** The maintainer reports that
+`make bot-check`, `make bot-test`, and `make contracts` pass locally. The
+frontend type/build checks and the solc artifact check also pass in the
+authoring sandbox. The continuation fixes in commit `4d5ac8c` make the sniper's
+factory scan retry-safe, add the V3 pool creation block to `V3Pool`, and make
+both event decoders validate topic0. These results update verification status;
+they do not waive the one-week funnel gates for W4/W5 or the evidence gate for
+W6. Remote Actions still needs a maintainer with GitHub `workflows` permission.
+
 ---
 
 ## 0. The three rules for this phase
@@ -61,8 +70,9 @@ against; §1.5 covers what has since landed.
 | Multi-leg arb (3–5 legs) | **Not started** | `strategies/arb.rs:48-62` is still the O(n²) pair-pair loop |
 | V3 sandwich sizing | **Not started** | `strategies/sandwich.rs` is V2-only; `dex::quote_v3` exists and is unused by it |
 | Aggregator decoding | **Not started** | `strategies::decode_swap` handles V2 routers; `jit::decode_v3_swap` handles `ISwapRouter02` |
-| Rust build/test verification | **Never run** | no Rust toolchain in the authoring environment; 51 `#[test]`/`#[tokio::test]` blocks exist but have not been executed |
-| CI | **Written, not enabled** | `ci/github-actions-ci.yml` is parked outside `.github/workflows/` |
+| Rust build/test verification | **Locally verified by the maintainer** | `make bot-check` and `make bot-test` pass; the authoring sandbox still cannot independently run Rust |
+| Contracts build/test | **Locally verified by the maintainer** | `make contracts` passes; `node contracts/script/compile-check.js` also passes in the sandbox |
+| CI | **Written, not remotely enabled** | `ci/github-actions-ci.yml` remains parked outside `.github/workflows/`; the GitHub App push is still rejected without `workflows` permission |
 
 Two corrections to the source documents worth calling out, because they change
 the plan:
@@ -70,9 +80,10 @@ the plan:
 - The design doc presented the funnel counter and pool discovery as work to be
   done. Both are already merged. The review caught this; the work that remains
   on them is *correctness*, not construction (W1, W2).
-- **The Rust in this repo has never been compiled or tested by CI.** Neither
-  source document stated this plainly. W0 exists because of it and blocks
-  everything else.
+- **Rust and Foundry are now locally verified, but not by remote CI.** The
+  maintainer reports green `make bot-check`, `make bot-test`, and
+  `make contracts` runs. W0 remains open until the workflow is enabled and the
+  checks run as required PR checks.
 
 ---
 
@@ -118,27 +129,39 @@ implementing:
   scan now re-covers a 12-block overlap; duplicate logs are idempotent, missing
   ones are not.
 
+### Continuation fixes after the local build pass
+
+Two follow-up correctness fixes are now part of the W2/W3 implementation:
+
+- **The sniper had the same failed-scan cursor bug.** `sniper.rs` now uses the
+  fallible shared scan, the same bounded/reorg-overlapping window as discovery,
+  and advances its cursor only after `eth_getLogs` succeeds. A pool is marked
+  seen only after its metadata read succeeds, so a transient pool RPC failure
+  remains retryable.
+- **V3 metadata and event boundaries are explicit.** `V3Pool` now records the
+  creation block, `PoolCreated` decoding reads `blockNumber`, and both
+  `PairCreated` and `PoolCreated` decoders reject the other event's topic0.
+
 ## 1.6 Verification status — read this before reviewing
 
 | Component | Verified how |
 | --- | --- |
-| Frontend | **Fully verified.** `npx tsc --noEmit` clean, `npm run build` succeeds, dev server renders the reworked panel |
-| Rust | **Parsed, not compiled.** Every `.rs` file parses clean under a tree-sitter Rust grammar (syntax only — no type checking, no borrow checking, no trait resolution) |
+| Frontend | **Fully verified.** `npx tsc --noEmit` clean and `npm run build` succeeds |
+| Rust | **Locally verified by the maintainer.** `make bot-check` and `make bot-test` pass; the authoring sandbox has no Rust toolchain |
+| Contracts | **Locally verified by the maintainer.** `make contracts` passes; the sandbox's solc-only artifact check also passes |
 | Event topics | **Computed, not guessed.** `PoolCreated` topic0 was derived with keccak256 and the same method reproduces the repo's existing `PairCreated` constant exactly |
-| Rust tests | **Written, never executed** — 38 new tests across `engine.rs`, `types.rs`, `strategies/mod.rs`, `discovery.rs`, `dex/graph.rs`, `arb.rs` |
+| Rust tests | **Executed by the maintainer.** `make bot-test` passes; the test runner, rather than the historical count in this document, is the source of truth for the exact number of tests |
+| Remote CI | **Not enabled yet.** The workflow is prepared at `ci/github-actions-ci.yml`, but pushing it into `.github/workflows/` is still blocked by GitHub `workflows` permission |
 
-One real compile error has already been found and fixed this way: the `Config`
-literal in `risk.rs`'s test module needs every new config field, and the first
-pass missed `pool_discovery_v3` / `arb_max_cycle_len`. Syntax checking cannot
-see that class of error — merging against `main`, which touched the same
-literal, is what surfaced it. Assume there are more.
+The authoring sandbox still cannot reach the Rust distribution hosts and has no
+`cargo`, `forge`, or `anvil` binaries, so it cannot independently reproduce the
+maintainer's Rust and Forge runs. The local checks are a meaningful verification
+of W1–W4, but they are not a substitute for required PR checks. **Do not mark
+W0 complete until the workflow is enabled and green on the working branch.**
 
-The sandbox this was written in cannot reach `crates.io` or
-`static.rust-lang.org`, so there is no toolchain and no way to run `cargo`.
-Expect the first CI run after W0 to surface mechanical errors — an import, a
-trait bound, a lifetime. The logic and tests are written to be read; the
-compiler has not had its turn. **Do not merge W1–W4 on the strength of this
-document — merge it on a green CI run.**
+The W1–W4 logic and tests have now had a compiler and test runner turn through
+them locally. Any future CI failure should be treated as a real regression or
+environment difference, not as an unverified baseline assumption.
 
 ## 1.7 Interaction with the bloXroute delivered-block ingestion
 
@@ -210,11 +233,11 @@ state.
 
 | ID | Workstream | Depends on | Size | Gate to start | Status |
 | --- | --- | --- | --- | --- | --- |
-| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **⛔ blocked — needs a human** (see below) |
-| **W1** | Fix funnel counter semantics + labels | W0 | S | none | **✅ implemented** (frontend verified, Rust uncompiled) |
-| **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented** (Rust uncompiled) |
-| **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented** (Rust uncompiled) |
-| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implemented, shipped disabled** (`ARB_MAX_CYCLE_LEN=2`) |
+| **W0** | Enable CI; get a green `cargo check` / `cargo test` / `forge test` | — | S | none | **🟡 local checks pass; remote CI enablement pending a human** |
+| **W1** | Fix funnel counter semantics + labels | W0 | S | none | **✅ implemented and locally verified** |
+| **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented and locally verified** (including sniper retry fix) |
+| **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented and locally verified** (shipped off) |
+| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation locally verified, shipped at 2 legs** (`ARB_MAX_CYCLE_LEN=2`) |
 | **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | ⬜ not started |
 | **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | ⬜ not started |
 
@@ -222,19 +245,20 @@ Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests a
 
 ### The one thing to do first
 
-**W0 cannot be done by the agent that wrote W1–W4.** Pushing
-`.github/workflows/ci.yml` is rejected — `refusing to allow a GitHub App to
-create or update workflow ... without workflows permission` — which is the same
-constraint that parked the file in `ci/` originally. A human with push rights
-runs one command:
+**The code and local checks for W0 are now complete; remote enablement still
+needs a human.** The maintainer reports green `make bot-check`, `make bot-test`,
+and `make contracts` runs. Pushing `.github/workflows/ci.yml` is still rejected
+with `refusing to allow a GitHub App to create or update workflow ... without
+workflows permission`, which is the same constraint that parked the file in
+`ci/` originally. A human with push rights runs one command:
 
 ```bash
 mkdir -p .github/workflows && git mv ci/github-actions-ci.yml .github/workflows/ci.yml
 git commit -m "ci: enable GitHub Actions" && git push
 ```
 
-Until that lands, **no Rust in this repository has ever been compiled** — not
-the code that was here before, and not W1–W4. See §1.6.
+Until that lands, **remote CI has not verified the repository**, even though
+the maintainer has now run the Rust and Forge checks locally. See §1.6.
 
 This ordering is the review's recommended sequence, made concrete: measure
 first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
@@ -262,15 +286,17 @@ mapping — read the referenced section before starting the ticket:
 
 ## W0 — Make the build verifiable
 
-**Status: blocked on a human.** The workflow file cannot be pushed by an
-automation without the GitHub `workflows` permission; the push is rejected at
-the remote. Everything else in this document waits on it.
+**Status: local checks pass; remote CI enablement is pending a human.** The
+maintainer reports passing `make bot-check`, `make bot-test`, and
+`make contracts`. The workflow file still cannot be pushed by this automation
+without the GitHub `workflows` permission, so the remote required-check gate
+remains open.
 
-**Why first.** No one has ever run `cargo check` on this crate. Every other
-workstream's acceptance criteria is meaningless until a compiler has an opinion.
-Budget for the possibility that the existing code does not compile cleanly on
-first contact. This is the review's recommended next step #1, promoted to a
-blocking ticket.
+**Why first.** Remote CI is still the source of truth for required PR checks,
+clippy, and the exact test environment. The local maintainer run substantially
+reduces the remaining uncertainty, but it does not replace a green workflow.
+Budget for environment-specific failures when the workflow is enabled; fix
+those here rather than deferring them.
 
 **Tasks**
 
@@ -307,12 +333,13 @@ accepted gap (`MAINTAINING.md` §4).
 
 ## W1 — Fix the funnel's semantics
 
-> **Status: implemented.** `engine.rs` (`FunnelCounters`, `record_invocation`,
-> `snapshot`), `api.rs` inherits the new keys via `snapshot()`, and the
-> dashboard is updated and verified. Counters are additionally split by
-> provenance into a live and a replay lane so the bloXroute delivered-block
-> backfill cannot dilute them — see §1.7. Rust is uncompiled; the frontend is
-> not.
+> **Status: implemented and locally verified.** `engine.rs` (`FunnelCounters`,
+> `record_invocation`, `snapshot`), `api.rs` inherits the new keys via
+> `snapshot()`, and the dashboard is updated and verified. Counters are
+> additionally split by provenance into a live and a replay lane so the
+> bloXroute delivered-block backfill cannot dilute them — see §1.7. The
+> maintainer reports passing `make bot-check` and `make bot-test`; remote CI is
+> still pending workflow permission.
 
 **The defect** (raised in the review, located here). `engine.rs:295-303` and
 `engine.rs:329-337` bump `candidates_emitted` / `candidates_skipped` **once per
@@ -375,18 +402,20 @@ and the current counter cannot see volume.
 
 ## W2 — Harden V2 discovery
 
-> **Status: implemented.** `strategies/discovery.rs` rewritten behind a
-> `DiscoverySource` trait with 11 network-free tests; `scan_factory_logs`
-> extracted in `strategies/mod.rs`. Two extra defects fixed beyond this spec —
-> cursor advance on a failed scan, and the unbounded dust-pair retry set. See
-> §1.5.
+> **Status: implemented and locally verified.** `strategies/discovery.rs` is
+> behind a `DiscoverySource` trait with 11 network-free tests;
+> `scan_factory_logs` is extracted in `strategies/mod.rs` and is used by both
+> discovery and the sniper. Beyond the original spec, the implementation fixes
+> failed-scan cursor advancement, unbounded dust retries, reorg overlap, and the
+> sniper's equivalent retry/cursor bug. See §1.5.
 
 `strategies/discovery.rs` is correct on the point that matters most — it only
 inserts into `seen` *after* a successful fetch that passes the filters, so a
 transient `fetch_v2_pool` failure or a rate-limited provider does not
 permanently blacklist a pool. That invariant is load-bearing during provider
 rate limiting and reorg recovery, and it is exactly what the review flagged.
-**Do not "optimise" it by marking seen early.** It currently has no test.
+**Do not "optimise" it by marking seen early.** The retry-after-failure path is
+covered by the network-free discovery tests.
 
 **Tasks**
 
@@ -396,7 +425,8 @@ rate limiting and reorg recovery, and it is exactly what the review flagged.
    - a transient `fetch_v2_pool` failure leaves the pair *unseen*, and the next
      block's scan retries it and succeeds;
    - the log window advances correctly (`last_log_block == 0` → `head - 50`;
-     otherwise `last + 1..=head`; `head <= last` → no-op returning 0);
+     otherwise it advances with the bounded reorg overlap; a rewound or equal
+     head re-scans the overlap instead of advancing a cursor);
    - duplicate `PairCreated` logs for the same pair load the pool once;
    - a non-WETH pair and a sub-`MIN_WETH_RESERVE` (0.5 WETH) pair are both
      rejected and, per the invariant above, are *not* inserted into `seen`.
@@ -429,9 +459,10 @@ rate limiting and reorg recovery, and it is exactly what the review flagged.
 
 ## W3 — V3 pool discovery
 
-> **Status: implemented, shipped off.** `dex::V3Pool`, `strategies::V3PoolCache`,
+> **Status: implemented, locally verified, shipped off.** `dex::V3Pool` (now
+> including its creation block), `strategies::V3PoolCache`, topic-validated
 > `decode_pool_created`, `try_scan_pool_created`, and
-> `PoolDiscovery::discover_v3_with`, behind `POOL_DISCOVERY_V3` (default
+> `PoolDiscovery::discover_v3_with` are behind `POOL_DISCOVERY_V3` (default
 > `false`). Turn it on when W5 needs it.
 
 **Hard constraint: V2 and V3 pools do not share a cache or a type.** `PoolCache`
@@ -462,8 +493,8 @@ available mistake in Phase 2.
 
 **Tests**
 
-- `PoolCreated` topic/data decoding against a captured mainnet log fixture
-  (checked in as JSON — no network).
+- `PoolCreated` topic/data decoding against a captured mainnet-shaped JSON
+  fixture in the test module (no network).
 - A `PairCreated` log fed to the V3 decoder is rejected, and vice versa.
 - V3 pools never appear in `PoolCache::all()`.
 
@@ -479,11 +510,12 @@ available mistake in Phase 2.
 
 ## W4 — Multi-leg V2 atomic arb
 
-> **Status: implemented, shipped at 2 legs.** `dex/graph.rs` plus
-> `arb.rs::build_cycle_opportunity`. `ARB_MAX_CYCLE_LEN` defaults to `2`, which
-> reproduces the previous pair-to-pair behaviour through the new code path —
-> an equivalence test pins that. Raise it to 3–5 only after the funnel week,
-> and record the before/after candidate volume.
+> **Status: implementation locally verified, shipped at 2 legs.** `dex/graph.rs`
+> plus `arb.rs::build_cycle_opportunity` are wired into `on_block` with the
+> documented budgets. `ARB_MAX_CYCLE_LEN` defaults to `2`, which reproduces the
+> previous pair-to-pair behaviour through the new code path — an equivalence
+> test pins that. Raise it to 3–5 only after the funnel week, and record the
+> before/after candidate volume.
 
 **Gate: do not start until the funnel (W1) has a week of data and W2 has grown
 the pool cache.** A 5-leg cycle search over 8 pools is pointless; the same
@@ -699,6 +731,12 @@ Phase 2 is complete when all of these hold:
 7. `docs/STRATEGIES.md`, `docs/ROADMAP.md`, `docs/RISK.md` and `.env.example`
    reflect the shipped state. Every new toggle is documented.
 8. `live_execution` is still false and the two-key switch is untouched.
+
+**Progress at this handoff update:** items W1–W4 have implementation and local
+verification; W0's remote workflow enablement is still pending. W4 remains at
+its compatibility default of two legs until the funnel baseline is read for a
+week. W5 has not started, and W6 remains gated on evidence of a meaningful
+public-mempool gap.
 
 ---
 

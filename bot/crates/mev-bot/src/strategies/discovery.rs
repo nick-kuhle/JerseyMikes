@@ -145,7 +145,7 @@ impl PoolDiscovery {
 
     /// The `[from, to]` range to scan for a head of `head`, given `cursor`
     /// (0 == never scanned). Pure, so the window rules are directly testable.
-    fn window(cursor: u64, head: u64) -> (u64, u64) {
+    pub(crate) fn window(cursor: u64, head: u64) -> (u64, u64) {
         let from = if cursor == 0 {
             head.saturating_sub(FIRST_SCAN_LOOKBACK)
         } else if head <= cursor {
@@ -538,6 +538,7 @@ mod tests {
                 token1: addr(9),
                 fee: 3_000,
                 tick_spacing: 60,
+                block: 1,
             }],
             ..Default::default()
         };
@@ -562,6 +563,7 @@ mod tests {
                     token1: addr(9),
                     fee: 100, // 1bp tier: skipped
                     tick_spacing: 1,
+                    block: 1,
                 },
                 V3Pool {
                     address: addr(4),
@@ -569,6 +571,7 @@ mod tests {
                     token1: addr(9), // no WETH() side
                     fee: 3_000,
                     tick_spacing: 60,
+                    block: 1,
                 },
             ],
             ..Default::default()

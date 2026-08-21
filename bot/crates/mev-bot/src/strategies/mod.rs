@@ -473,6 +473,10 @@ pub async fn scan_factory_logs(
 /// For `PairCreated`, `data` is `(pair address, uint256 allPairsLength)` with
 /// the pair address right-aligned in the first 32 bytes.
 pub fn decode_pair_created(log: &serde_json::Value) -> Option<(crate::dex::Venue, Address)> {
+    let topic0 = log["topics"].as_array()?.first()?.as_str()?;
+    if !topic0.eq_ignore_ascii_case(V2_PAIR_CREATED_TOPIC) {
+        return None;
+    }
     let venue = venue_from_factory(&log["address"])?;
     let data = crate::types::parse_bytes(&log["data"]);
     if data.len() < 32 {
@@ -488,6 +492,10 @@ pub fn decode_pair_created(log: &serde_json::Value) -> Option<(crate::dex::Venue
 /// while `tickSpacing` and `pool` live in `data` in that order.
 pub fn decode_pool_created(log: &serde_json::Value) -> Option<crate::dex::V3Pool> {
     let topics = log["topics"].as_array()?;
+    let topic0 = topics.first()?.as_str()?;
+    if !topic0.eq_ignore_ascii_case(V3_POOL_CREATED_TOPIC) {
+        return None;
+    }
     if topics.len() < 4 {
         return None;
     }
@@ -508,6 +516,7 @@ pub fn decode_pool_created(log: &serde_json::Value) -> Option<crate::dex::V3Pool
     }
     let tick_spacing = crate::strategies::jit::i256_word_to_i32(&data[0..32]);
     let address = Address::from_slice(&data[44..64]);
+    let block = crate::types::parse_u64(&log["blockNumber"]);
 
     Some(crate::dex::V3Pool {
         address,
@@ -515,6 +524,7 @@ pub fn decode_pool_created(log: &serde_json::Value) -> Option<crate::dex::V3Pool
         token1,
         fee,
         tick_spacing,
+        block,
     })
 }
 
@@ -670,6 +680,7 @@ mod tests {
         let pool = address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
         serde_json::json!({
             "address": format!("{:?}", known::UNIV3_FACTORY),
+            "blockNumber": "0x112a880",
             "topics": [
                 V3_POOL_CREATED_TOPIC,
                 padded(known::USDC),
@@ -704,6 +715,7 @@ mod tests {
         assert_eq!(got.token1, known::WETH);
         assert_eq!(got.fee, 500);
         assert_eq!(got.tick_spacing, 10);
+        assert_eq!(got.block, 18_000_000);
         assert!(crate::dex::V3Pool::is_actionable_fee(got.fee));
     }
 

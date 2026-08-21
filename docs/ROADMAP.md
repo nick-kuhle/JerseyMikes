@@ -41,12 +41,37 @@ Scoped and ticketed in [`PHASE_2_HANDOFF.md`](PHASE_2_HANDOFF.md), which is the
 source of truth for this phase (workstreams, budgets, acceptance criteria) and
 is deleted once the phase ships.
 
-- [ ] UniswapV3 sandwiches and V3 legs in the arb search
-- [ ] Aggregator calldata decoding: UniversalRouter, 1inch, 0x, CoWSwap
-- [ ] Multi-leg negative-cycle search over the full pool graph
-- [ ] Curve / Balancer / Maverick pool math
+The boxes below track implementation progress, not completion of the full Phase
+2 Definition of Done. A checked item has code in the branch and local build/test
+verification where available; the funnel-week and remote-CI gates remain called
+out in the handoff.
+
+- [ ] W0: CI enabled and required on pull requests. The maintainer reports
+      `make bot-check`, `make bot-test`, and `make contracts` passing locally;
+      the workflow still needs to be enabled by a GitHub account with workflow
+      permission.
+- [x] W1: Funnel counters distinguish per-invocation and per-opportunity units,
+      with live/replay provenance lanes and dashboard labels.
+- [x] W2: V2 discovery has retry-safe cursor/seen handling, bounded overlapping
+      scans, shared factory-log decoding, and network-free tests.
+- [x] W3: UniswapV3 `PoolCreated` discovery has a separate V3 metadata cache and
+      is gated by `POOL_DISCOVERY_V3=false` by default.
+- [x] W4 implementation: direct multi-leg V2 cycle enumeration is wired into
+      `on_block` with the documented budgets. `ARB_MAX_CYCLE_LEN=2` remains the
+      safe default until the funnel baseline is measured.
+
+Remaining Phase 2 coverage:
+
+- [ ] UniswapV3 sandwiches and V3 legs in the arb search (W5)
+- [ ] UniversalRouter calldata decoding (W6). 1inch v6, 0x v2, and CoW Swap
+      decoders are explicitly out of scope for this phase.
+- [ ] Raise W4 to 3–5 legs after the funnel week and report the before/after
+      candidate-volume delta.
+- [ ] Curve / Balancer / Maverick pool math (out of scope for this phase)
 - [ ] Compound V3, Morpho and Maker liquidations; oracle-update front-running
+      (out of scope for this phase)
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
+      (out of scope for this phase)
 
 ## Phase 3 — going live (opt-in, separate PR)
 
