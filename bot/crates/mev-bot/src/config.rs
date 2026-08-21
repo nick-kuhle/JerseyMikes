@@ -29,7 +29,8 @@ pub mod known {
     pub const UNIV3_SWAP_ROUTER: Address = address!("E592427A0AEce92De3Edee1F18E0157C05861564");
     /// SwapRouter02 (`exactInputSingle` without a deadline). Selector `0x04e45aaf`.
     pub const UNIV3_SWAP_ROUTER_02: Address = address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45");
-    /// UniversalRouter. `execute(commands, inputs)` selector `0x3593564c`.
+    /// UniversalRouter. `execute(bytes,bytes[])` is `0x24856bc3`;
+    /// `execute(bytes,bytes[],uint256)` is `0x3593564c`.
     pub const UNIVERSAL_ROUTER: Address = address!("3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD");
     pub const SUSHI_FACTORY: Address = address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac");
 
