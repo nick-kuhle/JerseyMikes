@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 use crate::config::Config;
 use crate::rpc::{sse_stream, RpcClient, WsSubscription};
 use crate::types::{
-    now_ms, parse_address, parse_b256, parse_bytes, parse_u256, parse_u64, BlockHead, PendingTx,
-    RelayBlock, TxSource,
+    now_ms, parse_address, parse_b256, parse_bytes, parse_u256, parse_u64, BlockHead, MinedAt,
+    PendingTx, RelayBlock, TxSource,
 };
 
 #[derive(Clone, Debug)]
@@ -242,6 +242,8 @@ pub fn parse_tx_object(v: &Value, source: TxSource) -> Option<PendingTx> {
             .map(parse_bytes)
             .filter(|b| !b.is_empty()),
         source,
+        // Live flow by default; the relay backfill stamps this after parsing.
+        mined_at: None,
         seen_at_ms: now_ms(),
     })
 }
@@ -486,8 +488,28 @@ async fn fetch_block_txs(http: &RpcClient, block_hash: alloy_primitives::B256) -
     let Some(txs) = v.get("transactions").and_then(|t| t.as_array()) else {
         return Vec::new();
     };
+
+    // Stamp every transaction with the block it landed in and that block's base
+    // fee. Downstream this is what routes the strategies to historical pool
+    // state (`number - 1`) and pins the replay fork to the same parent, instead
+    // of silently scoring a mined transaction against today's head.
+    let mined = MinedAt {
+        block_number: parse_u64(v.get("number").unwrap_or(&Value::Null)),
+        base_fee_per_gas: parse_u256(v.get("baseFeePerGas").unwrap_or(&Value::Null)),
+    };
+    if mined.block_number == 0 {
+        // Without a block number there is no parent to fork at, and scoring
+        // against the head would be worse than not scoring at all.
+        tracing::debug!(target: "ingest", ?block_hash, "delivered block has no number; skipping tx backfill");
+        return Vec::new();
+    }
+
     txs.iter()
         .filter_map(|t| parse_tx_object(t, TxSource::RelayDelivered))
+        .map(|mut t| {
+            t.mined_at = Some(mined);
+            t
+        })
         .collect()
 }
 

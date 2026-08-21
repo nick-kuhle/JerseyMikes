@@ -78,6 +78,7 @@ export function demoStatus(): StatusResponse {
       rejected: 5_512,
       startedAtMs: Date.now() - 1000 * 60 * 84,
       funnel: demoFunnel(),
+      funnelReplay: demoFunnelReplay(),
     },
     simBackends: {anvilFork: true, relayCallBundle: true},
     demo: true,
@@ -92,8 +93,9 @@ export function demoStatus(): StatusResponse {
  */
 export function demoFunnel(): Record<Strategy, FunnelCounters> {
   const f = (n: Partial<FunnelCounters>): FunnelCounters => ({
+    invocationsWithOutput: 0,
+    invocationsEmpty: 0,
     candidatesEmitted: 0,
-    candidatesSkipped: 0,
     gatedByRisk: 0,
     missingVictimRaw: 0,
     simulationsSucceeded: 0,
@@ -104,8 +106,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
   });
   return {
     sandwich: f({
-      candidatesEmitted: 184,
-      candidatesSkipped: 12_104,
+      invocationsWithOutput: 184,
+      invocationsEmpty: 12_104,
+      candidatesEmitted: 221,
       gatedByRisk: 142,
       missingVictimRaw: 31,
       simulationsSucceeded: 4,
@@ -114,8 +117,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 4,
     }),
     jit: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 184_223,
       candidatesEmitted: 0,
-      candidatesSkipped: 184_223,
       gatedByRisk: 0,
       missingVictimRaw: 0,
       simulationsSucceeded: 0,
@@ -124,8 +128,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 0,
     }),
     atomic_arb: f({
-      candidatesEmitted: 76,
-      candidatesSkipped: 0,
+      invocationsWithOutput: 76,
+      invocationsEmpty: 0,
+      candidatesEmitted: 412,
       gatedByRisk: 12,
       simulationsSucceeded: 18,
       simulationsReverted: 41,
@@ -133,8 +138,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 14,
     }),
     liquidation: f({
+      invocationsWithOutput: 11,
+      invocationsEmpty: 0,
       candidatesEmitted: 11,
-      candidatesSkipped: 0,
       gatedByRisk: 0,
       simulationsSucceeded: 6,
       simulationsReverted: 4,
@@ -142,14 +148,70 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 5,
     }),
     sniper: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 47,
       candidatesEmitted: 0,
-      candidatesSkipped: 47,
       gatedByRisk: 0,
       simulationsSucceeded: 0,
       simulationsReverted: 0,
       simulationsFailed: 0,
       submittable: 0,
     }),
+  };
+}
+
+/**
+ * The replay lane: bloXroute delivered-block transactions scored after the
+ * fact. Volumes are an order of magnitude above the live lane because every
+ * delivered block contributes ~150 already-mined transactions — which is
+ * exactly why the two lanes are counted separately.
+ */
+export function demoFunnelReplay(): Record<Strategy, FunnelCounters> {
+  const f = (n: Partial<FunnelCounters>): FunnelCounters => ({
+    invocationsWithOutput: 0,
+    invocationsEmpty: 0,
+    candidatesEmitted: 0,
+    gatedByRisk: 0,
+    missingVictimRaw: 0,
+    simulationsSucceeded: 0,
+    simulationsReverted: 0,
+    simulationsFailed: 0,
+    submittable: 0,
+    ...n,
+  });
+  return {
+    sandwich: f({
+      invocationsWithOutput: 2_940,
+      invocationsEmpty: 121_060,
+      candidatesEmitted: 3_512,
+      gatedByRisk: 2_701,
+      missingVictimRaw: 402,
+      simulationsSucceeded: 118,
+      simulationsReverted: 291,
+      simulationsFailed: 12,
+      submittable: 96,
+    }),
+    jit: f({invocationsEmpty: 124_000}),
+    atomic_arb: f({
+      invocationsWithOutput: 1_204,
+      invocationsEmpty: 122_796,
+      candidatesEmitted: 6_880,
+      gatedByRisk: 5_910,
+      simulationsSucceeded: 402,
+      simulationsReverted: 511,
+      simulationsFailed: 57,
+      submittable: 288,
+    }),
+    liquidation: f({
+      invocationsWithOutput: 42,
+      invocationsEmpty: 123_958,
+      candidatesEmitted: 42,
+      simulationsSucceeded: 19,
+      simulationsReverted: 21,
+      simulationsFailed: 2,
+      submittable: 17,
+    }),
+    sniper: f({invocationsEmpty: 123_806, invocationsWithOutput: 194, candidatesEmitted: 194}),
   };
 }
 

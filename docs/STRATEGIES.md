@@ -57,15 +57,30 @@ integer path.
 **Trigger.** Every block (cyclic scan) and every large mempool swap (back-run
 against the state the victim will leave behind).
 
-**Search.** WETH → token → WETH across two venues (UniV2 / Sushi today). Optimal
-input solved by ternary search over both curves composed.
+**Search.** Cycle enumeration over the cached pool graph (`dex/graph.rs`),
+anchored on WETH: every simple cycle up to `ARB_MAX_CYCLE_LEN` legs that starts
+and ends in WETH, with each pool used at most once. Optimal input is solved by
+ternary search over the composed curves.
+
+`ARB_MAX_CYCLE_LEN` defaults to **2**, which reproduces the original
+two-venue WETH → token → WETH scan. Raising it to 3–5 widens the search to
+multi-hop cycles such as WETH → USDC → WBTC → WETH, which only exist once pool
+discovery has loaded the cross pairs. The search is bounded on four axes
+regardless of configuration: 5 legs, 200 pools, 32 candidates and a 25 ms
+wall-clock budget per block, and it makes no RPC calls of its own.
+
+Anchoring on WETH alone is not a limitation: any cycle touching WETH can be
+rotated to start there. Cycles that never touch WETH are skipped on purpose —
+their profit is denominated in a token the gas model cannot price.
 
 **Capital.** A zero-fee Balancer V2 flash loan, so the strategy needs no
 inventory: `flashExecute` borrows, swaps twice, repays, and the executor
 verifies the leftover is ≥ `minProfit`.
 
-**Not yet.** Three-plus-leg cycles, V3 legs, Curve/Balancer pools as legs, and a
-proper negative-cycle (Bellman–Ford) search over the whole pool graph.
+**Not yet.** V3 legs, Curve/Balancer pools as legs. A negative-cycle
+(Bellman–Ford) search was considered and rejected: on log-rate weights a
+fixed-point `log_e` cheap enough to run per block reports false cycles, and the
+precise version is a research port. See `docs/PHASE_2_HANDOFF.md` W4.
 
 ## 4. Liquidation — `strategies/liquidation.rs`
 
@@ -105,3 +120,30 @@ point: the dashboard shows how much of new-token flow is a trap.
 **Not yet.** Holding a position across blocks (this build is atomic-only by
 design), simulating the token's `transfer` hooks for blacklist/cooldown logic,
 and liquidity-lock checks.
+
+## 6. Reading the funnel
+
+Every strategy reports into the per-strategy funnel on `/api/funnel` and the
+dashboard panel. **Two units live in it and must not be divided into each
+other:**
+
+| Counter | Unit | Meaning |
+| --- | --- | --- |
+| `invocationsWithOutput` | strategy calls | calls that produced ≥ 1 opportunity |
+| `invocationsEmpty` | strategy calls | calls that produced none |
+| `candidatesEmitted` | opportunities | total opportunities built (sum of `opps.len()`) |
+| `gatedByRisk`, `missingVictimRaw`, `simulations*`, `submittable` | opportunities | the rest of the per-opportunity funnel |
+
+A single call can emit many candidates — that is exactly what widening a search
+(multi-leg arb, V3 victims) does — so `candidatesEmitted / invocationsWithOutput`
+is a search-width signal, while `submittable / candidatesEmitted` is the
+conversion rate that matters.
+
+The funnel is also split by **provenance**. `stats.funnel` counts flow the bot
+could have acted on; `stats.funnelReplay` counts already-mined transactions
+replayed from bloXroute delivered blocks (`docs/BLOXROUTE_RELAY.md`). Never
+read a rate across the two: the replay population is roughly 150 transactions
+per block that were never winnable in real time, and folding it in would bury
+the live signal completely. Before this split the first stage counted calls
+and everything after it counted opportunities, which made the implied
+conversion rate meaningless.

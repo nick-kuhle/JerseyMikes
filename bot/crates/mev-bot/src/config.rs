@@ -44,10 +44,30 @@ pub struct Config {
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
+    /// Whether the UniswapV3 `PoolCreated` scan runs each block. Off by
+    /// default: it only earns its `eth_getLogs` once a strategy consumes the
+    /// V3 cache.
+    pub pool_discovery_v3: bool,
+    /// Longest cycle the atomic-arb search will consider, in legs.
+    ///
+    /// 2 reproduces the original pair-to-pair search exactly and is the
+    /// default; raise it (up to `MAX_CYCLE_LEN`) once the funnel has a
+    /// baseline to compare against. Every additional leg costs ~120k gas and
+    /// widens the search, so this is a measured change, not a free win.
+    pub arb_max_cycle_len: usize,
     /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
     /// their transactions ingested + scored. On by default; this is read-only
     /// (polling a public data API + the execution node), never a submission.
     pub relay_tx_ingest: bool,
+    /// How many delivered-block transactions are scored concurrently.
+    ///
+    /// A mainnet block carries ~150–200 transactions and each one fans out to
+    /// one task per strategy, so an unbounded backfill queues ~1000 tasks and a
+    /// matching burst of RPC per block — enough to get the bot rate limited off
+    /// its provider and starve the live mempool path. Replay work is never
+    /// latency-critical (the block is already mined), so it runs behind this
+    /// bound.
+    pub relay_tx_concurrency: usize,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -127,6 +147,14 @@ pub struct SimConfig {
     pub anvil_bin: String,
     /// Port anvil listens on.
     pub anvil_port: u16,
+    /// Port for the second anvil used to replay delivered blocks. Must differ
+    /// from `anvil_port`: the two forks pin to different heights on purpose.
+    pub anvil_replay_port: u16,
+    /// Whether to spawn that second fork at all. Without it, delivered-block
+    /// opportunities are recorded but not simulated — which is the honest
+    /// outcome, since scoring them on the live fork would measure them against
+    /// a state they never executed in.
+    pub replay_fork: bool,
     /// Re-fork the simulator every N blocks.
     pub refork_every_blocks: u64,
     /// Also cross-check with the relay's `eth_callBundle`.
@@ -258,6 +286,19 @@ impl Config {
             sim: SimConfig {
                 anvil_bin: env_or("ANVIL_BIN", "anvil"),
                 anvil_port: env_u64("ANVIL_PORT", 8548) as u16,
+                anvil_replay_port: {
+                    // Two anvils cannot share a port. A misconfigured pair
+                    // would fail at spawn time with a confusing bind error, so
+                    // nudge it here instead.
+                    let live = env_u64("ANVIL_PORT", 8548) as u16;
+                    let replay = env_u64("ANVIL_REPLAY_PORT", 8549) as u16;
+                    if replay == live {
+                        live.saturating_add(1)
+                    } else {
+                        replay
+                    }
+                },
+                replay_fork: env_bool("REPLAY_FORK", true),
                 refork_every_blocks: env_u64("REFORK_EVERY_BLOCKS", 1),
                 use_call_bundle: env_bool("USE_CALL_BUNDLE", true),
                 target_block_offset: env_u64("TARGET_BLOCK_OFFSET", 1),
@@ -270,9 +311,15 @@ impl Config {
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
+            pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", false),
+            // Clamped to the enumerator's hard ceiling: config cannot talk the
+            // search into an unbounded walk.
+            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
+                .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
             // Infrastructure toggle: pull delivered blocks + transactions from the
             // bloXroute Max Profit relay and score them for extractable value.
             relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
+            relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
@@ -281,7 +328,7 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={} bloxroute_txs={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} arb_legs={} bloxroute_txs={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -289,6 +336,8 @@ impl Config {
             self.sim.use_call_bundle,
             self.strategies.enabled_names().join(","),
             self.pool_discovery,
+            self.pool_discovery_v3,
+            self.arb_max_cycle_len,
             self.relay_tx_ingest,
             self.live_execution
         )

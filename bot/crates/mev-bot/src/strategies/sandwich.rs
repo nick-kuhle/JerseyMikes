@@ -41,12 +41,19 @@ impl StrategyImpl for SandwichStrategy {
         }
 
         let head = ctx.head();
+        // Live flow prices against the head; a replayed transaction prices
+        // against the parent of the block it landed in, which is the state it
+        // actually executed against.
+        let state_block = tx.state_block(&head);
+        let base_fee = tx.base_fee(&head);
+        let target_block = tx.target_block(&head, ctx.cfg.sim.target_block_offset);
+
         let mut out = Vec::new();
         for venue in [Venue::UniV2, Venue::SushiV2] {
             let Some(pair) = ctx.pools.pair_for(intent.token_in, intent.token_out, venue).await else {
                 continue;
             };
-            let Some(pool) = ctx.pools.load(pair, venue, head.number).await else {
+            let Some(pool) = ctx.pool_at(pair, venue, state_block).await else {
                 continue;
             };
             let Some(sizing) = dex::optimal_sandwich_in(
@@ -61,7 +68,7 @@ impl StrategyImpl for SandwichStrategy {
 
             // Rough gas model: front leg ~140k, back leg ~130k.
             let gas_estimate = U256::from(270_000u64);
-            let gas_cost = gas_estimate * (head.base_fee_per_gas + U256::from(1_000_000_000u64));
+            let gas_cost = gas_estimate * (base_fee + U256::from(1_000_000_000u64));
             if sizing.gross_profit <= gas_cost {
                 tracing::trace!(
                     target: "strategy::sandwich",
@@ -86,7 +93,7 @@ impl StrategyImpl for SandwichStrategy {
                 profit_token: weth,
                 expected_profit_wei: sizing.gross_profit.saturating_sub(gas_cost),
                 notional_wei: sizing.amount_in,
-                target_block: ctx.target_block(),
+                target_block,
                 created_at_ms: now_ms(),
                 notes: format!(
                     "sandwich {} on {} pair {:?}: victim in {} min_out {} -> front {} back {} gross {}",

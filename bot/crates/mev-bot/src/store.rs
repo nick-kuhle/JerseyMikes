@@ -615,6 +615,7 @@ mod tests {
             input: vec![0xde, 0xad, 0xbe, 0xef],
             raw: None,
             source: TxSource::RelayDelivered,
+            mined_at: None,
             seen_at_ms: now_ms(),
         };
 
