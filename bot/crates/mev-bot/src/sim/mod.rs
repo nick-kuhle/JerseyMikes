@@ -96,18 +96,7 @@ impl Simulator {
                     // Exact pin: the parent of the victim's own block. Anything
                     // else and the victim's nonce, the pool reserves and the
                     // oracle prices all belong to a different chain state.
-                    if let Err(e) = fork.ensure_fork_exact(parent).await {
-                        tracing::debug!(target: "sim", block = parent, error = %e, "replay fork reset failed");
-                        return Ok(SimOutcome {
-                            primary: crate::sim::empty_result(
-                                opp,
-                                "replay fork could not be pinned to the parent block",
-                            ),
-                            relay: None,
-                            bundle,
-                        });
-                    }
-                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee).await?
+                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee).await?
                 }
                 // Refusing to score is the honest outcome. Simulating a mined
                 // transaction on the live fork answers a question nobody asked
