@@ -669,7 +669,13 @@ mod tests {
         // DECODE_UNIVERSAL_ROUTER. Otherwise the funnel baseline is polluted.
         use alloy_sol_types::SolValue;
         let path = vec![known::WETH, known::USDC];
-        let input = (Address::with_last_byte(9), U256::from(1_000u64), U256::from(1u64), path, true)
+        let input = (
+            Address::with_last_byte(9),
+            U256::from(1_000u64),
+            U256::from(1u64),
+            path,
+            true,
+        )
             .abi_encode();
         let data = crate::dex::calldata::universal_router::encode_execute(
             vec![crate::dex::calldata::universal_router::CMD_V2_SWAP_EXACT_IN],
