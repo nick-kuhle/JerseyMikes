@@ -65,7 +65,10 @@ impl PoolDiscovery {
 
         let mut loaded = 0usize;
         for (venue, pair) in scan_pair_created(&ctx.rpc, from, head.number).await {
-            if !self.seen.write().insert(pair) {
+            // Do not mark a pair as seen until it has been fetched and passes
+            // the filters below. RPC failures are transient; marking first
+            // would permanently prevent a retry on the next block.
+            if self.seen.read().contains(&pair) {
                 continue;
             }
             // Fetch first, then insert only qualifying pools. `PoolCache::load`
@@ -79,6 +82,9 @@ impl PoolDiscovery {
             if weth_reserve < min_reserve {
                 continue;
             }
+            // Mark only successfully accepted pools as seen. This also makes
+            // the invariant explicit for future discovery filters.
+            self.seen.write().insert(pair);
             ctx.pools.insert(pool);
             tracing::info!(
                 target: "pools",

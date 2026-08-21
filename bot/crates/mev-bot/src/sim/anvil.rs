@@ -171,13 +171,19 @@ impl AnvilSim {
     ///
     /// Ordering inside the fork mirrors the bundle we would submit:
     ///   `[front-run] → [victim tx…] → [back-run]`
-    pub async fn simulate(&self, opp: &Opportunity, victims_raw: &[Vec<u8>], base_fee: U256) -> Result<SimulationResult> {
+    pub async fn simulate(
+        &self,
+        opp: &Opportunity,
+        victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(Address, u64)>,
+        base_fee: U256,
+    ) -> Result<SimulationResult> {
         let _guard = self.lock.lock().await;
         let started = Instant::now();
 
         let snapshot: Value = self.rpc.call_raw("evm_snapshot", json!([])).await?;
         let result = self
-            .simulate_inner(opp, victims_raw, base_fee, started)
+            .simulate_inner(opp, victims_raw, victim_sender_nonce, base_fee, started)
             .await;
         // Always roll the fork back, even if the simulation blew up.
         let _ = self.rpc.call_raw("evm_revert", json!([snapshot])).await;
@@ -188,6 +194,7 @@ impl AnvilSim {
         &self,
         opp: &Opportunity,
         victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(Address, u64)>,
         base_fee: U256,
         started: Instant,
     ) -> Result<SimulationResult> {
@@ -213,6 +220,16 @@ impl AnvilSim {
 
         // 2. victim transactions, replayed verbatim
         if ok {
+            // A pending transaction may have landed between observation and
+            // forking. Reset the impersonated sender's nonce so Anvil can
+            // replay the signed victim at the nonce it carried when observed.
+            // This is fork-local state and is reverted with the snapshot below.
+            if let Some((sender, nonce)) = victim_sender_nonce {
+                let _ = self.rpc.call_raw(
+                    "anvil_setNonce",
+                    json!([format!("{sender:?}"), format!("0x{nonce:x}")]),
+                ).await;
+            }
             for raw in victims_raw {
                 let hex_raw = format!("0x{}", hex::encode(raw));
                 match self
