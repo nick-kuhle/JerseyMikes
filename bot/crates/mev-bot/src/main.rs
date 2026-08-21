@@ -144,6 +144,24 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         }
     }
 
+    // bloXroute Max Profit relay: the source of delivered-block transaction
+    // ingestion. Only polled for blocks (not for value) when tx ingest is on.
+    {
+        let base = &cfg.endpoints.bloxroute_relay_url;
+        let url = format!(
+            "{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=1",
+            base.trim_end_matches('/')
+        );
+        match reqwest::get(&url).await {
+            Ok(r) => println!(
+                "· bloxroute relay   {base} -> {} (tx ingest {})",
+                r.status(),
+                if cfg.relay_tx_ingest { "on" } else { "off" }
+            ),
+            Err(e) => println!("! bloxroute relay   {base} -> {e}"),
+        }
+    }
+
     println!("\nmode: {}", if cfg.live_execution { "LIVE" } else { "simulation" });
     Ok(())
 }

@@ -95,6 +95,19 @@ the victim replay was not faithful.
 
 Step 6 is where a live bot would call `eth_sendBundle`. This build stops there.
 
+## The bloXroute Max Profit relay path
+
+On top of the value benchmark (`relay_bids`), the engine polls the bloXroute
+Max Profit relay's `proposer_payload_delivered` bid traces and, for every newly
+delivered block, fetches its full transaction list with `eth_getBlockByHash`.
+Each delivered block is persisted (`relay_blocks`, `relay_block_txs`) and pushed
+to the dashboard, and each of its transactions is routed through `on_pending`'s
+shared `evaluate` funnel with `TxSource::RelayDelivered`. The result is a
+post-mortem replay of the winning builder's block against the fork: our
+strategies propose opportunities against exactly the transactions that actually
+landed, and the simulator records whether value was extractable. See
+[`BLOXROUTE_RELAY.md`](BLOXROUTE_RELAY.md).
+
 ## Adding the second chain
 
 `ChainConfig` already carries chain id, WETH, stable, and block time; the
