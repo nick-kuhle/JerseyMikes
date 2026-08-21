@@ -44,6 +44,17 @@ pub struct Config {
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
+    /// Whether the UniswapV3 `PoolCreated` scan runs each block. Off by
+    /// default: it only earns its `eth_getLogs` once a strategy consumes the
+    /// V3 cache.
+    pub pool_discovery_v3: bool,
+    /// Longest cycle the atomic-arb search will consider, in legs.
+    ///
+    /// 2 reproduces the original pair-to-pair search exactly and is the
+    /// default; raise it (up to `MAX_CYCLE_LEN`) once the funnel has a
+    /// baseline to compare against. Every additional leg costs ~120k gas and
+    /// widens the search, so this is a measured change, not a free win.
+    pub arb_max_cycle_len: usize,
     /// Master switch. When false (the default and the only supported value today)
     /// the bot will *never* broadcast a transaction to a public node or a relay.
     pub live_execution: bool,
@@ -259,6 +270,11 @@ impl Config {
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
+            pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", false),
+            // Clamped to the enumerator's hard ceiling: config cannot talk the
+            // search into an unbounded walk.
+            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
+                .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
@@ -267,7 +283,7 @@ impl Config {
 
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} arb_legs={} live={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -275,6 +291,8 @@ impl Config {
             self.sim.use_call_bundle,
             self.strategies.enabled_names().join(","),
             self.pool_discovery,
+            self.pool_discovery_v3,
+            self.arb_max_cycle_len,
             self.live_execution
         )
     }

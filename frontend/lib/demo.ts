@@ -90,8 +90,9 @@ export function demoStatus(): StatusResponse {
  */
 export function demoFunnel(): Record<Strategy, FunnelCounters> {
   const f = (n: Partial<FunnelCounters>): FunnelCounters => ({
+    invocationsWithOutput: 0,
+    invocationsEmpty: 0,
     candidatesEmitted: 0,
-    candidatesSkipped: 0,
     gatedByRisk: 0,
     missingVictimRaw: 0,
     simulationsSucceeded: 0,
@@ -102,8 +103,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
   });
   return {
     sandwich: f({
-      candidatesEmitted: 184,
-      candidatesSkipped: 12_104,
+      invocationsWithOutput: 184,
+      invocationsEmpty: 12_104,
+      candidatesEmitted: 221,
       gatedByRisk: 142,
       missingVictimRaw: 31,
       simulationsSucceeded: 4,
@@ -112,8 +114,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 4,
     }),
     jit: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 184_223,
       candidatesEmitted: 0,
-      candidatesSkipped: 184_223,
       gatedByRisk: 0,
       missingVictimRaw: 0,
       simulationsSucceeded: 0,
@@ -122,8 +125,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 0,
     }),
     atomic_arb: f({
-      candidatesEmitted: 76,
-      candidatesSkipped: 0,
+      invocationsWithOutput: 76,
+      invocationsEmpty: 0,
+      candidatesEmitted: 412,
       gatedByRisk: 12,
       simulationsSucceeded: 18,
       simulationsReverted: 41,
@@ -131,8 +135,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 14,
     }),
     liquidation: f({
+      invocationsWithOutput: 11,
+      invocationsEmpty: 0,
       candidatesEmitted: 11,
-      candidatesSkipped: 0,
       gatedByRisk: 0,
       simulationsSucceeded: 6,
       simulationsReverted: 4,
@@ -140,8 +145,9 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       submittable: 5,
     }),
     sniper: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 47,
       candidatesEmitted: 0,
-      candidatesSkipped: 47,
       gatedByRisk: 0,
       simulationsSucceeded: 0,
       simulationsReverted: 0,

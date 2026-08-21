@@ -18,8 +18,16 @@ The sandbox this PR was written in has no access to `crates.io`,
 | Component | Status |
 | --- | --- |
 | Solidity (`src`, `test`, `script`) | **compiled** with solc 0.8.26 via `node contracts/script/compile-check.js` — 0 errors, `MevExecutor` runtime 9,618 bytes |
-| Frontend | **built and run** — `tsc --noEmit` clean, dev server serving the console with live SSE |
+| Frontend | **built and run** — `tsc --noEmit` clean, `next build` succeeds, dev server serving the console with live SSE |
 | Rust crate | **not compiled** — no toolchain available. `cargo fmt/clippy/test` run in CI on the first push |
+
+For Rust changes the sandbox falls back to a syntax-only check: every `.rs`
+file is parsed with a tree-sitter Rust grammar and any `ERROR`/`MISSING` node
+fails the check. That catches malformed syntax and nothing else — no type
+checking, no borrow checking, no trait resolution. Event-signature constants
+(`PairCreated`, `PoolCreated` topic0) are derived with keccak256 rather than
+recalled, and the derivation is validated by reproducing the constant already
+in the repo.
 
 If `cargo check` reports anything on the first CI run it will be small and
 mechanical (an import, a trait bound); the logic and the tests are written to be

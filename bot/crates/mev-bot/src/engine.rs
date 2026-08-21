@@ -55,17 +55,31 @@ pub struct Stats {
     pub funnel: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
 }
 
+/// Per-strategy funnel counters.
+///
+/// **Two different units live in this struct and mixing them is a
+/// mistake that has already been made once.** The `invocations_*`
+/// fields count *strategy calls*; everything else counts *individual
+/// opportunities*. A conversion rate is only meaningful between fields
+/// of the same unit — `candidates_emitted` → `gated_by_risk` →
+/// `simulations_*` → `submittable` is the per-opportunity funnel, and
+/// `invocations_with_output` / `invocations_empty` is the separate
+/// "how often does this strategy fire at all" signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FunnelCounters {
-    /// Total `on_pending` / `on_block` calls that produced at least one
-    /// `Opportunity`. This is the strategy's "output" rate.
+    /// **Unit: strategy calls.** `on_pending` / `on_block` calls that
+    /// produced at least one `Opportunity`. This is the strategy's
+    /// "fires at all" rate, not its output volume.
+    pub invocations_with_output: u64,
+    /// **Unit: strategy calls.** `on_pending` / `on_block` calls that
+    /// returned zero `Opportunity`s — typically min-notional filters,
+    /// victim-revert pre-checks, or pool-cache misses.
+    pub invocations_empty: u64,
+    /// **Unit: opportunities.** Total `Opportunity`s emitted, i.e. the
+    /// sum of `opps.len()` over every call. This is the number that
+    /// moves when a strategy widens its search (multi-leg arb, V3
+    /// victims), and the one every downstream counter is comparable to.
     pub candidates_emitted: u64,
-    /// Total `on_pending` / `on_block` calls that returned zero
-    /// `Opportunity`s. Split from `candidates_emitted` so the user can
-    /// see the proportion of "saw but emitted nothing" — typically
-    /// caused by min-notional filters, victim-revert pre-checks, or
-    /// pool-cache misses.
-    pub candidates_skipped: u64,
     /// `Opportunity`s rejected by `RiskEngine::check`. The reject
     /// reason is recorded elsewhere; this counter is just the count.
     pub gated_by_risk: u64,
@@ -103,6 +117,27 @@ impl Stats {
         f(entry);
     }
 
+    /// Record one strategy invocation together with the number of
+    /// opportunities it produced.
+    ///
+    /// This is the only correct way to bump the first funnel stage: it keeps
+    /// the two units consistent (exactly one invocation counter per call,
+    /// plus `produced` candidates). Bumping `candidates_emitted` by one per
+    /// call — as this code did before — makes a block that yields 30
+    /// candidates indistinguishable from one that yields a single candidate,
+    /// which is precisely the measurement multi-leg arb and V3 sandwiching
+    /// are judged by.
+    pub fn record_invocation(&self, strategy: Strategy, produced: usize) {
+        self.record_funnel(strategy, |f| {
+            if produced == 0 {
+                f.invocations_empty += 1;
+            } else {
+                f.invocations_with_output += 1;
+                f.candidates_emitted += produced as u64;
+            }
+        });
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         use std::sync::atomic::Ordering::Relaxed;
         let funnel = self
@@ -113,8 +148,9 @@ impl Stats {
                 (
                     k.as_str().to_string(),
                     serde_json::json!({
+                        "invocationsWithOutput": v.invocations_with_output,
+                        "invocationsEmpty": v.invocations_empty,
                         "candidatesEmitted": v.candidates_emitted,
-                        "candidatesSkipped": v.candidates_skipped,
                         "gatedByRisk": v.gated_by_risk,
                         "missingVictimRaw": v.missing_victim_raw,
                         "simulationsSucceeded": v.simulations_succeeded,
@@ -277,7 +313,7 @@ impl Engine {
         let _ = self.store.record_block(&head);
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
 
-        if self.cfg.pool_discovery {
+        if self.cfg.pool_discovery || self.cfg.pool_discovery_v3 {
             let discovery = &self.pool_discovery;
             let ctx = self.ctx.clone();
             let head = head.clone();
@@ -294,13 +330,7 @@ impl Engine {
             let kind = s.kind();
             tokio::spawn(async move {
                 let opps = strat.on_block(&this.ctx, &head).await;
-                this.stats.record_funnel(kind, |f| {
-                    if opps.is_empty() {
-                        f.candidates_skipped += 1;
-                    } else {
-                        f.candidates_emitted += 1;
-                    }
-                });
+                this.stats.record_invocation(kind, opps.len());
                 for opp in opps {
                     this.clone().consider(opp, Vec::new(), None).await;
                 }
@@ -328,13 +358,7 @@ impl Engine {
             let kind = s.kind();
             tokio::spawn(async move {
                 let opps = strat.on_pending(&this.ctx, &tx).await;
-                this.stats.record_funnel(kind, |f| {
-                    if opps.is_empty() {
-                        f.candidates_skipped += 1;
-                    } else {
-                        f.candidates_emitted += 1;
-                    }
-                });
+                this.stats.record_invocation(kind, opps.len());
                 if opps.is_empty() {
                     return;
                 }
@@ -544,9 +568,55 @@ mod tests {
         let snap = s.snapshot();
         let jit = snap["funnel"]["jit"].clone();
         assert_eq!(jit["candidatesEmitted"], 0);
-        assert_eq!(jit["candidatesSkipped"], 0);
+        assert_eq!(jit["invocationsWithOutput"], 0);
+        assert_eq!(jit["invocationsEmpty"], 0);
         assert_eq!(jit["gatedByRisk"], 0);
         assert_eq!(jit["submittable"], 0);
+    }
+
+    #[test]
+    fn invocation_with_three_opportunities_counts_three_candidates() {
+        // The defect this replaces: one call returning three opportunities
+        // used to bump candidatesEmitted by one, making it impossible to
+        // see search-width changes (multi-leg arb, V3 victims) in the funnel.
+        let s = Stats::default();
+        s.record_invocation(Strategy::AtomicArb, 3);
+        let snap = s.snapshot();
+        let arb = &snap["funnel"]["atomic_arb"];
+        assert_eq!(arb["candidatesEmitted"], 3);
+        assert_eq!(arb["invocationsWithOutput"], 1);
+        assert_eq!(arb["invocationsEmpty"], 0);
+    }
+
+    #[test]
+    fn empty_invocation_counts_only_as_an_empty_call() {
+        let s = Stats::default();
+        s.record_invocation(Strategy::Sandwich, 0);
+        let snap = s.snapshot();
+        let sw = &snap["funnel"]["sandwich"];
+        assert_eq!(sw["candidatesEmitted"], 0);
+        assert_eq!(sw["invocationsEmpty"], 1);
+        assert_eq!(sw["invocationsWithOutput"], 0);
+    }
+
+    #[test]
+    fn candidates_never_fall_below_invocations_with_output() {
+        // Invariant the dashboard relies on: every invocation that produced
+        // output contributed at least one candidate, so candidatesEmitted is
+        // always >= invocationsWithOutput. Mixed traffic must preserve it.
+        let s = Stats::default();
+        for n in [0usize, 1, 0, 5, 2, 0] {
+            s.record_invocation(Strategy::Jit, n);
+        }
+        let snap = s.snapshot();
+        let jit = &snap["funnel"]["jit"];
+        assert_eq!(jit["candidatesEmitted"], 8); // 1 + 5 + 2
+        assert_eq!(jit["invocationsWithOutput"], 3);
+        assert_eq!(jit["invocationsEmpty"], 3);
+        assert!(
+            jit["candidatesEmitted"].as_u64().unwrap()
+                >= jit["invocationsWithOutput"].as_u64().unwrap()
+        );
     }
 
     #[test]

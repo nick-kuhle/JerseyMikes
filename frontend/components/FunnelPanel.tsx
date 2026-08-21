@@ -32,8 +32,9 @@ const ALL_STRATEGIES: Strategy[] = [
 ];
 
 const ZERO: FunnelCounters = {
+  invocationsWithOutput: 0,
+  invocationsEmpty: 0,
   candidatesEmitted: 0,
-  candidatesSkipped: 0,
   gatedByRisk: 0,
   missingVictimRaw: 0,
   simulationsSucceeded: 0,
@@ -78,7 +79,7 @@ export default function FunnelPanel({funnel}: Props) {
   // Per-strategy table.
   const rows = ALL_STRATEGIES.map((s) => {
     const f = row(funnel[s] ?? ZERO);
-    const seen = f.candidatesEmitted + f.candidatesSkipped;
+    const seen = f.invocationsWithOutput + f.invocationsEmpty;
     const simulated = f.simulationsSucceeded + f.simulationsReverted;
     const revertRate = simulated > 0 ? f.simulationsReverted / simulated : 0;
     return {s, f, seen, simulated, revertRate};
@@ -87,7 +88,8 @@ export default function FunnelPanel({funnel}: Props) {
   // Aggregate summary.
   const total = rows.reduce(
     (acc, r) => {
-      acc.candidatesSkipped += r.f.candidatesSkipped;
+      acc.invocationsWithOutput += r.f.invocationsWithOutput;
+      acc.invocationsEmpty += r.f.invocationsEmpty;
       acc.candidatesEmitted += r.f.candidatesEmitted;
       acc.gatedByRisk += r.f.gatedByRisk;
       acc.missingVictimRaw += r.f.missingVictimRaw;
@@ -97,7 +99,8 @@ export default function FunnelPanel({funnel}: Props) {
       return acc;
     },
     {
-      candidatesSkipped: 0,
+      invocationsWithOutput: 0,
+      invocationsEmpty: 0,
       candidatesEmitted: 0,
       gatedByRisk: 0,
       missingVictimRaw: 0,
@@ -119,9 +122,18 @@ export default function FunnelPanel({funnel}: Props) {
       </div>
 
       <p className="muted" style={{fontSize: 12, lineHeight: 1.5, margin: 0}}>
-        If the simulation tape is empty, this is the first place to look.
-        <code> candidatesSkipped </code> means the strategy saw a transaction or block
-        but the pre-filter rejected it (often: too small, victim-revert trap, or no
+        If the simulation tape is empty, this is the first place to look.{" "}
+        <strong>Two units live in this table.</strong> <code>Calls</code>,{" "}
+        <code>Fired</code> and <code>Empty</code> count strategy invocations;
+        everything from <code>Cand.</code> rightwards counts individual
+        opportunities. Do not divide one into the other — a single call can
+        emit many candidates, which is exactly what widening the search
+        (multi-leg arb, V3 victims) is supposed to do.
+      </p>
+
+      <p className="muted" style={{fontSize: 12, lineHeight: 1.5, margin: 0}}>
+        <code> Empty </code> means the strategy saw a transaction or block but
+        the pre-filter rejected it (often: too small, victim-revert trap, or no
         matching pool cached). <code> gatedByRisk </code> means the opportunity was
         built but the risk engine said no (position too big, base fee too high,
         inflight cap, or kill-switch tripped). <code> simulationsReverted </code>
@@ -137,8 +149,9 @@ export default function FunnelPanel({funnel}: Props) {
           gap: 8,
         }}
       >
-        <SummaryStat label="Saw but skipped" value={fmt(total.candidatesSkipped)} color="var(--muted)" />
-        <SummaryStat label="Built (candidates)" value={fmt(total.candidatesEmitted)} color="var(--cyan)" />
+        <SummaryStat label="Calls, no output" value={fmt(total.invocationsEmpty)} color="var(--muted)" />
+        <SummaryStat label="Calls with output" value={fmt(total.invocationsWithOutput)} color="var(--muted)" />
+        <SummaryStat label="Candidates built" value={fmt(total.candidatesEmitted)} color="var(--cyan)" />
         <SummaryStat label="Gated by risk" value={fmt(total.gatedByRisk)} color="var(--red)" />
         <SummaryStat label="Missing victim raw" value={fmt(total.missingVictimRaw)} color="var(--amber)" />
         <SummaryStat label="Sims succeeded" value={fmt(total.simulationsSucceeded)} color="var(--green)" />
@@ -151,7 +164,7 @@ export default function FunnelPanel({funnel}: Props) {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "1.5fr repeat(8, 1fr)",
+            gridTemplateColumns: "1.5fr repeat(9, 1fr)",
             gap: 4,
             fontSize: 10,
             color: "var(--muted)",
@@ -160,9 +173,10 @@ export default function FunnelPanel({funnel}: Props) {
           }}
         >
           <span>Strategy</span>
-          <span title="Total times the strategy was called (on_pending + on_block)">Saw</span>
-          <span title="Strategy emitted at least one Opportunity">Built</span>
-          <span title="Strategy saw something but emitted zero">Skipped</span>
+          <span title="Unit: calls. Times the strategy ran (on_pending + on_block)">Calls</span>
+          <span title="Unit: calls. Calls that produced at least one opportunity">Fired</span>
+          <span title="Unit: calls. Calls that produced nothing">Empty</span>
+          <span title="Unit: opportunities. Total opportunities built (sum of opps.len())">Cand.</span>
           <span title="Opportunity rejected by RiskEngine::check">Risk ✗</span>
           <span title="Raw signed victim tx unavailable">No raw</span>
           <span title="Sims that completed with success=true">Sim ✓</span>
@@ -174,7 +188,7 @@ export default function FunnelPanel({funnel}: Props) {
             key={r.s}
             style={{
               display: "grid",
-              gridTemplateColumns: "1.5fr repeat(8, 1fr)",
+              gridTemplateColumns: "1.5fr repeat(9, 1fr)",
               gap: 4,
               fontSize: 12,
               alignItems: "center",
@@ -188,11 +202,12 @@ export default function FunnelPanel({funnel}: Props) {
               {STRATEGY_LABEL[r.s] || r.s}
             </span>
             <span style={{color: "var(--muted)"}}>{fmt(r.seen)}</span>
-            <span style={{color: r.f.candidatesEmitted > 0 ? "var(--cyan)" : "var(--muted)"}}>
-              {fmt(r.f.candidatesEmitted)}
+            <span style={{color: r.f.invocationsWithOutput > 0 ? "var(--cyan)" : "var(--muted)"}}>
+              {fmt(r.f.invocationsWithOutput)}
             </span>
-            <span style={{color: r.f.candidatesSkipped > 0 ? "var(--muted)" : "var(--muted)"}}>
-              {fmt(r.f.candidatesSkipped)}
+            <span style={{color: "var(--muted)"}}>{fmt(r.f.invocationsEmpty)}</span>
+            <span style={{color: r.f.candidatesEmitted > 0 ? "var(--cyan)" : "var(--muted)", fontWeight: 600}}>
+              {fmt(r.f.candidatesEmitted)}
             </span>
             <span style={{color: r.f.gatedByRisk > 0 ? "var(--red)" : "var(--muted)"}}>
               {fmt(r.f.gatedByRisk)}
@@ -217,17 +232,18 @@ export default function FunnelPanel({funnel}: Props) {
       </div>
 
       <p className="muted" style={{fontSize: 11, lineHeight: 1.5, margin: 0}}>
-        <strong>How to read this.</strong> The end-to-end funnel is
-        <code> saw → built → risk → sim → submittable</code>. A healthy bot has a
-        non-zero number in <code>built</code> and a reasonable fraction of{" "}
+        <strong>How to read this.</strong> The per-opportunity funnel is
+        <code> cand. → risk → sim → submittable</code>; <code>calls</code>,{" "}
+        <code>fired</code> and <code>empty</code> sit outside it as the
+        "does this strategy fire at all" signal. A healthy bot has a
+        non-zero <code>cand.</code> and a reasonable fraction of{" "}
         <code>sim ✓</code> (most sims should either succeed or revert cleanly;
-        <code> sim ✗ </code>dominates mean the strategy is producing
+        <code> sim ✗ </code>dominating means the strategy is producing
         opportunities that lose money in the fork, which means the pre-filter
-        sizing is wrong). A bot with all zeros in <code>built</code> is
-        pre-filtering too aggressively (raise <code>MIN_NET_PROFIT_WEI</code>{" "}
-        check, or check the pool cache for missing entries). A bot with
-        non-zero <code>built</code> but all zeros in <code>sim ✓</code> is
-        either risk-gating too tightly or hitting simulator failures.
+        sizing is wrong). All zeros in <code>cand.</code> means pre-filtering
+        is too aggressive, or the pool cache is empty. Non-zero{" "}
+        <code>cand.</code> with all zeros in <code>sim ✓</code> is either
+        risk-gating too tightly or simulator failures.
       </p>
     </div>
   );

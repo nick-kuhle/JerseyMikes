@@ -17,6 +17,9 @@ use serde_json::json;
 
 use crate::rpc::RpcClient;
 
+/// Multi-leg cycle search over the pool graph.
+pub mod graph;
+
 sol! {
     interface IUniswapV2Factory {
         function getPair(address tokenA, address tokenB) external view returns (address pair);
@@ -106,6 +109,40 @@ impl Venue {
             Venue::SushiV2 => "sushiv2",
             Venue::UniV3 => "univ3",
         }
+    }
+}
+
+/// Immutable metadata for a UniswapV3 pool.
+///
+/// There is no reserve pair here on purpose: concentrated liquidity has no
+/// single "reserve" and any attempt to price this with `v2_amount_out` is
+/// wrong. Exact-in pricing goes through [`quote_v3`] (the on-chain QuoterV2),
+/// and live state (`slot0`, `liquidity`) is read on demand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V3Pool {
+    pub address: Address,
+    pub token0: Address,
+    pub token1: Address,
+    /// Fee in hundredths of a bip (500 == 0.05%, 3000 == 0.30%).
+    pub fee: u32,
+    pub tick_spacing: i32,
+}
+
+impl V3Pool {
+    pub fn other_token(&self, token: Address) -> Option<Address> {
+        if token == self.token0 {
+            Some(self.token1)
+        } else if token == self.token1 {
+            Some(self.token0)
+        } else {
+            None
+        }
+    }
+
+    /// Fee tiers the bot is willing to act on. The 1 bp tier is skipped: it is
+    /// almost entirely stable-stable pairs where our strategies have no edge.
+    pub fn is_actionable_fee(fee: u32) -> bool {
+        matches!(fee, 500 | 3_000 | 10_000)
     }
 }
 
