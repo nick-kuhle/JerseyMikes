@@ -1,0 +1,83 @@
+Date: Fri, 21 Aug 2026 06:59:34 +0000
+Subject: [PATCH] fix(bot): compile and filter V2 pool discovery
+
+---
+ bot/crates/mev-bot/src/risk.rs                 | 1 +
+ bot/crates/mev-bot/src/strategies/discovery.rs | 7 +++++--
+ bot/crates/mev-bot/src/strategies/mod.rs       | 2 +-
+ bot/crates/mev-bot/src/strategies/sniper.rs    | 1 -
+ 4 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/bot/crates/mev-bot/src/risk.rs b/bot/crates/mev-bot/src/risk.rs
+index 0fc29e9..8740087 100644
+--- a/bot/crates/mev-bot/src/risk.rs
++++ b/bot/crates/mev-bot/src/risk.rs
+@@ -209,6 +209,7 @@ mod tests {
+                 db_path: ":memory:".into(),
+                 feed_capacity: 10,
+             },
++            pool_discovery: true,
+             live_execution: false,
+         })
+     }
+diff --git a/bot/crates/mev-bot/src/strategies/discovery.rs b/bot/crates/mev-bot/src/strategies/discovery.rs
+index e02528e..8ce9c0c 100644
+--- a/bot/crates/mev-bot/src/strategies/discovery.rs
++++ b/bot/crates/mev-bot/src/strategies/discovery.rs
+@@ -10,6 +10,7 @@ use std::collections::HashSet;
+ use alloy_primitives::{Address, U256};
+ use parking_lot::RwLock;
+ 
++use crate::dex;
+ use crate::strategies::{scan_pair_created, StrategyCtx};
+ use crate::types::BlockHead;
+ 
+@@ -67,16 +68,18 @@ impl PoolDiscovery {
+             if !self.seen.write().insert(pair) {
+                 continue;
+             }
+-            let Some(pool) = ctx.pools.load(pair, venue, head.number).await else {
++            // Fetch first, then insert only qualifying pools. `PoolCache::load`
++            // inserts immediately, which would retain non-WETH and dust pools.
++            let Ok(pool) = dex::fetch_v2_pool(&ctx.rpc, pair, venue, 30, head.number).await else {
+                 continue;
+             };
+-            // Only WETH-quoted pools, and only once they hold real liquidity.
+             let Some((weth_reserve, _)) = pool.reserves_for(weth) else {
+                 continue;
+             };
+             if weth_reserve < min_reserve {
+                 continue;
+             }
++            ctx.pools.insert(pool);
+             tracing::info!(
+                 target: "pools",
+                 pair = ?pool.address,
+diff --git a/bot/crates/mev-bot/src/strategies/mod.rs b/bot/crates/mev-bot/src/strategies/mod.rs
+index 13c66a4..fff6a90 100644
+--- a/bot/crates/mev-bot/src/strategies/mod.rs
++++ b/bot/crates/mev-bot/src/strategies/mod.rs
+@@ -392,7 +392,7 @@ mod tests {
+     #[test]
+     fn ignores_unrelated_calldata() {
+         assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
+-        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none();
++        assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
+     }
+ 
+     #[test]
+diff --git a/bot/crates/mev-bot/src/strategies/sniper.rs b/bot/crates/mev-bot/src/strategies/sniper.rs
+index b634fc0..a6502d6 100644
+--- a/bot/crates/mev-bot/src/strategies/sniper.rs
++++ b/bot/crates/mev-bot/src/strategies/sniper.rs
+@@ -19,7 +19,6 @@ use alloy_primitives::{Address, U256};
+ use async_trait::async_trait;
+ use parking_lot::RwLock;
+ 
+-use crate::config::known;
+ use crate::dex::{self, Venue};
+ use crate::strategies::sandwich::build_leg;
+ use crate::strategies::{scan_pair_created, StrategyCtx, StrategyImpl};
+-- 
+2.47.3
+
