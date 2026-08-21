@@ -103,7 +103,10 @@ impl Inventory {
     pub async fn refresh(&self, http: &RpcClient, searcher: Address, weth: Address) -> Result<()> {
         let who = format!("{searcher:?}");
         if let Ok(v) = http
-            .call_raw("eth_getTransactionCount", serde_json::json!([who.clone(), "latest"]))
+            .call_raw(
+                "eth_getTransactionCount",
+                serde_json::json!([who.clone(), "latest"]),
+            )
             .await
         {
             self.set_nonce(crate::types::parse_u64(&v));

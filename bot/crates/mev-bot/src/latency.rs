@@ -236,16 +236,10 @@ mod tests {
         // 1 ms → first bucket (le 1)
         assert_eq!(buckets[0]["count"], 1);
         // 150 ms → the budget bucket
-        let budget = buckets
-            .iter()
-            .find(|b| b["leMs"] == 150)
-            .unwrap();
+        let budget = buckets.iter().find(|b| b["leMs"] == 150).unwrap();
         assert_eq!(budget["count"], 1);
         // 151 ms → the 200 ms bucket
-        let two_hundred = buckets
-            .iter()
-            .find(|b| b["leMs"] == 200)
-            .unwrap();
+        let two_hundred = buckets.iter().find(|b| b["leMs"] == 200).unwrap();
         assert_eq!(two_hundred["count"], 1);
         // overflow
         assert_eq!(buckets.last().unwrap()["count"], 1);

@@ -289,7 +289,7 @@ impl Config {
                 // Liberal defaults: record anything at all that is net positive.
                 min_net_profit_wei: env_u256("MIN_NET_PROFIT_WEI", 1),
                 max_position_wei: env_u256("MAX_POSITION_WEI", 100_000_000_000_000_000_000), // 100 ETH
-                max_base_fee_wei: env_u256("MAX_BASE_FEE_WEI", 500_000_000_000),             // 500 gwei
+                max_base_fee_wei: env_u256("MAX_BASE_FEE_WEI", 500_000_000_000), // 500 gwei
                 bribe_bps: env_u64("BRIBE_BPS", 9_000) as u16,
                 max_gas_per_bundle: env_u64("MAX_GAS_PER_BUNDLE", 3_000_000),
                 max_drawdown_wei: env_u256("MAX_DRAWDOWN_WEI", 0),

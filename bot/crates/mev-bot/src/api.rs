@@ -150,7 +150,10 @@ async fn pnl_series(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> i
     }
 }
 
-async fn opportunities(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+async fn opportunities(
+    State(s): State<ApiState>,
+    Query(q): Query<LimitQuery>,
+) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
     match s.engine.store.recent_opportunities(limit) {
         Ok(rows) => Json(json!(rows)),
@@ -211,7 +214,11 @@ async fn latency(State(s): State<ApiState>) -> impl IntoResponse {
 
 async fn competition(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let summary = s.engine.store.competition_summary().unwrap_or_else(|_| json!({}));
+    let summary = s
+        .engine
+        .store
+        .competition_summary()
+        .unwrap_or_else(|_| json!({}));
     let rows = s
         .engine
         .store

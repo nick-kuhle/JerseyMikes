@@ -235,7 +235,11 @@ pub fn parse_tx_object(v: &Value, source: TxSource) -> Option<PendingTx> {
                 .unwrap_or(&Value::Null),
         ),
         nonce: parse_u64(v.get("nonce").unwrap_or(&Value::Null)),
-        input: parse_bytes(v.get("input").or_else(|| v.get("data")).unwrap_or(&Value::Null)),
+        input: parse_bytes(
+            v.get("input")
+                .or_else(|| v.get("data"))
+                .unwrap_or(&Value::Null),
+        ),
         raw: v
             .get("raw")
             .or_else(|| v.get("rawTransaction"))
@@ -264,7 +268,11 @@ fn spawn_mev_share(url: String, tx: mpsc::Sender<IngestEvent>) {
                 Some(h) => h,
                 None => continue,
             };
-            let logs = v.get("logs").and_then(|l| l.as_array()).map(|a| a.len()).unwrap_or(0);
+            let logs = v
+                .get("logs")
+                .and_then(|l| l.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             let mut selectors = Vec::new();
             let mut to = None;
             if let Some(txsv) = v.get("txs").and_then(|t| t.as_array()) {
@@ -299,7 +307,11 @@ fn spawn_external_mempool(url: String, tx: mpsc::Sender<IngestEvent>) {
     // Third-party streams differ in their subscribe payload; the common
     // denominator (bloXroute "newTxs", Blocknative "pendingTransactions") is an
     // eth_subscribe-shaped request, which is what WsSubscription sends.
-    let mut sub = WsSubscription::spawn(url, json!(["newPendingTransactions", {"includeTransactions": true}]), "external");
+    let mut sub = WsSubscription::spawn(
+        url,
+        json!(["newPendingTransactions", {"includeTransactions": true}]),
+        "external",
+    );
     tokio::spawn(async move {
         while let Some(v) = sub.rx.recv().await {
             let obj = v.get("txContents").unwrap_or(&v);
@@ -343,7 +355,10 @@ fn spawn_relay_data(base: String, block_time_ms: u64, tx: mpsc::Sender<IngestEve
             Ok(c) => c,
             Err(_) => return,
         };
-        let url = format!("{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=20", base.trim_end_matches('/'));
+        let url = format!(
+            "{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=20",
+            base.trim_end_matches('/')
+        );
         let mut last_slot = 0u64;
         loop {
             match client.get(&url).send().await {
@@ -383,7 +398,9 @@ fn spawn_relay_data(base: String, block_time_ms: u64, tx: mpsc::Sender<IngestEve
                         }
                     }
                 }
-                Err(e) => tracing::debug!(target: "ingest", relay = %base, error = %e, "relay data poll failed"),
+                Err(e) => {
+                    tracing::debug!(target: "ingest", relay = %base, error = %e, "relay data poll failed")
+                }
             }
             tokio::time::sleep(Duration::from_millis(block_time_ms.max(4_000))).await;
         }
@@ -433,8 +450,7 @@ fn spawn_relay_blocks(
                                 continue;
                             }
                             last_block = block_number;
-                            let Some(block_hash) =
-                                item.get("block_hash").and_then(parse_b256)
+                            let Some(block_hash) = item.get("block_hash").and_then(parse_b256)
                             else {
                                 continue;
                             };
@@ -457,7 +473,11 @@ fn spawn_relay_blocks(
                                 num_tx: decimal_u64(&item["num_tx"]),
                             };
                             let txs = fetch_block_txs(&http, block_hash).await;
-                            if tx.send(IngestEvent::RelayBlock { block, txs }).await.is_err() {
+                            if tx
+                                .send(IngestEvent::RelayBlock { block, txs })
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -480,7 +500,10 @@ fn spawn_relay_blocks(
 /// still recorded, only its transaction backfill is skipped.
 async fn fetch_block_txs(http: &RpcClient, block_hash: alloy_primitives::B256) -> Vec<PendingTx> {
     let Ok(v) = http
-        .call_raw("eth_getBlockByHash", json!([format!("{block_hash:?}"), true]))
+        .call_raw(
+            "eth_getBlockByHash",
+            json!([format!("{block_hash:?}"), true]),
+        )
         .await
     else {
         return Vec::new();

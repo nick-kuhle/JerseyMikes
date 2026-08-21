@@ -91,7 +91,9 @@ impl RiskEngine {
             return Err(Reject::BaseFeeTooHigh);
         }
         let inflight = self.inflight.read();
-        if inflight.get(&opp.strategy).copied().unwrap_or(0) >= self.cfg.risk.max_inflight_per_strategy {
+        if inflight.get(&opp.strategy).copied().unwrap_or(0)
+            >= self.cfg.risk.max_inflight_per_strategy
+        {
             return Err(Reject::TooManyInflight);
         }
         Ok(())
@@ -265,7 +267,10 @@ mod tests {
     #[test]
     fn rejects_disabled_strategies() {
         let r = RiskEngine::new(cfg());
-        assert_eq!(r.check(&opp(Strategy::Jit, 10), U256::ZERO), Err(Reject::Disabled));
+        assert_eq!(
+            r.check(&opp(Strategy::Jit, 10), U256::ZERO),
+            Err(Reject::Disabled)
+        );
         assert_eq!(
             r.check(&opp(Strategy::SandwichV3, 10), U256::ZERO),
             Err(Reject::Disabled),
@@ -307,7 +312,10 @@ mod tests {
         assert!(!r.is_tripped());
         r.observe(&sim(-600, 1));
         assert!(r.is_tripped());
-        assert_eq!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO), Err(Reject::KillSwitch));
+        assert_eq!(
+            r.check(&opp(Strategy::Sandwich, 10), U256::ZERO),
+            Err(Reject::KillSwitch)
+        );
         r.reset();
         assert!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO).is_ok());
     }

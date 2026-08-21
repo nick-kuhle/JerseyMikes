@@ -139,7 +139,12 @@ impl ReplaySummary {
 /// Compare stored anvil-fork simulations in `[from_block, to_block]` (inclusive
 /// on both ends; `None` means unbounded) against relay bid traces and
 /// delivered-block transactions.
-pub fn compare(store: &Store, from_block: Option<u64>, to_block: Option<u64>, limit: i64) -> Result<Vec<ReplayRow>> {
+pub fn compare(
+    store: &Store,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    limit: i64,
+) -> Result<Vec<ReplayRow>> {
     let sims = store.replay_candidates(from_block, to_block, limit)?;
     let mut out = Vec::with_capacity(sims.len());
     for s in sims {
@@ -254,7 +259,10 @@ fn truncate_wei(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{now_ms, Opportunity, PendingTx, RelayBlock, SimBackend, SimulationResult, Strategy, TxSource};
+    use crate::types::{
+        now_ms, Opportunity, PendingTx, RelayBlock, SimBackend, SimulationResult, Strategy,
+        TxSource,
+    };
     use alloy_primitives::{Address, B256};
 
     fn seed(store: &Store) {

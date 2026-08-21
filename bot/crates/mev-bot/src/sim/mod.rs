@@ -96,7 +96,8 @@ impl Simulator {
                     // Exact pin: the parent of the victim's own block. Anything
                     // else and the victim's nonce, the pool reserves and the
                     // oracle prices all belong to a different chain state.
-                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee).await?
+                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee)
+                        .await?
                 }
                 // Refusing to score is the honest outcome. Simulating a mined
                 // transaction on the live fork answers a question nobody asked
@@ -111,7 +112,8 @@ impl Simulator {
             match &self.fork {
                 Some(fork) => {
                     fork.ensure_fork_at(parent).await.ok();
-                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee).await?
+                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee)
+                        .await?
                 }
                 None => crate::sim::empty_result(opp, "no simulation backend configured"),
             }
