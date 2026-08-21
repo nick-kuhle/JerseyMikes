@@ -53,6 +53,7 @@ impl Simulator {
         &self,
         opp: &Opportunity,
         victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
         base_fee: U256,
         nonce: u64,
     ) -> Result<SimOutcome> {
@@ -76,7 +77,7 @@ impl Simulator {
         let primary = match &self.fork {
             Some(fork) => {
                 fork.ensure_fork_at(opp.target_block.saturating_sub(1)).await.ok();
-                fork.simulate(opp, victims_raw, base_fee).await?
+                fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee).await?
             }
             None => crate::sim::empty_result(opp, "no simulation backend configured"),
         };
