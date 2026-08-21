@@ -387,7 +387,10 @@ export default function Console() {
       <RelayBlocksPanel />
 
       {/* strategy funnel — answers "why no opportunities?" with data */}
-      <FunnelPanel funnel={status?.stats.funnel ?? null} />
+      <FunnelPanel
+        funnel={status?.stats.funnel ?? null}
+        funnelReplay={status?.stats.funnelReplay ?? null}
+      />
 
       {/* risk & strategy controls */}
       <section className="panel" style={{padding: 12}}>

@@ -8,6 +8,12 @@ changing it, and how the work ahead is shaped by where DeFi is going.
 If you only read three sections, read **§1 Mindset**, **§3 Common
 Change Patterns**, and **§6 The Landscape**.
 
+This guide is permanent — it outlives any single phase of work. The
+time-boxed Phase 2 work order lives in
+[`PHASE_2_HANDOFF.md`](PHASE_2_HANDOFF.md) and is deleted once Phase 2
+ships; anything in it that turns out to be a durable rule about the
+codebase should be folded back into this document before that happens.
+
 ---
 
 ## 1. Mindset
@@ -402,11 +408,14 @@ The existing [`ROADMAP.md`](ROADMAP.md) is the canonical source.
 For the team taking this over, the practical order is:
 
 1. **Read the funnel for a week.** Don't change any code yet.
-   The funnel will tell you which of the four scenarios in
-   `docs/PHASE_2_DESIGN.md` §5 you are in, and that determines
-   the next move. If the funnel shows the strategies are doing
-   their job, the next move is not "more strategies" but "more
-   pools in the cache" or "faster mempool feed".
+   The funnel tells you where opportunities are dying, and that
+   determines the next move. Note that until the fix in
+   `docs/PHASE_2_HANDOFF.md` W1 lands, the first-stage counters
+   are per *invocation* and the rest are per *opportunity*, so
+   don't read a conversion rate across that boundary. If the
+   funnel shows the strategies are doing their job, the next
+   move is not "more strategies" but "more pools in the cache"
+   or "faster mempool feed".
 
 2. **Add pool discovery.** The `PairCreated` log scan in the
    sniper is the seed of this work. Pull it out into a shared
@@ -415,16 +424,16 @@ For the team taking this over, the practical order is:
    mainnet.
 
 3. **Add the multi-leg V2 arb.** The spec is in
-   `docs/PHASE_2_DESIGN.md` §1. The algorithm choice (direct
-   cycle enumeration, not Bellman–Ford) is documented there, and
-   the design document explains the trade-off. This is the
+   `docs/PHASE_2_HANDOFF.md` W4. The algorithm choice (direct
+   cycle enumeration, not Bellman–Ford) is documented there with
+   the trade-off and the search budgets. This is the
    strategy that has the most simulation signal on a typical
    mainnet day.
 
 4. **Add the V3 sandwich trigger.** The spec is in
-   `docs/PHASE_2_DESIGN.md` §2. The approach (QuoterV2 for
-   sizing, not hand-rolled Q64.96 math) is documented there, and
-   the design explains the trade-off. This is the strategy that
+   `docs/PHASE_2_HANDOFF.md` W5. The approach (QuoterV2 for
+   sizing, not hand-rolled Q64.96 math) is documented there with
+   the trade-off and the RPC budget. This is the strategy that
    expands the bot's *visible* surface — it sees the large
    router-routed swaps that the existing V2-only sandwich
    ignores.

@@ -53,26 +53,79 @@ pub struct Stats {
     pub submittable: std::sync::atomic::AtomicU64,
     pub rejected: std::sync::atomic::AtomicU64,
     pub started_at_ms: std::sync::atomic::AtomicU64,
-    /// Per-strategy funnel: how many candidates each strategy *saw*, how
-    /// many it *emitted* (i.e. built an `Opportunity` for), how many were
-    /// *gated by risk*, and how many *simulated successfully*. The point
-    /// of this counter is to make the funnel visible: if the bot is
-    /// seeing opportunities but not submitting any, the question "where
-    /// did they die?" gets an immediate answer.
+    /// Per-strategy funnel for **live** flow: how many candidates each
+    /// strategy emitted, how many were gated by risk, and how many
+    /// simulated successfully. If the bot is seeing opportunities but not
+    /// submitting any, the question "where did they die?" gets an
+    /// immediate answer here.
     pub funnel: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
+    /// The same funnel for **replayed** flow — transactions that were
+    /// already mined when the bot scored them (the relay delivered-block
+    /// backfill). Kept separate so it cannot drown out the live signal;
+    /// see [`FunnelLane`].
+    pub funnel_replay: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
 }
 
+/// Which measurement lane a funnel observation belongs to.
+///
+/// The bloXroute delivered-block backfill scores transactions that were
+/// **already mined** when the bot saw them. Those observations are valuable —
+/// they are the raw material for Phase 1 replay validation — but they are not
+/// opportunities the bot could have taken, and a mainnet block delivers ~150
+/// of them every 12 seconds. Folded into the same counters as live mempool
+/// flow they would dominate it, and every conversion rate in the funnel would
+/// stop meaning what `docs/PHASE_2_HANDOFF.md` §0 says it means.
+///
+/// So the two are counted separately. Same shape, same code path, different
+/// ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FunnelLane {
+    /// Flow the bot could have acted on: public mempool, MEV-Share hints,
+    /// external streams, sequencer feeds, and the block-cadence strategies.
+    Live,
+    /// Post-mortem scoring of transactions that were already mined when
+    /// observed: the relay delivered-block backfill.
+    Replay,
+}
+
+impl FunnelLane {
+    /// Transactions are live unless we know they were already on chain.
+    pub fn for_source(source: TxSource) -> Self {
+        match source {
+            TxSource::RelayDelivered | TxSource::Mined => FunnelLane::Replay,
+            TxSource::PublicMempool
+            | TxSource::MevShare
+            | TxSource::Sequencer
+            | TxSource::ExternalStream => FunnelLane::Live,
+        }
+    }
+}
+
+/// Per-strategy funnel counters.
+///
+/// **Two different units live in this struct and mixing them is a
+/// mistake that has already been made once.** The `invocations_*`
+/// fields count *strategy calls*; everything else counts *individual
+/// opportunities*. A conversion rate is only meaningful between fields
+/// of the same unit — `candidates_emitted` → `gated_by_risk` →
+/// `simulations_*` → `submittable` is the per-opportunity funnel, and
+/// `invocations_with_output` / `invocations_empty` is the separate
+/// "how often does this strategy fire at all" signal.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FunnelCounters {
-    /// Total `on_pending` / `on_block` calls that produced at least one
-    /// `Opportunity`. This is the strategy's "output" rate.
+    /// **Unit: strategy calls.** `on_pending` / `on_block` calls that
+    /// produced at least one `Opportunity`. This is the strategy's
+    /// "fires at all" rate, not its output volume.
+    pub invocations_with_output: u64,
+    /// **Unit: strategy calls.** `on_pending` / `on_block` calls that
+    /// returned zero `Opportunity`s — typically min-notional filters,
+    /// victim-revert pre-checks, or pool-cache misses.
+    pub invocations_empty: u64,
+    /// **Unit: opportunities.** Total `Opportunity`s emitted, i.e. the
+    /// sum of `opps.len()` over every call. This is the number that
+    /// moves when a strategy widens its search (multi-leg arb, V3
+    /// victims), and the one every downstream counter is comparable to.
     pub candidates_emitted: u64,
-    /// Total `on_pending` / `on_block` calls that returned zero
-    /// `Opportunity`s. Split from `candidates_emitted` so the user can
-    /// see the proportion of "saw but emitted nothing" — typically
-    /// caused by min-notional filters, victim-revert pre-checks, or
-    /// pool-cache misses.
-    pub candidates_skipped: u64,
     /// `Opportunity`s rejected by `RiskEngine::check`. The reject
     /// reason is recorded elsewhere; this counter is just the count.
     pub gated_by_risk: u64,
@@ -101,27 +154,53 @@ impl Stats {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Bump a per-strategy funnel counter. This is the only path
-    /// through which funnel counters should be incremented, so the
+    /// Bump a per-strategy funnel counter in one lane. This is the only
+    /// path through which funnel counters should be incremented, so the
     /// funnel-stats update is in one place.
-    pub fn record_funnel(&self, strategy: Strategy, f: impl FnOnce(&mut FunnelCounters)) {
-        let mut guard = self.funnel.write();
+    pub fn record_funnel(&self, lane: FunnelLane, strategy: Strategy, f: impl FnOnce(&mut FunnelCounters)) {
+        let map = match lane {
+            FunnelLane::Live => &self.funnel,
+            FunnelLane::Replay => &self.funnel_replay,
+        };
+        let mut guard = map.write();
         let entry = guard.entry(strategy).or_default();
         f(entry);
     }
 
-    pub fn snapshot(&self) -> serde_json::Value {
-        use std::sync::atomic::Ordering::Relaxed;
-        let funnel = self
-            .funnel
-            .read()
+    /// Record one strategy invocation together with the number of
+    /// opportunities it produced.
+    ///
+    /// This is the only correct way to bump the first funnel stage: it keeps
+    /// the two units consistent (exactly one invocation counter per call,
+    /// plus `produced` candidates). Bumping `candidates_emitted` by one per
+    /// call — as this code did before — makes a block that yields 30
+    /// candidates indistinguishable from one that yields a single candidate,
+    /// which is precisely the measurement multi-leg arb and V3 sandwiching
+    /// are judged by.
+    pub fn record_invocation(&self, lane: FunnelLane, strategy: Strategy, produced: usize) {
+        self.record_funnel(lane, strategy, |f| {
+            if produced == 0 {
+                f.invocations_empty += 1;
+            } else {
+                f.invocations_with_output += 1;
+                f.candidates_emitted += produced as u64;
+            }
+        });
+    }
+
+    /// Serialise one funnel lane as `{strategy: counters}`.
+    fn funnel_json(
+        map: &parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        map.read()
             .iter()
             .map(|(k, v)| {
                 (
                     k.as_str().to_string(),
                     serde_json::json!({
+                        "invocationsWithOutput": v.invocations_with_output,
+                        "invocationsEmpty": v.invocations_empty,
                         "candidatesEmitted": v.candidates_emitted,
-                        "candidatesSkipped": v.candidates_skipped,
                         "gatedByRisk": v.gated_by_risk,
                         "missingVictimRaw": v.missing_victim_raw,
                         "simulationsSucceeded": v.simulations_succeeded,
@@ -131,7 +210,13 @@ impl Stats {
                     }),
                 )
             })
-            .collect::<serde_json::Map<_, _>>();
+            .collect::<serde_json::Map<_, _>>()
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let funnel = Self::funnel_json(&self.funnel);
+        let funnel_replay = Self::funnel_json(&self.funnel_replay);
         serde_json::json!({
             "pendingSeen": self.pending_seen.load(Relaxed),
             "hintsSeen": self.hints_seen.load(Relaxed),
@@ -143,7 +228,10 @@ impl Stats {
             "submittable": self.submittable.load(Relaxed),
             "rejected": self.rejected.load(Relaxed),
             "startedAtMs": self.started_at_ms.load(Relaxed),
+            // Live flow only. Post-mortem scoring of already-mined relay
+            // transactions is counted separately so it cannot inflate this.
             "funnel": funnel,
+            "funnelReplay": funnel_replay,
         })
     }
 }
@@ -178,6 +266,39 @@ impl Engine {
                 None
             }
         };
+        // Second fork, dedicated to replaying delivered blocks. Only worth its
+        // memory when there is a backfill to score, and only correct as a
+        // separate instance: it pins to historical parents while the live fork
+        // tracks the head.
+        let replay_fork = if cfg.relay_tx_ingest && cfg.sim.replay_fork {
+            match crate::sim::anvil::AnvilSim::spawn_on(
+                cfg.clone(),
+                head.number,
+                cfg.sim.anvil_replay_port,
+            )
+            .await
+            {
+                Ok(f) => {
+                    tracing::info!(
+                        target: "engine",
+                        port = cfg.sim.anvil_replay_port,
+                        "replay fork ready — delivered blocks scored at their parent state"
+                    );
+                    Some(Arc::new(f))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "engine",
+                        error = %e,
+                        "replay fork unavailable — delivered-block scoring will be skipped rather than mis-scored against head state"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let relay = if cfg.sim.use_call_bundle {
             crate::sim::relay::RelaySim::new(&cfg, signer.clone()).ok()
         } else {
@@ -190,7 +311,7 @@ impl Engine {
             .or(cfg.endpoints.executor)
             .unwrap_or(crate::sim::anvil::SIM_EXECUTOR);
 
-        let sim = Arc::new(Simulator::new(cfg.clone(), fork, relay, signer));
+        let sim = Arc::new(Simulator::new(cfg.clone(), fork, replay_fork, relay, signer));
         let ctx = Arc::new(StrategyCtx::new(cfg.clone(), http.clone(), executor, head));
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
@@ -324,8 +445,23 @@ impl Engine {
         // back-run, liquidation, sniper) and the simulator decides whether value
         // was extractable. Relay transactions are already mined, so the fork
         // replay is a post-mortem of what *could* have been captured.
+        //
+        // Bounded on purpose. A mainnet block carries ~150-200 transactions and
+        // each fans out to one task per strategy, so scoring a block unbounded
+        // queues ~1000 tasks and a matching burst of RPC every 12 seconds —
+        // which starves the live mempool path and gets the bot rate limited off
+        // its provider. `RELAY_TX_CONCURRENCY` caps how many are in flight; the
+        // work still completes, it just does not stampede.
+        let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.relay_tx_concurrency));
         for t in txs {
-            self.clone().evaluate(t).await;
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                break; // semaphore closed — shutting down
+            };
+            let this = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                this.evaluate_awaited(t).await;
+            });
         }
     }
 
@@ -335,7 +471,7 @@ impl Engine {
         let _ = self.store.record_block(&head);
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
 
-        if self.cfg.pool_discovery {
+        if self.cfg.pool_discovery || self.cfg.pool_discovery_v3 {
             let discovery = &self.pool_discovery;
             let ctx = self.ctx.clone();
             let head = head.clone();
@@ -352,15 +488,18 @@ impl Engine {
             let kind = s.kind();
             tokio::spawn(async move {
                 let opps = strat.on_block(&this.ctx, &head).await;
-                this.stats.record_funnel(kind, |f| {
-                    if opps.is_empty() {
-                        f.candidates_skipped += 1;
-                    } else {
-                        f.candidates_emitted += 1;
-                    }
-                });
+                this.stats
+                    .record_invocation(FunnelLane::Live, kind, opps.len());
                 for opp in opps {
-                    this.clone().consider(opp, Vec::new(), None).await;
+                    this.clone()
+                        .consider(
+                            FunnelLane::Live,
+                            opp,
+                            Vec::new(),
+                            None,
+                            head.base_fee_per_gas,
+                        )
+                        .await;
                 }
             });
         }
@@ -385,61 +524,100 @@ impl Engine {
     /// Run one observed transaction through every strategy, then risk-gate,
     /// simulate and record whatever they propose. Shared by the live mempool path
     /// (`on_pending`) and the relay-delivered-block backfill path, so both are
-    /// scored identically.
+    /// scored identically — but counted in separate funnel lanes, because one
+    /// is an opportunity and the other is a post-mortem.
+    ///
+    /// Fan-out form: one task per strategy, returns immediately. The live
+    /// mempool path is latency-critical, so it does not wait.
     async fn evaluate(self: Arc<Self>, tx: PendingTx) {
+        let lane = FunnelLane::for_source(tx.source);
         for s in &self.strategies {
             let strat = s.clone();
             let this = self.clone();
             let tx = tx.clone();
             let kind = s.kind();
             tokio::spawn(async move {
-                let opps = strat.on_pending(&this.ctx, &tx).await;
-                this.stats.record_funnel(kind, |f| {
-                    if opps.is_empty() {
-                        f.candidates_skipped += 1;
-                    } else {
-                        f.candidates_emitted += 1;
-                    }
-                });
-                if opps.is_empty() {
-                    return;
-                }
-                // The victim must be replayable inside the fork, which needs the
-                // raw signed bytes.
-                let raw = match &tx.raw {
-                    Some(r) => Some(r.clone()),
-                    None => ingest::fetch_raw_tx(&this.http, tx.hash).await,
-                };
-                let victims = raw.map(|r| vec![r]).unwrap_or_default();
-                for opp in opps {
-                    this.clone()
-                        .consider(opp, victims.clone(), tx.from.map(|from| (from, tx.nonce)))
-                        .await;
-                }
+                this.run_strategy(strat, kind, tx, lane).await;
             });
+        }
+    }
+
+    /// Awaited form of [`evaluate`]: runs the strategies one after another and
+    /// returns when they are all done.
+    ///
+    /// Used by the replay path, where completion is what makes back-pressure
+    /// possible. Already-mined transactions have no deadline, so trading
+    /// latency for a bounded task and RPC footprint is free.
+    async fn evaluate_awaited(self: Arc<Self>, tx: PendingTx) {
+        let lane = FunnelLane::for_source(tx.source);
+        for s in &self.strategies {
+            let strat = s.clone();
+            let kind = s.kind();
+            self.clone()
+                .run_strategy(strat, kind, tx.clone(), lane)
+                .await;
+        }
+    }
+
+    /// One strategy against one transaction: propose, then hand each proposal
+    /// to `consider`.
+    async fn run_strategy(
+        self: Arc<Self>,
+        strat: Arc<dyn StrategyImpl>,
+        kind: Strategy,
+        tx: PendingTx,
+        lane: FunnelLane,
+    ) {
+        let opps = strat.on_pending(&self.ctx, &tx).await;
+        self.stats.record_invocation(lane, kind, opps.len());
+        if opps.is_empty() {
+            return;
+        }
+        // The victim must be replayable inside the fork, which needs the
+        // raw signed bytes.
+        let raw = match &tx.raw {
+            Some(r) => Some(r.clone()),
+            None => ingest::fetch_raw_tx(&self.http, tx.hash).await,
+        };
+        let victims = raw.map(|r| vec![r]).unwrap_or_default();
+        let base_fee = tx.base_fee(&self.ctx.head());
+        for opp in opps {
+            self.clone()
+                .consider(
+                    lane,
+                    opp,
+                    victims.clone(),
+                    tx.from.map(|from| (from, tx.nonce)),
+                    base_fee,
+                )
+                .await;
         }
     }
 
     /// Risk-gate, simulate, record.
     async fn consider(
         self: Arc<Self>,
+        lane: FunnelLane,
         opp: Opportunity,
         victims_raw: Vec<Vec<u8>>,
         victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
+        base_fee: U256,
     ) {
-        let head = self.ctx.head();
         let kind = opp.strategy;
-        if let Err(reject) = self.risk.check(&opp, head.base_fee_per_gas) {
+        // `base_fee` is the head's for live flow and the victim's own block's
+        // for a replay. Gating a historical bundle on today's gas price, in
+        // either direction, invents a result.
+        if let Err(reject) = self.risk.check(&opp, base_fee) {
             Stats::bump(&self.stats.rejected);
             self.stats
-                .record_funnel(kind, |f| f.gated_by_risk += 1);
+                .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
             tracing::debug!(target: "engine", strategy = opp.strategy.as_str(), reason = reject.as_str(), "rejected");
             return;
         }
         // A sandwich or JIT without the victim's bytes cannot be simulated faithfully.
         if !opp.victim_hashes.is_empty() && victims_raw.is_empty() {
             self.stats
-                .record_funnel(kind, |f| f.missing_victim_raw += 1);
+                .record_funnel(lane, kind, |f| f.missing_victim_raw += 1);
             tracing::debug!(target: "engine", "skipping: victim raw transaction unavailable");
             return;
         }
@@ -455,8 +633,9 @@ impl Engine {
                 &opp,
                 &victims_raw,
                 victim_sender_nonce,
-                head.base_fee_per_gas,
+                base_fee,
                 0,
+                lane == FunnelLane::Replay,
             )
             .await;
         self.risk.end(opp.strategy);
@@ -466,7 +645,7 @@ impl Engine {
             Err(e) => {
                 tracing::debug!(target: "engine", error = %e, "simulation failed");
                 self.stats
-                    .record_funnel(kind, |f| f.simulations_failed += 1);
+                    .record_funnel(lane, kind, |f| f.simulations_failed += 1);
                 return;
             }
         };
@@ -482,17 +661,17 @@ impl Engine {
 
         if outcome.primary.success {
             self.stats
-                .record_funnel(kind, |f| f.simulations_succeeded += 1);
+                .record_funnel(lane, kind, |f| f.simulations_succeeded += 1);
         } else {
             self.stats
-                .record_funnel(kind, |f| f.simulations_reverted += 1);
+                .record_funnel(lane, kind, |f| f.simulations_reverted += 1);
         }
 
         let mut bundle = outcome.bundle;
         if self.risk.submittable(&outcome.primary) {
             Stats::bump(&self.stats.submittable);
             self.stats
-                .record_funnel(kind, |f| f.submittable += 1);
+                .record_funnel(lane, kind, |f| f.submittable += 1);
             tracing::info!(
                 target: "engine",
                 strategy = opp.strategy.as_str(),
@@ -547,6 +726,7 @@ fn hint_to_pending(raw: &serde_json::Value, hash: alloy_primitives::B256, to: Op
         input: calldata,
         raw: None,
         source: TxSource::MevShare,
+        mined_at: None,
         seen_at_ms: now_ms(),
     })
 }
@@ -584,10 +764,10 @@ mod tests {
     #[test]
     fn record_funnel_bumps_the_right_strategy() {
         let s = Stats::default();
-        s.record_funnel(Strategy::Sandwich, |f| f.candidates_emitted += 3);
-        s.record_funnel(Strategy::Sandwich, |f| f.gated_by_risk += 1);
-        s.record_funnel(Strategy::AtomicArb, |f| f.candidates_emitted += 7);
-        s.record_funnel(Strategy::AtomicArb, |f| f.simulations_succeeded += 2);
+        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| f.candidates_emitted += 3);
+        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| f.gated_by_risk += 1);
+        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| f.candidates_emitted += 7);
+        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| f.simulations_succeeded += 2);
         let snap = s.snapshot();
         let funnel = snap.get("funnel").unwrap().as_object().unwrap();
         let sandwich = funnel.get("sandwich").unwrap();
@@ -606,13 +786,112 @@ mod tests {
         // appear in the snapshot with zeros, so the dashboard always has
         // a row for every enabled strategy.
         let s = Stats::default();
-        s.record_funnel(Strategy::Jit, |_| {});
+        s.record_funnel(FunnelLane::Live, Strategy::Jit, |_| {});
         let snap = s.snapshot();
         let jit = snap["funnel"]["jit"].clone();
         assert_eq!(jit["candidatesEmitted"], 0);
-        assert_eq!(jit["candidatesSkipped"], 0);
+        assert_eq!(jit["invocationsWithOutput"], 0);
+        assert_eq!(jit["invocationsEmpty"], 0);
         assert_eq!(jit["gatedByRisk"], 0);
         assert_eq!(jit["submittable"], 0);
+    }
+
+    #[test]
+    fn invocation_with_three_opportunities_counts_three_candidates() {
+        // The defect this replaces: one call returning three opportunities
+        // used to bump candidatesEmitted by one, making it impossible to
+        // see search-width changes (multi-leg arb, V3 victims) in the funnel.
+        let s = Stats::default();
+        s.record_invocation(FunnelLane::Live, Strategy::AtomicArb, 3);
+        let snap = s.snapshot();
+        let arb = &snap["funnel"]["atomic_arb"];
+        assert_eq!(arb["candidatesEmitted"], 3);
+        assert_eq!(arb["invocationsWithOutput"], 1);
+        assert_eq!(arb["invocationsEmpty"], 0);
+    }
+
+    #[test]
+    fn empty_invocation_counts_only_as_an_empty_call() {
+        let s = Stats::default();
+        s.record_invocation(FunnelLane::Live, Strategy::Sandwich, 0);
+        let snap = s.snapshot();
+        let sw = &snap["funnel"]["sandwich"];
+        assert_eq!(sw["candidatesEmitted"], 0);
+        assert_eq!(sw["invocationsEmpty"], 1);
+        assert_eq!(sw["invocationsWithOutput"], 0);
+    }
+
+    #[test]
+    fn candidates_never_fall_below_invocations_with_output() {
+        // Invariant the dashboard relies on: every invocation that produced
+        // output contributed at least one candidate, so candidatesEmitted is
+        // always >= invocationsWithOutput. Mixed traffic must preserve it.
+        let s = Stats::default();
+        for n in [0usize, 1, 0, 5, 2, 0] {
+            s.record_invocation(FunnelLane::Live, Strategy::Jit, n);
+        }
+        let snap = s.snapshot();
+        let jit = &snap["funnel"]["jit"];
+        assert_eq!(jit["candidatesEmitted"], 8); // 1 + 5 + 2
+        assert_eq!(jit["invocationsWithOutput"], 3);
+        assert_eq!(jit["invocationsEmpty"], 3);
+        assert!(
+            jit["candidatesEmitted"].as_u64().unwrap()
+                >= jit["invocationsWithOutput"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn replay_flow_never_touches_the_live_funnel() {
+        // The bloXroute backfill scores ~150 already-mined transactions per
+        // block. If those landed in the live funnel they would swamp it and
+        // every conversion rate in the dashboard would become meaningless.
+        let s = Stats::default();
+        s.record_invocation(FunnelLane::Replay, Strategy::Sandwich, 4);
+        s.record_funnel(FunnelLane::Replay, Strategy::Sandwich, |f| f.submittable += 2);
+
+        let snap = s.snapshot();
+        assert!(
+            snap["funnel"].as_object().unwrap().is_empty(),
+            "replay observations must not appear in the live funnel"
+        );
+        let replay = &snap["funnelReplay"]["sandwich"];
+        assert_eq!(replay["candidatesEmitted"], 4);
+        assert_eq!(replay["submittable"], 2);
+    }
+
+    #[test]
+    fn the_two_lanes_count_the_same_strategy_separately() {
+        let s = Stats::default();
+        s.record_invocation(FunnelLane::Live, Strategy::AtomicArb, 1);
+        s.record_invocation(FunnelLane::Replay, Strategy::AtomicArb, 9);
+
+        let snap = s.snapshot();
+        assert_eq!(snap["funnel"]["atomic_arb"]["candidatesEmitted"], 1);
+        assert_eq!(snap["funnelReplay"]["atomic_arb"]["candidatesEmitted"], 9);
+    }
+
+    #[test]
+    fn lane_is_chosen_by_transaction_provenance() {
+        // Already-mined sources are post-mortem; everything else is actionable.
+        assert_eq!(
+            FunnelLane::for_source(TxSource::RelayDelivered),
+            FunnelLane::Replay
+        );
+        assert_eq!(FunnelLane::for_source(TxSource::Mined), FunnelLane::Replay);
+        assert_eq!(
+            FunnelLane::for_source(TxSource::PublicMempool),
+            FunnelLane::Live
+        );
+        assert_eq!(FunnelLane::for_source(TxSource::MevShare), FunnelLane::Live);
+        assert_eq!(
+            FunnelLane::for_source(TxSource::ExternalStream),
+            FunnelLane::Live
+        );
+        assert_eq!(
+            FunnelLane::for_source(TxSource::Sequencer),
+            FunnelLane::Live
+        );
     }
 
     #[test]
@@ -627,7 +906,8 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap["pendingSeen"], 2);
         assert_eq!(snap["blocksSeen"], 1);
-        // Funnel untouched.
+        // Both funnel lanes untouched.
         assert!(snap["funnel"].as_object().unwrap().is_empty());
+        assert!(snap["funnelReplay"].as_object().unwrap().is_empty());
     }
 }

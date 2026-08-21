@@ -3,6 +3,22 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use serde::{Deserialize, Serialize};
 
+/// Where an already-mined transaction sat when the bot saw it.
+///
+/// Present only for transactions that were on chain before we scored them —
+/// today that means the relay delivered-block backfill. It is what lets the
+/// replay path price against the state the transaction actually executed
+/// against (`block_number - 1`) instead of against whatever the head happens
+/// to be now, which may be hundreds of blocks later.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct MinedAt {
+    /// Block the transaction was included in.
+    pub block_number: u64,
+    /// That block's base fee. Costing a historical bundle at today's base fee
+    /// silently rewrites the economics of the opportunity in both directions.
+    pub base_fee_per_gas: U256,
+}
+
 /// A transaction observed in the public mempool or in a private orderflow stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingTx {
@@ -20,6 +36,10 @@ pub struct PendingTx {
     #[serde(default, with = "crate::types::opt_bytes_hex")]
     pub raw: Option<Vec<u8>>,
     pub source: TxSource,
+    /// Set when the transaction was already mined when observed. `None` is
+    /// live flow, which is evaluated against the current head.
+    #[serde(default)]
+    pub mined_at: Option<MinedAt>,
     pub seen_at_ms: u64,
 }
 
@@ -29,6 +49,46 @@ impl PendingTx {
             return None;
         }
         Some([self.input[0], self.input[1], self.input[2], self.input[3]])
+    }
+
+    /// True when this transaction was already on chain when we saw it.
+    pub fn is_replay(&self) -> bool {
+        self.mined_at.is_some()
+    }
+
+    /// The block whose **state** strategies must price against.
+    ///
+    /// For live flow that is the head: the next block builds on it. For a
+    /// mined transaction it is the *parent* of its block — the state the
+    /// transaction itself executed against. Using the head instead is the
+    /// post-mortem state-divergence bug: reserves, oracle prices and account
+    /// nonces have all moved on, so the sizing is computed against a world
+    /// the victim never saw.
+    pub fn state_block(&self, head: &BlockHead) -> u64 {
+        match &self.mined_at {
+            Some(m) => m.block_number.saturating_sub(1),
+            None => head.number,
+        }
+    }
+
+    /// The block a bundle built from this transaction targets.
+    ///
+    /// Live flow aims at `head + offset`; a replay aims at the block the
+    /// transaction actually landed in, so the simulator forks at its parent
+    /// and the victim's nonce is the one that was valid at the time.
+    pub fn target_block(&self, head: &BlockHead, offset: u64) -> u64 {
+        match &self.mined_at {
+            Some(m) => m.block_number,
+            None => head.number + offset,
+        }
+    }
+
+    /// Base fee that applies when costing a bundle built from this transaction.
+    pub fn base_fee(&self, head: &BlockHead) -> U256 {
+        match &self.mined_at {
+            Some(m) => m.base_fee_per_gas,
+            None => head.base_fee_per_gas,
+        }
     }
 }
 
@@ -408,5 +468,90 @@ mod tests {
     fn formats_eth() {
         assert_eq!(format_eth(U256::from(1_500_000_000_000_000_000u128)), "1.500000");
         assert_eq!(format_eth(U256::ZERO), "0.000000");
+    }
+
+    fn head_at(number: u64, base_fee: u64) -> BlockHead {
+        BlockHead {
+            number,
+            hash: B256::ZERO,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+            base_fee_per_gas: U256::from(base_fee),
+            gas_used: 0,
+            gas_limit: 30_000_000,
+        }
+    }
+
+    fn tx_with(mined_at: Option<MinedAt>) -> PendingTx {
+        PendingTx {
+            hash: B256::ZERO,
+            from: None,
+            to: None,
+            value: U256::ZERO,
+            gas: 0,
+            max_fee_per_gas: U256::ZERO,
+            max_priority_fee_per_gas: U256::ZERO,
+            nonce: 0,
+            input: Vec::new(),
+            raw: None,
+            source: TxSource::PublicMempool,
+            mined_at,
+            seen_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn live_flow_prices_against_the_head() {
+        let head = head_at(1_000, 7);
+        let tx = tx_with(None);
+        assert!(!tx.is_replay());
+        assert_eq!(tx.state_block(&head), 1_000);
+        assert_eq!(tx.target_block(&head, 1), 1_001);
+        assert_eq!(tx.base_fee(&head), U256::from(7u64));
+    }
+
+    #[test]
+    fn a_mined_transaction_prices_against_its_parent_block() {
+        // The whole point of block-context tagging: a transaction delivered in
+        // block 900 executed against the state left by block 899, and its
+        // bundle targets 900 — regardless of how far the head has moved on.
+        let head = head_at(1_000, 7);
+        let tx = tx_with(Some(MinedAt {
+            block_number: 900,
+            base_fee_per_gas: U256::from(42u64),
+        }));
+        assert!(tx.is_replay());
+        assert_eq!(tx.state_block(&head), 899);
+        assert_eq!(tx.target_block(&head, 1), 900);
+        assert_eq!(
+            tx.base_fee(&head),
+            U256::from(42u64),
+            "a historical bundle must be costed at its own block's base fee"
+        );
+    }
+
+    #[test]
+    fn the_offset_never_leaks_into_a_replay_target() {
+        // target_block_offset shifts live bundles into the *next* block. A
+        // replay is aimed at a block that already exists, so the offset must
+        // not move it.
+        let head = head_at(5_000, 1);
+        let tx = tx_with(Some(MinedAt {
+            block_number: 4_000,
+            base_fee_per_gas: U256::from(3u64),
+        }));
+        for offset in [0u64, 1, 2, 5] {
+            assert_eq!(tx.target_block(&head, offset), 4_000);
+        }
+    }
+
+    #[test]
+    fn genesis_block_does_not_underflow() {
+        let head = head_at(10, 1);
+        let tx = tx_with(Some(MinedAt {
+            block_number: 0,
+            base_fee_per_gas: U256::ZERO,
+        }));
+        assert_eq!(tx.state_block(&head), 0);
     }
 }

@@ -29,22 +29,33 @@ export interface StatusResponse {
     rejected: number;
     startedAtMs: number;
     /**
-     * Per-strategy funnel counters. The keys match `Strategy`. The values
-     * make it possible to see exactly *where* opportunities are being
-     * filtered out — e.g. if `gatedByRisk` is high, the risk filter is
-     * too tight; if `candidatesSkipped` is high, the strategy is seeing
-     * the right shape of transaction but rejecting them at the
-     * decode / pre-filter stage.
+     * Per-strategy funnel counters. The keys match `Strategy`.
+     *
+     * Two units live in here and must not be divided into each other:
+     * `invocationsWithOutput` / `invocationsEmpty` count *strategy calls*,
+     * everything else counts *individual opportunities*. See
+     * `FunnelCounters`.
      */
     funnel?: Partial<Record<Strategy, FunnelCounters>>;
+    /**
+     * The same funnel for transactions that were already mined when the bot
+     * scored them — the bloXroute delivered-block backfill. Kept apart from
+     * `funnel` so a ~150-tx-per-block post-mortem stream cannot drown out the
+     * live signal.
+     */
+    funnelReplay?: Partial<Record<Strategy, FunnelCounters>>;
   };
   simBackends: {anvilFork: boolean; relayCallBundle: boolean};
   demo?: boolean;
 }
 
 export interface FunnelCounters {
+  /** Unit: strategy calls that produced at least one opportunity. */
+  invocationsWithOutput: number;
+  /** Unit: strategy calls that produced none. */
+  invocationsEmpty: number;
+  /** Unit: opportunities. Sum of opps.len() over every call. */
   candidatesEmitted: number;
-  candidatesSkipped: number;
   gatedByRisk: number;
   missingVictimRaw: number;
   simulationsSucceeded: number;

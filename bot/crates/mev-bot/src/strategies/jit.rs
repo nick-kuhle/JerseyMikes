@@ -85,11 +85,17 @@ impl StrategyImpl for JitStrategy {
             return Vec::new();
         }
 
-        let Ok(Some(state)) = pool_state(ctx, p.token_in, p.token_out, p.fee).await else {
+        let head = ctx.head();
+        // Read V3 state at the block the victim executed against, not at the
+        // head: for a replayed transaction those are different worlds.
+        let state_tag = ctx.block_tag(tx.state_block(&head));
+        let Ok(Some(state)) = pool_state(ctx, p.token_in, p.token_out, p.fee, &state_tag).await
+        else {
             return Vec::new();
         };
 
-        let head = ctx.head();
+        let base_fee = tx.base_fee(&head);
+        let target_block = tx.target_block(&head, ctx.cfg.sim.target_block_offset);
         let capital = ctx.max_position().min(U256::from(MIN_VICTIM_NOTIONAL) * U256::from(10u8));
         let Some(plan) = size_position(&state, capital, p.zero_for_one) else {
             return Vec::new();
@@ -106,7 +112,7 @@ impl StrategyImpl for JitStrategy {
         let expected_fee = volume_fee * share / U256::from(1_000_000u32);
 
         // mint + burn + collect + arming ≈ 500k gas.
-        let gas_cost = U256::from(500_000u64) * (head.base_fee_per_gas + U256::from(1_000_000_000u64));
+        let gas_cost = U256::from(500_000u64) * (base_fee + U256::from(1_000_000_000u64));
         if expected_fee <= gas_cost {
             return Vec::new();
         }
@@ -168,7 +174,7 @@ impl StrategyImpl for JitStrategy {
             profit_token: weth,
             expected_profit_wei: expected_fee.saturating_sub(gas_cost),
             notional_wei: capital,
-            target_block: ctx.target_block(),
+            target_block,
             created_at_ms: now_ms(),
             notes: format!(
                 "jit {:?} fee {} ticks [{}, {}] L {} victim_in {} expected_fee {}",
@@ -218,11 +224,17 @@ pub struct V3State {
     pub liquidity: u128,
 }
 
-async fn pool_state(ctx: &StrategyCtx, a: Address, b: Address, fee: u32) -> anyhow::Result<Option<V3State>> {
+async fn pool_state(
+    ctx: &StrategyCtx,
+    a: Address,
+    b: Address,
+    fee: u32,
+    block_tag: &str,
+) -> anyhow::Result<Option<V3State>> {
     let call = |to: Address, data: Vec<u8>| {
         json!([
             {"to": format!("{to:?}"), "data": format!("0x{}", hex::encode(data))},
-            "latest"
+            block_tag
         ])
     };
 

@@ -200,6 +200,8 @@ mod tests {
             sim: crate::config::SimConfig {
                 anvil_bin: "anvil".into(),
                 anvil_port: 8548,
+                anvil_replay_port: 8549,
+                replay_fork: false,
                 refork_every_blocks: 1,
                 use_call_bundle: false,
                 target_block_offset: 1,
@@ -211,7 +213,10 @@ mod tests {
                 feed_capacity: 10,
             },
             pool_discovery: true,
+            pool_discovery_v3: false,
+            arb_max_cycle_len: 2,
             relay_tx_ingest: false,
+            relay_tx_concurrency: 4,
             live_execution: false,
         })
     }
