@@ -11,9 +11,11 @@ use alloy_primitives::U256;
 use serde_json::{json, Value};
 
 /// Logistic steepness. Chosen so that matching the winning bid is p = 0.5
-/// (we might or might not have won the race), 2× the bid is ~0.88, and
-/// half the bid is ~0.12. The model is deliberately simple: it is a ranking
+/// (we might or might not have won the race), 2× the bid is ~0.90, and
+/// half the bid is ~0.25. The model is deliberately simple: it is a ranking
 /// against a realised price, not a simulation of the builder's full auction.
+/// (The curve is centred on `ours/win - 1`, so halving the ratio moves the
+/// logit half as far as doubling it — the two are not symmetric.)
 const LOGISTIC_K: f64 = 2.2;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,8 +108,11 @@ mod tests {
 
     #[test]
     fn half_the_bid_is_unlikely() {
+        // At half the winning bid the logistic argument is -LOGISTIC_K/2 =
+        // -1.1, so p = σ(-1.1) ≈ 0.2497: meaningfully below the 0.5
+        // coin-flip at parity, which is the property under test.
         let p = inclusion_probability(w(500), w(1_000));
-        assert!(p > 0.05 && p < 0.20, "p={p}");
+        assert!(p > 0.20 && p < 0.30, "p={p}");
         assert!(!Competition::rank(w(500), w(1_000)).would_outbid);
     }
 

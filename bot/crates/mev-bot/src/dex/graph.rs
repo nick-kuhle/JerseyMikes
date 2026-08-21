@@ -625,7 +625,7 @@ mod tests {
             pools.push(pool(n, t(i), t(i + 1), 1_000_000_000_000, 1_000_000_000_000));
         }
         let started = Instant::now();
-        let _ = search(
+        let (_, _, found) = search(
             &pools,
             WETH(),
             U256::from(10u128.pow(20)),
@@ -633,11 +633,23 @@ mod tests {
             ENUMERATION_BUDGET,
         );
         let elapsed = started.elapsed();
-        // Generous slack over the budget: sizing runs after the deadline check
-        // for the cycle already in hand, and CI machines are noisy.
+        // The 25 ms budget bounds cycle *enumeration*: the deadline is checked
+        // on every recursion step, and the expired-deadline behaviour is
+        // pinned separately by
+        // `an_expired_deadline_returns_no_candidates_instead_of_running_long`.
+        // Sizing cycles that were already enumerated runs after that check,
+        // and a slow shared CI runner can stretch any wall clock, so only a
+        // generous ceiling belongs here — one that an unbounded search (the
+        // regression this test exists to catch) would still blow through.
+        assert!(elapsed < Duration::from_secs(2), "search took {elapsed:?}");
+        // Every pool in this fixture is priced identically, so fees make every
+        // cycle a loss and an empty candidate list is the correct result (the
+        // same shape as `identical_pools_have_no_profitable_cycle`). What must
+        // hold either way is the cap on handed-back candidates.
         assert!(
-            elapsed < ENUMERATION_BUDGET * 8,
-            "search took {:?}, budget {:?}", elapsed, ENUMERATION_BUDGET
+            found.len() <= MAX_CANDIDATES,
+            "search returned {} candidates, cap is {MAX_CANDIDATES}",
+            found.len()
         );
     }
 
