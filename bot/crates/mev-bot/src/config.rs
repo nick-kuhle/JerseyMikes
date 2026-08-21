@@ -62,10 +62,10 @@ pub struct Config {
     pub decode_universal_router: bool,
     /// Longest cycle the atomic-arb search will consider, in legs.
     ///
-    /// 2 reproduces the original pair-to-pair search exactly and is the
-    /// default; raise it (up to `MAX_CYCLE_LEN`) once the funnel has a
-    /// baseline to compare against. Every additional leg costs ~120k gas and
-    /// widens the search, so this is a measured change, not a free win.
+    /// Default is 3 (the first post-funnel-week raise). 2 reproduces the
+    /// original pair-to-pair search exactly. Raise further (up to
+    /// `MAX_CYCLE_LEN`) only after live `atomic_arb.candidatesEmitted` on
+    /// the same feed moves at 3. Every additional leg costs ~120k gas.
     pub arb_max_cycle_len: usize,
     /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
     /// their transactions ingested + scored. On by default; this is read-only
@@ -336,7 +336,7 @@ impl Config {
             decode_universal_router: env_bool("DECODE_UNIVERSAL_ROUTER", false),
             // Clamped to the enumerator's hard ceiling: config cannot talk the
             // search into an unbounded walk.
-            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 2) as usize)
+            arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 3) as usize)
                 .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
             // Infrastructure toggle: pull delivered blocks + transactions from the
             // bloXroute Max Profit relay and score them for extractable value.

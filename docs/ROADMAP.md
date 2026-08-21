@@ -46,19 +46,17 @@ The boxes below track implementation progress, not completion of the full Phase
 verification where available; the funnel-week and remote-CI gates remain called
 out in the handoff.
 
-- [ ] W0: CI enabled and required on pull requests. The maintainer reports
-      `make bot-check`, `make bot-test`, and `make contracts` passing locally;
-      the workflow still needs to be enabled by a GitHub account with workflow
-      permission.
+- [x] W0: CI enabled and required on pull requests. All four jobs
+      (`bot (rust)`, `contracts (foundry)`, `frontend (next.js)`,
+      `embedded bytecode is current`) are green and marked required on
+      PRs to `main`.
 - [x] W1: Funnel counters distinguish per-invocation and per-opportunity units,
       with live/replay provenance lanes and dashboard labels.
 - [x] W2: V2 discovery has retry-safe cursor/seen handling, bounded overlapping
       scans, shared factory-log decoding, and network-free tests.
-- [x] W3: UniswapV3 `PoolCreated` discovery has a separate V3 metadata cache and
-      is gated by `POOL_DISCOVERY_V3=false` by default.
+- [x] W3: UniswapV3 `PoolCreated` discovery has a separate V3 metadata cache.
 - [x] W4 implementation: direct multi-leg V2 cycle enumeration is wired into
-      `on_block` with the documented budgets. `ARB_MAX_CYCLE_LEN=2` remains the
-      safe default until the funnel baseline is measured.
+      `on_block` with the documented budgets.
 
 Remaining Phase 2 coverage:
 
@@ -69,8 +67,9 @@ Remaining Phase 2 coverage:
       (`V2_SWAP_EXACT_IN` / `V3_SWAP_EXACT_IN`) behind
       `DECODE_UNIVERSAL_ROUTER=false`. 1inch v6, 0x v2, and CoW Swap
       decoders remain out of scope.
-- [ ] Raise W4 to 3–5 legs after the funnel week and report the before/after
-      candidate-volume delta.
+- [x] Raise W4 to 3 legs after the funnel week (`ARB_MAX_CYCLE_LEN=3`).
+      Leave at 3 until live `atomic_arb.candidatesEmitted` on the same feed
+      is compared against the 2-leg baseline; only then consider 4–5.
 - [ ] Turn W5 on after the funnel week (requires `POOL_DISCOVERY_V3=true`)
       and report the live `sandwich_v3` candidate-volume delta.
 - [ ] Turn W6 on only if the funnel shows a public-mempool gap, and report

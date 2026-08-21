@@ -131,7 +131,7 @@ reviewers check the code against — and each now opens with what exists.
 | Funnel lanes | `engine.rs`, `FunnelPanel.tsx` | `FunnelLane::{Live,Replay}` keyed off `TxSource`; `funnelReplay` in the API; lane toggle in the dashboard; 3 new tests (§1.7) |
 | Replay back-pressure | `engine.rs`, `config.rs` | `evaluate_awaited` + `RELAY_TX_CONCURRENCY` semaphore bounds the delivered-block fan-out (§1.7) |
 | Parent-block replay | `types.rs`, `ingest.rs`, `strategies/*`, `engine.rs`, `sim/*` | `MinedAt` tagging, `state_block`/`target_block`/`base_fee` routing, uncached historical pool reads, dedicated replay fork (§1.8) |
-| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off), `ARB_MAX_CYCLE_LEN` (default 2, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
+| Config | `config.rs`, `.env.example` | `POOL_DISCOVERY_V3` (default off until the W5 flip), `ARB_MAX_CYCLE_LEN` (default 3, clamped to 2–5), `RELAY_TX_CONCURRENCY` (default 16), `REPLAY_FORK` (default on), `ANVIL_REPLAY_PORT` |
 
 Two deliberate defaults: **V3 discovery is off** (nothing consumes the V3 cache
 until W5) and **`ARB_MAX_CYCLE_LEN` is 2**, which makes the new search
@@ -275,27 +275,18 @@ state.
 | **W1** | Fix funnel counter semantics + labels | W0 | S | none | **✅ implemented and locally verified** |
 | **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | **✅ implemented and locally verified** (including sniper retry fix) |
 | **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented and locally verified** (shipped off) |
-| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation locally verified, shipped at 2 legs** (`ARB_MAX_CYCLE_LEN=2`) |
+| **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation shipped; default raised to 3 legs** (`ARB_MAX_CYCLE_LEN=3`). Do not raise to 4–5 until live `atomic_arb.candidatesEmitted` on the same feed moves at 3. |
 | **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | **✅ implementation locally written, shipped off** (`STRATEGY_SANDWICH_V3=false`). Do not flip until the funnel week is read and `POOL_DISCOVERY_V3` is on. |
 | **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation locally written, shipped off** (`DECODE_UNIVERSAL_ROUTER=false`). Do not flip until the funnel shows a public-mempool gap. |
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
-### The one thing to do now
+### What remains after the funnel week
 
-**W0's remaining step is administrative: make the workflow required.** All
-four CI jobs — `contracts (foundry)`, `frontend (next.js)`,
-`embedded bytecode is current`, and `bot (rust)` — are green on the working
-branch. The artifact-drift job's original failure (checkout-path-dependent
-bytecode from solc's IPFS metadata hash) is fixed, and the `bot (rust)`
-`cargo test --all` failure turned out to be a deterministic wrong assertion
-in `competition::tests::half_the_bid_is_unlikely` (expected `p ∈ (0.05,
-0.20)`; the shipped `LOGISTIC_K = 2.2` gives `p = σ(-1.1) ≈ 0.2497` at half
-the winning bid) — now corrected, with the dense-graph budget test's
-wall-clock ceiling also hardened against slow shared runners. The next step
-is for a maintainer with admin access to mark the CI checks required on PRs
-to `main` (branch protection is neither readable nor settable by the
-automation token); until then W0 stays open.
+W0 is required. W4's default is 3 legs. Next: the W5 paired flip
+(`POOL_DISCOVERY_V3` + `STRATEGY_SANDWICH_V3`), then a W6 go/no-go from
+live `invocationsEmpty` vs `pendingSeen`. Do not raise W4 past 3 until
+the live `atomic_arb.candidatesEmitted` delta at 3 is written down.
 
 This ordering is the review's recommended sequence, made concrete: measure
 first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
@@ -562,12 +553,12 @@ available mistake in Phase 2.
 
 ## W4 — Multi-leg V2 atomic arb
 
-> **Status: implementation locally verified, shipped at 2 legs.** `dex/graph.rs`
-> plus `arb.rs::build_cycle_opportunity` are wired into `on_block` with the
-> documented budgets. `ARB_MAX_CYCLE_LEN` defaults to `2`, which reproduces the
-> previous pair-to-pair behaviour through the new code path — an equivalence
-> test pins that. Raise it to 3–5 only after the funnel week, and record the
-> before/after candidate volume.
+> **Status: implementation shipped; default raised to 3 legs after the
+> funnel week.** `dex/graph.rs` plus `arb.rs::build_cycle_opportunity` are
+> wired into `on_block` with the documented budgets. `ARB_MAX_CYCLE_LEN`
+> defaults to `3`. Set it to `2` to reproduce the previous pair-to-pair
+> behaviour (an equivalence test still pins that path). Raise to 4–5 only
+> after live `atomic_arb.candidatesEmitted` on the same feed moves at 3.
 
 **Gate: do not start until the funnel (W1) has a week of data and W2 has grown
 the pool cache.** A 5-leg cycle search over 8 pools is pointless; the same
@@ -887,6 +878,15 @@ Carried over from the design doc's closing section, because it is still true:
 
 - Phase 2 does not guarantee opportunities. It adds strategies; the simulator
   discovers opportunities. The count per block is a property of the market,
+  competition and latency, not of this code.
+- Phase 2 is not a path to live trading. The simulation-only guard stays. Phase 1
+  (replay validation, competition modelling, latency budget) is the prerequisite
+  and is not addressed here.
+- Neither source document was written with a working Rust toolchain, and no
+  claim in them about compilation or test results was ever verified. W0 is how
+  that gets fixed; until it is green, treat any performance or correctness claim
+  in this file as a hypothesis.
+k is a property of the market,
   competition and latency, not of this code.
 - Phase 2 is not a path to live trading. The simulation-only guard stays. Phase 1
   (replay validation, competition modelling, latency budget) is the prerequisite

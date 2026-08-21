@@ -96,12 +96,14 @@ anchored on WETH: every simple cycle up to `ARB_MAX_CYCLE_LEN` legs that starts
 and ends in WETH, with each pool used at most once. Optimal input is solved by
 ternary search over the composed curves.
 
-`ARB_MAX_CYCLE_LEN` defaults to **2**, which reproduces the original
-two-venue WETH → token → WETH scan. Raising it to 3–5 widens the search to
-multi-hop cycles such as WETH → USDC → WBTC → WETH, which only exist once pool
-discovery has loaded the cross pairs. The search is bounded on four axes
-regardless of configuration: 5 legs, 200 pools, 32 candidates and a 25 ms
-wall-clock budget per block, and it makes no RPC calls of its own.
+`ARB_MAX_CYCLE_LEN` defaults to **3**, the first post-funnel-week raise.
+Set it back to 2 to reproduce the original two-venue WETH → token → WETH
+scan. 3-leg cycles such as WETH → USDC → WBTC → WETH only exist once pool
+discovery has loaded the cross pairs. Raise to 4–5 only after live
+`atomic_arb.candidatesEmitted` on the same feed moves at 3. The search is
+bounded on four axes regardless of configuration: 5 legs, 200 pools, 32
+candidates and a 25 ms wall-clock budget per block, and it makes no RPC
+calls of its own.
 
 Anchoring on WETH alone is not a limitation: any cycle touching WETH can be
 rotated to start there. Cycles that never touch WETH are skipped on purpose —
