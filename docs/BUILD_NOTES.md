@@ -43,8 +43,22 @@ cd contracts && node script/compile-check.js
 ```
 
 It compiled 28 sources with zero errors and confirmed the embedded
-`MevExecutor` runtime at 9,618 bytes. Solc reports the existing transient-storage
+`MevExecutor` runtime at 9,577 bytes. Solc reports the existing transient-storage
 and test-contract-size warnings; those are warnings, not compile failures.
+
+### Making the artifact deterministic (why 9,618 → 9,577)
+
+`compile-check.js` now passes `metadata: {bytecodeHash: "none", useLiteralContent: true}`
+to solc, matching `foundry.toml`'s existing `bytecode_hash = "none"`. Previously
+the script used solc's default IPFS metadata hash, whose inputs include the
+*absolute path* of every source file — so the emitted `MevExecutor.runtime.hex`
+changed depending on which directory the repo was checked out into. The
+`artifact-drift` CI job (`git diff --exit-code -- bot/crates/mev-bot/artifacts
+contracts/abi`) therefore failed in CI (checked out at
+`/home/runner/work/...`) even though the artifact reproduced in the authoring
+sandbox. Removing the embedded metadata hash drops the runtime to 9,577 bytes
+and makes the artifact reproducible from any checkout. Functionality is
+unchanged; the bytecode is injected into the anvil fork via `anvil_setCode`.
 
 ## Independent re-verification + security hardening (automation session, 2026-08-21)
 
@@ -53,7 +67,7 @@ has no Rust/Foundry binaries, so the bot and forge runs remain
 maintainer-verified only — and recorded clean results:
 
 ```bash
-cd contracts && node script/compile-check.js   # 28 sources, 5 deployables, MevExecutor runtime 9,618 B
+cd contracts && node script/compile-check.js   # 28 sources, 5 deployables, MevExecutor runtime 9,577 B
 git diff --exit-code -- bot/crates/mev-bot/artifacts contracts/abi   # artifact-drift step: no drift
 cd frontend && npx tsc --noEmit && npm run build   # clean
 ```

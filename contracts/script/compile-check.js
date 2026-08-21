@@ -58,6 +58,14 @@ const input = {
   settings: {
     optimizer: {enabled: true, runs: 1000000},
     evmVersion: "cancun",
+    // Match foundry.toml's `bytecode_hash = "none"` and keep the emitted
+    // artifacts reproducible from any checkout. solc's default is to embed an
+    // IPFS metadata hash whose inputs include the *absolute path* of every
+    // source file; the `compile-check.js` artifact-drift CI job would then
+    // fail (or pass) depending on which directory the repo happened to be
+    // checked out into. `useLiteralContent` keeps the creation-bytecode
+    // metadata deterministic too.
+    metadata: {bytecodeHash: "none", useLiteralContent: true},
     outputSelection: {"*": {"*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object"]}},
   },
 };
