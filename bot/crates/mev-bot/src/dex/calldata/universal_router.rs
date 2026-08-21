@@ -13,14 +13,28 @@ use alloy_sol_types::{sol, SolCall, SolValue};
 
 use crate::config::known;
 
+// Two overloads of `execute` must live in *separate* `sol!` blocks.
+// In one block alloy generates a single `executeCall` type and the last
+// definition wins, so both `IUniversalRouter::executeCall::SELECTOR` and
+// `IUniversalRouterWithDeadline::executeCall::SELECTOR` become the 3-arg
+// selector `0x24856bc3`. Then every 2-arg `execute(bytes,bytes[])` on
+// mainnet (`0x3593564c`) is invisible. MAINTAINING.md §5.
 sol! {
     interface IUniversalRouter {
         function execute(bytes calldata commands, bytes[] calldata inputs) external payable;
     }
+}
+
+sol! {
     interface IUniversalRouterWithDeadline {
         function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
     }
 }
+
+/// `execute(bytes,bytes[])` — published UniversalRouter selector.
+pub const SEL_EXECUTE: [u8; 4] = [0x35, 0x93, 0x56, 0x4c];
+/// `execute(bytes,bytes[],uint256)` — published UniversalRouter selector.
+pub const SEL_EXECUTE_DEADLINE: [u8; 4] = [0x24, 0x85, 0x6b, 0xc3];
 
 /// `V3_SWAP_EXACT_IN`
 pub const CMD_V3_SWAP_EXACT_IN: u8 = 0x00;
@@ -280,16 +294,35 @@ mod tests {
 
     #[test]
     fn selectors_match_the_published_universal_router() {
-        // execute(bytes,bytes[])
-        assert_eq!(
+        // Published 4byte.directory / UniversalRouter.sol values. If these
+        // two `sol!` types ever collapse into one again, *both* equals
+        // fail (they would share 0x24856bc3) rather than silently swapping.
+        assert_ne!(
             IUniversalRouter::executeCall::SELECTOR,
-            [0x35, 0x93, 0x56, 0x4c]
+            IUniversalRouterWithDeadline::executeCall::SELECTOR,
+            "the two execute overloads must not share a sol! type"
         );
+        // execute(bytes,bytes[])
+        assert_eq!(IUniversalRouter::executeCall::SELECTOR, SEL_EXECUTE);
+        assert_eq!(SEL_EXECUTE, [0x35, 0x93, 0x56, 0x4c]);
         // execute(bytes,bytes[],uint256)
         assert_eq!(
             IUniversalRouterWithDeadline::executeCall::SELECTOR,
-            [0x24, 0x85, 0x6b, 0xc3]
+            SEL_EXECUTE_DEADLINE
         );
+        assert_eq!(SEL_EXECUTE_DEADLINE, [0x24, 0x85, 0x6b, 0xc3]);
+    }
+
+    #[test]
+    fn encode_execute_uses_the_two_arg_selector() {
+        let data = encode_execute(vec![CMD_V2_SWAP_EXACT_IN], vec![vec![0u8; 4]]);
+        assert_eq!(&data[..4], &SEL_EXECUTE);
+    }
+
+    #[test]
+    fn encode_execute_deadline_uses_the_three_arg_selector() {
+        let data = encode_execute_deadline(vec![CMD_V2_SWAP_EXACT_IN], vec![vec![0u8; 4]]);
+        assert_eq!(&data[..4], &SEL_EXECUTE_DEADLINE);
     }
 
     #[test]
