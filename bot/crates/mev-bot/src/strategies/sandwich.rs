@@ -50,7 +50,11 @@ impl StrategyImpl for SandwichStrategy {
 
         let mut out = Vec::new();
         for venue in [Venue::UniV2, Venue::SushiV2] {
-            let Some(pair) = ctx.pools.pair_for(intent.token_in, intent.token_out, venue).await else {
+            let Some(pair) = ctx
+                .pools
+                .pair_for(intent.token_in, intent.token_out, venue)
+                .await
+            else {
                 continue;
             };
             let Some(pool) = ctx.pool_at(pair, venue, state_block).await else {
@@ -79,8 +83,20 @@ impl StrategyImpl for SandwichStrategy {
                 continue;
             }
 
-            let front = build_leg(&pool, intent.token_in, intent.token_out, sizing.amount_in, ctx.executor);
-            let back = build_leg(&pool, intent.token_out, intent.token_in, sizing.front_out, ctx.executor);
+            let front = build_leg(
+                &pool,
+                intent.token_in,
+                intent.token_out,
+                sizing.amount_in,
+                ctx.executor,
+            );
+            let back = build_leg(
+                &pool,
+                intent.token_out,
+                intent.token_in,
+                sizing.front_out,
+                ctx.executor,
+            );
 
             out.push(Opportunity {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -176,11 +192,20 @@ mod tests {
     #[test]
     fn leg_transfers_then_swaps() {
         let p = pool();
-        let calls = build_leg(&p, p.token0, p.token1, U256::from(1000u64), Address::with_last_byte(9));
+        let calls = build_leg(
+            &p,
+            p.token0,
+            p.token1,
+            U256::from(1000u64),
+            Address::with_last_byte(9),
+        );
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].target, p.token0);
         assert_eq!(calls[1].target, p.address);
-        assert_eq!(&calls[1].data[..4], &dex::IUniswapV2Pair::swapCall::SELECTOR);
+        assert_eq!(
+            &calls[1].data[..4],
+            &dex::IUniswapV2Pair::swapCall::SELECTOR
+        );
     }
 
     #[test]

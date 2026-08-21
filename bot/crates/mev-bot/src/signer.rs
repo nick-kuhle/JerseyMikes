@@ -176,7 +176,10 @@ mod tests {
     #[test]
     fn derives_the_right_address() {
         let s = Signer::from_hex(KEY).unwrap();
-        assert_eq!(format!("{:?}", s.address()).to_lowercase(), ADDR.to_lowercase());
+        assert_eq!(
+            format!("{:?}", s.address()).to_lowercase(),
+            ADDR.to_lowercase()
+        );
     }
 
     #[test]

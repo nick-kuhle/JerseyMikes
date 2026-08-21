@@ -464,7 +464,8 @@ pub fn to_bytes(v: &[u8]) -> Bytes {
 /// Format wei as a human readable ETH string with 6 decimals (UI/logging only).
 pub fn format_eth(wei: U256) -> String {
     let whole = wei / U256::from(1_000_000_000_000_000_000u128);
-    let frac = (wei % U256::from(1_000_000_000_000_000_000u128)) / U256::from(1_000_000_000_000u128);
+    let frac =
+        (wei % U256::from(1_000_000_000_000_000_000u128)) / U256::from(1_000_000_000_000u128);
     format!("{}.{:06}", whole, frac.to::<u64>())
 }
 
@@ -481,7 +482,10 @@ mod tests {
 
     #[test]
     fn formats_eth() {
-        assert_eq!(format_eth(U256::from(1_500_000_000_000_000_000u128)), "1.500000");
+        assert_eq!(
+            format_eth(U256::from(1_500_000_000_000_000_000u128)),
+            "1.500000"
+        );
         assert_eq!(format_eth(U256::ZERO), "0.000000");
     }
 

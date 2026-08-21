@@ -48,7 +48,9 @@ async fn main() -> Result<()> {
     let _ = dotenvy::from_filename(&cli.env_file);
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(true)
         .init();
 
@@ -104,7 +106,10 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
 
     let http = RpcClient::new(cfg.endpoints.http_url.clone())?;
     match http.call_raw("eth_blockNumber", json!([])).await {
-        Ok(v) => println!("✓ http rpc          {} (head {})", cfg.endpoints.http_url, v),
+        Ok(v) => println!(
+            "✓ http rpc          {} (head {})",
+            cfg.endpoints.http_url, v
+        ),
         Err(e) => println!("✗ http rpc          {}: {e}", cfg.endpoints.http_url),
     }
 
@@ -126,7 +131,9 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
             if e.to_string().contains("not found") || e.to_string().contains("null") {
                 println!("✓ raw tx access     supported");
             } else {
-                println!("! raw tx access     unsupported ({e}) — sandwich/JIT sims will be skipped");
+                println!(
+                    "! raw tx access     unsupported ({e}) — sandwich/JIT sims will be skipped"
+                );
             }
         }
     }
@@ -150,7 +157,10 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
             "✓ anvil             {}",
             String::from_utf8_lossy(&o.stdout).trim()
         ),
-        Err(e) => println!("✗ anvil             {} not runnable: {e}", cfg.sim.anvil_bin),
+        Err(e) => println!(
+            "✗ anvil             {} not runnable: {e}",
+            cfg.sim.anvil_bin
+        ),
     }
 
     for relay in &cfg.endpoints.relay_data_urls {
@@ -182,7 +192,14 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         }
     }
 
-    println!("\nmode: {}", if cfg.live_execution { "LIVE" } else { "simulation" });
+    println!(
+        "\nmode: {}",
+        if cfg.live_execution {
+            "LIVE"
+        } else {
+            "simulation"
+        }
+    );
     Ok(())
 }
 

@@ -539,7 +539,13 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub fn record_relay_bid(&self, relay: &str, slot: u64, builder: &str, value: U256) -> Result<()> {
+    pub fn record_relay_bid(
+        &self,
+        relay: &str,
+        slot: u64,
+        builder: &str,
+        value: U256,
+    ) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR IGNORE INTO relay_bids (relay, slot, builder, value_wei, seen_at_ms)
              VALUES (?1,?2,?3,?4,?5)",
@@ -650,7 +656,11 @@ impl Store {
         Ok(v)
     }
 
-    pub fn recent_simulations(&self, limit: i64, strategy: Option<Strategy>) -> Result<Vec<serde_json::Value>> {
+    pub fn recent_simulations(
+        &self,
+        limit: i64,
+        strategy: Option<Strategy>,
+    ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let sql = "SELECT s.opportunity_id, s.strategy, s.backend, s.success, s.gross_wei, s.gas_used,
                           s.gas_cost_wei, s.bribe_wei, s.net_wei, s.revert_reason, s.target_block,
@@ -843,7 +853,8 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         s.record_simulation(&sim(Strategy::Sandwich, 500)).unwrap();
         s.record_simulation(&sim(Strategy::Sandwich, -200)).unwrap();
-        s.record_simulation(&sim(Strategy::AtomicArb, 1_000)).unwrap();
+        s.record_simulation(&sim(Strategy::AtomicArb, 1_000))
+            .unwrap();
 
         let pnl = s.pnl().unwrap();
         assert_eq!(pnl.len(), 2);
@@ -890,8 +901,8 @@ mod tests {
 
     #[test]
     fn relay_blocks_and_txs_round_trip() {
-        use alloy_primitives::B256;
         use crate::types::{PendingTx, RelayBlock, TxSource};
+        use alloy_primitives::B256;
 
         let s = Store::open_in_memory().unwrap();
         let block = RelayBlock {
@@ -977,7 +988,10 @@ mod tests {
         a.slot = 2;
         a.value_wei = U256::from(99u64);
         s.record_relay_block(&a).unwrap();
-        assert_eq!(s.winning_bid_for_block(50).unwrap(), Some(U256::from(99u64)));
+        assert_eq!(
+            s.winning_bid_for_block(50).unwrap(),
+            Some(U256::from(99u64))
+        );
         assert_eq!(s.winning_bid_for_block(1).unwrap(), None);
     }
 }

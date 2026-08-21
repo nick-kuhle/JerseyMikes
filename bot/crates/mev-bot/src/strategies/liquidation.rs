@@ -115,7 +115,9 @@ impl LiquidationStrategy {
                 }
                 *self.last_log_block.write() = head.number;
             }
-            Err(e) => tracing::debug!(target: "strategy::liquidation", error = %e, "log harvest failed"),
+            Err(e) => {
+                tracing::debug!(target: "strategy::liquidation", error = %e, "log harvest failed")
+            }
         }
     }
 
@@ -192,7 +194,8 @@ impl StrategyImpl for LiquidationStrategy {
             } else {
                 5_000u64
             };
-            let debt_to_cover = total_debt_base * U256::from(close_factor_bps) / U256::from(10_000u64);
+            let debt_to_cover =
+                total_debt_base * U256::from(close_factor_bps) / U256::from(10_000u64);
 
             // Default shape: repay USDC debt, seize WETH collateral.
             let debt_asset = known::USDC;
@@ -226,7 +229,11 @@ impl StrategyImpl for LiquidationStrategy {
             ];
 
             // Swap the seized collateral back into the debt asset to repay the flash loan.
-            if let Some(pair) = ctx.pools.pair_for(collateral, debt_asset, Venue::UniV2).await {
+            if let Some(pair) = ctx
+                .pools
+                .pair_for(collateral, debt_asset, Venue::UniV2)
+                .await
+            {
                 if let Some(pool) = ctx.pools.load(pair, Venue::UniV2, head.number).await {
                     // 5% liquidation bonus is the common configuration.
                     let seized = debt_amount * U256::from(105u64) / U256::from(100u64);
@@ -241,7 +248,13 @@ impl StrategyImpl for LiquidationStrategy {
                         })
                         .unwrap_or(U256::ZERO);
                     if !collateral_amount.is_zero() {
-                        calls.extend(build_leg(&pool, collateral, debt_asset, collateral_amount, ctx.executor));
+                        calls.extend(build_leg(
+                            &pool,
+                            collateral,
+                            debt_asset,
+                            collateral_amount,
+                            ctx.executor,
+                        ));
                     }
                 }
             }
@@ -285,7 +298,10 @@ mod tests {
         .abi_encode();
         assert_eq!(&data[..4], &IAaveV3Pool::liquidationCallCall::SELECTOR);
         let decoded = IAaveV3Pool::liquidationCallCall::abi_decode(&data, true).unwrap();
-        assert!(!decoded.receiveAToken, "we always want the underlying, not aTokens");
+        assert!(
+            !decoded.receiveAToken,
+            "we always want the underlying, not aTokens"
+        );
     }
 
     #[test]

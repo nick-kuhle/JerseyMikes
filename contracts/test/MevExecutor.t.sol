@@ -28,11 +28,7 @@ contract MevExecutorTest is Test {
 
     function _guard(address token, uint256 minProfit) internal pure returns (MevExecutor.Guard memory) {
         return MevExecutor.Guard({
-            profitToken: token,
-            minProfit: minProfit,
-            bribeBps: 0,
-            blockDeadline: 0,
-            maxBaseFee: 0
+            profitToken: token, minProfit: minProfit, bribeBps: 0, blockDeadline: 0, maxBaseFee: 0
         });
     }
 
@@ -67,7 +63,8 @@ contract MevExecutorTest is Test {
     function test_revertsWhenUnprofitable() public {
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
         // Burn 1 wei of ETH: guaranteed negative delta.
-        calls[0] = MevExecutor.Call({target: address(weth), value: 1, data: abi.encodeWithSignature("deposit()")});
+        calls[0] =
+            MevExecutor.Call({target: address(weth), value: 1, data: abi.encodeWithSignature("deposit()")});
 
         vm.prank(searcher);
         vm.expectRevert(abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 0, 1));
@@ -155,7 +152,8 @@ contract MevExecutorTest is Test {
 
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
         // Donate 1 ETH into the executor to create a positive ETH delta.
-        calls[0] = MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
+        calls[0] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
 
         MevExecutor.Guard memory g = _guard(address(0), 0.5 ether);
         g.bribeBps = 9000; // pay 90% of profit to the builder

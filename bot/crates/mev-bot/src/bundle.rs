@@ -63,7 +63,12 @@ fn tag_of(opp: &Opportunity, front: bool) -> B256 {
 /// front leg's `minProfit` is zero while the back leg carries the real
 /// requirement. For single-shot strategies (arb, liquidation) there is only a
 /// front leg and it carries the requirement.
-pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &RiskConfig) -> Vec<u8> {
+pub fn encode_execute(
+    opp: &Opportunity,
+    calls: &[Call],
+    front: bool,
+    risk: &RiskConfig,
+) -> Vec<u8> {
     let single_leg = opp.back_calls.is_empty();
     let enforce = !front || single_leg;
     let min_profit = if enforce {

@@ -1,5 +1,46 @@
 # Local build & sandbox notes
 
+## Session 2026-08-21 (W0 closeout: fmt made required, clippy to zero, first sandbox Rust compile)
+
+The authoring sandbox could **reach the Rust distribution hosts for the first
+time** (every earlier session documented here could not). That converted the
+last verifiable W0 gaps from "CI-only" to locally verified:
+
+- **Toolchain**: rustup stable **1.98.0** — the exact version CI's last green
+  run used — plus rustfmt 1.9.0 and clippy; Foundry 1.7.1; forge-std
+  submodule restored.
+- **`cargo fmt --all`**: the codebase-wide drift CI had been reporting since
+  W0 (100+ hunks across 29 files, visible in every advisory fmt step) is
+  fixed. `cargo fmt --all -- --check` now passes locally.
+- **`forge fmt`**: the one drifted contracts test file
+  (`test/MevExecutor.t.sol`) is reformatted; `forge fmt --check` passes.
+- **Clippy: zero warnings.** The ten pre-existing warnings (lib + tests) are
+  fixed, not silenced: `sort_by` → `sort_by_key(Reverse)` in `graph.rs`, a
+  redundant `is_none`/`?` double-check in `arb.rs`, a negated float
+  comparison → explicit `partial_cmp` in `jit.rs`, a `PairIndex` type alias
+  for the complex cache type in `strategies/mod.rs`, `vec!` → arrays in two
+  tests, a per-call `debug_assert!(1 <= MAX_CANDIDATES_PER_TX)` → a
+  compile-time `const _: () = assert!(…)` in `sandwich_v3.rs`, and
+  `V3SwapIntent` test `.clone()`s removed (it is `Copy`).
+- **`cargo test --all`: 146 passed / 0 failed. `forge test`: 13 passed /
+  0 failed. `forge build --sizes`: `MevExecutor` runtime still 9,577 B, and
+  `compile-check.js` + `git diff --exit-code` on the artifacts show no
+  drift.** This is the first time the Rust side has been compiled and tested
+  inside an authoring sandbox rather than only by the maintainer and CI.
+- **CI hardened**: the `cargo fmt --check` and `forge fmt --check` steps in
+  `.github/workflows/ci.yml` lost their `continue-on-error: true` — both are
+  required now. The job table below is updated accordingly.
+
+**W0 closed.** The `require-ci-on-main` branch ruleset now enforces all four
+checks on `main` (observed via `GET /repos/…/rules/branches/main`:
+`required_status_checks` for `bot (rust)`, `contracts (foundry)`,
+`frontend (next.js)` and `embedded bytecode is current`, plus `deletion` and
+`non_fast_forward` rules). Set by the maintainer in the UI — the automation
+token's Administration permission was read-only, which the rulesets API
+surfaces as a misleading 422 rather than a 403 (worth knowing for future
+sessions: a 422 "data matches no possible input" on `/rulesets` can mean
+*missing write permission*, not a malformed body).
+
 ## Session 2026-08-21 (go-live checklist + deploy wizard)
 
 Added the beginner's deployment path: `docs/GO_LIVE.md` and a console
@@ -140,9 +181,9 @@ including `bot (rust)`.
 
 | Job | Commands |
 | --- | --- |
-| `contracts` | `forge fmt --check`, `forge build --sizes`, `forge test -vvv` (`forge fmt --check` is currently advisory) |
+| `contracts` | `forge fmt --check` (**required** since 2026-08-21), `forge build --sizes`, `forge test -vvv` |
 | `artifact-drift` | recompiles with solc-js and fails if `bot/crates/mev-bot/artifacts` or `contracts/abi` drifted from the sources |
-| `bot` | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test --all` (`cargo fmt --check` is currently advisory) |
+| `bot` | `cargo fmt --all -- --check` (**required** since 2026-08-21), `cargo clippy --all-targets`, `cargo test --all` |
 | `frontend` | `npm ci`, `tsc --noEmit`, `next build` |
 
 ## Verification status for the Phase 2 handoff (historical)

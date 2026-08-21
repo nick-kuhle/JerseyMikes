@@ -330,7 +330,11 @@ mod tests {
         let path = vec![known::WETH, known::USDC];
         let data = encode_execute(
             vec![CMD_V2_SWAP_EXACT_IN],
-            vec![v2_input(U256::from(10u128.pow(18)), U256::from(1_000u64), path.clone())],
+            vec![v2_input(
+                U256::from(10u128.pow(18)),
+                U256::from(1_000u64),
+                path.clone(),
+            )],
         );
         let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
         assert_eq!(s.token_in, known::WETH);

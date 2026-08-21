@@ -82,7 +82,11 @@ impl StrategyImpl for AtomicArbStrategy {
         // block started from, not the state a hundred blocks later.
         let state_block = tx.state_block(&head);
 
-        let Some(victim_pair) = ctx.pools.pair_for(intent.token_in, intent.token_out, Venue::UniV2).await else {
+        let Some(victim_pair) = ctx
+            .pools
+            .pair_for(intent.token_in, intent.token_out, Venue::UniV2)
+            .await
+        else {
             return Vec::new();
         };
         let Some(victim_pool) = ctx.pool_at(victim_pair, Venue::UniV2, state_block).await else {
@@ -185,10 +189,13 @@ fn build_cycle_opportunity(
 }
 
 /// Try `token_in → mid → token_in` buying on `a` and selling on `b`.
-fn try_cycle(ctx: &StrategyCtx, a: &V2Pool, b: &V2Pool, token_in: Address, head: &BlockHead) -> Option<Opportunity> {
-    if a.other_token(token_in).is_none() {
-        return None;
-    }
+fn try_cycle(
+    ctx: &StrategyCtx,
+    a: &V2Pool,
+    b: &V2Pool,
+    token_in: Address,
+    head: &BlockHead,
+) -> Option<Opportunity> {
     let mid = a.other_token(token_in)?;
     if b.other_token(mid)? != token_in {
         return None;
@@ -276,7 +283,9 @@ mod tests {
         let a = pool(Venue::UniV2, 1_000e18 as u128, 2_000_000e6 as u128);
         let b = pool(Venue::SushiV2, 1_000e18 as u128, 2_000_000e6 as u128);
         // identical pricing -> the fee makes every size a loss
-        assert!(dex::optimal_two_leg_arb(&a, &b, known::WETH, U256::from(10u128.pow(20))).is_none());
+        assert!(
+            dex::optimal_two_leg_arb(&a, &b, known::WETH, U256::from(10u128.pow(20))).is_none()
+        );
     }
 
     #[test]

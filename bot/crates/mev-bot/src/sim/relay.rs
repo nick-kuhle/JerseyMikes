@@ -88,7 +88,8 @@ impl RelaySim {
                 U256::ZERO
             },
             gas_cost_wei: gas_fees,
-            bribe_wei: eth_sent.max(coinbase_diff * U256::from(self.bribe_bps) / U256::from(10_000u32)),
+            bribe_wei: eth_sent
+                .max(coinbase_diff * U256::from(self.bribe_bps) / U256::from(10_000u32)),
             net_profit_wei: net,
             revert_reason,
             target_block: bundle.target_block,

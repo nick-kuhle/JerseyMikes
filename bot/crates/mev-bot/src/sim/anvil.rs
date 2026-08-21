@@ -26,7 +26,8 @@ use crate::types::{now_ms, parse_u64, Call, Opportunity, SimBackend, SimulationR
 pub const EXECUTOR_RUNTIME_BYTECODE: &str = include_str!("../../artifacts/MevExecutor.runtime.hex");
 
 /// Address the executor is mounted at inside the fork when no real deployment exists.
-pub const SIM_EXECUTOR: Address = alloy_primitives::address!("00000000000000000000000000000000000e0000");
+pub const SIM_EXECUTOR: Address =
+    alloy_primitives::address!("00000000000000000000000000000000000e0000");
 
 pub struct AnvilSim {
     cfg: Arc<Config>,
@@ -69,9 +70,12 @@ impl AnvilSim {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn `{}` — is Foundry installed?", cfg.sim.anvil_bin))?;
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn `{}` — is Foundry installed?",
+                cfg.sim.anvil_bin
+            )
+        })?;
 
         let rpc = RpcClient::new(format!("http://127.0.0.1:{port}"))?;
 
@@ -131,7 +135,10 @@ impl AnvilSim {
             self.rpc
                 .call_raw(
                     "anvil_setCode",
-                    json!([format!("{:?}", self.executor), format!("0x{}", code.trim_start_matches("0x"))]),
+                    json!([
+                        format!("{:?}", self.executor),
+                        format!("0x{}", code.trim_start_matches("0x"))
+                    ]),
                 )
                 .await
                 .context("anvil_setCode for the simulated executor")?;
@@ -222,7 +229,8 @@ impl AnvilSim {
         victim_sender_nonce: Option<(Address, u64)>,
         base_fee: U256,
     ) -> Result<SimulationResult> {
-        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee).await
+        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee)
+            .await
     }
 
     /// Pin and simulate while holding the same mutex. This prevents a reset
@@ -237,7 +245,8 @@ impl AnvilSim {
     ) -> Result<SimulationResult> {
         let _guard = self.lock.lock().await;
         self.ensure_fork_exact_locked(block).await?;
-        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee).await
+        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee)
+            .await
     }
 
     async fn simulate_locked(
@@ -276,7 +285,10 @@ impl AnvilSim {
 
         // 1. front-run
         if !opp.front_calls.is_empty() {
-            match self.send_executor_tx(opp, &opp.front_calls, base_fee, true).await {
+            match self
+                .send_executor_tx(opp, &opp.front_calls, base_fee, true)
+                .await
+            {
                 Ok(h) => tx_hashes.push(h),
                 Err(e) => {
                     ok = false;
@@ -292,10 +304,13 @@ impl AnvilSim {
             // replay the signed victim at the nonce it carried when observed.
             // This is fork-local state and is reverted with the snapshot below.
             if let Some((sender, nonce)) = victim_sender_nonce {
-                let _ = self.rpc.call_raw(
-                    "anvil_setNonce",
-                    json!([format!("{sender:?}"), format!("0x{nonce:x}")]),
-                ).await;
+                let _ = self
+                    .rpc
+                    .call_raw(
+                        "anvil_setNonce",
+                        json!([format!("{sender:?}"), format!("0x{nonce:x}")]),
+                    )
+                    .await;
             }
             for raw in victims_raw {
                 let hex_raw = format!("0x{}", hex::encode(raw));
@@ -322,7 +337,10 @@ impl AnvilSim {
 
         // 3. back-run
         if ok && !opp.back_calls.is_empty() {
-            match self.send_executor_tx(opp, &opp.back_calls, base_fee, false).await {
+            match self
+                .send_executor_tx(opp, &opp.back_calls, base_fee, false)
+                .await
+            {
                 Ok(h) => tx_hashes.push(h),
                 Err(e) => {
                     ok = false;
@@ -404,7 +422,10 @@ impl AnvilSim {
         if token == Address::ZERO {
             let v = self
                 .rpc
-                .call_raw("eth_getBalance", json!([format!("{:?}", self.executor), "latest"]))
+                .call_raw(
+                    "eth_getBalance",
+                    json!([format!("{:?}", self.executor), "latest"]),
+                )
                 .await?;
             return Ok(crate::types::parse_u256(&v));
         }

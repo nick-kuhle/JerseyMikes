@@ -27,7 +27,9 @@ use parking_lot::RwLock;
 
 use crate::dex::{self, V2Pool, V3Pool, Venue};
 use crate::rpc::RpcClient;
-use crate::strategies::{try_scan_pair_created, try_scan_pool_created, PoolCache, StrategyCtx, V3PoolCache};
+use crate::strategies::{
+    try_scan_pair_created, try_scan_pool_created, PoolCache, StrategyCtx, V3PoolCache,
+};
 use crate::types::BlockHead;
 
 /// Minimum WETH liquidity (wei) before a discovered pool enters the cache —
@@ -79,7 +81,9 @@ impl DiscoverySource for RpcSource<'_> {
     }
 
     async fn fetch_pool(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool> {
-        dex::fetch_v2_pool(self.rpc, pair, venue, 30, block).await.ok()
+        dex::fetch_v2_pool(self.rpc, pair, venue, 30, block)
+            .await
+            .ok()
     }
 
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>> {
@@ -489,7 +493,10 @@ mod tests {
         let d = PoolDiscovery::new();
         let pools = cache();
 
-        assert_eq!(d.discover_v2_with(&src, &pools, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v2_with(&src, &pools, WETH(), 100).await.loaded,
+            0
+        );
         assert_eq!(pools.len(), 0);
         assert_eq!(d.seen_count(), 0);
 
@@ -524,7 +531,12 @@ mod tests {
         }
         let d = PoolDiscovery::new();
         let pools = cache();
-        assert_eq!(d.discover_v2_with(&NonWeth, &pools, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v2_with(&NonWeth, &pools, WETH(), 100)
+                .await
+                .loaded,
+            0
+        );
         assert!(d.non_weth.read().contains(&addr(1)));
         assert_eq!(pools.len(), 0);
     }
@@ -578,7 +590,12 @@ mod tests {
         };
         let d = PoolDiscovery::new();
         let pools_v3 = V3PoolCache::new();
-        assert_eq!(d.discover_v3_with(&src, &pools_v3, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v3_with(&src, &pools_v3, WETH(), 100)
+                .await
+                .loaded,
+            0
+        );
         assert_eq!(pools_v3.len(), 0);
     }
 }

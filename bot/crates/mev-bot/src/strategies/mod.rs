@@ -122,11 +122,17 @@ pub trait StrategyImpl: Send + Sync {
 ///
 /// Reserves are the only thing that changes, and they can be read for dozens of
 /// pools in a single batched JSON-RPC round trip.
+///
+/// Pair-lookup index type: `(tokenA, tokenB, venue)` → the factory pair
+/// address, `None` once the factory answered "no pair". Shared behind the
+/// cache's lock.
+type PairIndex = Arc<RwLock<HashMap<(Address, Address, Venue), Option<Address>>>>;
+
 #[derive(Clone)]
 pub struct PoolCache {
     rpc: RpcClient,
     inner: Arc<RwLock<HashMap<Address, V2Pool>>>,
-    pair_index: Arc<RwLock<HashMap<(Address, Address, Venue), Option<Address>>>>,
+    pair_index: PairIndex,
 }
 
 impl PoolCache {
@@ -458,7 +464,9 @@ pub async fn scan_pair_created(
     from: u64,
     to: u64,
 ) -> Vec<(crate::dex::Venue, Address)> {
-    try_scan_pair_created(rpc, from, to).await.unwrap_or_default()
+    try_scan_pair_created(rpc, from, to)
+        .await
+        .unwrap_or_default()
 }
 
 /// Fallible form of [`scan_pair_created`]: `None` means the RPC call itself
@@ -658,7 +666,11 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_calldata() {
-        assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
+        assert!(decode_swap(
+            &tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO),
+            known::WETH
+        )
+        .is_none());
         assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
     }
 
@@ -702,7 +714,9 @@ mod tests {
         );
         // Unknown factory -> None.
         assert_eq!(
-            venue_from_factory(&serde_json::json!("0x0000000000000000000000000000000000000000")),
+            venue_from_factory(&serde_json::json!(
+                "0x0000000000000000000000000000000000000000"
+            )),
             None
         );
         // Non-string -> None.
@@ -713,7 +727,7 @@ mod tests {
     fn scan_decodes_pair_address_from_log_data() {
         // Build a 32-byte data payload with a known address right-aligned.
         let expected_pair = address!("1234567890abcdef1234567890abcdef12345678");
-        let mut data = vec![0u8; 32];
+        let mut data = [0u8; 32];
         data[12..32].copy_from_slice(expected_pair.as_slice());
 
         // Simulate the inner decode loop of `scan_pair_created` without an RPC.
@@ -721,7 +735,7 @@ mod tests {
         assert_eq!(pair, expected_pair);
 
         // A short data payload (< 32 bytes) must be skipped.
-        let short = vec![0u8; 16];
+        let short = [0u8; 16];
         assert!(short.len() < 32);
     }
 
@@ -768,7 +782,8 @@ mod tests {
         assert_eq!(venue, Venue::UniV2);
         assert_eq!(got, pair);
 
-        let (venue, _) = decode_pair_created(&pair_created_log(known::SUSHI_FACTORY, pair)).unwrap();
+        let (venue, _) =
+            decode_pair_created(&pair_created_log(known::SUSHI_FACTORY, pair)).unwrap();
         assert_eq!(venue, Venue::SushiV2);
     }
 
@@ -778,7 +793,10 @@ mod tests {
         // address come from data. Mixing those up yields addresses that look
         // valid, which is why this is pinned against a real mainnet pool.
         let got = decode_pool_created(&pool_created_log()).expect("PoolCreated decodes");
-        assert_eq!(got.address, address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"));
+        assert_eq!(
+            got.address,
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")
+        );
         assert_eq!(got.token0, known::USDC);
         assert_eq!(got.token1, known::WETH);
         assert_eq!(got.fee, 500);
