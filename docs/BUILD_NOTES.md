@@ -12,14 +12,19 @@ measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
   `eth_getBalance` through it; `eth_sendTransaction` / `personal_sign`
   refused by the allowlist), and demo rows carrying `victims` for the
   explorer links.
-- **Rust: edited in the sandbox, compiled only by CI.** The sandbox has no
-  Rust toolchain (unchanged from every earlier session). The changes are
-  small and surgical — `LiveMode` in `engine.rs` (+2 unit tests), the
-  `GET/POST /api/mode` handlers and `mode`/`liveArmed` fields in `api.rs`,
-  and one extra `COALESCE(o.victims, '')` column on the existing LEFT JOIN
-  in `store.rs::recent_simulations` — but treat the PR's CI run
-  (`cargo clippy`, `cargo test`) as their first real compile, exactly as
-  W0's process prescribes.
+- **Rust: edited in the sandbox; CI is its compiler.** The sandbox has no
+  Rust toolchain (unchanged from every earlier session). CI's first run
+  caught exactly one error — an `E0382` borrow-after-move in
+  `Engine::new` (the struct literal moves `cfg`, so the new `mode:` field
+  could not read `cfg.live_execution` after it) — fixed by building
+  `LiveMode` before the literal ([PR
+  #18](https://github.com/nick-kuhle/JerseyMikes/pull/18) commit
+  `345decc`). The follow-up run is green: `cargo clippy --all-targets`
+  and `cargo test --all` (the two new `LiveMode` tests included) pass
+  alongside `contracts (foundry)`, `frontend (next.js)` and the
+  artifact-drift job. This is the W0 process working as designed: treat a
+  CI failure on un-sandbox-compilable code as a real regression, fix, and
+  re-run.
 - The mode API cannot arm a process: `LiveMode::set_live(true)` on an
   unarmed bot returns the restart instructions (surfaced as `409`), pinned
   by `live_mode_can_never_arm_an_unarmed_process`. See `docs/RISK.md`.
