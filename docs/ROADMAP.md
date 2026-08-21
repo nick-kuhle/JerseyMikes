@@ -73,6 +73,20 @@ Remaining Phase 2 coverage:
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
       (out of scope for this phase)
 
+**Status note (2026-08-21):** No new Phase 2 strategy box is ticked in this
+session — W5/W6 remain gated on funnel data and raising W4 to 3–5 legs waits
+for the same baseline. However, **W0's remote CI is now enabled**: the
+maintainer granted GitHub `workflows` permission, the workflow was moved into
+`.github/workflows/ci.yml`, and GitHub Actions is running on every push and PR.
+CI passes `contracts (foundry)` and `frontend (next.js)`. It surfaced a real
+bug the artifact-drift job — `compile-check.js` embedded solc's IPFS metadata
+hash (which includes absolute source paths) into `MevExecutor.runtime.hex`, so
+the artifact only reproduced in the sandbox where it was generated. Fixed by
+disabling that hash (`bytecode_hash = "none"`, matching `foundry.toml`) and
+regenerating the artifact; a fresh checkout now reproduces it byte-for-byte.
+`bot (rust)` still fails on `cargo test --all` (exit 101) and needs diagnosis on
+a Rust-capable environment. Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
+
 ## Phase 3 — going live (opt-in, separate PR)
 
 - [ ] Multi-relay submission with per-relay inclusion stats
