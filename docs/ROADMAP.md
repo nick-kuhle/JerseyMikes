@@ -46,14 +46,14 @@ The boxes below track implementation progress, not completion of the full Phase
 verification where available; the funnel-week and remote-CI gates remain called
 out in the handoff.
 
-- [x] W0: CI enabled; all four jobs (`bot (rust)`, `contracts (foundry)`,
-      `frontend (next.js)`, `embedded bytecode is current`) green. Since
-      2026-08-21 the fmt steps are required inside the workflow (not
-      advisory), the tree is fmt-clean and clippy-clean, and the Rust side
-      is locally verified in the authoring sandbox
-      ([`docs/BUILD_NOTES.md`](BUILD_NOTES.md)). One human step remains:
-      setting the four checks as *required on PRs to `main`* in branch
-      protection (needs repo Administration access).
+- [x] W0: CI enabled and **required on pull requests to `main`**. All four
+      jobs (`bot (rust)`, `contracts (foundry)`, `frontend (next.js)`,
+      `embedded bytecode is current`) green; since 2026-08-21 the fmt steps
+      are required inside the workflow, the tree is fmt-clean and
+      clippy-clean, the Rust side is locally verified in the authoring
+      sandbox, and the `require-ci-on-main` branch ruleset enforces all
+      four checks on `main` (plus no deletes / force-pushes). W0 is
+      complete.
 - [x] W1: Funnel counters distinguish per-invocation and per-opportunity units,
       with live/replay provenance lanes and dashboard labels.
 - [x] W2: V2 discovery has retry-safe cursor/seen handling, bounded overlapping
@@ -99,10 +99,11 @@ funnel panel renders that exact go/no-go reading from live data and
 note, CI's fmt steps became required (the tree is fmt-clean and
 clippy-clean, with the Rust side now compiling and passing 146/146 tests
 inside the authoring sandbox — see
-[`docs/BUILD_NOTES.md`](BUILD_NOTES.md)). W0's final step is branch
-protection (Administration access). Phase 2 is **not** closed: W6 is still
-open, W4 is not raised past 3, and the handoff stays until those reports
-exist.
+[`docs/BUILD_NOTES.md`](BUILD_NOTES.md)), and the `require-ci-on-main`
+ruleset makes the four checks required on PRs to `main` — **W0 is
+closed**. Phase 2 is **not** closed: the W6 decision is open, W4 stays at
+3 until its delta is written down, and the handoff stays until those
+reports exist.
 
 ## Phase 3 — going live (opt-in, separate PR)
 

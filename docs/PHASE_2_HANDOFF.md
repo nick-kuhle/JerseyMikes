@@ -19,9 +19,11 @@ restating them.
 live-execution path.
 
 **Status (2026-08-21):** W0–W6 implementations are shipped and CI-green
-(log in [`BUILD_NOTES.md`](BUILD_NOTES.md)). What is open: one administrative
-W0 step, the W6 go/no-go decision, and the standing watch conditions below.
-Phase 2 is **not** closed.
+(log in [`BUILD_NOTES.md`](BUILD_NOTES.md)), and W0 is fully closed —
+the `require-ci-on-main` ruleset makes all four checks required on `main`.
+What is open: the W6 go/no-go decision, the W4 ceiling note, and the W5
+watch — all data-gated on live funnel runs, not on code. Phase 2 is
+**not** closed.
 
 ---
 
@@ -51,7 +53,6 @@ two-key arming, `BRIBE_BPS`, or the profit guard in `MevExecutor.sol`.
 
 | Item | What is left | Who / how |
 | --- | --- | --- |
-| **W0 admin step** | Set the CI workflow as a **required** check on PRs to `main` (branch protection). Everything else in W0 closed on 2026-08-21: fmt checks are required *inside* the workflow, the tree is fmt-clean and clippy-clean, and the Rust side compiles + passes 146/146 tests in the authoring sandbox | a maintainer with admin access (the automation token lacks the Administration permission — Settings → Branches → ruleset requiring the four checks), or grant the token Administration: read/write and set it via the API |
 | **W6 decision** | Go/no-go on UniversalRouter decoding, gated on a **written** public-mempool gap memo after ≥ 7 days of funnel data | measure with the funnel panel's **W6 go/no-go** card; write the memo in [`W6_MEMO.md`](W6_MEMO.md); the flip itself stays an env change (`DECODE_UNIVERSAL_ROUTER=true`) |
 | **W4 ceiling** | Keep `ARB_MAX_CYCLE_LEN=3` until the live `atomic_arb.candidatesEmitted` delta at 3 (vs the 2-leg baseline) is written down; only then consider 4–5 | record the delta in the W6-style memo pattern or a PR description |
 | **W5 watch** | Watch live `sandwich_v3` funnel rows and `/api/latency` stage `strategy` p95 (budget: ≤ 25 ms added on the pending path, ≤ 12 QuoterV2 `eth_call`s per candidate). Revert the `STRATEGY_SANDWICH_V3` + `POOL_DISCOVERY_V3` pair if the pending-path p95 blows the 150 ms budget or the provider rate-limits | dashboard: funnel panel (live lane) + latency panel |
@@ -68,7 +69,7 @@ off) — is done, verified, and logged in
 
 | ID | Workstream | Depends on | Size | Gate to start | Status |
 | --- | --- | --- | --- | --- | --- |
-| **W0** | Enable CI; green `cargo check` / `cargo test` / `forge test` | — | S | none | ✅ all four jobs green; **required-check admin step open** |
+| **W0** | Enable CI; green `cargo check` / `cargo test` / `forge test` | — | S | none | ✅ complete — all four jobs green, fmt required in-workflow, clippy at zero, checks required on `main` via the `require-ci-on-main` ruleset |
 | **W1** | Fix funnel counter semantics + labels | W0 | S | none | ✅ shipped |
 | **W2** | Harden V2 discovery; extract shared log decoding | W0 | M | none | ✅ shipped (incl. sniper retry fix) |
 | **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | ✅ shipped, on (`POOL_DISCOVERY_V3=true`) |
@@ -173,10 +174,9 @@ certainty, therefore last and gated on data.
 
 Phase 2 is complete when all of these hold:
 
-1. CI is enabled, green and **required** on PRs to `main`. *(The in-workflow
-   fmt checks are required and the tree is clean since 2026-08-21; the
-   branch-protection step itself still needs a maintainer with Administration
-   access.)*
+1. CI is enabled, green and **required** on PRs to `main`. ✅ (the
+   `require-ci-on-main` ruleset enforces all four checks; fmt steps are
+   required inside the workflow and the tree is clean).
 2. The funnel reports per-opportunity and per-invocation counts distinctly,
    and the dashboard labels both.
 3. Pool discovery covers V2 and V3 with disjoint caches, bounded log windows,

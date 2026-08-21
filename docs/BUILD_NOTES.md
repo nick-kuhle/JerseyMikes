@@ -31,14 +31,15 @@ last verifiable W0 gaps from "CI-only" to locally verified:
   `.github/workflows/ci.yml` lost their `continue-on-error: true` — both are
   required now. The job table below is updated accordingly.
 
-**The one remaining W0 step is still human**: making the workflow's checks
-*required on PRs to `main`* needs branch-protection access (repo
-**Administration** permission). The automation token does not have it —
-`GET /repos/…/branches/main/protection` returns "Resource not accessible by
-personal access token". A maintainer: Settings → Branches → Add branch ruleset
-on `main` → require the four check names (`bot (rust)`, `contracts (foundry)`,
-`frontend (next.js)`, `embedded bytecode is current`) — or grant the token
-Administration: read/write and it can be set via the API.
+**W0 closed.** The `require-ci-on-main` branch ruleset now enforces all four
+checks on `main` (observed via `GET /repos/…/rules/branches/main`:
+`required_status_checks` for `bot (rust)`, `contracts (foundry)`,
+`frontend (next.js)` and `embedded bytecode is current`, plus `deletion` and
+`non_fast_forward` rules). Set by the maintainer in the UI — the automation
+token's Administration permission was read-only, which the rulesets API
+surfaces as a misleading 422 rather than a 403 (worth knowing for future
+sessions: a 422 "data matches no possible input" on `/rulesets` can mean
+*missing write permission*, not a malformed body).
 
 ## Session 2026-08-21 (go-live checklist + deploy wizard)
 
