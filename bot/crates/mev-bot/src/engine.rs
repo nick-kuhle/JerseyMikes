@@ -302,7 +302,7 @@ impl Engine {
                     }
                 });
                 for opp in opps {
-                    this.clone().consider(opp, Vec::new()).await;
+                    this.clone().consider(opp, Vec::new(), None).await;
                 }
             });
         }
@@ -346,14 +346,21 @@ impl Engine {
                 };
                 let victims = raw.map(|r| vec![r]).unwrap_or_default();
                 for opp in opps {
-                    this.clone().consider(opp, victims.clone()).await;
+                    this.clone()
+                        .consider(opp, victims.clone(), tx.from.map(|from| (from, tx.nonce)))
+                        .await;
                 }
             });
         }
     }
 
     /// Risk-gate, simulate, record.
-    async fn consider(self: Arc<Self>, opp: Opportunity, victims_raw: Vec<Vec<u8>>) {
+    async fn consider(
+        self: Arc<Self>,
+        opp: Opportunity,
+        victims_raw: Vec<Vec<u8>>,
+        victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
+    ) {
         let head = self.ctx.head();
         let kind = opp.strategy;
         if let Err(reject) = self.risk.check(&opp, head.base_fee_per_gas) {
@@ -378,7 +385,13 @@ impl Engine {
         self.risk.begin(opp.strategy);
         let outcome = self
             .sim
-            .run(&opp, &victims_raw, head.base_fee_per_gas, 0)
+            .run(
+                &opp,
+                &victims_raw,
+                victim_sender_nonce,
+                head.base_fee_per_gas,
+                0,
+            )
             .await;
         self.risk.end(opp.strategy);
 
