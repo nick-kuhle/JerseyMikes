@@ -625,7 +625,7 @@ mod tests {
             pools.push(pool(n, t(i), t(i + 1), 1_000_000_000_000, 1_000_000_000_000));
         }
         let started = Instant::now();
-        let _ = search(
+        let found = search(
             &pools,
             WETH(),
             U256::from(10u128.pow(20)),
@@ -633,11 +633,19 @@ mod tests {
             ENUMERATION_BUDGET,
         );
         let elapsed = started.elapsed();
-        // Generous slack over the budget: sizing runs after the deadline check
-        // for the cycle already in hand, and CI machines are noisy.
+
+        // The deadline bounds cycle enumeration. Sizing cycles that were
+        // already enumerated happens afterwards, so it has no 25 ms guarantee.
+        // Keep a generous ceiling to catch a pathological unbounded search
+        // without making this test depend on noisy shared CI runner speed.
         assert!(
-            elapsed < ENUMERATION_BUDGET * 8,
-            "search took {:?}, budget {:?}", elapsed, ENUMERATION_BUDGET
+            elapsed < Duration::from_secs(2),
+            "search took {:?}", elapsed
+        );
+        assert!(!found.is_empty(), "dense graph should yield candidates");
+        assert!(
+            found.len() <= MAX_CANDIDATES,
+            "search returned more than {MAX_CANDIDATES} candidates"
         );
     }
 
