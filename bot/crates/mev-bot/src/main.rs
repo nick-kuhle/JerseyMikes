@@ -69,10 +69,12 @@ async fn main() -> Result<()> {
             persist,
         } => replay(cfg, from_block, to_block, limit, persist),
         Command::Api => {
+            cfg.validate()?;
             let engine = Arc::new(Engine::new(cfg.clone()).await?);
             api::serve(engine, &cfg.api.bind).await
         }
         Command::Run => {
+            cfg.validate()?;
             let engine = Arc::new(Engine::new(cfg.clone()).await?);
             let api_engine = engine.clone();
             let bind = cfg.api.bind.clone();
@@ -106,6 +108,31 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
     match http.call_raw("eth_blockNumber", json!([])).await {
         Ok(v) => println!("✓ http rpc          {} (head {})", cfg.endpoints.http_url, v),
         Err(e) => println!("✗ http rpc          {}: {e}", cfg.endpoints.http_url),
+    }
+
+    match cfg.validate() {
+        Ok(()) => {
+            if cfg.api.auth_token.is_some() {
+                println!(
+                    "\u{2713} api bind          {} (token required on mutating endpoints)",
+                    cfg.api.bind
+                );
+            } else {
+                println!(
+                    "\u{2713} api bind          {} (loopback, no token needed)",
+                    cfg.api.bind
+                );
+            }
+        }
+        // Not fatal here: `doctor` binds nothing. Report it the way every
+        // other check reports, so the operator sees this problem alongside
+        // the rest instead of getting a wall of text and no diagnostics.
+        Err(e) => {
+            println!("\u{2717} api bind          {}", cfg.api.bind);
+            for line in e.to_string().lines() {
+                println!("                    {line}");
+            }
+        }
     }
 
     match http.call_raw("eth_chainId", json!([])).await {

@@ -633,11 +633,17 @@ impl Config {
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
         };
-        cfg.validate()?;
+        // NOTE: `validate()` is deliberately NOT called here. `doctor` and
+        // `replay` load the config without ever binding a port, and they must
+        // keep working (and *reporting*) on a configuration that would be
+        // unsafe to serve. The commands that actually listen call it.
         Ok(cfg)
     }
 
-    /// Boot-time safety checks that would otherwise be discovered in production.
+    /// Safety checks for the commands that actually bind the API port
+    /// (`run`, `api`). Deliberately not run by `from_env`, so read-only
+    /// commands like `doctor` can inspect and report on an unsafe config
+    /// instead of refusing to run.
     ///
     /// Currently one rule, and it exists because the default configuration is
     /// genuinely dangerous on a shared network: whenever `API_BIND` is set to
@@ -653,22 +659,30 @@ impl Config {
     /// when it would listen on a non-loopback address without
     /// `API_AUTH_TOKEN`. Loopback-only setups are unaffected.
     pub fn validate(&self) -> Result<()> {
-        if self.api.auth_token.is_none() && !bind_is_loopback(&self.api.bind) {
-            anyhow::bail!(
-                "API_BIND is {} (not loopback) but API_AUTH_TOKEN is unset.\n\
-                 The API exposes unauthenticated mutating endpoints — POST /api/mode, \
-                 /api/risk and /api/risk/reset — so anyone who can reach that port can \
-                 trip the kill switch, disable strategies, or set bribeBps to 100%.\n\
-                 Fix by either:\n  \
-                 * binding to loopback and reaching it through the dashboard proxy or an \
-                 SSH tunnel:  API_BIND=127.0.0.1:8080\n  \
-                 * or setting a shared secret:  API_AUTH_TOKEN=$(openssl rand -hex 32)",
-                self.api.bind
-            );
-        }
-        Ok(())
+        validate_api(&self.api)
     }
+}
 
+/// The bind/auth rule, split out so it can be tested without constructing a
+/// whole `Config`.
+pub fn validate_api(api: &ApiConfig) -> Result<()> {
+    if api.auth_token.is_none() && !bind_is_loopback(&api.bind) {
+        anyhow::bail!(
+            "API_BIND is {} (not loopback) but API_AUTH_TOKEN is unset.\n\
+             The API exposes unauthenticated mutating endpoints — POST /api/mode, \
+             /api/risk and /api/risk/reset — so anyone who can reach that port can \
+             trip the kill switch, disable strategies, or set bribeBps to 100%.\n\
+             Fix by either:\n  \
+             * binding to loopback and reaching it through the dashboard proxy or an \
+             SSH tunnel:  API_BIND=127.0.0.1:8080\n  \
+             * or setting a shared secret:  API_AUTH_TOKEN=$(openssl rand -hex 32)",
+            api.bind
+        );
+    }
+    Ok(())
+}
+
+impl Config {
     pub fn summary(&self) -> String {
         format!(
             "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} ur={} arb_legs={} bloxroute_txs={} live={}",
@@ -752,6 +766,34 @@ mod tests {
         assert!(!bind_is_loopback("not a bind string"));
         assert!(!bind_is_loopback(""));
         assert!(!bind_is_loopback("8080"));
+    }
+
+    /// Regression guard for the `doctor` breakage: `validate()` used to run
+    /// inside `from_env`, so *every* subcommand inherited the bind rule —
+    /// including `doctor`, the command you run precisely to diagnose a bad
+    /// config, and `replay`, which binds nothing. Only `run` and `api` open a
+    /// port, so only they call `validate`.
+    ///
+    /// This asserts the rule itself still bites, and that either lever clears
+    /// it. That `from_env` no longer calls it is enforced at the two call
+    /// sites in `main.rs`.
+    #[test]
+    fn the_bind_rule_is_enforced_by_validate_not_by_loading() {
+        fn api(bind: &str, token: Option<&str>) -> ApiConfig {
+            ApiConfig {
+                bind: bind.into(),
+                db_path: ":memory:".into(),
+                feed_capacity: 10,
+                write_queue_capacity: 1_024,
+                auth_token: token.map(str::to_string),
+                allowed_origins: vec![],
+            }
+        }
+        // The dangerous shape is still rejected...
+        assert!(validate_api(&api("0.0.0.0:8080", None)).is_err());
+        // ...and either remedy clears it.
+        assert!(validate_api(&api("0.0.0.0:8080", Some("t"))).is_ok());
+        assert!(validate_api(&api("127.0.0.1:8080", None)).is_ok());
     }
 
     #[test]
