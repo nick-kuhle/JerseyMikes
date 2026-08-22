@@ -41,6 +41,10 @@ const ALL_STRATEGIES: Strategy[] = [
   "jit",
   "atomic_arb",
   "liquidation",
+  "liquidation_compound",
+  "liquidation_morpho",
+  "liquidation_maker",
+  "oracle_frontrun",
   "sniper",
 ];
 

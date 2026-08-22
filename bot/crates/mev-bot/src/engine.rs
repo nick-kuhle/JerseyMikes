@@ -16,13 +16,15 @@ use crate::inventory::Inventory;
 use crate::latency::{Latency, Stage};
 use crate::risk::RiskEngine;
 use crate::rpc::RpcClient;
-use crate::sim::Simulator;
 use crate::signer::Signer;
+use crate::sim::Simulator;
 use crate::store::Store;
 use crate::strategies::{
-    arb::AtomicArbStrategy, discovery::PoolDiscovery, jit::JitStrategy, liquidation::LiquidationStrategy,
-    sandwich::SandwichStrategy, sandwich_v3::SandwichV3Strategy, sniper::SniperStrategy, StrategyCtx,
-    StrategyImpl,
+    arb::AtomicArbStrategy, discovery::PoolDiscovery, jit::JitStrategy, leads::LiquidationLeads,
+    liquidation::LiquidationStrategy, liquidation_compound::CompoundLiquidationStrategy,
+    liquidation_maker::MakerLiquidationStrategy, liquidation_morpho::MorphoLiquidationStrategy,
+    oracle_frontrun::OracleFrontrunStrategy, sandwich::SandwichStrategy,
+    sandwich_v3::SandwichV3Strategy, sniper::SniperStrategy, StrategyCtx, StrategyImpl,
 };
 use crate::types::{
     now_ms, BlockHead, FeedEvent, Opportunity, PendingTx, RelayTxSummary, Strategy, TxSource,
@@ -227,7 +229,12 @@ impl Stats {
     /// Bump a per-strategy funnel counter in one lane. This is the only
     /// path through which funnel counters should be incremented, so the
     /// funnel-stats update is in one place.
-    pub fn record_funnel(&self, lane: FunnelLane, strategy: Strategy, f: impl FnOnce(&mut FunnelCounters)) {
+    pub fn record_funnel(
+        &self,
+        lane: FunnelLane,
+        strategy: Strategy,
+        f: impl FnOnce(&mut FunnelCounters),
+    ) {
         let map = match lane {
             FunnelLane::Live => &self.funnel,
             FunnelLane::Replay => &self.funnel_replay,
@@ -382,8 +389,19 @@ impl Engine {
             .or(cfg.endpoints.executor)
             .unwrap_or(crate::sim::anvil::SIM_EXECUTOR);
 
-        let sim = Arc::new(Simulator::new(cfg.clone(), fork, replay_fork, relay, signer));
-        let ctx = Arc::new(StrategyCtx::new(cfg.clone(), http.clone(), executor, head.clone()));
+        let sim = Arc::new(Simulator::new(
+            cfg.clone(),
+            fork,
+            replay_fork,
+            relay,
+            signer,
+        ));
+        let ctx = Arc::new(StrategyCtx::new(
+            cfg.clone(),
+            http.clone(),
+            executor,
+            head.clone(),
+        ));
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
@@ -404,8 +422,47 @@ impl Engine {
         if cfg.strategies.atomic_arb {
             strategies.push(Arc::new(AtomicArbStrategy));
         }
+        // Shared near-miss registry: the health-polling liquidation
+        // strategies publish into it every block, the oracle front-runner
+        // reads it when a price update appears in the mempool.
+        let leads = LiquidationLeads::new();
         if cfg.strategies.liquidation {
-            strategies.push(Arc::new(LiquidationStrategy::new()));
+            strategies.push(Arc::new(LiquidationStrategy::new(leads.clone())));
+        }
+        if cfg.strategies.liquidation_compound {
+            strategies.push(Arc::new(CompoundLiquidationStrategy::new(
+                cfg.liquidation.watch_cap,
+            )));
+        }
+        if cfg.strategies.liquidation_morpho {
+            strategies.push(Arc::new(MorphoLiquidationStrategy::new(
+                cfg.liquidation.morpho_market_cap,
+                cfg.liquidation.morpho_borrower_cap,
+                leads.clone(),
+            )));
+        }
+        if cfg.strategies.liquidation_maker {
+            let ilks: Vec<&'static crate::strategies::liquidation_maker::maker::IlkSpec> = cfg
+                .liquidation
+                .maker_ilks
+                .iter()
+                .filter_map(|name| crate::strategies::liquidation_maker::maker::spec_by_name(name))
+                .collect();
+            if ilks.is_empty() {
+                tracing::warn!(target: "engine", "STRATEGY_LIQUIDATION_MAKER is on but MAKER_ILKS matched nothing in the built-in table");
+            }
+            strategies.push(Arc::new(MakerLiquidationStrategy::new(
+                ilks,
+                cfg.liquidation.watch_cap,
+                leads.clone(),
+            )));
+        }
+        if cfg.strategies.oracle_frontrun {
+            strategies.push(Arc::new(OracleFrontrunStrategy::new(
+                cfg.oracle.watch_feeds.clone(),
+                cfg.oracle.max_leads,
+                leads.clone(),
+            )));
         }
         if cfg.strategies.sniper {
             strategies.push(Arc::new(SniperStrategy::new()));
@@ -485,7 +542,9 @@ impl Engine {
                     builder,
                     value_wei,
                 } => {
-                    let _ = self.store.record_relay_bid(&relay, slot, &builder, value_wei);
+                    let _ = self
+                        .store
+                        .record_relay_bid(&relay, slot, &builder, value_wei);
                     let _ = self.feed.send(FeedEvent::Relay {
                         relay,
                         slot,
@@ -505,11 +564,7 @@ impl Engine {
     /// Ingest a delivered block and its transactions: persist both, push a feed
     /// event, and score every transaction for extractable value through the same
     /// strategy → risk → simulation funnel as a mempool transaction.
-    async fn on_relay_block(
-        self: Arc<Self>,
-        block: crate::types::RelayBlock,
-        txs: Vec<PendingTx>,
-    ) {
+    async fn on_relay_block(self: Arc<Self>, block: crate::types::RelayBlock, txs: Vec<PendingTx>) {
         Stats::bump(&self.stats.relay_blocks_seen);
         self.stats
             .relay_txs_seen
@@ -619,7 +674,11 @@ impl Engine {
 
         let _ = self
             .inventory
-            .refresh(&self.http, self.cfg.endpoints.searcher_address, self.cfg.chain.weth)
+            .refresh(
+                &self.http,
+                self.cfg.endpoints.searcher_address,
+                self.cfg.chain.weth,
+            )
             .await;
 
         self.ctx.set_head(head.clone());
@@ -838,7 +897,9 @@ impl Engine {
         }
         self.risk.observe(&outcome.primary);
         let _ = self.store.record_simulation(&outcome.primary);
-        let _ = self.feed.send(FeedEvent::Simulation(outcome.primary.clone()));
+        let _ = self
+            .feed
+            .send(FeedEvent::Simulation(outcome.primary.clone()));
         if let Some(relay) = &outcome.relay {
             let _ = self.store.record_simulation(relay);
             let _ = self.feed.send(FeedEvent::Simulation(relay.clone()));
@@ -855,8 +916,7 @@ impl Engine {
         let mut bundle = outcome.bundle;
         if self.risk.submittable(&outcome.primary) {
             Stats::bump(&self.stats.submittable);
-            self.stats
-                .record_funnel(lane, kind, |f| f.submittable += 1);
+            self.stats.record_funnel(lane, kind, |f| f.submittable += 1);
             tracing::info!(
                 target: "engine",
                 strategy = opp.strategy.as_str(),
@@ -928,7 +988,11 @@ async fn fetch_head(http: &RpcClient) -> Result<BlockHead> {
 
 /// MEV-Share hints occasionally include full calldata; when they do we can treat
 /// them exactly like a mempool transaction.
-fn hint_to_pending(raw: &serde_json::Value, hash: alloy_primitives::B256, to: Option<alloy_primitives::Address>) -> Option<PendingTx> {
+fn hint_to_pending(
+    raw: &serde_json::Value,
+    hash: alloy_primitives::B256,
+    to: Option<alloy_primitives::Address>,
+) -> Option<PendingTx> {
     let txs = raw.get("txs")?.as_array()?;
     let first = txs.first()?;
     let calldata = first.get("callData").map(crate::types::parse_bytes)?;
@@ -962,6 +1026,10 @@ pub fn enabled_strategies(cfg: &Config) -> Vec<&'static str> {
             Strategy::Jit => cfg.strategies.jit,
             Strategy::AtomicArb => cfg.strategies.atomic_arb,
             Strategy::Liquidation => cfg.strategies.liquidation,
+            Strategy::LiquidationCompound => cfg.strategies.liquidation_compound,
+            Strategy::LiquidationMorpho => cfg.strategies.liquidation_morpho,
+            Strategy::LiquidationMaker => cfg.strategies.liquidation_maker,
+            Strategy::OracleFrontrun => cfg.strategies.oracle_frontrun,
             Strategy::Sniper => cfg.strategies.sniper,
         })
         .map(|s| s.as_str())
@@ -1010,10 +1078,18 @@ mod tests {
     #[test]
     fn record_funnel_bumps_the_right_strategy() {
         let s = Stats::default();
-        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| f.candidates_emitted += 3);
-        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| f.gated_by_risk += 1);
-        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| f.candidates_emitted += 7);
-        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| f.simulations_succeeded += 2);
+        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| {
+            f.candidates_emitted += 3
+        });
+        s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| {
+            f.gated_by_risk += 1
+        });
+        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| {
+            f.candidates_emitted += 7
+        });
+        s.record_funnel(FunnelLane::Live, Strategy::AtomicArb, |f| {
+            f.simulations_succeeded += 2
+        });
         let snap = s.snapshot();
         let funnel = snap.get("funnel").unwrap().as_object().unwrap();
         let sandwich = funnel.get("sandwich").unwrap();
@@ -1094,7 +1170,9 @@ mod tests {
         // every conversion rate in the dashboard would become meaningless.
         let s = Stats::default();
         s.record_invocation(FunnelLane::Replay, Strategy::Sandwich, 4);
-        s.record_funnel(FunnelLane::Replay, Strategy::Sandwich, |f| f.submittable += 2);
+        s.record_funnel(FunnelLane::Replay, Strategy::Sandwich, |f| {
+            f.submittable += 2
+        });
 
         let snap = s.snapshot();
         assert!(

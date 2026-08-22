@@ -302,10 +302,14 @@ first, then pool coverage, then multi-leg arb, then V3 sandwich, aggregators
 last. It matches `MAINTAINING.md` §7.
 
 **Explicitly out of scope for Phase 2.** 1inch v6 and 0x v2 decoders (revisit
-after W6 produces data); Curve/Balancer/Maverick pool math;
-Compound/Morpho/Maker liquidations; MEV-Share backrun bidding; any new chain;
-anything in Phase 1 or Phase 3 of `ROADMAP.md`. If a ticket starts growing
-toward one of these, stop and re-scope.
+after W6 produces data); Curve/Balancer/Maverick pool math; MEV-Share
+backrun bidding; any new chain; anything in Phase 1 or Phase 3 of
+`ROADMAP.md`. If a ticket starts growing toward one of these, stop and
+re-scope. — *Update 2026-08-21: Compound/Morpho/Maker liquidations and
+oracle-update front-running were subsequently pulled in (see
+[`ROADMAP.md`](ROADMAP.md) and [`STRATEGIES.md`](STRATEGIES.md) §4b–4e);
+they outgrew this handoff's ticket shapes and were done as their own
+change.*
 
 **Footguns by ticket.** Rather than restate `MAINTAINING.md` §5, here is the
 mapping — read the referenced section before starting the ticket:

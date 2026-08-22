@@ -1,7 +1,8 @@
 # JerseyMikes
 
 A simulation-first MEV searcher for Ethereum mainnet: **sandwich, JIT liquidity,
-atomic arbitrage, liquidations and new-token sniping**, wired to live mempool
+atomic arbitrage, liquidations (Aave V3, Compound V3, Morpho Blue, Maker),
+oracle-update front-running and new-token sniping**, wired to live mempool
 and private-orderflow data, scored against a forked EVM, and rendered in a
 real-time console.
 
@@ -15,9 +16,10 @@ bot (Rust)                contracts (Foundry)          frontend (Next.js)
 ──────────                ───────────────────          ──────────────────
 mempool + MEV-Share  ──▶  MevExecutor.execute()   ──▶  P/L + equity curve
 relay + block feeds       profit-or-revert guard       simulated tx history
-5 strategies + V3 sandwich Balancer flash loans         live mempool tape
-anvil fork simulation     V3 JIT mint callback         contract control panel
-SQLite + REST/SSE         coinbase bribe               (viem, injected wallet)
+10 strategy rows          Balancer flash loans         live mempool tape
+liq ×4 + oracle backruns  V3 JIT mint callback         contract control panel
+anvil fork simulation     coinbase bribe               (viem, injected wallet)
+SQLite + REST/SSE
 ```
 
 ---
@@ -125,7 +127,9 @@ code rather than a provider stack, because the exact bytes we sign matter.
 src/
   ingest.rs      every data source → one normalised event
   dex.rs         AMM math, optimal sandwich/arb sizing, V3 quoter
-  strategies/    sandwich · jit · arb · liquidation · sniper
+  strategies/    sandwich · jit · arb · sniper
+                 liquidation ×4 (aave · compound · morpho · maker)
+                 oracle_frontrun (price-update back-runs)
   risk.rs        gates, caps, drawdown kill switch
   sim/           anvil fork backend + relay eth_callBundle backend
   bundle.rs      Opportunity → calldata → signed bundle → relay payloads

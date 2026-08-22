@@ -69,6 +69,10 @@ impl RiskEngine {
             Strategy::Jit => t.jit,
             Strategy::AtomicArb => t.atomic_arb,
             Strategy::Liquidation => t.liquidation,
+            Strategy::LiquidationCompound => t.liquidation_compound,
+            Strategy::LiquidationMorpho => t.liquidation_morpho,
+            Strategy::LiquidationMaker => t.liquidation_maker,
+            Strategy::OracleFrontrun => t.oracle_frontrun,
             Strategy::Sniper => t.sniper,
         }
     }
@@ -91,7 +95,9 @@ impl RiskEngine {
             return Err(Reject::BaseFeeTooHigh);
         }
         let inflight = self.inflight.read();
-        if inflight.get(&opp.strategy).copied().unwrap_or(0) >= self.cfg.risk.max_inflight_per_strategy {
+        if inflight.get(&opp.strategy).copied().unwrap_or(0)
+            >= self.cfg.risk.max_inflight_per_strategy
+        {
             return Err(Reject::TooManyInflight);
         }
         Ok(())
@@ -197,6 +203,10 @@ mod tests {
                 jit: false,
                 atomic_arb: true,
                 liquidation: true,
+                liquidation_compound: false,
+                liquidation_morpho: false,
+                liquidation_maker: false,
+                oracle_frontrun: false,
                 sniper: true,
             },
             sim: crate::config::SimConfig {
@@ -208,6 +218,16 @@ mod tests {
                 use_call_bundle: false,
                 target_block_offset: 1,
                 timeout: std::time::Duration::from_millis(1_000),
+            },
+            liquidation: crate::config::LiquidationConfig {
+                watch_cap: 8,
+                morpho_market_cap: 4,
+                morpho_borrower_cap: 4,
+                maker_ilks: vec!["ETH-A".to_string()],
+            },
+            oracle: crate::config::OracleConfig {
+                watch_feeds: vec![],
+                max_leads: 3,
             },
             api: crate::config::ApiConfig {
                 bind: "127.0.0.1:0".into(),
@@ -265,7 +285,10 @@ mod tests {
     #[test]
     fn rejects_disabled_strategies() {
         let r = RiskEngine::new(cfg());
-        assert_eq!(r.check(&opp(Strategy::Jit, 10), U256::ZERO), Err(Reject::Disabled));
+        assert_eq!(
+            r.check(&opp(Strategy::Jit, 10), U256::ZERO),
+            Err(Reject::Disabled)
+        );
         assert_eq!(
             r.check(&opp(Strategy::SandwichV3, 10), U256::ZERO),
             Err(Reject::Disabled),
@@ -307,7 +330,10 @@ mod tests {
         assert!(!r.is_tripped());
         r.observe(&sim(-600, 1));
         assert!(r.is_tripped());
-        assert_eq!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO), Err(Reject::KillSwitch));
+        assert_eq!(
+            r.check(&opp(Strategy::Sandwich, 10), U256::ZERO),
+            Err(Reject::KillSwitch)
+        );
         r.reset();
         assert!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO).is_ok());
     }

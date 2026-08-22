@@ -9,10 +9,11 @@
  sequencer feed ───▶└───────────────────┬──────────────────────────┘
                                         │
                           ┌─────────────▼─────────────┐
-                          │ strategies/               │
-                          │  sandwich · jit · arb ·   │  ← pool cache, router
-                          │  liquidation · sniper     │    calldata decoding,
-                          └─────────────┬─────────────┘    AMM math
+                          │ strategies/               │  ← pool cache, router
+                          │  sandwich · jit · arb ·   │    calldata decoding,
+                          │  sniper · liq ×4 ·        │    AMM math, and the
+                          │  oracle_frontrun          │    near-miss leads
+                          └─────────────┬─────────────┘    registry
                                         │ Opportunity
                           ┌─────────────▼─────────────┐
                           │ risk.rs                   │  size caps, base-fee cap,
@@ -67,7 +68,7 @@ the victim replay was not faithful.
 | `contracts/script/compile-check.js` | solc-js compile check; also emits the ABI + runtime bytecode the bot embeds |
 | `bot/crates/mev-bot/src/rpc.rs` | JSON-RPC client, WS subscriptions, SSE reader |
 | `bot/crates/mev-bot/src/dex.rs` | Constant-product math, optimal sandwich/arb sizing, V3 quoter |
-| `bot/crates/mev-bot/src/strategies/` | The five strategies |
+| `bot/crates/mev-bot/src/strategies/` | The strategy rows (sandwich ×2, JIT, arb, liquidations ×4, oracle front-run, sniper) plus the shared near-miss `leads.rs` registry |
 | `bot/crates/mev-bot/src/sim/` | anvil fork backend + relay `eth_callBundle` backend |
 | `bot/crates/mev-bot/src/signer.rs`, `rlp.rs` | EIP-1559 signing and a 60-line RLP encoder |
 | `bot/crates/mev-bot/src/store.rs` | SQLite schema and aggregate queries |

@@ -1,6 +1,6 @@
 # Strategies
 
-All five run concurrently and all five are gated by the same rule: the bundle
+All strategies run concurrently and all are gated by the same rule: the bundle
 must be net-positive in a forked simulation, and on chain `MevExecutor` reverts
 anything that does not clear `minProfit`.
 
@@ -119,7 +119,7 @@ verifies the leftover is ≥ `minProfit`.
 fixed-point `log_e` cheap enough to run per block reports false cycles, and the
 precise version is a research port. See `docs/PHASE_2_HANDOFF.md` W4.
 
-## 4. Liquidation — `strategies/liquidation.rs`
+## 4. Liquidations (Aave V3) — `strategies/liquidation.rs`
 
 **Discovery.** `Borrow` logs from the Aave V3 pool build a borrower watchlist;
 every block their `getUserAccountData` is polled in batches of 100.
@@ -130,9 +130,188 @@ every block their `getUserAccountData` is polled in batches of 100.
 `receiveAToken`, we want the underlying) → swap the seized collateral back →
 repay. Close factor is 50%, or 100% when HF < 0.95.
 
-**Not yet.** Compound V3, Morpho, Maker; oracle-update front-running (the real
-edge — being first in the block where the price update lands); per-reserve
-liquidation bonus lookup instead of the 5% assumption.
+**Near-miss publication.** Positions with HF in `[1.00, 1.05)` are published
+into the shared `LiquidationLeads` registry (`strategies/leads.rs`, see §4e)
+every block, with the exact builder inputs to rebuild the liquidation later.
+This costs nothing extra — the health numbers were computed anyway — and it
+is what lets the oracle front-runner act in the same block as the price
+change instead of one block later.
+
+**Not yet.** Per-reserve liquidation bonus lookup instead of the 5%
+assumption.
+
+## 4b. Compound V3 liquidation — `strategies/liquidation_compound.rs`
+
+**Toggle.** `STRATEGY_LIQUIDATION_COMPOUND` (default **on**).
+
+**Trigger.** `isLiquidatable(account)` — a boolean view Comet exposes exactly
+for this. Accounts are harvested from `Supply`/`Withdraw` logs (capped at
+`LIQUIDATION_WATCH_CAP`, least-recently-active evicted first), so the poll is
+one batched sweep, and only the (rare) liquidatable ones pay the deeper
+per-asset reads.
+
+**Shape.** Comet is a two-step storefront, not a single `liquidate` call:
+
+```
+flash USDC → approve Comet → absorb(executor, [account])
+          → buyCollateral(asset, minAmount, baseAmount, executor)  (per asset)
+          → swap collateral back to USDC → repay
+```
+
+`absorb` moves the account's collateral into protocol reserves (the absorber
+receives nothing yet); `buyCollateral` buys it back **at a discount** —
+`quoteCollateral` prices it with `storeFrontPriceFactor × (1 −
+liquidationFactor)` — and the discount *is* the liquidation reward. Doing the
+two calls in one batch matters: `buyCollateral` reverts `NotForSale` while
+reserves are healthy, and the absorb is usually what pushes them below
+`targetReserves`.
+
+**Sizing.** Per asset, `quoteCollateral(asset, 1e9)` once per block gives the
+discounted collateral-per-base rate; `base_needed = ⌈seized · 1e9 / rate⌉`,
+seized read from `userCollateral`. The `minAmount` bound is 97% of the
+seizure (3% slippage cap).
+
+**Verified against the chain.** Every selector (`absorb` `0xc3cecfd2`,
+`buyCollateral` `0xe4e6e779`, `isLiquidatable`, `quoteCollateral`,
+`userCollateral`, `getAssetInfo`, `numAssets`) was found in the dispatcher of
+the *live implementation* behind the 0xc3d688B6… proxy
+(`CometWithExtendedAssetList`), and the `AssetInfo` decode offsets were
+checked against real returns (asset[2] reads back as WETH, asset[1] as WBTC,
+13 assets listed).
+
+**Not yet.** Multi-account absorbs in one bundle; Comet markets on other
+bases; a near-miss band (Comet exposes no continuous health factor, so
+oracle front-running cannot use it — see §4e).
+
+## 4c. Morpho Blue liquidation — `strategies/liquidation_morpho.rs`
+
+**Toggle.** `STRATEGY_LIQUIDATION_MORPHO` (default **on**).
+
+**Discovery.** Markets are self-seeding: activity logs (`Supply`,
+`SupplyCollateral`, and `Borrow` — *both* the current six-field signature and
+the pre-v1.1 five-field one, OR'd in one `eth_getLogs`) reveal which market
+ids are being used *now*, which is the population worth watching; borrowers
+come from the same logs. Params are resolved per id via `idToMarketParams`
+and markets are filtered to a whitelist the swap leg can actually price
+(USDC/DAI/USDT/WETH loans against WETH/WBTC/wstETH collateral). Caps:
+`MORPHO_MARKET_CAP` markets, `MORPHO_BORROWER_CAP` borrowers per market.
+
+**Trigger.** The health check mirrors the deployed contract exactly:
+`borrowed = ⌈shares · (tba+1) / (tbs+1e6)⌉` (the virtual-share rounding
+included) and `maxBorrow = collateral · price/1e36 · lltv`; liquidatable when
+`maxBorrow < borrowed`. Two batched reads per position (`position`,
+`market`) plus one oracle `price()` per market.
+
+**Shape.** Full close, repay-by-shares:
+
+```
+flash loan token → approve Blue → liquidate(params, borrower, 0, borrowShares, "")
+                 → swap seized collateral back → repay
+```
+
+The reward is `min(1.15e18, 1 / (1 − 0.3 · (1 − lltv)))` — lltv-proportional,
+~2.6% at 0.915 lltv, capping at 15% for the deepest-risk markets.
+
+**The v1.1 interface.** The deployed singleton at 0xBBBB…FFCb exposes
+`liquidate` (not the 2024 `liquidationCall` — no `id` argument; the id is
+re-derived from the market params), `position(bytes32,address)` for reads,
+and `MarketParams` ordered `(loan, collateral, oracle, irm, lltv)`. The
+contract is immutable, so this ABI is frozen on mainnet; all four selectors
+were verified against its bytecode dispatcher before implementation.
+
+**Not yet.** Partial liquidations sized to pool depth; MetaMorpho vaults;
+seized-collateral oracles that need historical rounds.
+
+## 4d. Maker liquidation — `strategies/liquidation_maker.rs`
+
+**Toggle.** `STRATEGY_LIQUIDATION_MAKER` (default **on**, `MAKER_ILKS=ETH-A`).
+
+**Discovery.** The Vat emits **nothing** (verified live — two independent
+RPCs return zero `frob` notes; the source dropped LibNote), so urns are
+harvested from each ilk's **gem join**: the joins emit *anonymous* DSNote
+LogNotes — topic0 is the padded `join`/`exit` selector, and topics[2] carries
+the `usr` argument (the urn, usually the owner's proxy). One `eth_getLogs`
+per ilk per block; layout pinned against live ETH-A join logs. Polled with
+batched `vat.urns` + `vat.ilks`: unsafe ⇔ `ink · spot < art · rate`.
+
+**Shape.** Maker liquidates through auctions, and the bundle makes the
+auction atomic:
+
+```
+flash DAI → daiJoin.join → vat.hope(daiJoin)
+          → dog.bark(ilk, urn, executor)          (kick reward mints to the executor)
+          → clip.take(kicks+1, MAX, marketPrice, executor, "")
+          → gemJoin.exit(slice)                    (ERC20 WETH out)
+          → swap WETH → DAI
+          → daiJoin.exit(leftover vat.dai) → repay
+```
+
+Profit = kick reward (`tip + tab·chip`) plus the spread between the auction's
+opening price and the market. Both the reward and the opening price
+(`getFeedPrice() × buf`) are public reads, so the whole bundle is sized with
+exact integers — including the take's own `slice = min(lot, tab/price)` floor.
+
+**The deterministic-id trick.** A `Call[]` batch cannot thread bark's return
+value into take. It does not need to: the auction id is `++kicks`, and
+`clip.kicks()` is public — the bundle hardcodes `kicks + 1`. If another
+searcher barks in between, the take targets a dead auction and reverts; the
+bundle dies, nothing is broadcast. Fail-safe is the correct polarity.
+
+**Price cap.** `max` is a ray price (DAI per 1e18 collateral). We bid exactly
+the V2 pool price (`dai_reserve · 1e27 / weth_reserve`): if the auction opens
+above market, `take` reverts `too-expensive` (correct — not a discount yet);
+if below, the spread is realised on the swap leg. Both directions fail safe,
+which is why a pure market cap beats any off-chain "fair value".
+
+**Addresses.** Resolved from the live Maker chainlog — notably `MCD_DOG` is
+*not* the pre-2024 address (the Dog was replaced in the Sky-era upgrades);
+`dog.ilks(ilk)` supplies the clip at runtime so a clip swap never goes stale.
+The built-in ilk table (ETH-A, WBTC-A, WSTETH-A) holds the stable adapter
+addresses (gem joins, OSM pips), each entry cross-checked against the
+chainlog.
+
+**Not yet.** Auctions needing a reset (`list.max` staleness), multi-ilk
+bundles, ETH-C/WSTETH-B beyond the table.
+
+## 4e. Oracle-update front-running — `strategies/oracle_frontrun.rs`
+
+**Toggle.** `STRATEGY_ORACLE_FRONTRUN` (default **on**).
+
+The other liquidation strategies watch *state* and react a block late. This
+one watches the *event that changes state*: a downward collateral price
+update flips every position priced at the stale higher value, and the first
+searcher behind that transaction in the block captures the liquidation.
+
+**Watched update paths.**
+
+| Source | Transaction shape | Notes |
+| --- | --- | --- |
+| Chainlink OCR2 | `transmit(bytes)` to the **aggregator** | the proxy is what protocols read; the aggregator (what `transmit` actually hits) is resolved via `proxy.aggregator()` at runtime and refreshed every ~50 blocks |
+| Chainlink legacy | `submit(uint256,int256,uint256,uint256,address)` | same target set |
+| Maker OSM | `poke()` to the ilk's pip; `poke(bytes32)` via OsmMom | the pip reprices the ilk's spot an hour later |
+| Maker Spot | `poke(bytes32)` | reprices every ilk at once |
+
+**Trigger.** A pending transaction matching (target, selector) above. The
+affected collateral is looked up in the shared `LiquidationLeads` registry
+(`strategies/leads.rs`): every block, the Aave / Morpho / Maker strategies
+publish positions within 5% above their liquidation threshold, normalised to
+bps of the threshold, together with everything needed to rebuild their
+liquidation. On a match, up to `ORACLE_FRONTRUN_MAX_LEADS` leads are rebuilt
+— each with the owning strategy's own builder, so protocol logic lives in
+exactly one place — and emitted as **back-run bundles**: the oracle
+transaction is the victim, our calls run directly behind it.
+
+**Why this is honest.** The new price is *not* decoded out of the OCR report
+(offchain-consensus bytes, drifting layouts); the fork simulation replays
+victim → back and decides. Upward or too-small updates revert the liquidation
+(`HEALTHY_POSITION` on Morpho, `not-unsafe` on Maker), the bundle dies, and
+private orderflow means nothing is broadcast. The strategy measures how often
+the pattern exists before anyone cares about winning it — Chainlink
+`transmit`s are only back-runnable when they land in the public mempool.
+
+**Not yet.** Redstone/Api3 oracle families, OCR proposal/aggregation rounds,
+the Maker medianizer itself (an hour ahead of the OSM — needs addresses the
+operator trusts), decoding the upcoming price pre-simulation.
 
 ## 5. New-token sniper — `strategies/sniper.rs`
 
@@ -180,6 +359,15 @@ V2 and V3 sandwiches are **separate funnel rows** (`sandwich` vs
 `sandwich_v3`). Do not add them together and call it "the sandwich conversion
 rate" — they have different RPC costs, different victim populations and
 different revert modes.
+
+The same rule applies to the liquidation rows (`liquidation` (Aave),
+`liquidation_compound`, `liquidation_morpho`, `liquidation_maker`) and
+`oracle_frontrun`: different victim populations, different reward shapes
+(Aave bonus bps, Comet storefront discount, Morpho lltv-proportional
+incentive, Maker kick reward + auction spread) and different revert modes.
+They share the leads registry but nothing else; `oracle_frontrun` candidates
+are back-runs measured against a victim, the four block-cadence rows are
+standalone. Read each row's `candidatesEmitted → submittable` on its own.
 
 ## 7. UniversalRouter decoding — `dex/calldata/universal_router.rs`
 
