@@ -124,6 +124,12 @@ Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 
 ## Phase 3 — going live (opt-in, separate PR)
 
+> Sequencing note: the remaining unchecked items below are the only code in
+> the repo that can lose money, and the only code with no test coverage —
+> nothing currently submits a bundle to a relay. See
+> [`WHERE_TO_GO_NEXT.md`](WHERE_TO_GO_NEXT.md) for the recommended order
+> (measure the edge, then shadow-submit, then go live small).
+
 - [x] Console control surface: runtime simulation ⇄ live switch
       (`GET/POST /api/mode`, `engine.rs::LiveMode`) layered strictly on top of
       the boot-time two-key arming — an unarmed process refuses the switch

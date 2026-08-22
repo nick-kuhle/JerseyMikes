@@ -230,6 +230,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
 | [`docs/RISK.md`](docs/RISK.md) | Why nothing can be broadcast, every guard, known limitations |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased plan through going live and chains 2–5 |
+| [`docs/WHERE_TO_GO_NEXT.md`](docs/WHERE_TO_GO_NEXT.md) | Prioritisation memo: prove the edge before submitting, and why the live path is the least-exercised code |
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
 | [`docs/W6_MEMO.md`](docs/W6_MEMO.md) | The public-mempool gap memo that gates UniversalRouter decoding — template + decision record |
