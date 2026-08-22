@@ -1,5 +1,18 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (handoff doc: verification story brought current)
+
+The Phase 2 handoff still described the era when the automation sandbox had
+no Rust toolchain and no `workflows` permission, so the maintainer compiled
+and CI was the only real check. That ended over the last several sessions:
+the handoff now carries a **verification posture** note (local-first: rustup
++ Foundry in the sandbox, cargo fmt/clippy/test, tsc, next build, YAML
+parses, live-RPC interface checks — with CI as the merge gate and the
+authority on cross-toolchain builds, artifact drift and check-state), the
+stale evidence-table rows are corrected, the historical paragraphs are
+marked as such, and the "not by remote CI" correction carries a bracketed
+update. Docs-only change; no code touched.
+
 ## Session 2026-08-22 (alerting + deployment units)
 
 Phase 3's ops items: a rule engine over live engine state (`alerts.rs`,
