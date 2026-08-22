@@ -99,8 +99,10 @@ tightening order once there is data:
 - **MEV-Share hints are usually redacted.** Most private orderflow yields only
   a function selector and log topics; strategies that need calldata cannot act
   on those.
-- **Liquidation sizing assumes a USDC debt leg and a 5% bonus.** Correct
-  per-reserve configuration lookup is a to-do.
+- **Aave sizing is per-reserve** (real debt/collateral assets, real bonus
+  from the data provider); the close factor remains the HF-based 50%/100%
+  simplification rather than v3.1's per-reserve value — the fork simulation
+  absorbs the residue.
 - **Re-orgs are marked, not replayed.** A parent-hash mismatch or rewind
   flags simulations in the discarded range (`reorged = 1`) and drops them
   from P/L. The bot does not re-simulate the new canonical chain for those

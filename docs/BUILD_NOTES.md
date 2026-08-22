@@ -1,5 +1,24 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (Aave per-reserve liquidation config)
+
+Retired the last documented assumption in the Aave strategy: positions are
+composed from their actual reserves before a bundle is built.
+`Pool.getUserConfiguration` (bitmap over `getReservesList`) selects the
+reserves a user touches, batched `DataProvider.getUserReserveData` supplies
+the real balances, `getReserveConfigurationData` the real liquidation bonus
+(cached per block; instance-owned caches so live/replay lanes stay
+disjoint). The bundle repays the largest actual debt against the largest
+actual collateral, sized with the real bonus; near-miss leads publish the
+real collateral so oracle back-runs match on the right feed; the oracle
+path re-composes at trigger time. Close factor stays the documented
+HF-based simplification. All four ABI shapes verified against the live
+pool implementation (`0x728a138A…`) and data provider before coding.
+
+**Verification:** `cargo test --all` 203 passed (4 new: bitmap decode,
+reserves-list decode, reserve-config word decode, bonus math); clippy
+clean. Docs: STRATEGIES.md §4, RISK.md limitation updated.
+
 ## Session 2026-08-22 (handoff doc: verification story brought current)
 
 The Phase 2 handoff still described the era when the automation sandbox had
