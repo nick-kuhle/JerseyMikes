@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Method};
+use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,7 +19,7 @@ use axum::{Json, Router};
 use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::json;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 use crate::engine::Engine;
 use crate::risk::RiskPatch;
@@ -29,7 +31,37 @@ pub struct ApiState {
 }
 
 pub fn router(engine: Arc<Engine>) -> Router {
+    let cfg = engine.cfg.clone();
     let state = ApiState { engine };
+
+    // Mutating endpoints, split out so an auth layer can be applied to them
+    // alone. Reads stay open: they are already public information for anyone
+    // who can see the dashboard, and gating them would break the demo flow.
+    let mutating = Router::new()
+        .route("/api/mode", post(set_mode))
+        .route("/api/risk", post(set_risk))
+        .route("/api/risk/reset", post(reset_risk))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    // Browsers get no cross-origin access by default. The dashboard reaches
+    // the bot server-side through its own `/api/bot/*` proxy, so nothing
+    // legitimate needs `Access-Control-Allow-Origin: *` — and with it, any
+    // page the operator visited could POST to the risk endpoints.
+    let cors = if cfg.api.allowed_origins.is_empty() {
+        CorsLayer::new()
+    } else {
+        let origins: Vec<HeaderValue> = cfg
+            .api
+            .allowed_origins
+            .iter()
+            .filter_map(|o| o.parse::<HeaderValue>().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+    };
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
@@ -46,18 +78,66 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/competition", get(competition))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
-        .route("/api/mode", get(mode).post(set_mode))
-        .route("/api/risk", get(risk_state).post(set_risk))
-        .route("/api/risk/reset", post(reset_risk))
+        .route("/api/mode", get(mode))
+        .route("/api/risk", get(risk_state))
         .route("/api/alerts", get(alerts))
         .route("/api/metrics", get(metrics))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .merge(mutating)
+        .layer(cors)
         .with_state(state)
+}
+
+/// Bearer-token gate for the mutating endpoints.
+///
+/// A no-op when `API_AUTH_TOKEN` is unset — which `Config::validate` only
+/// permits when the API is bound to loopback, so the open case is never
+/// reachable from off-box. Comparison is constant-time: these tokens are
+/// low-entropy shared secrets and an early-exit `==` leaks their prefix to a
+/// patient attacker.
+async fn require_auth(
+    State(s): State<ApiState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(expected) = s.engine.cfg.api.auth_token.as_deref() else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "error": "missing or invalid bearer token",
+            "hint": "send `Authorization: Bearer <API_AUTH_TOKEN>`",
+        })),
+    )
+        .into_response()
+}
+
+/// Length-independent byte comparison, so neither the token's length nor its
+/// matching prefix is observable through response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Still fold over the longer input so the mismatch is not a fast path.
+        let mut sink = 0u8;
+        for byte in a.iter().chain(b.iter()) {
+            sink |= *byte;
+        }
+        return std::hint::black_box(sink) == 0 && false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn health() -> impl IntoResponse {

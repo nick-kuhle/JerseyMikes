@@ -207,8 +207,11 @@ pub struct ChainConfig {
     pub block_time_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Endpoints {
+    // NOTE: `flashbots_signer_key` below is a secret. `Serialize` skips it and
+    // the hand-written `Debug` below redacts it, so neither a serialised config
+    // nor a stray `{:?}` can leak a live key.
     pub http_url: String,
     pub ws_url: Option<String>,
     /// Flashbots MEV-Share SSE endpoint.
@@ -230,11 +233,44 @@ pub struct Endpoints {
     pub mev_blocker_ws: Option<String>,
     /// Flashbots reputation key. Only used to sign the `X-Flashbots-Signature`
     /// header for read-only `eth_callBundle` requests.
+    ///
+    /// **Secret.** Redacted from `Debug` and omitted from `Serialize` so it
+    /// cannot reach a log line or an API response by accident — `Endpoints`
+    /// derives both, and a single `tracing::debug!(?cfg)` added later would
+    /// otherwise print a live key.
+    #[serde(skip_serializing, default)]
     pub flashbots_signer_key: Option<String>,
     /// Executor contract address, if deployed.
     pub executor: Option<Address>,
     /// Address the simulated searcher trades from.
     pub searcher_address: Address,
+}
+
+/// Hand-written so the signer key is redacted.
+///
+/// The derive would print it verbatim. That is a real risk on a struct that
+/// is cloned into every task and sits one `tracing::debug!(?cfg)` away from a
+/// log aggregator.
+impl std::fmt::Debug for Endpoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoints")
+            .field("http_url", &self.http_url)
+            .field("ws_url", &self.ws_url)
+            .field("mev_share_sse", &self.mev_share_sse)
+            .field("relay_url", &self.relay_url)
+            .field("relay_data_urls", &self.relay_data_urls)
+            .field("bloxroute_relay_url", &self.bloxroute_relay_url)
+            .field("sequencer_feed", &self.sequencer_feed)
+            .field("extra_mempool_ws", &self.extra_mempool_ws)
+            .field("mev_blocker_ws", &self.mev_blocker_ws)
+            .field(
+                "flashbots_signer_key",
+                &self.flashbots_signer_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("executor", &self.executor)
+            .field("searcher_address", &self.searcher_address)
+            .finish()
+    }
 }
 
 /// Deliberately permissive to start: we want observations, not profit.
@@ -313,6 +349,21 @@ pub struct ApiConfig {
     /// writer. When it fills, telemetry writes are dropped (and counted)
     /// rather than blocking the searcher.
     pub write_queue_capacity: usize,
+    /// Shared secret required on the *mutating* endpoints
+    /// (`POST /api/mode`, `/api/risk`, `/api/risk/reset`).
+    ///
+    /// `None` (the default) leaves them open, which is fine only while the
+    /// API is bound to loopback. When `API_BIND` listens on a non-loopback
+    /// address the engine refuses to start without this set — see
+    /// `Config::validate`. Presented as `Authorization: Bearer <token>`.
+    pub auth_token: Option<String>,
+    /// Origins allowed to call the API from a browser.
+    ///
+    /// Empty (the default) means "reflect nothing": the dashboard talks to the
+    /// bot server-side through its own `/api/bot/*` proxy, so no browser
+    /// origin needs direct access. Set `API_ALLOWED_ORIGINS` only if something
+    /// really does call the bot from a page.
+    pub allowed_origins: Vec<String>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -321,6 +372,30 @@ fn env_opt(key: &str) -> Option<String> {
 
 fn env_or(key: &str, default: &str) -> String {
     env_opt(key).unwrap_or_else(|| default.to_string())
+}
+
+/// Whether a `host:port` bind string listens only on the loopback interface.
+///
+/// Unparseable or unresolvable hosts are treated as **not** loopback: this
+/// gates a security check, so the ambiguous case must fail closed.
+pub fn bind_is_loopback(bind: &str) -> bool {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    if let Ok(addr) = bind.parse::<SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+    match bind.to_socket_addrs() {
+        Ok(mut addrs) => {
+            // Every resolved address must be loopback, or a hostname pointing
+            // at both 127.0.0.1 and a routable IP would slip through.
+            let mut any = false;
+            let all_loopback = addrs.all(|a| {
+                any = true;
+                a.ip().is_loopback()
+            });
+            any && all_loopback
+        }
+        Err(_) => false,
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -384,7 +459,7 @@ impl Config {
 
         let chain_id = env_u64("CHAIN_ID", 1);
 
-        Ok(Self {
+        let cfg = Self {
             chain: ChainConfig {
                 chain_id,
                 name: env_or("CHAIN_NAME", "ethereum"),
@@ -508,10 +583,19 @@ impl Config {
                 max_leads: (env_u64("ORACLE_FRONTRUN_MAX_LEADS", 3) as usize).max(1),
             },
             api: ApiConfig {
-                bind: env_or("API_BIND", "0.0.0.0:8080"),
+                // Loopback by default: the API has mutating endpoints and no
+                // auth unless `API_AUTH_TOKEN` is set, so the out-of-the-box
+                // configuration must not be reachable from the network. The
+                // dashboard proxies server-side, so it is unaffected.
+                // Containers that need to publish the port set `API_BIND`
+                // explicitly (see deploy/docker-compose.yml) and must then
+                // also set `API_AUTH_TOKEN`.
+                bind: env_or("API_BIND", "127.0.0.1:8080"),
                 db_path: env_or("DB_PATH", "data/mev.sqlite"),
                 feed_capacity: env_u64("FEED_CAPACITY", 2_000) as usize,
                 write_queue_capacity: (env_u64("WRITE_QUEUE_CAPACITY", 8_192) as usize).max(64),
+                auth_token: env_opt("API_AUTH_TOKEN").filter(|t| !t.is_empty()),
+                allowed_origins: env_list("API_ALLOWED_ORIGINS"),
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
@@ -548,7 +632,41 @@ impl Config {
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Boot-time safety checks that would otherwise be discovered in production.
+    ///
+    /// Currently one rule, and it exists because the default configuration is
+    /// genuinely dangerous on a shared network: whenever `API_BIND` is set to
+    /// a routable address (containers must, to be reachable across the compose
+    /// network) the API exposes **mutating** endpoints
+    /// (`POST /api/mode`, `/api/risk`, `/api/risk/reset`) with no
+    /// authentication. Anyone who can reach the port can trip the kill switch,
+    /// disable every strategy, or set `bribeBps` to 10000 so the builder takes
+    /// 100% of gross.
+    ///
+    /// Rather than change the default bind (which would break every existing
+    /// container deployment that maps the port), the bot now refuses to start
+    /// when it would listen on a non-loopback address without
+    /// `API_AUTH_TOKEN`. Loopback-only setups are unaffected.
+    pub fn validate(&self) -> Result<()> {
+        if self.api.auth_token.is_none() && !bind_is_loopback(&self.api.bind) {
+            anyhow::bail!(
+                "API_BIND is {} (not loopback) but API_AUTH_TOKEN is unset.\n\
+                 The API exposes unauthenticated mutating endpoints — POST /api/mode, \
+                 /api/risk and /api/risk/reset — so anyone who can reach that port can \
+                 trip the kill switch, disable strategies, or set bribeBps to 100%.\n\
+                 Fix by either:\n  \
+                 * binding to loopback and reaching it through the dashboard proxy or an \
+                 SSH tunnel:  API_BIND=127.0.0.1:8080\n  \
+                 * or setting a shared secret:  API_AUTH_TOKEN=$(openssl rand -hex 32)",
+                self.api.bind
+            );
+        }
+        Ok(())
     }
 
     pub fn summary(&self) -> String {
@@ -604,5 +722,82 @@ impl StrategyToggles {
             v.push("sniper");
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_binds_are_recognised() {
+        assert!(bind_is_loopback("127.0.0.1:8080"));
+        assert!(bind_is_loopback("[::1]:8080"));
+        assert!(bind_is_loopback("localhost:8080"));
+    }
+
+    #[test]
+    fn routable_binds_are_not_loopback() {
+        // The dangerous default, and the shapes people actually deploy.
+        assert!(!bind_is_loopback("0.0.0.0:8080"));
+        assert!(!bind_is_loopback("[::]:8080"));
+        assert!(!bind_is_loopback("192.168.1.10:8080"));
+        assert!(!bind_is_loopback("10.0.0.5:8080"));
+    }
+
+    #[test]
+    fn unparseable_binds_fail_closed() {
+        // This gates a security check: if we cannot prove it is loopback, it
+        // must be treated as exposed.
+        assert!(!bind_is_loopback("not a bind string"));
+        assert!(!bind_is_loopback(""));
+        assert!(!bind_is_loopback("8080"));
+    }
+
+    #[test]
+    fn the_signer_key_is_redacted_from_debug() {
+        // Endpoints is cloned into every task; one `tracing::debug!(?cfg)`
+        // added later must not print a live Flashbots key.
+        let e = Endpoints {
+            http_url: "http://localhost:8545".into(),
+            ws_url: None,
+            mev_share_sse: String::new(),
+            relay_url: String::new(),
+            relay_data_urls: vec![],
+            bloxroute_relay_url: String::new(),
+            sequencer_feed: None,
+            extra_mempool_ws: vec![],
+            mev_blocker_ws: None,
+            flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
+            executor: None,
+            searcher_address: Address::ZERO,
+        };
+        let rendered = format!("{e:?}");
+        assert!(
+            !rendered.contains("supersecret"),
+            "signer key leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn the_signer_key_is_not_serialised() {
+        let e = Endpoints {
+            http_url: "http://localhost:8545".into(),
+            ws_url: None,
+            mev_share_sse: String::new(),
+            relay_url: String::new(),
+            relay_data_urls: vec![],
+            bloxroute_relay_url: String::new(),
+            sequencer_feed: None,
+            extra_mempool_ws: vec![],
+            mev_blocker_ws: None,
+            flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
+            executor: None,
+            searcher_address: Address::ZERO,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("supersecret"), "signer key leaked: {json}");
+        assert!(!json.contains("flashbots_signer_key"), "{json}");
     }
 }

@@ -107,6 +107,10 @@ fn decode_revert_data_at(data: &[u8], depth: u8) -> String {
             error CallFailed(uint256 index, bytes returndata);
             error BadFlashCallback();
             error BadBribe();
+            error SweepFailed();
+            error BribeFailed();
+            error TransferFailed(address token, address to, uint256 amount);
+            error QuoteIsEthCallOnly();
         }
         interface KnownProtocolErrors {
             // Morpho Blue (ErrorsLib)
@@ -174,6 +178,18 @@ fn decode_revert_data_at(data: &[u8], depth: u8) -> String {
         ),
         (MevExecutorErrors::BadBribe::SELECTOR, "BadBribe()"),
         (
+            MevExecutorErrors::SweepFailed::SELECTOR,
+            "SweepFailed() (the ETH sweep recipient rejected the transfer)",
+        ),
+        (
+            MevExecutorErrors::BribeFailed::SELECTOR,
+            "BribeFailed() (block.coinbase rejected the bribe transfer)",
+        ),
+        (
+            MevExecutorErrors::QuoteIsEthCallOnly::SELECTOR,
+            "QuoteIsEthCallOnly() (call quote() with no `from`, or use quoteFrom())",
+        ),
+        (
             KnownProtocolErrors::HEALTHY_POSITION::SELECTOR,
             "HEALTHY_POSITION() (position healthy at execution)",
         ),
@@ -214,6 +230,21 @@ fn decode_revert_data_at(data: &[u8], depth: u8) -> String {
             "Unprofitable(realised={}, required={}) — the profit guard: gross did not clear minProfit",
             w.first().copied().unwrap_or_default(),
             w.get(1).copied().unwrap_or_default()
+        );
+    }
+    if selector == MevExecutorErrors::TransferFailed::SELECTOR {
+        // Same word-decoding style as `Unprofitable` above: the three args are
+        // (address token, address to, uint256 amount), each one word wide.
+        let w = words(0);
+        let as_addr = |v: Option<U256>| {
+            v.map(|x| format!("0x{}", hex::encode(&x.to_be_bytes::<32>()[12..])))
+                .unwrap_or_else(|| "?".to_string())
+        };
+        return format!(
+            "TransferFailed(token={}, to={}, amount={}) — the ERC20 returned false or reverted",
+            as_addr(w.first().copied()),
+            as_addr(w.get(1).copied()),
+            w.get(2).copied().unwrap_or_default()
         );
     }
     if selector == MevExecutorErrors::CallFailed::SELECTOR {
@@ -935,6 +966,42 @@ mod tests {
         code[31] = 0x11; // arithmetic overflow
         data.extend_from_slice(&code);
         assert_eq!(decode_revert_data(&data), "Panic(17)");
+    }
+
+    #[test]
+    fn decodes_the_new_executor_custom_errors() {
+        // These replaced `require("sweep failed")` / `require("bribe failed")`
+        // / `require("transfer failed")` in MevExecutor. If the decoder is not
+        // kept in step, the console degrades from a named reason to a raw
+        // selector — which is exactly the diagnostic the funnel depends on.
+        sol! {
+            interface E {
+                error SweepFailed();
+                error BribeFailed();
+                error QuoteIsEthCallOnly();
+                error TransferFailed(address token, address to, uint256 amount);
+            }
+        }
+        assert!(decode_revert_data(&E::SweepFailed {}.abi_encode()).contains("SweepFailed()"));
+        assert!(decode_revert_data(&E::BribeFailed {}.abi_encode()).contains("BribeFailed()"));
+        assert!(decode_revert_data(&E::QuoteIsEthCallOnly {}.abi_encode())
+            .contains("QuoteIsEthCallOnly()"));
+
+        let token = alloy_primitives::Address::with_last_byte(0xAA);
+        let to = alloy_primitives::Address::with_last_byte(0xBB);
+        let text = decode_revert_data(
+            &E::TransferFailed {
+                token,
+                to,
+                amount: U256::from(1_234u64),
+            }
+            .abi_encode(),
+        );
+        assert!(text.contains("TransferFailed("), "{text}");
+        assert!(text.contains("amount=1234"), "{text}");
+        // The address words must render as addresses, not as huge integers.
+        assert!(text.to_lowercase().contains("aa"), "{text}");
+        assert!(text.to_lowercase().contains("bb"), "{text}");
     }
 
     #[test]

@@ -327,3 +327,253 @@ gap. That was the *test* racing the live feed, not drift — scrolling and
 measuring in a single `evaluate` gives 0 px, and a static (filtered) list also
 gives 0 px. The row-height constant was nonetheless corrected from an assumed
 25 px to the measured 31 px, and `measureElement` now makes it self-correcting.
+
+---
+
+# Part 3 — Web3 / contract layer
+
+The review's verdict that `MevExecutor.sol` is "already excellent" held up. It
+is small, deterministic, and the profit guard and reentrancy protection are
+sound. **Two of the three recommendations turned out to be actively harmful or
+redundant, and are deliberately not implemented.** What follows is what the
+evidence supported.
+
+## Recommendations evaluated
+
+### ❌ "Add a `receive()` fallback with a clear revert (currently only `fallback`)"
+
+**Not implemented — the premise is inverted, and doing it would break live
+funds.**
+
+The contract already has `receive() external payable {}` and has **no**
+`fallback()`. So the recommendation is backwards on both halves.
+
+Worse, making `receive()` revert would be a real bug. `_settle` pays builder
+bribes in ETH; when profit is denominated in WETH it calls
+`IWETH.withdraw(bribe)`, and WETH9 pays out by sending ETH **straight back to
+the executor** — through `receive()`. Proven by experiment: patching
+`receive()` to revert turns the suite red with `withdraw failed` and breaks
+`test_coinbaseBribeIsPaidFromProfit`. Every WETH-denominated bribe would
+silently stop working. The same applies to any batch leg that unwraps WETH or
+takes an ETH refund from a router.
+
+The absence of `fallback()` is already correct: unknown selectors revert by
+default, at zero bytecode cost.
+
+**Done instead:** documented *why* `receive()` must stay permissive, and added
+three regression tests (`test_wethProfitBribeRoutesEthThroughReceive`,
+`test_plainEthTransferIsAccepted`, `test_unknownSelectorReverts`) so this
+refactor cannot land unnoticed later.
+
+### ❌ "Add more granular events (`ProfitRealized`, `BundleExecuted`)"
+
+**Not implemented — pure cost, zero consumers.**
+
+Two findings:
+
+1. **Nothing consumes the contract's events.** Every `eth_getLogs` in the
+   codebase is pool discovery or a lending protocol. The dashboard reads the
+   bot's SQLite + SSE feed, never chain logs.
+2. **They would duplicate `Executed`,** which already emits
+   `(tag, profitToken, profit, bribe, gasUsed)`. `ProfitRealized` is a strict
+   subset; `BundleExecuted`'s `gasUsed` is already there.
+
+Measured cost of adding both: **+3,618 gas per execution** and +154 bytes
+runtime. At 20 gwei and 100 landed bundles/day that is ~2.6 ETH/year, for logs
+nobody reads. On a contract whose entire design goal is "never land
+unprofitable", spending gas on redundant logs is the wrong trade.
+
+If a log consumer is ever built, `Executed` already carries the data; the right
+move then is to index it off-chain, not to emit more.
+
+### ✅ "`quote()` is underused — expose it more clearly for off-chain sizing"
+
+**Implemented — this one was right, and there was a real usability bug behind
+it.**
+
+`quote()` is gated on `msg.sender == address(0)`, which is correct and load
+bearing: the function executes the batch for real before reporting the delta,
+so reachability from a transaction would let anyone move the contract's funds
+through arbitrary calls. `address(0)` cannot originate a transaction, so the
+body can only run inside a simulated call. Verified against a live chain: an
+`eth_call` with no `from` reports `msg.sender == address(0)`; with `from` set it
+does not.
+
+The problem: **a lot of tooling cannot omit `from`.** Wallets, block explorers,
+viem's `simulateContract`, and several RPC providers all inject a sender, and
+for them `quote` is simply unreachable.
+
+- Added **`quoteFrom(calls, profitToken)`** — the identical dry-run, gated on
+  `onlySearcher` instead of `address(0)`. Keeps the arbitrary-calls surface
+  closed to the public while letting an allowlisted operator size from a wallet
+  or an explorer. Both share one `_quote` internal, so they cannot drift; a test
+  asserts they return identical deltas for the same batch.
+- Rewrote the NatSpec to say *how to call it* (omit `from`, pair with state
+  overrides), why the gate exists, and what to use when you can't omit `from`.
+- Documented `encode_quote` in `bundle.rs` (it was dead code with no
+  explanation) and added `encode_quote_from`.
+- **Surfaced it in the dashboard**: a "dry-run quote" control in the executor
+  panel, issuing an `eth_call` with no `from`. Verified in a browser against a
+  locally deployed executor — returns `delta 0 ETH · gas 456`, matching `cast`
+  exactly.
+
+## Improvements found independently
+
+### Custom errors instead of require-strings (−139 bytes)
+
+`"sweep failed"`, `"bribe failed"` and `"transfer failed"` became
+`SweepFailed()`, `BribeFailed()` and `TransferFailed(token, to, amount)`.
+Smaller runtime, and the ERC20 failure now names *which* token and amount
+failed instead of a bare string.
+
+**The bot's revert decoder was updated in the same commit** — otherwise the
+console would have regressed from a named reason to a raw selector, which is
+precisely the diagnostic the funnel depends on. All four new selectors were
+cross-checked three ways: `cast sig`, an independent keccak implementation, and
+a live revert from a deployed contract.
+
+### Corrected a false comment on the transient-storage slots
+
+The three guard slots carried `// keccak256("jerseymikes.…")` comments. **They
+are not those hashes** — verified in Python and again in Solidity;
+`keccak256("jerseymikes.reentrancy.guard")` is `0x0217913e…3090`, not the value
+in the file. They are hand-typed constants.
+
+**The values are left byte-for-byte unchanged.** They are already correct for
+their purpose — transient storage is private to the contract, all three are
+distinct, and each is far outside the range the compiler would assign — so
+changing them would alter runtime bytecode for no benefit. Only the false claim
+about their derivation is fixed.
+
+### Considered and rejected: splitting `_run`
+
+`_run` allocates a `bytes[]` of every leg's returndata, and only `ownerCall`
+uses it — `execute` and `quote` discard it. Splitting into allocating and
+non-allocating variants saves ~200 gas on `execute` but costs **+319 bytes** of
+runtime (duplicated loop). Measured both ways, including a single-runner
+variant. The optimizer was already handling this well; not worth the size.
+Recorded here so nobody re-derives it.
+
+## Net effect
+
+| Metric | Before | After | Δ |
+| --- | --- | --- | --- |
+| Runtime size | 9,577 B | 9,599 B | **+22** (−139 errors, +161 `quoteFrom`) |
+| `execute` gas (min/max) | 25,543 / 120,494 | 25,543 / 120,494 | **identical** |
+| `flashExecute` gas (min) | 211,794 | 211,807 | +13 (+0.006%) |
+| `sweep` gas | 24,118 | 24,118 | identical |
+| Solidity tests | 13 | **27** | +14 |
+| Rust tests | 217 | **218** | +1 |
+
+The hot path is untouched: `execute` costs exactly what it did before. The
++13 gas on `flashExecute` is the larger error-selector table, and the +22 bytes
+buys a genuinely reachable `quoteFrom` plus better diagnostics.
+
+## Verification
+
+- `forge build --sizes`, `forge test` → **27 passed**
+- `cargo test --all` → **218 passed**; `cargo clippy` → 0 errors
+- `tsc --noEmit`, `next build` → clean
+- Artifacts regenerated; **forge and solc-js produce byte-identical runtime
+  bytecode**, so deterministic compilation is preserved and the CI drift job
+  passes
+- Live-chain checks against a deployed executor: `quote` succeeds with no
+  `from` and reverts `QuoteIsEthCallOnly` with one; `quoteFrom` succeeds for the
+  owner and reverts `NotSearcher` for a stranger
+- Browser check of the new dashboard control against that same deployment
+
+---
+
+# Security & dependency audit
+
+A full-repo audit run after the contract work. Two issues were found by
+reading, then **reproduced against a running bot** before being fixed — the
+first one is not theoretical.
+
+## 1. Unauthenticated mutating API on a public bind (HIGH — fixed)
+
+`API_BIND` defaulted to `0.0.0.0:8080` and the API applied
+`CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)`,
+with no authentication on any route.
+
+Reproduced end-to-end against a live bot bound to `0.0.0.0`, from a
+non-loopback interface, with `Origin: https://evil.example`:
+
+| Request | Result before |
+| --- | --- |
+| `POST /api/risk {"bribeBps":10000}` | **accepted** — 100% of gross profit redirected to the block builder |
+| `POST /api/risk {"maxPositionWei":1}` | **accepted** — sizing throttled to 1 wei |
+| `POST /api/risk` (strategy list) | **accepted** — `sandwich` and `atomic_arb` switched off |
+| `POST /api/risk/reset` | **accepted** — kill switch cleared remotely |
+| response header | `access-control-allow-origin: *` — so any page the operator had open could do all of the above from their browser |
+
+`POST /api/mode {"live":true}` was correctly refused: arming live execution
+needs `LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes` at boot. Remote
+*arming* was never possible; remote *sabotage* was.
+
+The fix is three independent layers, so no single mistake re-opens it:
+
+1. **Safe default** — `API_BIND` is now `127.0.0.1:8080`. The console reaches
+   the bot server-side through its `/api/bot/*` proxy, so nothing breaks.
+2. **Fail-closed boot check** — `Config::validate` refuses to start when the
+   bind is non-loopback and `API_AUTH_TOKEN` is unset, naming both remedies.
+   `bind_is_loopback` treats unparseable binds as exposed.
+3. **Bearer auth + closed CORS** — the three mutating routes sit behind a
+   constant-time bearer check (`API_AUTH_TOKEN`); reads stay open. CORS now
+   reflects only `API_ALLOWED_ORIGINS`, empty by default.
+
+Reads are deliberately still unauthenticated: they are what the dashboard
+renders, and gating them would break the demo flow for no security gain.
+
+Verified after the fix, same external interface:
+
+| Case | Result |
+| --- | --- |
+| `GET /api/status` | 200 — reads unaffected |
+| `POST /api/risk` no token | **401** |
+| `POST /api/risk` wrong token | **401** |
+| `POST /api/risk` correct token | 200, applied |
+| CORS header | absent |
+| loopback, no token | fully open, unchanged — backward compatible |
+| non-loopback, no token | **refuses to boot** with actionable guidance |
+| console proxy + `BOT_API_TOKEN` | drives the bot normally; token absent from `.next/static` and served HTML |
+
+`deploy/docker-compose.yml` needs `0.0.0.0` inside the container for the
+console to reach the bot, so it now sets `API_AUTH_TOKEN` (a `:?` guard fails
+the run with a named error if it is missing) and publishes the port on host
+loopback only.
+
+## 2. Flashbots signer key reachable via `Debug`/`Serialize` (MEDIUM — fixed)
+
+`Endpoints` derived both `Debug` and `Serialize` while holding
+`flashbots_signer_key`. Nothing printed it today, but the struct is cloned
+into every task and one `tracing::debug!(?cfg)` would have put a live key in
+the logs. Now `#[serde(skip_serializing)]` plus a hand-written `Debug` that
+renders `<redacted>`, mirroring the existing treatment in `signer.rs`. Two
+tests lock the behaviour in.
+
+## 3. Dependencies
+
+- **Rust:** `cargo audit` → **0 vulnerabilities** (3 unmaintained transitive
+  crates: `derivative`, `paste`, `proc-macro-error2` — no action available).
+- **Frontend:** `npm audit` 5 → **3** via `next` 15.5.7 → 15.5.23 and
+  `viem` → 2.55.19, both patch-level. That clears the Next.js SSRF, cache
+  poisoning, XSS, DoS and middleware-bypass advisories plus `ws` via viem. The
+  remaining 3 (`postcss`, `sharp`) are nested inside `next`'s own tree, need
+  the breaking `next@16`, and are unreachable here — the app uses no
+  `next/image`.
+
+## Checked and found sound
+
+Parameterised SQL throughout, clamped API `limit`s, thorough `RuntimeRisk::apply`
+validation, the read-only 17-method `/api/eth` proxy, `.gitignore` coverage, and
+no committed secrets (every 64-hex string in the tree is an event topic hash, a
+transient-storage slot constant, or the public anvil test key).
+
+## Verification
+
+- `cargo test --all` → **223 passed** (218 + 5 new security tests)
+- `cargo clippy --all-targets -- -A clippy::too_many_arguments` → clean
+- `rustfmt --check` clean on every file touched
+- `forge test` → **27 passed**; `tsc --noEmit` and `next build` clean
+- Playwright smoke against `next start` → PASS, 0 console errors

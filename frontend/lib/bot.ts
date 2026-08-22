@@ -9,6 +9,23 @@
  */
 export const BOT_API_URL = process.env.BOT_API_URL ?? "http://127.0.0.1:8080";
 
+/**
+ * Bearer token for the bot's *mutating* endpoints, when it runs with
+ * `API_AUTH_TOKEN` set (required whenever the bot binds to a non-loopback
+ * address).
+ *
+ * Server-side only — deliberately **not** `NEXT_PUBLIC_`, so the secret stays
+ * on the Next.js server and never reaches the browser bundle. Every bot call
+ * already goes through the `/api/bot/*` proxy, so the token only has to exist
+ * here.
+ */
+const BOT_API_TOKEN = process.env.BOT_API_TOKEN ?? "";
+
+/** Auth header for bot requests, or `{}` when no token is configured. */
+export function botAuthHeaders(): Record<string, string> {
+  return BOT_API_TOKEN ? {authorization: `Bearer ${BOT_API_TOKEN}`} : {};
+}
+
 export async function botFetch(path: string, timeoutMs = 2500): Promise<{ok: true; data: unknown} | {ok: false}> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -16,7 +33,7 @@ export async function botFetch(path: string, timeoutMs = 2500): Promise<{ok: tru
     const res = await fetch(`${BOT_API_URL}${path}`, {
       signal: controller.signal,
       cache: "no-store",
-      headers: {accept: "application/json"},
+      headers: {accept: "application/json", ...botAuthHeaders()},
     });
     if (!res.ok) return {ok: false};
     return {ok: true, data: await res.json()};
@@ -44,7 +61,11 @@ export async function botPost(
       method: "POST",
       signal: controller.signal,
       cache: "no-store",
-      headers: {"content-type": "application/json", accept: "application/json"},
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        ...botAuthHeaders(),
+      },
       body: JSON.stringify(body),
     });
     const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;

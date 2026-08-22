@@ -35,6 +35,11 @@ sol! {
         ) external;
 
         function quote(Call[] calldata calls, address profitToken) external payable returns (int256, uint256);
+
+        function quoteFrom(Call[] calldata calls, address profitToken)
+            external
+            payable
+            returns (int256, uint256);
     }
 }
 
@@ -101,8 +106,33 @@ pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &Ris
 }
 
 /// Read-only `quote` calldata, for `eth_call` sizing without any state changes.
+///
+/// **Send this with no `from` field.** `quote` is gated on
+/// `msg.sender == address(0)` — the value an `eth_call` reports when `from` is
+/// omitted — because the function runs the batch for real before reporting the
+/// delta, so reachability from a transaction would be a hole. Providers that
+/// inject a `from` should use [`encode_quote_from`] instead.
+///
+/// The natural pairing is with state overrides: override the executor's
+/// balances, quote a few candidate sizes, then submit only the best through
+/// `execute`.
 pub fn encode_quote(calls: &[Call], profit_token: Address) -> Vec<u8> {
     IMevExecutor::quoteCall {
+        calls: to_sol_calls(calls),
+        profitToken: profit_token,
+    }
+    .abi_encode()
+}
+
+/// `quoteFrom` calldata: the same dry-run for callers that cannot omit `from`.
+///
+/// Gated on the caller being an allowlisted searcher (or the owner) rather than
+/// on `address(0)`, so it works from a wallet, an explorer, or any RPC provider
+/// that injects a sender. Still meant for `eth_call`: it carries no profit
+/// guard, so sending it as a transaction would execute the batch and pay gas
+/// for the privilege.
+pub fn encode_quote_from(calls: &[Call], profit_token: Address) -> Vec<u8> {
+    IMevExecutor::quoteFromCall {
         calls: to_sol_calls(calls),
         profitToken: profit_token,
     }
@@ -218,6 +248,27 @@ pub fn send_bundle_params(bundle: &BundleRecord) -> Value {
 mod tests {
     use super::*;
     use crate::types::Strategy;
+
+    /// The two quote entry points must encode to different selectors but
+    /// otherwise identical calldata: same args, same ABI shape. If they ever
+    /// diverge, one of them is silently calling the wrong function.
+    #[test]
+    fn quote_and_quote_from_differ_only_in_selector() {
+        let calls = vec![Call {
+            target: Address::with_last_byte(7),
+            value: U256::ZERO,
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+        }];
+        let token = Address::with_last_byte(9);
+        let a = encode_quote(&calls, token);
+        let b = encode_quote_from(&calls, token);
+        assert_ne!(a[..4], b[..4], "selectors must differ");
+        assert_eq!(a[4..], b[4..], "arguments must encode identically");
+        // Pin the selectors against the deployed contract (verified with
+        // `cast sig`), so an ABI drift is caught here rather than at runtime.
+        assert_eq!(hex::encode(&a[..4]), "cc3f61d0", "quote selector");
+        assert_eq!(hex::encode(&b[..4]), "766db46a", "quoteFrom selector");
+    }
 
     fn opp() -> Opportunity {
         Opportunity {
