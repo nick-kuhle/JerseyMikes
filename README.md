@@ -213,8 +213,13 @@ The bot's API binds `127.0.0.1:8080` by default. Its three mutating endpoints
 (`POST /api/mode`, `/api/risk`, `/api/risk/reset`) can trip the kill switch,
 disable strategies, and rewrite the risk envelope, so exposing them off-box
 requires a shared secret: set `API_AUTH_TOKEN` whenever `API_BIND` is not
-loopback, or the bot refuses to start. See
+loopback, or the bot refuses to start — in simulation mode too. See
 [Securing the API](docs/DEPLOYMENT.md#securing-the-api).
+
+Upgrading a bot that already has a `.env`? That file is gitignored, so it keeps
+your old `API_BIND=0.0.0.0:8080` and the bot will refuse to start until you
+change it. One-line fix in
+[`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md#if-you-are-upgrading-an-existing-env).
 
 Risk defaults are intentionally permissive — `MIN_NET_PROFIT_WEI=1`,
 `MAX_POSITION_WEI=100 ETH`, every strategy on — because the first run's job is
@@ -233,6 +238,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
 | [`docs/W6_MEMO.md`](docs/W6_MEMO.md) | The public-mempool gap memo that gates UniversalRouter decoding — template + decision record |
+| [`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md) | Switching a simulating bot over to live: securing the API first, the `.env` upgrade trap, tightening risk, arming last |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
 

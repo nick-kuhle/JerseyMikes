@@ -39,6 +39,10 @@ quietly:
 API_AUTH_TOKEN=$(openssl rand -hex 32)
 ```
 
+Upgrading an existing deployment, or moving from simulation to live? The
+`.env` migration and the full switch-over order are in
+[`SIM_TO_LIVE.md`](SIM_TO_LIVE.md).
+
 The console forwards the token on the operator's behalf when `BOT_API_TOKEN`
 is set (see `.env.example`). It is a server-only variable — deliberately not
 `NEXT_PUBLIC_`, so it never reaches the browser bundle.
