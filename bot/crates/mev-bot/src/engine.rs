@@ -91,6 +91,9 @@ impl LiveMode {
 pub struct Engine {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
+    /// Runtime risk envelope (shared with `risk` and `sim`); the /api/risk
+    /// endpoints read and write this.
+    pub runtime: crate::risk::RuntimeRisk,
     pub risk: Arc<RiskEngine>,
     pub sim: Arc<Simulator>,
     pub ctx: Arc<StrategyCtx>,
@@ -318,7 +321,10 @@ impl Engine {
     pub async fn new(cfg: Arc<Config>) -> Result<Self> {
         let http = RpcClient::new(cfg.endpoints.http_url.clone())?;
         let store = Arc::new(Store::open(&cfg.api.db_path)?);
-        let risk = Arc::new(RiskEngine::new(cfg.clone()));
+        // Runtime risk envelope: boot values from the environment, mutable
+        // via POST /api/risk (see RuntimeRisk for the narrowing invariants).
+        let runtime = crate::risk::RuntimeRisk::new(cfg.risk.clone(), cfg.strategies.clone());
+        let risk = Arc::new(RiskEngine::new(cfg.clone(), runtime.clone()));
 
         let signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
             Some(k) => Signer::from_hex(k)?,
@@ -337,7 +343,13 @@ impl Engine {
 
         // Local fork simulator. Absence is not fatal: the bot still observes and
         // records, it just cannot score opportunities.
-        let fork = match crate::sim::anvil::AnvilSim::spawn(cfg.clone(), head.number).await {
+        let fork = match crate::sim::anvil::AnvilSim::spawn(
+            cfg.clone(),
+            head.number,
+            runtime.clone(),
+        )
+        .await
+        {
             Ok(f) => Some(Arc::new(f)),
             Err(e) => {
                 tracing::error!(target: "engine", error = %e, "anvil fork unavailable — simulations disabled");
@@ -353,6 +365,7 @@ impl Engine {
                 cfg.clone(),
                 head.number,
                 cfg.sim.anvil_replay_port,
+                runtime.clone(),
             )
             .await
             {
@@ -395,6 +408,7 @@ impl Engine {
             replay_fork,
             relay,
             signer,
+            runtime.clone(),
         ));
         let ctx = Arc::new(StrategyCtx::new(
             cfg.clone(),
@@ -492,6 +506,7 @@ impl Engine {
         Ok(Self {
             cfg,
             store,
+            runtime,
             risk,
             sim,
             ctx,

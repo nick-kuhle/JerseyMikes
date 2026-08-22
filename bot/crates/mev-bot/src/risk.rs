@@ -16,9 +16,203 @@ use std::sync::Arc;
 
 use alloy_primitives::U256;
 use parking_lot::RwLock;
+use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{Config, RiskConfig, StrategyToggles};
 use crate::types::{Opportunity, SimulationResult, Strategy};
+
+/// The runtime-adjustable slice of the risk envelope.
+///
+/// Boot values come from the environment (`Config::from_env`); the dashboard
+/// can change them while the bot runs via `POST /api/risk` — the console's
+/// risk panel is instant-apply, no restart. Two boundaries are deliberate:
+///
+/// - **Strategy toggles can only narrow.** A strategy that was not
+///   constructed at boot (its env toggle was off) cannot be switched on at
+///   runtime — the engine never built it, so "enabling" it would silently do
+///   nothing. Same shape as the live-mode switch: runtime can only restrict
+///   what the environment allowed.
+/// - **Risk *limits* can loosen at runtime.** Tightening or loosening caps
+///   is an explicit operator decision made visible on the dashboard; the
+///   one-way protections (live arming, broadcasting) live elsewhere.
+#[derive(Clone)]
+pub struct RuntimeRisk {
+    risk: std::sync::Arc<RwLock<RiskConfig>>,
+    strategies: std::sync::Arc<RwLock<StrategyToggles>>,
+    /// Boot toggles — the ceiling a runtime toggle cannot exceed.
+    boot: StrategyToggles,
+}
+
+/// A partial risk update from the dashboard. Every field is optional; only
+/// present fields are applied. Wei values arrive as decimal strings (they
+/// routinely exceed JS safe integers).
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RiskPatch {
+    pub min_net_profit_wei: Option<String>,
+    pub max_position_wei: Option<String>,
+    pub max_base_fee_wei: Option<String>,
+    pub max_drawdown_wei: Option<String>,
+    pub bribe_bps: Option<u16>,
+    pub max_gas_per_bundle: Option<u64>,
+    pub max_inflight_per_strategy: Option<usize>,
+    /// `{"sandwich": false, "liquidation_maker": true, ...}` — partial map.
+    pub strategies: Option<std::collections::HashMap<String, bool>>,
+}
+
+fn parse_wei(label: &str, raw: &str) -> Result<U256, String> {
+    raw.trim()
+        .parse::<U256>()
+        .map_err(|_| format!("{label}: \"{raw}\" is not a non-negative decimal wei amount"))
+}
+
+impl RuntimeRisk {
+    pub fn new(risk: RiskConfig, boot: StrategyToggles) -> Self {
+        Self {
+            risk: std::sync::Arc::new(RwLock::new(risk)),
+            strategies: std::sync::Arc::new(RwLock::new(boot.clone())),
+            boot,
+        }
+    }
+
+    /// Current effective risk configuration (snapshot copy).
+    pub fn risk(&self) -> RiskConfig {
+        self.risk.read().clone()
+    }
+
+    /// Current effective strategy toggles (already intersected with boot).
+    pub fn strategies(&self) -> StrategyToggles {
+        self.strategies.read().clone()
+    }
+
+    /// Boot-time strategy toggles — the ceiling for runtime toggles.
+    pub fn boot_strategies(&self) -> &StrategyToggles {
+        &self.boot
+    }
+
+    /// Effective enablement of one strategy: runtime toggle **and** boot
+    /// construction. Strategies not built at boot report `false` here.
+    pub fn enabled(&self, s: Strategy) -> bool {
+        let t = self.strategies.read();
+        let b = &self.boot;
+        let (rt, bt) = match s {
+            Strategy::Sandwich => (t.sandwich, b.sandwich),
+            Strategy::SandwichV3 => (t.sandwich_v3, b.sandwich_v3),
+            Strategy::Jit => (t.jit, b.jit),
+            Strategy::AtomicArb => (t.atomic_arb, b.atomic_arb),
+            Strategy::Liquidation => (t.liquidation, b.liquidation),
+            Strategy::LiquidationCompound => (t.liquidation_compound, b.liquidation_compound),
+            Strategy::LiquidationMorpho => (t.liquidation_morpho, b.liquidation_morpho),
+            Strategy::LiquidationMaker => (t.liquidation_maker, b.liquidation_maker),
+            Strategy::OracleFrontrun => (t.oracle_frontrun, b.oracle_frontrun),
+            Strategy::Sniper => (t.sniper, b.sniper),
+        };
+        rt && bt
+    }
+
+    /// Names of strategies effectively enabled right now.
+    pub fn enabled_names(&self) -> Vec<&'static str> {
+        Strategy::all()
+            .iter()
+            .filter(|s| self.enabled(**s))
+            .map(|s| s.as_str())
+            .collect()
+    }
+
+    /// Validate and apply a patch. On success every listed field is applied
+    /// atomically; on failure nothing changes and the reason comes back as a
+    /// human-readable string (surfaced 400 by the API).
+    pub fn apply(&self, patch: RiskPatch) -> Result<(), String> {
+        // Validate everything first, then write — a rejected patch must not
+        // leave half of it applied.
+        let mut risk = self.risk.read().clone();
+        if let Some(v) = &patch.min_net_profit_wei {
+            risk.min_net_profit_wei = parse_wei("minNetProfitWei", v)?;
+        }
+        if let Some(v) = &patch.max_position_wei {
+            risk.max_position_wei = parse_wei("maxPositionWei", v)?;
+            if risk.max_position_wei.is_zero() {
+                return Err("maxPositionWei must be > 0".to_string());
+            }
+        }
+        if let Some(v) = &patch.max_base_fee_wei {
+            risk.max_base_fee_wei = parse_wei("maxBaseFeeWei", v)?;
+            if risk.max_base_fee_wei.is_zero() {
+                return Err("maxBaseFeeWei must be > 0".to_string());
+            }
+        }
+        if let Some(v) = &patch.max_drawdown_wei {
+            risk.max_drawdown_wei = parse_wei("maxDrawdownWei", v)?; // 0 == disabled, by design
+        }
+        if let Some(v) = patch.bribe_bps {
+            if v > 10_000 {
+                return Err(format!("bribeBps {v} exceeds 10000 (100% of gross)"));
+            }
+            risk.bribe_bps = v;
+        }
+        if let Some(v) = patch.max_gas_per_bundle {
+            if !(21_000..=crate::sim::anvil::MAX_TX_GAS_CEILING).contains(&v) {
+                return Err(format!(
+                    "maxGasPerBundle {v} outside [21000, {}]",
+                    crate::sim::anvil::MAX_TX_GAS_CEILING
+                ));
+            }
+            risk.max_gas_per_bundle = v;
+        }
+        if let Some(v) = patch.max_inflight_per_strategy {
+            if !(1..=256).contains(&v) {
+                return Err(format!("maxInflightPerStrategy {v} outside [1, 256]"));
+            }
+            risk.max_inflight_per_strategy = v;
+        }
+        let mut strategies = self.strategies.read().clone();
+        if let Some(wanted) = &patch.strategies {
+            for (name, on) in wanted {
+                let all = Strategy::all();
+                let Some(strategy) = all.iter().find(|s| s.as_str() == name.as_str()) else {
+                    return Err(format!("strategies: unknown strategy \"{name}\""));
+                };
+                if *on && !self.enabled_at_boot(*strategy) {
+                    return Err(format!(
+                        "strategies: \"{name}\" was not constructed at boot (its env toggle was off) — set STRATEGY_{}=true and restart to make it available",
+                        name.to_ascii_uppercase()
+                    ));
+                }
+                match strategy {
+                    Strategy::Sandwich => strategies.sandwich = *on,
+                    Strategy::SandwichV3 => strategies.sandwich_v3 = *on,
+                    Strategy::Jit => strategies.jit = *on,
+                    Strategy::AtomicArb => strategies.atomic_arb = *on,
+                    Strategy::Liquidation => strategies.liquidation = *on,
+                    Strategy::LiquidationCompound => strategies.liquidation_compound = *on,
+                    Strategy::LiquidationMorpho => strategies.liquidation_morpho = *on,
+                    Strategy::LiquidationMaker => strategies.liquidation_maker = *on,
+                    Strategy::OracleFrontrun => strategies.oracle_frontrun = *on,
+                    Strategy::Sniper => strategies.sniper = *on,
+                }
+            }
+        }
+        *self.risk.write() = risk;
+        *self.strategies.write() = strategies;
+        Ok(())
+    }
+
+    fn enabled_at_boot(&self, s: Strategy) -> bool {
+        let b = &self.boot;
+        match s {
+            Strategy::Sandwich => b.sandwich,
+            Strategy::SandwichV3 => b.sandwich_v3,
+            Strategy::Jit => b.jit,
+            Strategy::AtomicArb => b.atomic_arb,
+            Strategy::Liquidation => b.liquidation,
+            Strategy::LiquidationCompound => b.liquidation_compound,
+            Strategy::LiquidationMorpho => b.liquidation_morpho,
+            Strategy::LiquidationMaker => b.liquidation_maker,
+            Strategy::OracleFrontrun => b.oracle_frontrun,
+            Strategy::Sniper => b.sniper,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
@@ -44,7 +238,13 @@ impl Reject {
 }
 
 pub struct RiskEngine {
+    /// Kept for fields that are not runtime-adjustable.
+    #[allow(dead_code)]
     cfg: Arc<Config>,
+    /// The live risk envelope — shared with the simulator and the API, so a
+    /// dashboard change gates the very next opportunity and prices the very
+    /// next bundle's guards with it.
+    runtime: RuntimeRisk,
     inflight: RwLock<HashMap<Strategy, usize>>,
     /// Running simulated PnL in wei; drives the drawdown kill switch.
     cumulative_net: RwLock<i128>,
@@ -52,33 +252,27 @@ pub struct RiskEngine {
 }
 
 impl RiskEngine {
-    pub fn new(cfg: Arc<Config>) -> Self {
+    pub fn new(cfg: Arc<Config>, runtime: RuntimeRisk) -> Self {
         Self {
             cfg,
+            runtime,
             inflight: RwLock::new(HashMap::new()),
             cumulative_net: RwLock::new(0),
             tripped: RwLock::new(false),
         }
     }
 
+    pub fn runtime(&self) -> &RuntimeRisk {
+        &self.runtime
+    }
+
     pub fn enabled(&self, s: Strategy) -> bool {
-        let t = &self.cfg.strategies;
-        match s {
-            Strategy::Sandwich => t.sandwich,
-            Strategy::SandwichV3 => t.sandwich_v3,
-            Strategy::Jit => t.jit,
-            Strategy::AtomicArb => t.atomic_arb,
-            Strategy::Liquidation => t.liquidation,
-            Strategy::LiquidationCompound => t.liquidation_compound,
-            Strategy::LiquidationMorpho => t.liquidation_morpho,
-            Strategy::LiquidationMaker => t.liquidation_maker,
-            Strategy::OracleFrontrun => t.oracle_frontrun,
-            Strategy::Sniper => t.sniper,
-        }
+        self.runtime.enabled(s)
     }
 
     /// Gate an opportunity before it costs us a simulation slot.
     pub fn check(&self, opp: &Opportunity, base_fee: U256) -> Result<(), Reject> {
+        let risk = self.runtime.risk();
         if !self.enabled(opp.strategy) {
             return Err(Reject::Disabled);
         }
@@ -88,16 +282,14 @@ impl RiskEngine {
         if opp.front_calls.is_empty() && opp.back_calls.is_empty() {
             return Err(Reject::NoCalls);
         }
-        if opp.notional_wei > self.cfg.risk.max_position_wei {
+        if opp.notional_wei > risk.max_position_wei {
             return Err(Reject::TooLarge);
         }
-        if base_fee > self.cfg.risk.max_base_fee_wei {
+        if base_fee > risk.max_base_fee_wei {
             return Err(Reject::BaseFeeTooHigh);
         }
         let inflight = self.inflight.read();
-        if inflight.get(&opp.strategy).copied().unwrap_or(0)
-            >= self.cfg.risk.max_inflight_per_strategy
-        {
+        if inflight.get(&opp.strategy).copied().unwrap_or(0) >= risk.max_inflight_per_strategy {
             return Err(Reject::TooManyInflight);
         }
         Ok(())
@@ -122,7 +314,7 @@ impl RiskEngine {
     pub fn observe(&self, sim: &SimulationResult) {
         let mut cum = self.cumulative_net.write();
         *cum += sim.net_profit_wei;
-        let limit = self.cfg.risk.max_drawdown_wei;
+        let limit = self.runtime.risk().max_drawdown_wei;
         if !limit.is_zero() {
             let limit_i = crate::sim::anvil::to_i128(limit);
             if *cum < -limit_i {
@@ -151,10 +343,11 @@ impl RiskEngine {
 
     /// Would we have sent this bundle? Simulation-only builds never actually do.
     pub fn submittable(&self, sim: &SimulationResult) -> bool {
+        let risk = self.runtime.risk();
         sim.success
             && sim.net_profit_wei > 0
-            && U256::from(sim.net_profit_wei.max(0) as u128) >= self.cfg.risk.min_net_profit_wei
-            && sim.gas_used <= self.cfg.risk.max_gas_per_bundle
+            && U256::from(sim.net_profit_wei.max(0) as u128) >= risk.min_net_profit_wei
+            && sim.gas_used <= risk.max_gas_per_bundle
     }
 }
 
@@ -284,7 +477,9 @@ mod tests {
 
     #[test]
     fn rejects_disabled_strategies() {
-        let r = RiskEngine::new(cfg());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let r = RiskEngine::new(c, rt.clone());
         assert_eq!(
             r.check(&opp(Strategy::Jit, 10), U256::ZERO),
             Err(Reject::Disabled)
@@ -299,7 +494,9 @@ mod tests {
 
     #[test]
     fn rejects_oversized_and_expensive() {
-        let r = RiskEngine::new(cfg());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let r = RiskEngine::new(c, rt.clone());
         assert_eq!(
             r.check(&opp(Strategy::Sandwich, 10_000), U256::ZERO),
             Err(Reject::TooLarge)
@@ -312,7 +509,9 @@ mod tests {
 
     #[test]
     fn caps_inflight_per_strategy() {
-        let r = RiskEngine::new(cfg());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let r = RiskEngine::new(c, rt.clone());
         r.begin(Strategy::Sandwich);
         r.begin(Strategy::Sandwich);
         assert_eq!(
@@ -325,7 +524,9 @@ mod tests {
 
     #[test]
     fn kill_switch_trips_on_drawdown() {
-        let r = RiskEngine::new(cfg());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let r = RiskEngine::new(c, rt.clone());
         r.observe(&sim(-600, 1));
         assert!(!r.is_tripped());
         r.observe(&sim(-600, 1));
@@ -340,11 +541,169 @@ mod tests {
 
     #[test]
     fn only_net_positive_bundles_are_submittable() {
-        let r = RiskEngine::new(cfg());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let r = RiskEngine::new(c, rt.clone());
         assert!(r.submittable(&sim(5, 100)));
         assert!(!r.submittable(&sim(0, 100)));
         assert!(!r.submittable(&sim(-5, 100)));
         // over the gas cap
         assert!(!r.submittable(&sim(5, 10_000_000)));
+    }
+
+    fn runtime() -> crate::risk::RuntimeRisk {
+        let c = cfg();
+        // Boot: everything on except jit and sniper (to exercise narrowing).
+        let mut toggles = c.strategies.clone();
+        toggles.jit = false;
+        toggles.sniper = false;
+        crate::risk::RuntimeRisk::new(c.risk.clone(), toggles)
+    }
+
+    #[test]
+    fn runtime_patch_applies_and_is_read_immediately() {
+        let rt = runtime();
+        let patch = crate::risk::RiskPatch {
+            min_net_profit_wei: Some("123".to_string()),
+            bribe_bps: Some(5_000),
+            max_inflight_per_strategy: Some(2),
+            ..Default::default()
+        };
+        rt.apply(patch).expect("valid patch");
+        let r = rt.risk();
+        assert_eq!(r.min_net_profit_wei.to_string(), "123");
+        assert_eq!(r.bribe_bps, 5_000);
+        assert_eq!(r.max_inflight_per_strategy, 2);
+        // Untouched fields keep boot values.
+        assert_eq!(r.max_gas_per_bundle, 1_000_000);
+    }
+
+    #[test]
+    fn runtime_patch_rejects_out_of_range_values_atomically() {
+        let rt = runtime();
+        let before = rt.risk();
+        let patch = crate::risk::RiskPatch {
+            bribe_bps: Some(10_001),
+            ..Default::default()
+        }; // > 100%
+        assert!(rt.apply(patch).is_err());
+        // A valid field in the same patch shape must NOT have been applied.
+        let patch = crate::risk::RiskPatch {
+            min_net_profit_wei: Some("7".to_string()),
+            bribe_bps: Some(10_001),
+            ..Default::default()
+        };
+        assert!(rt.apply(patch).is_err());
+        let after = rt.risk();
+        assert_eq!(after.bribe_bps, before.bribe_bps);
+        assert_eq!(after.min_net_profit_wei, before.min_net_profit_wei);
+        // Gas cap is bounded by the same ceiling the simulator clamps to.
+        let bad_gas = crate::risk::RiskPatch {
+            max_gas_per_bundle: Some(10_000),
+            ..Default::default()
+        };
+        assert!(rt.apply(bad_gas).is_err());
+    }
+
+    #[test]
+    fn runtime_patch_rejects_non_numeric_wei() {
+        let rt = runtime();
+        let patch = crate::risk::RiskPatch {
+            max_position_wei: Some("0.1 ETH".to_string()),
+            ..Default::default()
+        };
+        let err = rt.apply(patch).unwrap_err();
+        assert!(err.contains("maxPositionWei"), "{err}");
+    }
+
+    #[test]
+    fn runtime_strategy_toggles_can_only_narrow() {
+        let rt = runtime(); // jit + sniper off at boot
+        let mut off = std::collections::HashMap::new();
+        off.insert("sandwich".to_string(), false);
+        rt.apply(crate::risk::RiskPatch {
+            strategies: Some(off),
+            ..Default::default()
+        })
+        .expect("disabling a boot-enabled strategy is fine");
+        assert!(!rt.enabled(Strategy::Sandwich));
+
+        let mut on = std::collections::HashMap::new();
+        on.insert("jit".to_string(), true);
+        let err = rt
+            .apply(crate::risk::RiskPatch {
+                strategies: Some(on),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(err.contains("not constructed at boot"), "{err}");
+        // And the failed patch changed nothing.
+        assert!(!rt.enabled(Strategy::Jit));
+
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("frontrun_v2".to_string(), true);
+        assert!(rt
+            .apply(crate::risk::RiskPatch {
+                strategies: Some(unknown),
+                ..Default::default()
+            })
+            .is_err());
+
+        // Re-enabling a boot-enabled strategy that was disabled at runtime
+        // is allowed — runtime may always return to the boot set.
+        let mut re_on = std::collections::HashMap::new();
+        re_on.insert("sandwich".to_string(), true);
+        rt.apply(crate::risk::RiskPatch {
+            strategies: Some(re_on),
+            ..Default::default()
+        })
+        .expect("re-enabling within the boot set is fine");
+        assert!(rt.enabled(Strategy::Sandwich));
+    }
+
+    #[test]
+    fn risk_engine_gates_with_runtime_values() {
+        let rt = runtime();
+        let c = cfg();
+        let r = RiskEngine::new(c, rt.clone());
+        // Boot min profit is 1 wei, so this passes...
+        assert!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO).is_ok());
+        // ...until the runtime floor is raised above it.
+        let patch = crate::risk::RiskPatch {
+            min_net_profit_wei: Some("1000".to_string()),
+            ..Default::default()
+        };
+        rt.apply(patch).unwrap();
+        // check() gates notional/base-fee/inflight, not profit (the sim
+        // measures that); submittable() is where the floor bites.
+        let sim = crate::types::SimulationResult {
+            opportunity_id: "x".into(),
+            strategy: Strategy::Sandwich,
+            backend: crate::types::SimBackend::AnvilFork,
+            success: true,
+            gross_profit_wei: U256::from(100u64),
+            gas_used: 100,
+            gas_price_wei: U256::ONE,
+            gas_cost_wei: U256::from(100u64),
+            bribe_wei: U256::ZERO,
+            net_profit_wei: 0,
+            revert_reason: None,
+            target_block: 1,
+            sim_latency_ms: 1,
+            created_at_ms: 0,
+        };
+        assert!(!r.submittable(&sim));
+        // And a disabled-at-runtime strategy is rejected on the spot.
+        let mut off = std::collections::HashMap::new();
+        off.insert("sandwich".to_string(), false);
+        rt.apply(crate::risk::RiskPatch {
+            strategies: Some(off),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            r.check(&opp(Strategy::Sandwich, 10), U256::ZERO),
+            Err(Reject::Disabled)
+        );
     }
 }

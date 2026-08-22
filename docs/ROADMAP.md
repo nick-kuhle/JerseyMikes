@@ -117,6 +117,12 @@ Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
       the boot-time two-key arming — an unarmed process refuses the switch
       with the restart instructions; an armed one can pause/resume without a
       restart. See `docs/RISK.md`.
+- [x] Console control surface (round 2): runtime risk envelope
+      (`GET/POST /api/risk` + kill-switch reset) — instant-apply panel,
+      share down to the simulator's bundle guards; strategy toggles narrow
+      only. Plus the six-step go-live deployment panel (deploy / fund /
+      allowlist / verify with CI-checked bytecode). Deploying and tuning
+      remain separate from the two-key arming.
 - [ ] Multi-relay submission with per-relay inclusion stats
 - [ ] Bundle merging and cancellation
 - [ ] Hot-wallet inventory management, WETH top-ups, profit sweeping

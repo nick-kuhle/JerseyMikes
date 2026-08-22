@@ -1,8 +1,23 @@
 "use client";
 
-import {useState, useEffect} from "react";
-import type {StatusResponse, Strategy} from "@/lib/types";
-import {formatEther, parseEther} from "viem";
+/**
+ * Risk envelope controls — instant-apply.
+ *
+ * Every change POSTs to /api/risk and gates the very next opportunity the
+ * engine considers (the risk engine, the fork simulator's minProfit/bribe
+ * guards and the signed-bundle gas cap all read the same runtime envelope).
+ * No restart, no .env round-trip. The .env snippet is still generated — but
+ * demoted to what it always really was: persisting the *current* values as
+ * boot defaults.
+ *
+ * Strategy toggles can only narrow (a strategy not constructed at boot
+ * cannot be summoned at runtime — the bot refuses with the restart
+ * instructions, same shape as the live-mode switch).
+ */
+
+import {useCallback, useEffect, useRef, useState} from "react";
+import {parseEther} from "viem";
+import type {RiskStateResponse, RiskValues, Strategy, StatusResponse} from "@/lib/types";
 import {STRATEGY_COLOR, STRATEGY_LABEL} from "@/lib/format";
 
 interface Props {
@@ -22,89 +37,202 @@ const ALL_STRATEGIES: Strategy[] = [
   "sniper",
 ];
 
+const DEFAULTS: RiskValues = {
+  minNetProfitWei: "1",
+  maxPositionWei: "100000000000000000000",
+  maxBaseFeeWei: "500000000000",
+  maxDrawdownWei: "0",
+  bribeBps: 9000,
+  maxGasPerBundle: 3000000,
+  maxInflightPerStrategy: 32,
+};
+
+type ApplyState =
+  | {kind: "idle"}
+  | {kind: "applying"}
+  | {kind: "applied"; at: string; demo?: boolean}
+  | {kind: "error"; message: string};
+
 export default function RiskPanel({status}: Props) {
-  const [minProfitEth, setMinProfitEth] = useState("0.002");
-  const [bribeBps, setBribeBps] = useState(9000);
-  const [maxBaseFeeGwei, setMaxBaseFeeGwei] = useState(250);
-  const [maxPositionEth, setMaxPositionEth] = useState(100);
-  const [maxGas, setMaxGas] = useState(3000000);
-  const [enabledStrats, setEnabledStrats] = useState<Record<Strategy, boolean>>({
-    sandwich: true,
-    sandwich_v3: true,
-    jit: true,
-    atomic_arb: true,
-    liquidation: true,
-    liquidation_compound: true,
-    liquidation_morpho: true,
-    liquidation_maker: true,
-    oracle_frontrun: true,
-    sniper: true,
-  });
-  const [copied, setCopied] = useState(false);
   const [activeTab, setActiveTab] = useState<"controls" | "diagnostics" | "sources">("controls");
 
-  // Sync initial state from live status if available
+  // The live form. Seeded from /api/risk once, then edited locally; every
+  // edit schedules a debounced POST of the full numeric patch (idempotent).
+  const [values, setValues] = useState<RiskValues>(DEFAULTS);
+  const [strategyRows, setStrategyRows] = useState<RiskStateResponse["strategies"]>(
+    ALL_STRATEGIES.map((name) => ({name, enabled: true, bootEnabled: true})),
+  );
+  const [killSwitch, setKillSwitch] = useState<RiskStateResponse["killSwitch"]>({
+    tripped: false,
+    cumulativeNetWei: "0",
+  });
+  const [apply, setApply] = useState<ApplyState>({kind: "idle"});
+  const [demo, setDemo] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  // Derived display state (ETH / gwei units for the inputs).
+  const [minProfitEth, setMinProfitEth] = useState("0.000000000000000001");
+  const [maxPositionEth, setMaxPositionEth] = useState("100");
+  const [maxBaseFeeGwei, setMaxBaseFeeGwei] = useState(500);
+  const [maxGas, setMaxGas] = useState(3000000);
+  const [maxInflight, setMaxInflight] = useState(32);
+
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const skipFirst = useRef(true);
+
+  const seed = useCallback((v: RiskValues) => {
+    setValues(v);
+    try {
+      setMinProfitEth(formatMinimalEther(BigInt(v.minNetProfitWei)));
+    } catch {
+      /* keep previous */
+    }
+    setMaxPositionEth(String(Number(BigInt(v.maxPositionWei)) / 1e18));
+    setMaxBaseFeeGwei(Math.max(1, Math.round(Number(BigInt(v.maxBaseFeeWei)) / 1e9)));
+    setMaxGas(v.maxGasPerBundle);
+    setMaxInflight(v.maxInflightPerStrategy);
+  }, []);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot/risk", {cache: "no-store"});
+      const data = (await res.json()) as RiskStateResponse & {demo?: boolean};
+      setDemo(Boolean(data.demo));
+      if (data.effective) seed(data.effective);
+      if (data.strategies) setStrategyRows(data.strategies);
+      if (data.killSwitch) setKillSwitch(data.killSwitch);
+    } catch {
+      /* bot unreachable — the demo flag on /api/status data covers this */
+    } finally {
+      setLoaded(true);
+    }
+  }, [seed]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Keep the kill-switch badge in sync with the polled status.
   useEffect(() => {
     if (status?.risk) {
-      const rawWei = BigInt(status.risk.minNetProfitWei || "1");
-      if (rawWei > 1000000n) {
-        setMinProfitEth(formatEther(rawWei));
+      setKillSwitch((k) => ({...k, tripped: status.risk.killSwitchTripped}));
+    }
+  }, [status?.risk?.killSwitchTripped]);
+
+  const pushPatch = useCallback(
+    (patch: Record<string, unknown>) => {
+      setApply({kind: "applying"});
+      fetch("/api/bot/risk", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify(patch),
+      })
+        .then(async (res) => {
+          const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+          if (!res.ok || data.ok === false) {
+            const message = typeof data.error === "string" ? data.error : `HTTP ${res.status}`;
+            setApply({kind: "error", message});
+            void load(); // revert the form to the authoritative state
+            return;
+          }
+          const at = new Date().toLocaleTimeString("en-US", {hour12: false});
+          setApply({kind: "applied", at, demo: Boolean(data.demo)});
+          if (data.effective) seed(data.effective as RiskValues);
+          if (data.strategies) {
+            setStrategyRows((rows) =>
+              rows.map((r) => ({
+                ...r,
+                enabled: (data.strategies as string[]).includes(r.name),
+              })),
+            );
+          }
+        })
+        .catch(() => setApply({kind: "error", message: "network error — is the bot up?"}));
+    },
+    [load, seed],
+  );
+
+  // Debounced full-patch push on any numeric edit.
+  useEffect(() => {
+    if (skipFirst.current) {
+      skipFirst.current = false;
+      return;
+    }
+    if (!loaded) return;
+    if (timer.current) clearTimeout(timer.current);
+    setApply({kind: "applying"});
+    timer.current = setTimeout(() => {
+      let minWei = values.minNetProfitWei;
+      try {
+        minWei = parseEther(minProfitEth || "0").toString();
+      } catch {
+        /* invalid input: keep the last valid value */
       }
-      setBribeBps(status.risk.bribeBps || 9000);
-      setMaxBaseFeeGwei(Math.round(Number(status.risk.maxBaseFeeWei) / 1e9) || 250);
-      setMaxPositionEth(Math.round(Number(formatEther(BigInt(status.risk.maxPositionWei || "100000000000000000000")))) || 100);
-    }
-    if (status?.strategies) {
-      const current = status.strategies;
-      setEnabledStrats({
-        sandwich: current.includes("sandwich"),
-        sandwich_v3: current.includes("sandwich_v3"),
-        jit: current.includes("jit"),
-        atomic_arb: current.includes("atomic_arb"),
-        liquidation: current.includes("liquidation"),
-        liquidation_compound: current.includes("liquidation_compound"),
-        liquidation_morpho: current.includes("liquidation_morpho"),
-        liquidation_maker: current.includes("liquidation_maker"),
-        oracle_frontrun: current.includes("oracle_frontrun"),
-        sniper: current.includes("sniper"),
-      });
-    }
-  }, [status]);
+      let posWei = values.maxPositionWei;
+      try {
+        posWei = parseEther(String(maxPositionEth || "0")).toString();
+      } catch {
+        /* keep */
+      }
+      const patch = {
+        minNetProfitWei: minWei,
+        maxPositionWei: posWei,
+        maxBaseFeeWei: String(BigInt(maxBaseFeeGwei) * 1_000_000_000n),
+        maxDrawdownWei: values.maxDrawdownWei,
+        bribeBps: values.bribeBps,
+        maxGasPerBundle: maxGas,
+        maxInflightPerStrategy: maxInflight,
+      };
+      pushPatch(patch);
+    }, 500);
+    return () => {
+      if (timer.current) clearTimeout(timer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minProfitEth, maxPositionEth, maxBaseFeeGwei, maxGas, maxInflight, values.bribeBps, values.maxDrawdownWei]);
 
   const toggleStrat = (s: Strategy) => {
-    setEnabledStrats((prev) => ({...prev, [s]: !prev[s]}));
+    const row = strategyRows.find((r) => r.name === s);
+    if (!row) return;
+    const next = !row.enabled;
+    setStrategyRows((rows) => rows.map((r) => (r.name === s ? {...r, enabled: next} : r)));
+    pushPatch({strategies: {[s]: next}});
   };
 
-  const getMinProfitWei = () => {
-    try {
-      return parseEther(minProfitEth || "0").toString();
-    } catch {
-      return "1";
-    }
+  const resetKillSwitch = () => {
+    fetch("/api/bot/risk/reset", {method: "POST", headers: {"content-type": "application/json"}, body: "{}"})
+      .then(() => {
+        setKillSwitch({tripped: false, cumulativeNetWei: "0"});
+        setApply({kind: "applied", at: new Date().toLocaleTimeString("en-US", {hour12: false})});
+      })
+      .catch(() => setApply({kind: "error", message: "network error"}));
   };
 
   const generateEnvSnippet = () => {
+    const enabled = (s: Strategy) => strategyRows.find((r) => r.name === s)?.enabled ?? false;
     return `# ─────────────────────────────────────────────────────────────
-# TUNED RISK & STRATEGY SETTINGS
+# TUNED RISK & STRATEGY SETTINGS (persist current values as boot defaults)
 # ─────────────────────────────────────────────────────────────
-MIN_NET_PROFIT_WEI=${getMinProfitWei()} # (${minProfitEth} ETH)
-MAX_POSITION_WEI=${parseEther(String(maxPositionEth)).toString()} # (${maxPositionEth} ETH)
-MAX_BASE_FEE_WEI=${maxBaseFeeGwei}000000000 # (${maxBaseFeeGwei} gwei)
-BRIBE_BPS=${bribeBps} # (${(bribeBps / 100).toFixed(1)}% to builder)
+MIN_NET_PROFIT_WEI=${values.minNetProfitWei}
+MAX_POSITION_WEI=${values.maxPositionWei}
+MAX_BASE_FEE_WEI=${BigInt(maxBaseFeeGwei) * 1_000_000_000n}
+BRIBE_BPS=${values.bribeBps}
 MAX_GAS_PER_BUNDLE=${maxGas}
+MAX_INFLIGHT_PER_STRATEGY=${maxInflight}
 
-STRATEGY_SANDWICH=${enabledStrats.sandwich}
-STRATEGY_SANDWICH_V3=${enabledStrats.sandwich_v3}
-STRATEGY_JIT=${enabledStrats.jit}
-STRATEGY_ATOMIC_ARB=${enabledStrats.atomic_arb}
-STRATEGY_LIQUIDATION=${enabledStrats.liquidation}
-STRATEGY_LIQUIDATION_COMPOUND=${enabledStrats.liquidation_compound}
-STRATEGY_LIQUIDATION_MORPHO=${enabledStrats.liquidation_morpho}
-STRATEGY_LIQUIDATION_MAKER=${enabledStrats.liquidation_maker}
-STRATEGY_ORACLE_FRONTRUN=${enabledStrats.oracle_frontrun}
-STRATEGY_SNIPER=${enabledStrats.sniper}`;
+STRATEGY_SANDWICH=${enabled("sandwich")}
+STRATEGY_SANDWICH_V3=${enabled("sandwich_v3")}
+STRATEGY_JIT=${enabled("jit")}
+STRATEGY_ATOMIC_ARB=${enabled("atomic_arb")}
+STRATEGY_LIQUIDATION=${enabled("liquidation")}
+STRATEGY_LIQUIDATION_COMPOUND=${enabled("liquidation_compound")}
+STRATEGY_LIQUIDATION_MORPHO=${enabled("liquidation_morpho")}
+STRATEGY_LIQUIDATION_MAKER=${enabled("liquidation_maker")}
+STRATEGY_ORACLE_FRONTRUN=${enabled("oracle_frontrun")}
+STRATEGY_SNIPER=${enabled("sniper")}`;
   };
 
+  const [copied, setCopied] = useState(false);
   const handleCopy = () => {
     navigator.clipboard.writeText(generateEnvSnippet());
     setCopied(true);
@@ -135,11 +263,29 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
         </button>
       </div>
 
-      {/* Tab 1: Controls */}
+      {/* Tab 1: Controls — instant apply */}
       {activeTab === "controls" && (
         <div style={{display: "grid", gap: 16}}>
+          {/* apply status line */}
+          <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8}}>
+            <span className="muted" style={{fontSize: 11}}>
+              Changes apply <strong style={{color: "var(--cyan)"}}>instantly</strong> — the next opportunity is gated
+              with these values. No restart.
+              {demo && <span className="badge" style={{marginLeft: 8, color: "var(--amber)"}}>DEMO DATA</span>}
+            </span>
+            {apply.kind === "applying" && (
+              <span className="muted" style={{fontSize: 11}}>● applying…</span>
+            )}
+            {apply.kind === "applied" && (
+              <span style={{fontSize: 11, color: "var(--green)"}}>✓ applied {apply.at}{apply.demo ? " (demo)" : ""}</span>
+            )}
+            {apply.kind === "error" && (
+              <span style={{fontSize: 11, color: "var(--red)"}}>✗ {apply.message}</span>
+            )}
+          </div>
+
           <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 14}}>
-            {/* Min Net Profit Filter */}
+            {/* Min Net Profit */}
             <div className="panel" style={{padding: 12}}>
               <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
                 <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Minimum Net Profit</span>
@@ -170,23 +316,20 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                   </button>
                 ))}
               </div>
-              <div style={{display: "flex", alignItems: "center", gap: 8}}>
-                <input
-                  type="text"
-                  value={minProfitEth}
-                  onChange={(e) => setMinProfitEth(e.target.value)}
-                  style={{...inputStyle, width: "100%"}}
-                  placeholder="Custom ETH amount..."
-                />
-                <span className="muted" style={{fontSize: 11}}>ETH</span>
-              </div>
+              <input
+                type="text"
+                value={minProfitEth}
+                onChange={(e) => setMinProfitEth(e.target.value)}
+                style={{...inputStyle, width: "100%"}}
+                placeholder="Custom ETH amount..."
+              />
             </div>
 
             {/* Builder Bribe */}
             <div className="panel" style={{padding: 12}}>
               <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
                 <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Builder Bribe Auction</span>
-                <span style={{color: "var(--cyan)", fontWeight: "bold"}}>{(bribeBps / 100).toFixed(1)}% ({bribeBps} BPS)</span>
+                <span style={{color: "var(--cyan)", fontWeight: "bold"}}>{(values.bribeBps / 100).toFixed(1)}% ({values.bribeBps} BPS)</span>
               </div>
               <p className="muted" style={{fontSize: 11, margin: "4px 0 10px"}}>
                 Percentage of gross profit paid to block.coinbase to win the bundle auction.
@@ -196,8 +339,8 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                 min="5000"
                 max="9900"
                 step="100"
-                value={bribeBps}
-                onChange={(e) => setBribeBps(Number(e.target.value))}
+                value={values.bribeBps}
+                onChange={(e) => setValues((v) => ({...v, bribeBps: Number(e.target.value)}))}
                 style={{width: "100%", accentColor: "var(--cyan)", cursor: "pointer"}}
               />
               <div style={{display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--muted)", marginTop: 6}}>
@@ -207,7 +350,7 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
               </div>
             </div>
 
-            {/* Gas & Position Caps */}
+            {/* Max Base Fee */}
             <div className="panel" style={{padding: 12}}>
               <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
                 <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Max Base Fee Ceiling</span>
@@ -232,7 +375,7 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
               </div>
             </div>
 
-            {/* Max Notional */}
+            {/* Max Position */}
             <div className="panel" style={{padding: 12}}>
               <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
                 <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Max Position Size</span>
@@ -245,11 +388,11 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                 {[10, 25, 50, 100, 250].map((eth) => (
                   <button
                     key={eth}
-                    onClick={() => setMaxPositionEth(eth)}
+                    onClick={() => setMaxPositionEth(String(eth))}
                     style={{
                       ...btnStyle,
-                      background: maxPositionEth === eth ? "var(--panel-2)" : "var(--panel)",
-                      borderColor: maxPositionEth === eth ? "var(--green)" : "var(--line)",
+                      background: maxPositionEth === String(eth) ? "var(--panel-2)" : "var(--panel)",
+                      borderColor: maxPositionEth === String(eth) ? "var(--green)" : "var(--line)",
                       fontSize: 10,
                     }}
                   >
@@ -258,20 +401,107 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                 ))}
               </div>
             </div>
+
+            {/* Gas cap + inflight */}
+            <div className="panel" style={{padding: 12}}>
+              <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
+                <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Gas Cap / Concurrency</span>
+                <span style={{color: "var(--cyan)", fontWeight: "bold"}}>{(maxGas / 1_000_000).toFixed(1)}M · {maxInflight} inf</span>
+              </div>
+              <p className="muted" style={{fontSize: 11, margin: "4px 0 10px"}}>
+                Per-bundle gas ceiling (the simulator clamps it below the block limit) and concurrent simulations per strategy.
+              </p>
+              <div style={{display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8}}>
+                {[1_000_000, 2_000_000, 3_000_000, 5_000_000].map((g) => (
+                  <button
+                    key={g}
+                    onClick={() => setMaxGas(g)}
+                    style={{
+                      ...btnStyle,
+                      background: maxGas === g ? "var(--panel-2)" : "var(--panel)",
+                      borderColor: maxGas === g ? "var(--cyan)" : "var(--line)",
+                      fontSize: 10,
+                    }}
+                  >
+                    {g / 1_000_000}M
+                  </button>
+                ))}
+                {[8, 32, 64].map((n) => (
+                  <button
+                    key={n}
+                    onClick={() => setMaxInflight(n)}
+                    style={{
+                      ...btnStyle,
+                      background: maxInflight === n ? "var(--panel-2)" : "var(--panel)",
+                      borderColor: maxInflight === n ? "var(--cyan)" : "var(--line)",
+                      fontSize: 10,
+                    }}
+                  >
+                    {n} inflight
+                  </button>
+                ))}
+              </div>
+              <div style={{display: "flex", gap: 8, alignItems: "center"}}>
+                <input
+                  type="number"
+                  min={1}
+                  max={256}
+                  value={maxInflight}
+                  onChange={(e) => setMaxInflight(Math.max(1, Math.min(256, Number(e.target.value) || 1)))}
+                  style={{...inputStyle, width: 90}}
+                />
+                <span className="muted" style={{fontSize: 10}}>max inflight per strategy</span>
+              </div>
+            </div>
+
+            {/* Kill switch */}
+            <div className="panel" style={{padding: 12, borderColor: killSwitch.tripped ? "var(--red)" : "var(--line)"}}>
+              <div style={{display: "flex", justifyContent: "space-between", marginBottom: 6}}>
+                <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>Drawdown Kill Switch</span>
+                <span style={{color: killSwitch.tripped ? "var(--red)" : "var(--green)", fontWeight: "bold"}}>
+                  {killSwitch.tripped ? "TRIPPED" : "armed"}
+                </span>
+              </div>
+              <p className="muted" style={{fontSize: 11, margin: "4px 0 10px"}}>
+                Stops all new positions once cumulative simulated PnL drops below −maxDrawdown (0 disables). Cumulative:{" "}
+                <strong>{(Number(BigInt(killSwitch.cumulativeNetWei || "0")) / 1e18).toFixed(4)} ETH</strong>
+              </p>
+              <button
+                onClick={resetKillSwitch}
+                disabled={!killSwitch.tripped}
+                style={{
+                  ...btnStyle,
+                  borderColor: killSwitch.tripped ? "var(--red)" : "var(--line)",
+                  color: killSwitch.tripped ? "var(--red)" : "var(--muted)",
+                  cursor: killSwitch.tripped ? "pointer" : "not-allowed",
+                }}
+              >
+                {killSwitch.tripped ? "Reset kill switch (re-arm)" : "Not tripped"}
+              </button>
+            </div>
           </div>
 
           {/* Strategy Toggles */}
           <div className="panel" style={{padding: 12}}>
             <div style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)", marginBottom: 8}}>
-              Strategy Toggles
+              Strategy Toggles — instant; can only narrow what booted on
             </div>
             <div style={{display: "flex", gap: 10, flexWrap: "wrap"}}>
-              {ALL_STRATEGIES.map((s) => {
-                const active = enabledStrats[s];
+              {strategyRows.map((row) => {
+                const active = row.enabled;
+                const bootLocked = !row.bootEnabled;
                 return (
                   <button
-                    key={s}
-                    onClick={() => toggleStrat(s)}
+                    key={row.name}
+                    onClick={() => toggleStrat(row.name)}
+                    disabled={bootLocked}
+                    title={
+                      bootLocked
+                        ? `${row.name} was off at boot — set STRATEGY_${row.name.toUpperCase()}=true and restart to construct it`
+                        : active
+                          ? "Click to disable (applies instantly)"
+                          : "Click to enable (applies instantly)"
+                    }
                     style={{
                       ...btnStyle,
                       display: "flex",
@@ -279,7 +509,9 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                       gap: 8,
                       padding: "6px 12px",
                       background: active ? "#0f1c29" : "#080c12",
-                      borderColor: active ? STRATEGY_COLOR[s] : "var(--line)",
+                      borderColor: active ? STRATEGY_COLOR[row.name] : "var(--line)",
+                      opacity: bootLocked ? 0.4 : 1,
+                      cursor: bootLocked ? "not-allowed" : "pointer",
                     }}
                   >
                     <span
@@ -287,14 +519,14 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
                         width: 8,
                         height: 8,
                         borderRadius: "50%",
-                        background: active ? STRATEGY_COLOR[s] : "#444",
+                        background: active ? STRATEGY_COLOR[row.name] : "#444",
                       }}
                     />
                     <span style={{color: active ? "#fff" : "var(--muted)"}}>
-                      {STRATEGY_LABEL[s] || s}
+                      {STRATEGY_LABEL[row.name] || row.name}
                     </span>
                     <span style={{fontSize: 10, color: active ? "var(--green)" : "var(--red)"}}>
-                      {active ? "ON" : "OFF"}
+                      {active ? "ON" : bootLocked ? "BOOT-OFF" : "OFF"}
                     </span>
                   </button>
                 );
@@ -302,16 +534,20 @@ STRATEGY_SNIPER=${enabledStrats.sniper}`;
             </div>
           </div>
 
-          {/* Export / Copy Config */}
+          {/* Persist as defaults */}
           <div className="panel" style={{padding: 12}}>
             <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8}}>
               <span style={{fontSize: 11, textTransform: "uppercase", color: "var(--muted)"}}>
-                Generated .env Config Snippet
+                Persist current values as boot defaults (.env)
               </span>
               <button onClick={handleCopy} style={{...btnStyle, borderColor: "var(--cyan)", color: "var(--cyan)"}}>
-                {copied ? "✓ Copied to Clipboard!" : "📋 Copy to .env"}
+                {copied ? "✓ Copied to Clipboard!" : "📋 Copy .env snippet"}
               </button>
             </div>
+            <p className="muted" style={{fontSize: 11, margin: "0 0 8px"}}>
+              Runtime changes live until the process exits. Paste this into <code>.env</code> to make the current
+              values the defaults at the next boot.
+            </p>
             <pre
               style={{
                 background: "#040608",
@@ -463,6 +699,13 @@ EXTRA_MEMPOOL_WS=wss://api.blxrbdn.com/ws,...`}
       )}
     </div>
   );
+}
+
+/** "0.000000000000000001" for 1 wei instead of "0.000000000000000001000000000000". */
+function formatMinimalEther(wei: bigint): string {
+  const whole = wei / 10n ** 18n;
+  const frac = (wei % 10n ** 18n).toString().padStart(18, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
 }
 
 const tabBtnStyle: React.CSSProperties = {

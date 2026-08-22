@@ -30,6 +30,8 @@ pub struct Simulator {
     pub replay_fork: Option<Arc<anvil::AnvilSim>>,
     pub relay: Option<relay::RelaySim>,
     signer: Arc<Signer>,
+    /// Shared runtime risk envelope — bundle guards follow dashboard changes.
+    risk: crate::risk::RuntimeRisk,
 }
 
 pub struct SimOutcome {
@@ -48,6 +50,7 @@ impl Simulator {
         replay_fork: Option<Arc<anvil::AnvilSim>>,
         relay: Option<relay::RelaySim>,
         signer: Arc<Signer>,
+        risk: crate::risk::RuntimeRisk,
     ) -> Self {
         Self {
             cfg,
@@ -55,6 +58,7 @@ impl Simulator {
             replay_fork,
             relay,
             signer,
+            risk,
         }
     }
 
@@ -85,15 +89,17 @@ impl Simulator {
             nonce,
             base_fee,
             priority_fee: U256::from(1_000_000_000u64),
-            // Clamped below any block gas limit: relays reject an over-limit tx
-            // before simulating it, exactly like the fork does.
+            // Clamped below any block gas limit: relays reject an over-limit
+            // tx before simulating it, exactly like the fork does. The cap
+            // follows the runtime risk envelope: a dashboard change applies
+            // to the next signed bundle, not the next restart.
             gas_limit: self
-                .cfg
                 .risk
+                .risk()
                 .max_gas_per_bundle
                 .min(anvil::MAX_TX_GAS_CEILING),
         };
-        let bundle = bundle::build_bundle(opp, victims_raw, &ctx, &self.cfg.risk, &self.signer);
+        let bundle = bundle::build_bundle(opp, victims_raw, &ctx, &self.risk.risk(), &self.signer);
 
         let parent = opp.target_block.saturating_sub(1);
         let primary = if replay {

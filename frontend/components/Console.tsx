@@ -4,6 +4,7 @@ import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import EquityChart from "./EquityChart";
 import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
+import GoLivePanel from "./GoLivePanel";
 import RiskPanel from "./RiskPanel";
 import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
@@ -480,6 +481,17 @@ export default function Console() {
           <span className="muted">Live Parameters & Diagnostics</span>
         </div>
         <RiskPanel status={status} />
+      </section>
+
+      {/* go-live checklist — deploying MevExecutor (Phase 3 readiness) */}
+      <section className="panel">
+        <div className="panel-head">
+          <span>Go live — deploy MevExecutor to mainnet</span>
+          <span className="muted">six-step checklist · docs/GO_LIVE.md</span>
+        </div>
+        <div style={{padding: 12}}>
+          <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} />
+        </div>
       </section>
 
       {/* contract */}

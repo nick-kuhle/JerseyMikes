@@ -40,7 +40,10 @@ Optional: Etherscan API key	only for the CLI path's --verify	source verification
 Path A — the console's checklist (easiest)
 Open the console and scroll to "Go live — deploy MevExecutor to mainnet".
 The six steps are the rest of this section; each step is disabled until the
-ones before it make sense.
+ones before it make sense. (The panel deploys the exact creation bytecode
+the bot simulates against — a CI-checked copy of the bot artifact — with the
+mainnet Balancer V2 vault and WETH9 constructor arguments prefilled, and
+prefills the bot's SEARCHER_ADDRESS for the allowlist step.)
 
 Connect a wallet on chain 1. If your wallet sits on another network the
 panel offers a one-click switch. This wallet becomes the executor's owner.

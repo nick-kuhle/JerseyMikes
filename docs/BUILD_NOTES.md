@@ -1,5 +1,58 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (runtime risk envelope + go-live console surface)
+
+Operator request: make the risk envelope instant from the console (it was
+env-and-restart), clean the UI up for go-live, and spell out which web3
+functions the live path actually needs.
+
+**Backend** (`risk.rs`, `engine.rs`, `sim/*`, `api.rs`):
+
+- `RuntimeRisk` — a shared, lock-protected risk envelope + strategy-toggle
+  set, seeded from the environment and mutated by `POST /api/risk`.
+  Patches validate completely before applying (all-or-nothing), and
+  strategy toggles can only narrow: enabling a strategy that was not
+  constructed at boot is refused with the restart instruction, mirroring
+  the live-mode switch. The risk engine, the fork simulator's
+  `minProfit`/`bribeBps` guards, the gas clamp and the signed-bundle gas
+  cap all read this same state, so a dashboard change is in force for the
+  next opportunity, not the next boot.
+- `GET /api/risk` (effective + boot + per-strategy enablement + kill
+  switch), `POST /api/risk` (patch), `POST /api/risk/reset` (re-arm the
+  drawdown kill switch). `/api/status` now reports the runtime-effective
+  set (`strategies`) alongside `bootStrategies`, and the full risk block;
+  `/api/config` exposes the searcher EOA for the deploy panel's prefill.
+
+**Frontend:**
+
+- `RiskPanel` controls tab rebuilt as instant-apply (debounced 500 ms,
+  full-patch POSTs, applied/error status line, demo-flag aware); the
+  kill switch got a card with its reset; the `.env` snippet is labelled
+  "persist current values as boot defaults". Diagnostics/sources tabs
+  untouched.
+- `GoLivePanel` (new) — `GO_LIVE.md` Path A as six gated steps: wallet on
+  chain 1 (with one-click switch), gas balance, deploy (free
+  `eth_estimateGas` estimate; browser sends creation bytecode +
+  ABI-encoded `MevExecutor(balancerVault, weth)` args; receipt followed;
+  address remembered in localStorage), fund the executor, `setSearcher`
+  (prefilled from `/api/config`), verify (code/owner/allowlist reads) +
+  copy the `EXECUTOR_ADDRESS` line. Reads ride the read-only `/api/eth`
+  proxy (`eth_estimateGas` added to its allowlist; write methods still
+  refused).
+- The creation bytecode is a byte-for-byte copy of the bot artifact at
+  `frontend/lib/MevExecutor.creation.hex`, and the artifact-drift CI job
+  now diffs that copy against the artifact — the panel can never deploy
+  bytecode the bot does not simulate against.
+
+**Verification:** `cargo test --all` 185 passed (5 new: patch apply/read,
+atomic rejection, wei parsing, narrow-only toggles, engine gating on
+runtime values); clippy clean on touched files; `npx tsc --noEmit` clean;
+`next build` succeeds (note: needed the sandbox's Rust toolchain freed
+first — the 2 GB cgroup could not hold both); production server smoke: GET/
+POST `/api/bot/risk` + reset + strategy toggles round-trip (demo fallback
+included), page renders, `/api/eth` forwards estimateGas and refuses
+`eth_sendTransaction`.
+
 ## Session 2026-08-22 (sim diagnostics: gas-limit clamp + revert-reason decoding)
 
 Operator-reported symptoms after running the merged liquidation coverage:
