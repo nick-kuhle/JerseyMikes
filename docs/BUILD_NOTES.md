@@ -44,6 +44,17 @@ functions the live path actually needs.
   now diffs that copy against the artifact — the panel can never deploy
   bytecode the bot does not simulate against.
 
+**Post-merge-fix note:** the first push of this PR broke CI *silently* —
+the new artifact-drift step was written through a patch script whose Python
+string continuation ate the YAML newlines, the workflow file stopped
+parsing, and all four checks sat at "Expected — waiting for status"
+forever (no job ever started). Nothing local catches that: the Rust and TS
+toolchains validated every other file, but no tool parses
+`.github/workflows/*.yml`. Fixed, and the step's shell logic was then
+executed locally in both directions (identical copies pass; a drifted copy
+fails with the message) before pushing, along with a full YAML parse.
+Lesson recorded: validate workflow YAML locally before every push.
+
 **Verification:** `cargo test --all` 185 passed (5 new: patch apply/read,
 atomic rejection, wei parsing, narrow-only toggles, engine gating on
 runtime values); clippy clean on touched files; `npx tsc --noEmit` clean;
