@@ -365,6 +365,13 @@ pub enum FeedEvent {
         seen_at_ms: u64,
     },
     Opportunity(Opportunity),
+    Alert {
+        rule: String,
+        severity: String,
+        message: String,
+        active: bool,
+        seen_at_ms: u64,
+    },
     Simulation(SimulationResult),
     Bundle(BundleRecord),
     Relay {

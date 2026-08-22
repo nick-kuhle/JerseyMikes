@@ -99,6 +99,8 @@ function kindColor(e: FeedEvent): string {
       return "#4f8bff";
     case "relay_block":
       return "#4f8bff";
+    case "alert":
+      return "var(--amber)";
     case "reorg":
       return "#ff5c5c";
   }
@@ -204,6 +206,14 @@ function detail(e: FeedEvent, chainId?: number) {
           </span>
         </span>
       );
+    case "alert": {
+      const ev = e as unknown as {severity?: string; rule?: string; message?: string; active?: boolean};
+      return (
+        <span style={{color: ev.active ? (ev.severity === "critical" ? "#ff5c5c" : "#f5b544") : undefined}}>
+          {ev.active ? "⚠" : "✓"} {ev.severity} · {ev.rule} — {ev.message}
+        </span>
+      );
+    }
     case "reorg":
       return (
         <span>

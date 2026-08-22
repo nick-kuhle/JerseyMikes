@@ -1,0 +1,28 @@
+# JerseyMikes — bot + console.
+#   docker compose --env-file ../.env up -d --build
+# Metrics: scrape http://localhost:8080/api/metrics from the host.
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.bot
+    env_file: ../.env
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - bot-data:/data
+  console:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.console
+    environment:
+      BOT_API_URL: http://bot:8080
+      ETH_PROXY_URL: ${ETH_HTTP_URL:-}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - bot
+volumes:
+  bot-data:

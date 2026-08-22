@@ -1,0 +1,26 @@
+# JerseyMikes searcher — systemd unit.
+# Install: sudo cp deploy/systemd/*.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now mev-bot
+# Configure: EnvironmentFile points at the same .env the bot already uses
+# (copy it somewhere stable, e.g. /etc/jerseymikes/env).
+# Logs: journalctl -u mev-bot -f  (journald is the log shipper — forward it
+# with rsyslog/Vector/etc. rather than adding one to the app).
+
+[Unit]
+Description=JerseyMikes MEV searcher (simulation-first)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# User=jerseymikes
+WorkingDirectory=/opt/jerseymikes
+EnvironmentFile=/etc/jerseymikes/env
+ExecStart=/opt/jerseymikes/mev-bot
+Restart=always
+RestartSec=3
+# The bot needs anvil (Foundry) on PATH for the fork simulator.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

@@ -222,6 +222,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
 | [`docs/W6_MEMO.md`](docs/W6_MEMO.md) | The public-mempool gap memo that gates UniversalRouter decoding — template + decision record |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
 
 ## Status

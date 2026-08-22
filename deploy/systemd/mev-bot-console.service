@@ -1,0 +1,19 @@
+# JerseyMikes console (Next.js) — talks to mev-bot over BOT_API_URL.
+
+[Unit]
+Description=JerseyMikes MEV console
+After=network-online.target mev-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/jerseymikes/console
+EnvironmentFile=/etc/jerseymikes/env
+Environment=PORT=3000
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

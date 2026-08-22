@@ -126,8 +126,13 @@ Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 - [ ] Multi-relay submission with per-relay inclusion stats
 - [ ] Bundle merging and cancellation
 - [ ] Hot-wallet inventory management, WETH top-ups, profit sweeping
-- [ ] Alerting: kill-switch trips, endpoint failures, inclusion-rate collapse
-- [ ] Deployment: systemd/docker units, metrics endpoint, log shipping
+- [x] Alerting: kill-switch trips, endpoint failures (head/pending stalls),
+      inclusion-rate collapse — rule engine over live state, lifecycle
+      (fire/resolve), `GET /api/alerts`, SSE feed events, optional
+      `ALERT_WEBHOOK_URL` delivery. See `docs/DEPLOYMENT.md`.
+- [x] Deployment: systemd units + Docker Compose (anvil included), Prometheus
+      `GET /api/metrics`, health endpoint; log shipping is delegated to
+      journald/the Docker logging driver. See `docs/DEPLOYMENT.md`.
 
 ## Phase 4 — more chains
 

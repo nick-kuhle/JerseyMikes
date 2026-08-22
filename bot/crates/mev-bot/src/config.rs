@@ -74,6 +74,39 @@ pub struct LiquidationConfig {
     pub maker_ilks: Vec<String>,
 }
 
+/// Alerting tunables (rules live in `alerts.rs`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlertsConfig {
+    /// No new head for this long is a critical endpoint/node failure.
+    pub head_stall_secs: u64,
+    /// No mempool transaction for this long while a WS feed is configured.
+    pub pending_stall_secs: u64,
+    /// A strategy whose live funnel converts under this percent (after the
+    /// sample floor) trips the inclusion-collapse warning. 0 disables.
+    pub min_conversion_pct: f64,
+    /// Candidates a strategy needs before its conversion rate is judged.
+    pub min_candidates: u64,
+    /// Optional webhook (Slack/Discord-compatible JSON POST) for alert
+    /// transitions.
+    pub webhook_url: Option<String>,
+    /// Seconds between evaluation passes.
+    pub eval_secs: u64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            head_stall_secs: 60,
+            pending_stall_secs: 180,
+            min_conversion_pct: 2.0,
+            min_candidates: 100,
+            webhook_url: None,
+            eval_secs: 30,
+        }
+    }
+}
+
 /// Oracle-update front-runner tuning.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OracleConfig {
@@ -95,6 +128,8 @@ pub struct Config {
     pub liquidation: LiquidationConfig,
     /// Oracle-update front-runner tuning.
     pub oracle: OracleConfig,
+    /// Alerting tunables.
+    pub alerts: AlertsConfig,
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
@@ -421,6 +456,14 @@ impl Config {
                     let v = env_list("MAKER_ILKS");
                     if v.is_empty() { vec!["ETH-A".to_string()] } else { v }
                 },
+            },
+            alerts: AlertsConfig {
+                head_stall_secs: env_u64("ALERT_HEAD_STALL_SECS", 60),
+                pending_stall_secs: env_u64("ALERT_PENDING_STALL_SECS", 180),
+                min_conversion_pct: env_f64("ALERT_MIN_CONVERSION_PCT", 2.0),
+                min_candidates: env_u64("ALERT_MIN_CANDIDATES", 100),
+                webhook_url: env_opt("ALERT_WEBHOOK_URL"),
+                eval_secs: env_u64("ALERT_EVAL_SECS", 30).max(5),
             },
             oracle: OracleConfig {
                 watch_feeds: parse_feed_list(&env_or(

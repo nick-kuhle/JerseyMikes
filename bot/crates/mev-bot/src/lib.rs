@@ -15,6 +15,7 @@
 //! (`bundle::send_bundle_params`) are behind `Config::live_execution`, which
 //! requires two independent environment acknowledgements to enable.
 
+pub mod alerts;
 pub mod api;
 pub mod bundle;
 pub mod competition;
@@ -24,12 +25,13 @@ pub mod engine;
 pub mod ingest;
 pub mod inventory;
 pub mod latency;
+pub mod metrics;
 pub mod replay;
 pub mod risk;
 pub mod rlp;
 pub mod rpc;
-pub mod sim;
 pub mod signer;
+pub mod sim;
 pub mod store;
 pub mod strategies;
 pub mod types;

@@ -91,6 +91,9 @@ impl LiveMode {
 pub struct Engine {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
+    /// Rule evaluation over live engine state (kill switch, stalls,
+    /// conversion collapse); served on /api/alerts, pushed to the feed.
+    pub alerts: Arc<crate::alerts::Alerts>,
     /// Runtime risk envelope (shared with `risk` and `sim`); the /api/risk
     /// endpoints read and write this.
     pub runtime: crate::risk::RuntimeRisk,
@@ -269,7 +272,7 @@ impl Stats {
     }
 
     /// Serialise one funnel lane as `{strategy: counters}`.
-    fn funnel_json(
+    pub fn funnel_json(
         map: &parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
     ) -> serde_json::Map<String, serde_json::Value> {
         map.read()
@@ -321,6 +324,8 @@ impl Engine {
     pub async fn new(cfg: Arc<Config>) -> Result<Self> {
         let http = RpcClient::new(cfg.endpoints.http_url.clone())?;
         let store = Arc::new(Store::open(&cfg.api.db_path)?);
+        let alerts = Arc::new(crate::alerts::Alerts::new(cfg.alerts.clone()));
+
         // Runtime risk envelope: boot values from the environment, mutable
         // via POST /api/risk (see RuntimeRisk for the narrowing invariants).
         let runtime = crate::risk::RuntimeRisk::new(cfg.risk.clone(), cfg.strategies.clone());
@@ -506,6 +511,7 @@ impl Engine {
         Ok(Self {
             cfg,
             store,
+            alerts,
             runtime,
             risk,
             sim,
@@ -525,6 +531,7 @@ impl Engine {
 
     /// Run forever.
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        self.spawn_alert_evaluator();
         let mut ingest = Ingest::start(self.cfg.clone());
         tracing::info!(target: "engine", "ingest started: {}", self.cfg.summary());
 
@@ -647,12 +654,14 @@ impl Engine {
 
     async fn on_block(self: Arc<Self>, head: BlockHead) {
         Stats::bump(&self.stats.blocks_seen);
+        self.alerts.observe_head();
 
         let prev = self.last_head.lock().clone();
         if let Some(prev) = prev {
             if let Some((from, to)) = detect_reorg(&prev, &head) {
                 Stats::bump(&self.stats.reorgs_seen);
                 let old_hash = prev.hash;
+                self.alerts.observe_reorg();
                 let _ = self.store.record_reorg(
                     from,
                     to,
@@ -737,6 +746,7 @@ impl Engine {
 
     async fn on_pending(self: Arc<Self>, tx: PendingTx) {
         Stats::bump(&self.stats.pending_seen);
+        self.alerts.observe_pending();
         self.latency.observe(
             Stage::IngestToStrategy,
             now_ms().saturating_sub(tx.seen_at_ms),
@@ -1049,6 +1059,50 @@ pub fn enabled_strategies(cfg: &Config) -> Vec<&'static str> {
         })
         .map(|s| s.as_str())
         .collect()
+}
+
+impl Engine {
+    /// Evaluate the alert rules on a fixed interval. Transitions are logged,
+    /// pushed to the SSE feed and (optionally) delivered to a webhook.
+    fn spawn_alert_evaluator(self: &Arc<Self>) {
+        let this = self.clone();
+        let interval = std::time::Duration::from_secs(self.cfg.alerts.eval_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let risk = this.runtime.risk();
+                let funnel = this.stats.funnel.read().clone();
+                let conversion = funnel
+                    .iter()
+                    .map(|(s, c)| (s.as_str(), c.candidates_emitted, c.submittable))
+                    .collect::<Vec<_>>();
+                let signals = crate::alerts::AlertSignals {
+                    now_ms: now_ms(),
+                    last_head_ms: this.alerts.last_head_ms(),
+                    last_pending_ms: this.alerts.last_pending_ms(),
+                    mempool_feed_configured: this.cfg.endpoints.ws_url.is_some(),
+                    kill_switch_tripped: this.risk.is_tripped(),
+                    drawdown: Some((
+                        u128::try_from(risk.max_drawdown_wei).unwrap_or(u128::MAX),
+                        this.risk.cumulative_net(),
+                    )),
+                    conversion,
+                    reorgs_since_last_eval: this.alerts.take_reorgs(),
+                };
+                for a in this.alerts.evaluate(&signals) {
+                    let _ = this.feed.send(FeedEvent::Alert {
+                        rule: a.rule.to_string(),
+                        severity: format!("{:?}", a.severity).to_lowercase(),
+                        message: a.message.clone(),
+                        active: a.active,
+                        seen_at_ms: a.at_ms,
+                    });
+                }
+            }
+        });
+    }
 }
 
 #[cfg(test)]

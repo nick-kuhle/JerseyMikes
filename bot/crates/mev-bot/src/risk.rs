@@ -422,6 +422,7 @@ mod tests {
                 watch_feeds: vec![],
                 max_leads: 3,
             },
+            alerts: crate::config::AlertsConfig::default(),
             api: crate::config::ApiConfig {
                 bind: "127.0.0.1:0".into(),
                 db_path: ":memory:".into(),
