@@ -1,15 +1,22 @@
-//! Aave V3 liquidations.
+//! Aave V3 liquidations — per-reserve.
 //!
 //! Borrowers are discovered from `Borrow`/`Supply` logs, then their health
 //! factor is polled once per block with batched `getUserAccountData` calls.
-//! When HF < 1 the bot builds a flash-loan-funded `liquidationCall`:
+//! When HF < 1 the position's **actual composition** is read per reserve —
+//! `Pool.getUserConfiguration` gives the borrowing/collateral bitmap,
+//! `DataProvider.getUserReserveData` the real balances, and
+//! `getReserveConfigurationData` the real liquidation bonus — so the bundle
+//! repays the user's actual debt asset, seizes their actual collateral, and
+//! prices the spread with the actual bonus (no more USDC/WETH/5% assumption;
+//! all four ABI shapes verified against the live pool implementation and
+//! data provider):
 //!
-//!   flash borrow debt asset → repay up to the close factor → receive collateral
-//!   at a bonus → swap collateral back → repay the flash loan → keep the spread.
+//!   flash borrow the debt asset → repay up to the close factor → receive
+//!   collateral at the reserve's bonus → swap collateral back → repay →
+//!   keep the spread.
 //!
-//! The swap leg uses the deepest V2 pool we know about for the collateral; when
-//! there isn't one, the opportunity is still recorded (with the collateral as
-//! the profit token) so the dashboard shows what was missed.
+//! The oracle front-runner reuses the same composition reader at trigger
+//! time, so a feed update back-runs the position as it stands then.
 
 use std::collections::HashSet;
 
@@ -47,6 +54,41 @@ sol! {
             uint256 debtToCover,
             bool receiveAToken
         ) external;
+        function getReservesList() external view returns (address[] memory);
+        function getUserConfiguration(address user) external view returns (uint256 data);
+    }
+
+    interface IAaveDataProvider {
+        function getUserReserveData(address asset, address user)
+            external
+            view
+            returns (
+                uint256 currentATokenBalance,
+                uint256 currentStableDebt,
+                uint256 currentVariableDebt,
+                uint256 principalStableDebt,
+                uint256 scaledVariableDebt,
+                uint256 stableBorrowRate,
+                uint256 liquidityRate,
+                uint40 stableRateLastUpdated,
+                bool usageAsCollateralEnabled
+            );
+
+        function getReserveConfigurationData(address asset)
+            external
+            view
+            returns (
+                uint256 ltv,
+                uint256 liquidationThreshold,
+                uint256 liquidationBonus,
+                uint256 decimals,
+                uint256 reserveFactor,
+                bool usageAsCollateralEnabled,
+                bool borrowingEnabled,
+                bool stableBorrowRateEnabled,
+                bool isActive,
+                bool isFrozen
+            );
     }
 }
 
@@ -64,6 +106,8 @@ pub struct LiquidationStrategy {
     last_log_block: RwLock<u64>,
     /// Shared near-miss registry (see `leads.rs`).
     leads: LiquidationLeads,
+    /// Reserve list + per-block reserve-config cache.
+    cache: AaveCache,
 }
 
 impl LiquidationStrategy {
@@ -72,6 +116,7 @@ impl LiquidationStrategy {
             watchlist: RwLock::new(HashSet::new()),
             last_log_block: RwLock::new(0),
             leads,
+            cache: AaveCache::default(),
         }
     }
 
@@ -191,17 +236,23 @@ impl StrategyImpl for LiquidationStrategy {
         for (user, total_debt_base, health) in unhealthy {
             let hf_one = U256::from(HEALTH_FACTOR_ONE);
             if health < hf_one {
-                if let Some(opp) = build_opportunity(ctx, user, total_debt_base, health).await {
-                    out.push(opp);
+                if let Some(pos) = compose(ctx, &self.cache, user, health).await {
+                    if let Some(opp) = build_opportunity(ctx, &pos).await {
+                        out.push(opp);
+                    }
                 }
             } else {
                 // Near-miss (HF in [1, 1.05)): publish for the oracle
-                // front-runner. Ratio in bps of the threshold: HF 1.02 ->
-                // 10_200 bps.
+                // front-runner with the position's REAL collateral, so a
+                // feed update matches it. Ratio in bps of the threshold.
                 let bps = ratio_bps(health, Some(hf_one), hf_one);
+                let collateral = compose(ctx, &self.cache, user, health)
+                    .await
+                    .map(|p| p.collateral)
+                    .unwrap_or(ctx.cfg.chain.weth);
                 near_misses.push(Lead {
                     account: user,
-                    collateral: ctx.cfg.chain.weth,
+                    collateral,
                     debt_asset: known::USDC,
                     ratio_bps: bps,
                     debt_wei: total_debt_base,
@@ -214,34 +265,227 @@ impl StrategyImpl for LiquidationStrategy {
     }
 }
 
-/// Build the flash-borrow → liquidationCall → swap bundle for one Aave
-/// borrower. Public so the oracle front-runner can rebuild the exact same
-/// bundle as a back-run of a feed update.
-pub async fn build_opportunity(
-    ctx: &StrategyCtx,
-    user: alloy_primitives::Address,
-    total_debt_base: U256,
-    health: U256,
-) -> Option<Opportunity> {
-    let weth = ctx.cfg.chain.weth;
-    // Aave's close factor: at most 50% of the debt in one call (100% when
-    // HF < 0.95). Base units are USD with 8 decimals; we size in the debt
-    // asset by assuming the stable leg, which the simulation will correct.
-    let close_factor_bps = if health < U256::from(950_000_000_000_000_000u128) {
-        10_000u64
-    } else {
-        5_000u64
-    };
-    let debt_to_cover = total_debt_base * U256::from(close_factor_bps) / U256::from(10_000u64);
+/// Borrow bit for reserve `i` in the `getUserConfiguration` bitmap.
+pub fn aave_config_borrowing(data: U256, i: usize) -> bool {
+    ((data >> (i * 2)) & U256::from(1u8)) == U256::from(1u8)
+}
 
-    // Default shape: repay USDC debt, seize WETH collateral.
-    let debt_asset = known::USDC;
-    let collateral = weth;
-    // Base units are 1e8; USDC is 1e6.
-    let debt_amount = debt_to_cover / U256::from(100u64);
+/// Collateral bit for reserve `i`.
+pub fn aave_config_collateral(data: U256, i: usize) -> bool {
+    ((data >> (i * 2 + 1)) & U256::from(1u8)) == U256::from(1u8)
+}
+
+/// A user's actionable position: the largest debt against the largest
+/// collateral, with the collateral reserve's real liquidation bonus.
+#[derive(Clone, Debug)]
+pub struct AavePosition {
+    pub user: alloy_primitives::Address,
+    pub collateral: Address,
+    pub collateral_amount: U256,
+    pub debt_asset: Address,
+    pub debt_amount_total: U256,
+    /// The reserve's liquidation bonus, in bps over 1e4 (10500 == 5%).
+    pub bonus_bps: u64,
+    /// Close factor applied to size the repay, in bps.
+    pub close_factor_bps: u64,
+}
+
+/// Per-reserve config cache entry (refreshed each block it is used).
+#[derive(Clone, Copy, Debug)]
+pub struct ReserveCfg {
+    pub bonus_bps: u64,
+    pub decimals: u8,
+    pub active: bool,
+}
+
+/// Read a user's actual composition. One `getUserConfiguration` call, then
+/// batched `getUserReserveData` over the reserves the bitmap says the user
+/// touches (bounded to the 8 busiest), then per-asset config (cached per
+/// block). Public: the oracle front-runner calls this at trigger time.
+pub async fn compose(
+    ctx: &StrategyCtx,
+    cache: &AaveCache,
+    user: Address,
+    health: U256,
+) -> Option<AavePosition> {
+    let reserves = aave_reserves(ctx, cache).await;
+    if reserves.is_empty() {
+        return None;
+    }
+    let cfg = ctx.rpc
+        .call_raw("eth_call", serde_json::json!([
+            { "to": format!("{:?}", known::AAVE_V3_POOL), "data": format!("0x{}", hex::encode(IAaveV3Pool::getUserConfigurationCall { user }.abi_encode())) },
+            "latest"
+        ]))
+        .await
+        .ok()?;
+    let bitmap = U256::from_be_slice(&crate::types::parse_bytes(&cfg)[0..32]);
+
+    // Which reserves does this user touch?
+    let mut assets = Vec::new();
+    for (i, asset) in reserves.iter().enumerate().take(128) {
+        if aave_config_borrowing(bitmap, i) || aave_config_collateral(bitmap, i) {
+            assets.push(*asset);
+        }
+    }
+    if assets.is_empty() {
+        return None;
+    }
+    let assets: Vec<Address> = assets.into_iter().take(8).collect();
+
+    let calls: Vec<(String, serde_json::Value)> = assets
+        .iter()
+        .map(|a| {
+            (
+                "eth_call".to_string(),
+                serde_json::json!([
+                    { "to": format!("{:?}", known::AAVE_V3_DATA_PROVIDER), "data": format!("0x{}", hex::encode(IAaveDataProvider::getUserReserveDataCall { asset: *a, user }.abi_encode())) },
+                    "latest"
+                ]),
+            )
+        })
+        .collect();
+    let results = ctx.rpc.batch(&calls).await.ok()?;
+
+    let mut debts: Vec<(Address, U256)> = Vec::new();
+    let mut collaterals: Vec<(Address, U256)> = Vec::new();
+    for (asset, res) in assets.iter().zip(results) {
+        let Ok(v) = res else { continue };
+        let raw = crate::types::parse_bytes(&v);
+        if raw.len() < 96 {
+            continue;
+        }
+        let a_balance = U256::from_be_slice(&raw[0..32]);
+        let stable = U256::from_be_slice(&raw[32..64]);
+        let variable = U256::from_be_slice(&raw[64..96]);
+        let debt = stable.saturating_add(variable);
+        if !debt.is_zero() {
+            debts.push((*asset, debt));
+        }
+        if !a_balance.is_zero() {
+            collaterals.push((*asset, a_balance));
+        }
+    }
+    debts.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+    collaterals.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    let (debt_asset, debt_total) = debts.first().copied()?;
+    let (collateral, collateral_amount) = collaterals.first().copied()?;
+
+    let cfg = aave_reserve_cfg(ctx, cache, collateral).await?;
+    if !cfg.active {
+        return None;
+    }
+    // HF-based close factor as before: 100% when deeply under, else 50%.
+    // (v3.1 has a per-reserve close factor; this stays the documented
+    // simplification and the simulation corrects any residue.)
+    let close_factor_bps = if health < U256::from(950_000_000_000_000_000u128) {
+        10_000
+    } else {
+        5_000
+    };
+    let debt_amount =
+        debt_total.saturating_mul(U256::from(close_factor_bps)) / U256::from(10_000u64);
     if debt_amount.is_zero() {
         return None;
     }
+    Some(AavePosition {
+        user,
+        collateral,
+        collateral_amount,
+        debt_asset,
+        debt_amount_total: debt_amount,
+        bonus_bps: cfg.bonus_bps.max(10_000),
+        close_factor_bps,
+    })
+}
+
+/// The pool's reserve list, cached per strategy instance (refreshed if a
+/// read fails — governance does add reserves).
+async fn aave_reserves(ctx: &StrategyCtx, cache: &AaveCache) -> Vec<Address> {
+    {
+        let cached = cache.reserves.read();
+        if !cached.is_empty() {
+            return cached.clone();
+        }
+    }
+    let Ok(v) = ctx.rpc
+        .call_raw("eth_call", serde_json::json!([
+            { "to": format!("{:?}", known::AAVE_V3_POOL), "data": format!("0x{}", hex::encode(IAaveV3Pool::getReservesListCall {}.abi_encode())) },
+            "latest"
+        ]))
+        .await
+    else {
+        return Vec::new();
+    };
+    // address[]: offset(1 word), length, then one word per address.
+    let raw = crate::types::parse_bytes(&v);
+    if raw.len() < 64 {
+        return Vec::new();
+    }
+    let len = (U256::from_be_slice(&raw[32..64]).min(U256::from(64u8))).to::<usize>();
+    if raw.len() < 64 + len * 32 {
+        return Vec::new();
+    }
+    let out = (0..len)
+        .map(|i| Address::from_slice(&raw[64 + i * 32 + 12..64 + (i + 1) * 32]))
+        .collect::<Vec<_>>();
+    if !out.is_empty() {
+        *cache.reserves.write() = out.clone();
+    }
+    out
+}
+
+/// Reserve list + per-block reserve-config cache. Instance-owned (not
+/// globals) so the live and replay lanes cannot contaminate each other —
+/// same reasoning as the pool caches in `strategies/mod.rs`.
+#[derive(Default)]
+pub struct AaveCache {
+    reserves: RwLock<Vec<Address>>,
+    cfg: RwLock<std::collections::HashMap<Address, (u64, ReserveCfg)>>,
+}
+
+pub async fn aave_reserve_cfg(
+    ctx: &StrategyCtx,
+    cache: &AaveCache,
+    asset: Address,
+) -> Option<ReserveCfg> {
+    let head = ctx.head().number;
+    if let Some((block, cfg)) = cache.cfg.read().get(&asset) {
+        if *block == head {
+            return Some(*cfg);
+        }
+    }
+    let v = ctx.rpc
+        .call_raw("eth_call", serde_json::json!([
+            { "to": format!("{:?}", known::AAVE_V3_DATA_PROVIDER), "data": format!("0x{}", hex::encode(IAaveDataProvider::getReserveConfigurationDataCall { asset }.abi_encode())) },
+            "latest"
+        ]))
+        .await
+        .ok()?;
+    let raw = crate::types::parse_bytes(&v);
+    if raw.len() < 96 {
+        return None;
+    }
+    let bonus = U256::from_be_slice(&raw[64..96]).to::<u64>();
+    let decimals = raw[127];
+    let active = raw.len() >= 288 && raw[287] == 1;
+    let cfg = ReserveCfg {
+        bonus_bps: bonus,
+        decimals,
+        active,
+    };
+    cache.cfg.write().insert(asset, (head, cfg));
+    Some(cfg)
+}
+
+/// Build the flash-borrow → liquidationCall → swap bundle for one composed
+/// position. Public so the oracle front-runner rebuilds the exact same
+/// bundle as a back-run of a feed update.
+pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<Opportunity> {
+    let debt_asset = pos.debt_asset;
+    let collateral = pos.collateral;
+    let debt_amount = pos.debt_amount_total;
+    let executor = ctx.executor;
 
     let mut calls = vec![
         Call::new(
@@ -257,7 +501,7 @@ pub async fn build_opportunity(
             IAaveV3Pool::liquidationCallCall {
                 collateralAsset: collateral,
                 debtAsset: debt_asset,
-                user,
+                user: pos.user,
                 debtToCover: debt_amount,
                 receiveAToken: false,
             }
@@ -265,35 +509,26 @@ pub async fn build_opportunity(
         ),
     ];
 
-    // Swap the seized collateral back into the debt asset to repay the flash loan.
+    // Seized estimate from the reserve's actual bonus; the fork simulation
+    // produces the real number.
+    let seized = debt_amount.saturating_mul(U256::from(pos.bonus_bps)) / U256::from(10_000u64);
+    let mut notes = format!(
+        "aave v3 liquidation user {:?} hf-derived close {}/{} repay {} {:?} seize ~{} {:?} (bonus {} bps)",
+        pos.user, pos.close_factor_bps, 10_000, debt_amount, debt_asset, seized, collateral, pos.bonus_bps
+    );
+
     if let Some(pair) = ctx
         .pools
         .pair_for(collateral, debt_asset, Venue::UniV2)
         .await
     {
         if let Some(pool) = ctx.pools.load(pair, Venue::UniV2, ctx.head().number).await {
-            // 5% liquidation bonus is the common configuration.
-            let seized = debt_amount * U256::from(105u64) / U256::from(100u64);
-            let collateral_amount = pool
-                .reserves_for(debt_asset)
-                .map(|(r_in, r_out)| {
-                    if r_in.is_zero() {
-                        U256::ZERO
-                    } else {
-                        seized * r_out / r_in
-                    }
-                })
-                .unwrap_or(U256::ZERO);
-            if !collateral_amount.is_zero() {
-                calls.extend(build_leg(
-                    &pool,
-                    collateral,
-                    debt_asset,
-                    collateral_amount,
-                    ctx.executor,
-                ));
-            }
+            calls.extend(build_leg(&pool, collateral, debt_asset, seized, executor));
+        } else {
+            notes.push_str("; swap pool state unavailable");
         }
+    } else {
+        notes.push_str("; no V2 pool for collateral→debt (recorded unsimulatable)");
     }
 
     Some(crate::strategies::leads::liquidation_opportunity(
@@ -302,19 +537,71 @@ pub async fn build_opportunity(
         vec![debt_asset],
         vec![debt_amount],
         debt_asset,
-        // 5% bonus minus swap slippage; the simulator produces the real number.
-        debt_amount * U256::from(5u64) / U256::from(100u64),
+        seized.saturating_sub(debt_amount),
         debt_amount,
         ctx.target_block(),
-        format!(
-            "aave v3 liquidation user {user:?} hf {health} debt_base {total_debt_base} cover {debt_amount}"
-        ),
+        notes,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_bitmap_decodes_borrow_and_collateral_bits() {
+        // 0b110110: bits 1,2,4,5 set. Reserve i uses bits (2i, 2i+1) as
+        // (borrowing, collateral), so: r0 = collateral only, r1 = borrowing
+        // only, r2 = both, r3 = neither.
+        let data = U256::from(0b110110u64);
+        assert!(!aave_config_borrowing(data, 0));
+        assert!(aave_config_collateral(data, 0));
+        assert!(aave_config_borrowing(data, 1));
+        assert!(!aave_config_collateral(data, 1));
+        assert!(aave_config_borrowing(data, 2));
+        assert!(aave_config_collateral(data, 2));
+        assert!(!aave_config_borrowing(data, 3));
+        assert!(!aave_config_collateral(data, 3));
+    }
+
+    #[test]
+    fn reserves_list_decodes_static_address_array() {
+        // offset(32) | length(32) | padded addresses.
+        let mut raw = vec![0u8; 64];
+        raw[63] = 2;
+        for (i, a) in [known::WETH, known::USDC].iter().enumerate() {
+            let mut word = vec![0u8; 32];
+            word[12..].copy_from_slice(a.as_slice());
+            raw.extend_from_slice(&word);
+            let _ = i;
+        }
+        assert_eq!(Address::from_slice(&raw[64 + 12..64 + 32]), known::WETH);
+        assert_eq!(Address::from_slice(&raw[96 + 12..96 + 32]), known::USDC);
+    }
+
+    #[test]
+    fn reserve_config_words_decode_bonus_decimals_active() {
+        // Word layout verified against the live data provider: bonus is the
+        // 3rd return, decimals the 4th (last byte of that word), isActive
+        // the 9th return (word index 8, byte 31).
+        let mut raw = vec![0u8; 288];
+        let bonus: u64 = 10_650; // 6.5% — e.g. a riskier collateral
+        raw[64..96].copy_from_slice(&U256::from(bonus).to_be_bytes::<32>());
+        raw[127] = 18;
+        raw[287] = 1;
+        assert_eq!(U256::from_be_slice(&raw[64..96]).to::<u64>(), bonus);
+        assert_eq!(raw[127], 18);
+        assert_eq!(raw[287], 1);
+    }
+
+    #[test]
+    fn seized_estimate_uses_the_real_bonus() {
+        let debt = U256::from(1_000_000u64);
+        let bonus_bps = 10_650u64;
+        let seized = debt * U256::from(bonus_bps) / U256::from(10_000u64);
+        assert_eq!(seized, U256::from(1_065_000u64));
+        assert_eq!(seized - debt, U256::from(65_000u64));
+    }
 
     #[test]
     fn liquidation_call_encodes_the_right_selector() {

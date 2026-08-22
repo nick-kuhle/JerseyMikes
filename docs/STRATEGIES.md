@@ -126,9 +126,22 @@ every block their `getUserAccountData` is polled in batches of 100.
 
 **Trigger.** `healthFactor < 1e18`.
 
-**Shape.** Flash-borrow the debt asset → `liquidationCall` (never
-`receiveAToken`, we want the underlying) → swap the seized collateral back →
-repay. Close factor is 50%, or 100% when HF < 0.95.
+**Per-reserve composition.** The old USDC-debt/WETH-collateral/5%-bonus
+assumption is gone. For each unhealthy user the strategy reads the position's
+*actual* composition — `Pool.getUserConfiguration` (the borrowing/collateral
+bitmap over `getReservesList`), batched `DataProvider.getUserReserveData`
+for the reserves the bitmap says the user touches (bounded to 8), and
+`getReserveConfigurationData` for the real liquidation bonus (cached per
+block). All four ABI shapes verified against the live pool implementation
+(`0x728a138A…`) and data provider. The bundle pairs the largest debt against
+the largest collateral; the seized estimate uses the reserve's actual bonus.
+
+**Shape.** Flash-borrow the *actual* debt asset → `liquidationCall` (never
+`receiveAToken`, we want the underlying) → swap the *actual* collateral back
+→ repay. Close factor stays the HF-based simplification (50%, or 100% when
+HF < 0.95; v3.1 has a per-reserve close factor) — the simulation corrects
+any residue. Near-miss leads publish the position's real collateral, so
+the oracle front-runner matches on the right feed.
 
 **Near-miss publication.** Positions with HF in `[1.00, 1.05)` are published
 into the shared `LiquidationLeads` registry (`strategies/leads.rs`, see §4e)
@@ -136,9 +149,6 @@ every block, with the exact builder inputs to rebuild the liquidation later.
 This costs nothing extra — the health numbers were computed anyway — and it
 is what lets the oracle front-runner act in the same block as the price
 change instead of one block later.
-
-**Not yet.** Per-reserve liquidation bonus lookup instead of the 5%
-assumption.
 
 ## 4b. Compound V3 liquidation — `strategies/liquidation_compound.rs`
 

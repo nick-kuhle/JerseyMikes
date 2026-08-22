@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use crate::config::known;
 use crate::strategies::leads::LiquidationLeads;
-use crate::strategies::liquidation::build_opportunity as build_aave;
+use crate::strategies::liquidation::{build_opportunity as build_aave, compose as compose_aave};
 use crate::strategies::liquidation_maker as maker;
 use crate::strategies::liquidation_morpho as morpho;
 use crate::strategies::{StrategyCtx, StrategyImpl};
@@ -100,6 +100,8 @@ pub struct OracleFrontrunStrategy {
     resolved_at_block: RwLock<u64>,
     max_leads: usize,
     leads: LiquidationLeads,
+    /// Aave reserve cache for trigger-time position composition.
+    cache_aave: crate::strategies::liquidation::AaveCache,
 }
 
 impl OracleFrontrunStrategy {
@@ -120,6 +122,7 @@ impl OracleFrontrunStrategy {
             resolved_at_block: RwLock::new(0),
             max_leads: max_leads.max(1),
             leads,
+            cache_aave: crate::strategies::liquidation::AaveCache::default(),
         }
     }
 
@@ -243,13 +246,14 @@ impl OracleFrontrunStrategy {
         use crate::strategies::leads::LeadAction;
         match &lead.action {
             LeadAction::AaveV3 { user } => {
-                build_aave(
-                    ctx,
-                    *user,
-                    lead.debt_wei,
-                    U256::from(lead.ratio_bps as u128) * U256::from(1_000_000_000_000_000u64),
-                )
-                .await
+                // Re-read the composition at trigger time — the position may
+                // have moved since the lead was published; a healthy
+                // position reverts and the bundle dies honestly.
+                let hf_one = U256::from(1_000_000_000_000_000_000u128);
+                let health =
+                    U256::from(lead.ratio_bps as u128) * U256::from(1_000_000_000_000_000u64);
+                let pos = compose_aave(ctx, &self.cache_aave, *user, health.max(hf_one)).await?;
+                build_aave(ctx, &pos).await
             }
             LeadAction::Morpho {
                 market_id,
