@@ -1,5 +1,9 @@
 # Risk & safety
 
+> Moving a simulating bot to live? Do it in the order set out in
+> [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) — secure the API first, tighten these
+> knobs second, arm last.
+
 ## Why nothing can be broadcast
 
 1. **No submission call site.** The engine records `BundleRecord`s and stops.
