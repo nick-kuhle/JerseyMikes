@@ -20,6 +20,24 @@ Profit relay delivered-block ingestion. That integration routes already-mined
 transactions through the strategy funnel, which interacts directly with W1 —
 see §1.7.
 
+**Closeout status (2026-08-22):** Phase 2 implementation work is **done** —
+this document now exists only for the two decision gates that need live
+funnel data, then it gets deleted (§4). Shipped since the continuation
+note below: liquidation coverage (Compound V3 absorb+storefront, Morpho
+Blue v1.1, Maker bark+atomic take — `STRATEGIES.md` §4b–4d), oracle-update
+front-running (§4e), the near-miss leads registry, decoded revert reasons
+(including `CallFailed` inner data), the fork gas clamps, fixture-executor
+WETH funding (the sandwich/sniper/JIT leg-0 artifact), the instant runtime
+risk envelope (`GET/POST /api/risk`), the go-live deployment panel, console
+jump-nav/collapsible sections, and the Phase 3 ops surface — alerting rules
+(`GET /api/alerts`, `docs/DEPLOYMENT.md`), Prometheus `GET /api/metrics`,
+systemd/Docker units. **Remaining before deletion:** (1) the W6 go/no-go —
+read the funnel panel's gap card after ≥7 days of post-WETH-fix data (the
+earlier sandwich/sniper/JIT rows measured an inventory artifact, so the
+baseline resets from that merge), fill `W6_MEMO.md`, flip or close;
+(2) the W4 raise decision (`atomic_arb.candidatesEmitted` at 3 legs vs the
+2-leg baseline, same fresh window). Both are decisions, not code.
+
 **Continuation status (2026-08-21, later session):** Funnel week is done. W4
 default is 3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off
 until a written public-mempool gap memo exists — the funnel panel now renders

@@ -326,6 +326,7 @@ export type FeedEvent =
   | {kind: "bundle"; id: string; strategy: Strategy; target_block: number; submitted: boolean}
   | {kind: "relay"; relay: string; slot: number; builder: string; value_wei: string; seen_at_ms: number}
   | {kind: "relay_block"; block: RelayBlock; tx_count: number; txs: RelayTxSummary[]}
+  | {kind: "alert"; rule: string; severity: string; message: string; active: boolean; seen_at_ms: number}
   | {
       kind: "reorg";
       from_block: number;

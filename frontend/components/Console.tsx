@@ -318,6 +318,7 @@ export default function Console() {
                 "relay",
                 "relay_block",
                 "reorg",
+                "alert",
               ].map((k) => (
                 <option key={k} value={k}>
                   {k}

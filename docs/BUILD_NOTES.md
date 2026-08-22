@@ -1,5 +1,24 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (alerting + deployment units)
+
+Phase 3's ops items: a rule engine over live engine state (`alerts.rs`,
+evaluated on `ALERT_EVAL_SECS`), a Prometheus text endpoint
+(`/api/metrics`, `metrics.rs` — a JSON→samples renderer plus labelled
+per-strategy funnel lines with a `lane` so the two lanes are never summed),
+`GET /api/alerts`, alert transitions on the SSE feed, optional webhook
+delivery, systemd units + Dockerfiles/compose under `deploy/` (the bot image
+ships anvil from the official Foundry image), and `docs/DEPLOYMENT.md` with
+a scrape config and starter alert expressions. Log shipping is delegated to
+journald / the Docker logging driver — one logging system, in the platform.
+
+Verified: `cargo test --all` 199 passed (10 new: rule table incl. threshold
+edges and the boot-noise cases, lifecycle fire/resolve, Prometheus renderer
+incl. labelled funnels and label escaping); clippy clean; compose YAML
+parsed locally (the CI-workflow lesson, applied). Not verified here: the
+systemd units and images themselves — they need a host with systemd/Docker;
+`docs/DEPLOYMENT.md` is the runbook.
+
 ## Session 2026-08-22 (fixture-executor WETH funding + console nav/collapse)
 
 **Every sandwich/sniper/JIT leg-0 `CallFailed ... reverted bare`.** Decoded

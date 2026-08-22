@@ -49,6 +49,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/mode", get(mode).post(set_mode))
         .route("/api/risk", get(risk_state).post(set_risk))
         .route("/api/risk/reset", post(reset_risk))
+        .route("/api/alerts", get(alerts))
+        .route("/api/metrics", get(metrics))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -409,4 +411,67 @@ async fn reset_risk(State(s): State<ApiState>) -> impl IntoResponse {
     e.risk.reset();
     tracing::warn!(target: "api", was_tripped = was, "kill switch reset from the dashboard");
     Json(json!({"ok": true, "wasTripped": was, "tripped": false}))
+}
+
+/// Active alerts + transition history (see `alerts.rs` for the rules).
+async fn alerts(State(s): State<ApiState>) -> impl IntoResponse {
+    let e = &s.engine;
+    Json(json!({
+        "active": e.alerts.active(),
+        "recent": e.alerts.history(),
+        "evalSecs": e.cfg.alerts.eval_secs,
+    }))
+}
+
+/// Prometheus text exposition of everything the console already shows.
+async fn metrics(State(s): State<ApiState>) -> Response {
+    let e = &s.engine;
+    let head = e.ctx.head();
+    let risk = e.runtime.risk();
+    let status = json!({
+        "up_ms": now_ms().saturating_sub(e.stats.started_at_ms.load(std::sync::atomic::Ordering::Relaxed)),
+        "live": e.mode.live(),
+        "live_armed": e.mode.armed(),
+        "head_number": head.number,
+        "head_base_fee_wei": head.base_fee_per_gas.to_string(),
+        "pools": e.ctx.pools.len(),
+        "pools_v3": e.ctx.pools_v3.len(),
+        "kill_switch_tripped": e.risk.is_tripped(),
+        "cumulative_net_wei": e.risk.cumulative_net().to_string(),
+        "risk": {
+            "min_net_profit_wei": risk.min_net_profit_wei.to_string(),
+            "max_position_wei": risk.max_position_wei.to_string(),
+            "max_base_fee_wei": risk.max_base_fee_wei.to_string(),
+            "max_drawdown_wei": risk.max_drawdown_wei.to_string(),
+            "bribe_bps": risk.bribe_bps,
+            "max_gas_per_bundle": risk.max_gas_per_bundle,
+        },
+        "stats": e.stats.snapshot(),
+        "latency": e.latency.snapshot(),
+        "inventory": e.inventory.snapshot(),
+        "alerts_active": e.alerts.active().len(),
+    });
+    let mut body = crate::metrics::render(&status, "mev");
+    let live = serde_json::Value::Object(crate::engine::Stats::funnel_json(&e.stats.funnel));
+    let replay =
+        serde_json::Value::Object(crate::engine::Stats::funnel_json(&e.stats.funnel_replay));
+    body.push_str(&crate::metrics::render_funnel(&live, "mev_funnel", "live"));
+    body.push_str(&crate::metrics::render_funnel(
+        &replay,
+        "mev_funnel",
+        "replay",
+    ));
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
