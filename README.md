@@ -209,6 +209,13 @@ read-only RPC proxy (uses the bot's `ETH_HTTP_URL` when set).
 Everything is environment-driven; see [`.env.example`](.env.example) for the
 annotated list. The only required variable is `ETH_HTTP_URL`.
 
+The bot's API binds `127.0.0.1:8080` by default. Its three mutating endpoints
+(`POST /api/mode`, `/api/risk`, `/api/risk/reset`) can trip the kill switch,
+disable strategies, and rewrite the risk envelope, so exposing them off-box
+requires a shared secret: set `API_AUTH_TOKEN` whenever `API_BIND` is not
+loopback, or the bot refuses to start. See
+[Securing the API](docs/DEPLOYMENT.md#securing-the-api).
+
 Risk defaults are intentionally permissive — `MIN_NET_PROFIT_WEI=1`,
 `MAX_POSITION_WEI=100 ETH`, every strategy on — because the first run's job is
 to measure what is reachable, not to be profitable. See

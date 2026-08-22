@@ -1,5 +1,5 @@
 import {NextRequest} from "next/server";
-import {botFetch, BOT_API_URL} from "@/lib/bot";
+import {botAuthHeaders, botFetch, BOT_API_URL} from "@/lib/bot";
 import {
   demoCompetition,
   demoEvent,
@@ -152,7 +152,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
       const upstream = await fetch(`${BOT_API_URL}/api/${route}`, {
         method: "POST",
         signal: controller.signal,
-        headers: {"content-type": "application/json"},
+        headers: {"content-type": "application/json", ...botAuthHeaders()},
         body: JSON.stringify(body),
       });
       clearTimeout(timer);
@@ -214,7 +214,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
     const upstream = await fetch(`${BOT_API_URL}/api/mode`, {
       method: "POST",
       signal: controller.signal,
-      headers: {"content-type": "application/json"},
+      headers: {"content-type": "application/json", ...botAuthHeaders()},
       body: JSON.stringify({live: body.live}),
     });
     clearTimeout(timer);
@@ -251,7 +251,7 @@ async function streamResponse(qs: string): Promise<Response> {
     const timer = setTimeout(() => controller.abort(), 2000);
     const upstream = await fetch(`${BOT_API_URL}/api/stream${qs ? `?${qs}` : ""}`, {
       signal: controller.signal,
-      headers: {accept: "text/event-stream"},
+      headers: {accept: "text/event-stream", ...botAuthHeaders()},
     });
     clearTimeout(timer);
     if (upstream.ok && upstream.body) {

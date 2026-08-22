@@ -1,15 +1,26 @@
 # JerseyMikes — bot + console.
 #   docker compose --env-file ../.env up -d --build
-# Metrics: scrape http://localhost:8080/api/metrics from the host.
+# Metrics: scrape http://127.0.0.1:8080/api/metrics from the host.
+#
+# The bot binds 0.0.0.0 inside its container so the console container can
+# reach it over the compose network. That makes API_AUTH_TOKEN mandatory —
+# the bot refuses to start on a non-loopback bind without one, because the
+# mutating endpoints (mode / risk / risk reset) are otherwise wide open.
+# Set it in ../.env:  API_AUTH_TOKEN=$(openssl rand -hex 32)
 services:
   bot:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.bot
     env_file: ../.env
+    environment:
+      API_BIND: "0.0.0.0:8080"
+      API_AUTH_TOKEN: "${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env - generate with openssl rand -hex 32}"
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # Host-loopback only. Publishing on 0.0.0.0 would expose the API to the
+      # whole network; reach it remotely over an SSH tunnel instead.
+      - "127.0.0.1:8080:8080"
     volumes:
       - bot-data:/data
   console:
@@ -18,6 +29,8 @@ services:
       dockerfile: deploy/Dockerfile.console
     environment:
       BOT_API_URL: http://bot:8080
+      # Lets the console's server-side proxy call the bot's mutating endpoints.
+      BOT_API_TOKEN: "${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env - generate with openssl rand -hex 32}"
       ETH_PROXY_URL: ${ETH_HTTP_URL:-}
     restart: unless-stopped
     ports:

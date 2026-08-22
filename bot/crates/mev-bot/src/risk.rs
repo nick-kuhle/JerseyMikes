@@ -429,6 +429,8 @@ mod tests {
                 db_path: ":memory:".into(),
                 feed_capacity: 10,
                 write_queue_capacity: 1_024,
+                auth_token: None,
+                allowed_origins: vec![],
             },
             pool_discovery: true,
             pool_discovery_v3: false,

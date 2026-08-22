@@ -11,6 +11,48 @@ the same operational surface:
 | Metrics | `GET /api/metrics` — Prometheus text: funnel per strategy/lane, latency percentiles, stats, risk envelope, kill switch, inventory |
 | Alerts | `GET /api/alerts` — active set + transition history; also on the SSE feed (`alert` events) and, if `ALERT_WEBHOOK_URL` is set, POSTed there |
 
+## Securing the API
+
+The API is **split into reads and writes**, and only the writes are guarded:
+
+| | Endpoints | Auth |
+| --- | --- | --- |
+| Reads | `/api/health`, `/api/status`, `/api/metrics`, `/api/alerts`, `/api/stream`, `GET /api/mode`, `GET /api/risk`, … | none |
+| Writes | `POST /api/mode`, `POST /api/risk`, `POST /api/risk/reset` | `Authorization: Bearer $API_AUTH_TOKEN` |
+
+Those three writes are not cosmetic: they trip and clear the kill switch,
+disable strategies, and set the risk envelope — including `bribeBps`, which at
+10000 hands 100% of gross profit to the block builder. Treat the token like a
+production credential.
+
+Two rules enforce this, so a dangerous deployment fails loudly instead of
+quietly:
+
+1. **`API_BIND` defaults to `127.0.0.1:8080`.** The console reaches the bot
+   *server-side* through its own `/api/bot/*` proxy, so a loopback bind is
+   fully functional for the normal single-host setup.
+2. **A non-loopback `API_BIND` requires `API_AUTH_TOKEN`.** The bot refuses to
+   start otherwise, with a message naming both fixes.
+
+```bash
+# generate once, put it in .env
+API_AUTH_TOKEN=$(openssl rand -hex 32)
+```
+
+The console forwards the token on the operator's behalf when `BOT_API_TOKEN`
+is set (see `.env.example`). It is a server-only variable — deliberately not
+`NEXT_PUBLIC_`, so it never reaches the browser bundle.
+
+Browser CORS is closed by default: `API_ALLOWED_ORIGINS` is empty, meaning no
+cross-origin page can call the API at all. Only set it if some *other* browser
+app must talk to the bot directly; the bundled console does not.
+
+To reach a loopback-bound API from your laptop, tunnel rather than rebind:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 user@host   # then use http://127.0.0.1:8080
+```
+
 ## systemd
 
 ```bash
@@ -35,8 +77,17 @@ cd deploy && docker compose --env-file ../.env up -d --build
 ```
 
 The bot image carries `anvil` (copied from the official Foundry image);
-SQLite persists on the `bot-data` volume. Point your Prometheus at
-`http://<host>:8080/api/metrics`.
+SQLite persists on the `bot-data` volume.
+
+Compose sets `API_BIND=0.0.0.0:8080` inside the bot container — the console
+container has to reach it over the compose network — and therefore **requires
+`API_AUTH_TOKEN` in `../.env`**; `docker compose` errors out naming the
+variable if it is missing. The published port is bound to host loopback
+(`127.0.0.1:8080:8080`), so the API is not exposed to your network even though
+it is `0.0.0.0` inside the container.
+
+Point your Prometheus at `http://127.0.0.1:8080/api/metrics` (or scrape the
+container directly over the compose network).
 
 ## Alert rules (evaluated every `ALERT_EVAL_SECS`, default 30s)
 
