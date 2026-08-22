@@ -31,6 +31,11 @@
     "type": "error"
   },
   {
+    "inputs": [],
+    "name": "BribeFailed",
+    "type": "error"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint256",
@@ -63,7 +68,38 @@
   },
   {
     "inputs": [],
+    "name": "QuoteIsEthCallOnly",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "Reentrancy",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SweepFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "to",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "TransferFailed",
     "type": "error"
   },
   {
@@ -451,6 +487,52 @@
       }
     ],
     "name": "quote",
+    "outputs": [
+      {
+        "internalType": "int256",
+        "name": "delta",
+        "type": "int256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "gasUsed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "value",
+            "type": "uint256"
+          },
+          {
+            "internalType": "bytes",
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "internalType": "struct MevExecutor.Call[]",
+        "name": "calls",
+        "type": "tuple[]"
+      },
+      {
+        "internalType": "address",
+        "name": "profitToken",
+        "type": "address"
+      }
+    ],
+    "name": "quoteFrom",
     "outputs": [
       {
         "internalType": "int256",
