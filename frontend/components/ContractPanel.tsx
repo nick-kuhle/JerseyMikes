@@ -15,6 +15,8 @@ import {
   createPublicClient,
   createWalletClient,
   custom,
+  decodeFunctionResult,
+  encodeFunctionData,
   http,
   formatEther,
   isAddress,
@@ -26,6 +28,8 @@ import EXECUTOR_ABI from "@/lib/MevExecutor.abi.json";
 import {shortHash} from "@/lib/format";
 import {addressUrl, explorerName, txUrl} from "@/lib/explorer";
 import {useWallet} from "@/lib/wallet";
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 export default function ContractPanel({
   executor,
@@ -45,6 +49,9 @@ export default function ContractPanel({
   const [status, setStatus] = useState<string>("");
   const [txHash, setTxHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** `quote()` dry-run: the profit token to measure the delta in. */
+  const [quoteToken, setQuoteToken] = useState("0x0000000000000000000000000000000000000000");
+  const [quoteResult, setQuoteResult] = useState<string | null>(null);
 
   const publicClient = useMemo(
     () => createPublicClient({chain: mainnet, transport: http("/api/eth")}),
@@ -203,6 +210,49 @@ export default function ContractPanel({
     [address, target, eip1193, publicClient, read]
   );
 
+  /**
+   * Dry-run the executor's `quote(calls, profitToken)` against current state.
+   *
+   * Sent as an `eth_call` with **no `from`**, which is what makes
+   * `msg.sender == address(0)` hold and the gate pass — viem's
+   * `simulateContract` would inject an account and hit `QuoteIsEthCallOnly`.
+   *
+   * An empty batch is the useful default here: it costs nothing and proves the
+   * whole path (proxy → RPC → contract → decode) works, which is exactly what
+   * an operator wants to confirm before trusting a sized quote.
+   */
+  const runQuote = useCallback(async () => {
+    if (!isAddress(target)) {
+      setQuoteResult("not a valid executor address");
+      return;
+    }
+    if (!isAddress(quoteToken)) {
+      setQuoteResult("profit token must be an address (0x0 for native ETH)");
+      return;
+    }
+    setQuoteResult("quoting…");
+    try {
+      const data = encodeFunctionData({
+        abi: EXECUTOR_ABI,
+        functionName: "quote",
+        args: [[], quoteToken as Address],
+      });
+      // Deliberately no `account`: the zero sender is the gate.
+      const res = await publicClient.call({to: target as Address, data});
+      const [delta, gasUsed] = decodeFunctionResult({
+        abi: EXECUTOR_ABI,
+        functionName: "quote",
+        data: res.data ?? "0x",
+      }) as [bigint, bigint];
+      const sign = delta > 0n ? "+" : "";
+      setQuoteResult(
+        `delta ${sign}${formatEther(delta)} ${quoteToken === ZERO_ADDRESS ? "ETH" : "tokens"} · gas ${gasUsed.toString()}`,
+      );
+    } catch (e) {
+      setQuoteResult(`quote failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+  }, [target, quoteToken, publicClient]);
+
   const wrongChain = address !== null && chainId !== undefined && walletChain !== null && walletChain !== chainId;
   const txLink = txUrl(chainId ?? walletChain ?? undefined, txHash);
 
@@ -323,6 +373,27 @@ export default function ContractPanel({
         </button>
         <span className="muted" style={{fontSize: 11}}>
           owner-only · amount in ETH · `sweep(token, to, amount)`
+        </span>
+      </div>
+
+      <div style={{display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
+        <input
+          value={quoteToken}
+          onChange={(e) => setQuoteToken(e.target.value)}
+          placeholder="profit token (0x0 = ETH)"
+          spellCheck={false}
+          style={{...inputStyle, minWidth: 320}}
+        />
+        <button
+          disabled={!isAddress(target) || !isAddress(quoteToken)}
+          onClick={() => void runQuote()}
+          style={btnStyle}
+          title="eth_call dry-run of quote(calls, profitToken) with an empty batch — no wallet, no gas, nothing broadcast"
+        >
+          dry-run quote
+        </button>
+        <span className="muted" style={{fontSize: 11}}>
+          {quoteResult ?? "read-only · `quote(calls, profitToken)` · empty batch"}
         </span>
       </div>
 

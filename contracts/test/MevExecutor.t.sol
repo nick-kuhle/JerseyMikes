@@ -319,5 +319,60 @@ contract MevExecutorTest is Test {
         console2.log("sandwich gross (tokenA wei)", profitA - frontRun);
     }
 
+    // -----------------------------------------------------------------
+    // receive() is load-bearing, not decorative
+    // -----------------------------------------------------------------
+
+    /// The WETH-profit bribe path unwraps via `IWETH.withdraw`, and WETH9 pays
+    /// out by sending ETH straight back to the executor. If `receive()` ever
+    /// reverts, `withdraw` fails, the whole batch reverts, and every
+    /// WETH-denominated bribe silently stops working. This test pins that
+    /// dependency so the "make receive() revert" refactor cannot land
+    /// unnoticed.
+    function test_wethProfitBribeRoutesEthThroughReceive() public {
+        weth.mint(address(this), 1 ether);
+        weth.approve(address(exec), type(uint256).max);
+        // Back the WETH contract so withdraw() can actually pay out.
+        vm.deal(address(weth), 1 ether);
+
+        MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
+        calls[0] = MevExecutor.Call({
+            target: address(weth),
+            value: 0,
+            data: abi.encodeWithSignature(
+                "transferFrom(address,address,uint256)", address(this), address(exec), 1 ether
+            )
+        });
+
+        MevExecutor.Guard memory g = _guard(address(weth), 1);
+        g.bribeBps = 5000; // half the profit to the builder
+
+        address builder = address(0xC0FFEE);
+        vm.coinbase(builder);
+        uint256 before = builder.balance;
+
+        vm.prank(searcher);
+        uint256 profit = exec.execute(bytes32("weth-bribe"), calls, g);
+
+        assertEq(profit, 1 ether, "profit measured in WETH");
+        assertEq(builder.balance, before + 0.5 ether, "builder paid in unwrapped ETH");
+    }
+
+    /// A plain ETH transfer into the executor must succeed: routers refund
+    /// unspent ETH this way, and `sweep` is how it comes back out.
+    function test_plainEthTransferIsAccepted() public {
+        uint256 before = address(exec).balance;
+        (bool ok,) = address(exec).call{value: 1 ether}("");
+        assertTrue(ok, "executor must accept native ETH");
+        assertEq(address(exec).balance, before + 1 ether);
+    }
+
+    /// There is no fallback(): an unknown selector must revert rather than
+    /// silently succeed.
+    function test_unknownSelectorReverts() public {
+        (bool ok,) = address(exec).call(abi.encodeWithSignature("noSuchFunction()"));
+        assertFalse(ok, "unknown selectors must revert (no fallback)");
+    }
+
     receive() external payable {}
 }

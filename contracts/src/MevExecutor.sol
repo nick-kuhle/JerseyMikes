@@ -39,14 +39,24 @@ contract MevExecutor is IFlashLoanRecipient {
         uint256 maxBaseFee;
     }
 
-    // keccak256("jerseymikes.reentrancy.guard")
+    // Transient-storage (EIP-1153) guard slots.
+    //
+    // These are arbitrary fixed constants, not hashes — an earlier comment
+    // described them as `keccak256("jerseymikes.…")`, which they are not
+    // (verified: keccak256("jerseymikes.reentrancy.guard") is
+    // 0x0217913e…3090, not the value below). The values are left byte-for-byte
+    // unchanged because they are already correct for their purpose and
+    // changing them would alter the runtime bytecode for no benefit; only the
+    // claim about their derivation is fixed.
+    //
+    // Uniqueness is what actually matters here, and it holds: transient
+    // storage is private to this contract, all three constants are distinct,
+    // and each is far outside the low slot range the compiler would ever
+    // assign on its own.
     bytes32 private constant _REENTRANCY_SLOT =
         0x9d0c4a1f5e1a2b6f5f8c0e5f3f5c0a6b1b5b2a7c8d9e0f1a2b3c4d5e6f708192;
-    // keccak256("jerseymikes.flashloan.guard")
     bytes32 private constant _FLASHLOAN_SLOT =
         0x1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809;
-
-    // keccak256("jerseymikes.v3.callback.guard")
     bytes32 private constant _V3_CALLBACK_SLOT =
         0x2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a;
 
@@ -72,6 +82,14 @@ contract MevExecutor is IFlashLoanRecipient {
     error CallFailed(uint256 index, bytes returndata);
     error BadFlashCallback();
     error BadBribe();
+    /// @notice `sweep` could not deliver native ETH to `to`.
+    error SweepFailed();
+    /// @notice The coinbase transfer of the builder bribe reverted.
+    error BribeFailed();
+    /// @notice An ERC20 `transfer` returned false or reverted.
+    error TransferFailed(address token, address to, uint256 amount);
+    /// @notice `quote` was called with a real sender; use `quoteFrom` instead.
+    error QuoteIsEthCallOnly();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -106,6 +124,19 @@ contract MevExecutor is IFlashLoanRecipient {
         emit OwnerChanged(address(0), msg.sender);
     }
 
+    /// @notice Accepts native ETH.
+    ///
+    /// @dev This MUST stay permissive. It is not a convenience: the WETH-profit
+    ///      bribe path in `_settle` calls `IWETH.withdraw(bribe)`, and WETH9
+    ///      pays out by sending ETH straight back here. A reverting `receive()`
+    ///      would make `withdraw` fail, which reverts the whole batch and
+    ///      silently disables every WETH-denominated bribe. The same applies to
+    ///      any batch leg that unwraps WETH or receives an ETH refund from a
+    ///      router.
+    ///
+    ///      There is deliberately no `fallback()`: calls to unknown selectors
+    ///      revert by default, which is the desired behaviour and costs no
+    ///      bytecode.
     receive() external payable {}
 
     // ---------------------------------------------------------------------
@@ -126,7 +157,7 @@ contract MevExecutor is IFlashLoanRecipient {
     function sweep(address token, address to, uint256 amount) external onlyOwner {
         if (token == address(0)) {
             (bool ok,) = to.call{value: amount}("");
-            require(ok, "sweep failed");
+            if (!ok) revert SweepFailed();
         } else {
             _safeTransfer(token, to, amount);
         }
@@ -261,19 +292,73 @@ contract MevExecutor is IFlashLoanRecipient {
     // Views used by the off-chain simulator
     // ---------------------------------------------------------------------
 
-    /// @notice Dry-run helper: returns the realised delta without the profit requirement.
-    /// @dev Intended to be used with `eth_call` (optionally with state overrides) so the
-    ///      bot can size an opportunity before it commits to a bundle. Always reverts when
-    ///      called on-chain by anyone other than address(0) (the eth_call default sender).
+    /// @notice Dry-run a batch and report the realised profit-token delta,
+    ///         without enforcing any profit requirement.
+    ///
+    /// @dev **This is an `eth_call`-only entry point and is not usable in a
+    ///      transaction.** It executes the batch for real against the current
+    ///      state and then reports the delta, so allowing it on-chain would let
+    ///      anyone move the contract's funds through arbitrary calls. The
+    ///      `msg.sender == address(0)` requirement is what makes that
+    ///      impossible: `address(0)` cannot originate a transaction, so this
+    ///      body can only ever run inside a simulated call.
+    ///
+    ///      **How to call it.** Send an `eth_call` with **no `from` field** (or
+    ///      an explicit `from` of the zero address); most clients default to
+    ///      `address(0)` when `from` is omitted. Pair it with state overrides to
+    ///      size an opportunity against a hypothetical state — the usual
+    ///      pattern is to override the executor's token balances, quote several
+    ///      candidate sizes, then submit only the best one through `execute`.
+    ///
+    ///      Callers that cannot omit `from` (some wallets and providers inject
+    ///      one) should use [`quoteFrom`], which is override-friendly, or the
+    ///      simulator's fork path.
+    ///
+    /// @param calls       The batch to dry-run, in order.
+    /// @param profitToken Token the delta is measured in; `address(0)` = native ETH.
+    /// @return delta      Signed change in the executor's `profitToken` balance.
+    ///                    Negative means the batch would lose money.
+    /// @return gasUsed    Gas consumed by the batch, for the bot's gas model.
     function quote(Call[] calldata calls, address profitToken)
         external
         payable
         returns (int256 delta, uint256 gasUsed)
     {
-        require(msg.sender == address(0), "eth_call only");
+        if (msg.sender != address(0)) revert QuoteIsEthCallOnly();
+        return _quote(calls, profitToken);
+    }
+
+    /// @notice `quote` for callers whose tooling always sets a `from` address.
+    ///
+    /// @dev Same dry-run, same return values, but gated on the caller being a
+    ///      searcher or the owner instead of on `address(0)`. That keeps the
+    ///      "arbitrary calls with the contract's funds" surface closed to the
+    ///      public while letting an allowlisted operator size an opportunity
+    ///      from a wallet, a block explorer, or any provider that injects a
+    ///      `from`.
+    ///
+    ///      **Still intended for `eth_call` only.** Nothing stops a searcher
+    ///      from sending this as a transaction, but doing so would execute the
+    ///      batch with *no profit guard* and pay gas for it — use `execute` for
+    ///      anything that should land on chain.
+    function quoteFrom(Call[] calldata calls, address profitToken)
+        external
+        payable
+        onlySearcher
+        returns (int256 delta, uint256 gasUsed)
+    {
+        return _quote(calls, profitToken);
+    }
+
+    function _quote(Call[] calldata calls, address profitToken)
+        private
+        returns (int256 delta, uint256 gasUsed)
+    {
         uint256 gasStart = gasleft();
         uint256 before = _balance(profitToken);
         _run(calls);
+        // Balances are bounded by total supply, so neither cast can overflow
+        // int256 for any real token.
         delta = int256(_balance(profitToken)) - int256(before);
         gasUsed = gasStart - gasleft();
     }
@@ -311,7 +396,7 @@ contract MevExecutor is IFlashLoanRecipient {
                 }
                 if (bribe != 0) {
                     (bool ok,) = block.coinbase.call{value: bribe}("");
-                    require(ok, "bribe failed");
+                    if (!ok) revert BribeFailed();
                 }
             }
         }
@@ -350,6 +435,9 @@ contract MevExecutor is IFlashLoanRecipient {
 
     function _safeTransfer(address token, address to, uint256 amount) private {
         (bool ok, bytes memory ret) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "transfer failed");
+        // Non-standard tokens return nothing on success; treat empty as ok.
+        if (!ok || (ret.length != 0 && !abi.decode(ret, (bool)))) {
+            revert TransferFailed(token, to, amount);
+        }
     }
 }
