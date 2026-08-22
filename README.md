@@ -184,6 +184,10 @@ cargo run --release --bin mev-bot    # run
   `.env` snippet remains for persisting values as boot defaults. Strategy
   toggles narrow only (boot set is the ceiling), and a tripped drawdown
   kill switch can be re-armed from the panel.
+- **Alerts**: rule engine (kill switch, endpoint stalls, conversion
+  collapse, reorgs) with fire/resolve lifecycle — `GET /api/alerts`, the
+  live tape (`alert` events), and Prometheus metrics at `/api/metrics`
+  (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md))
 - **Go-live checklist**: the six-step MevExecutor deployment panel
   (`docs/GO_LIVE.md` Path A) — connect wallet, gas check, deploy (CI-checked
   bytecode, free cost estimate), fund, `setSearcher`, verify + copy the
@@ -227,13 +231,19 @@ to measure what is reachable, not to be profitable. See
 
 ## Status
 
-Phase 2 of [the roadmap](docs/ROADMAP.md) is in measurement: W0–W5 are on
-(`ARB_MAX_CYCLE_LEN=3`, V3 sandwich + V3 discovery paired). UniversalRouter
-decoding stays off until a public-mempool gap is written down (the funnel
-panel now measures that gap and [`docs/W6_MEMO.md`](docs/W6_MEMO.md) records
-the decision). The pipeline is still simulation-only: the dashboard's mode
-switch is layered strictly on top of the boot-time two-key arming and can
-never arm an unarmed bot. Going live is Phase 3 and is a separate decision.
+Phase 2 implementation is complete — including liquidation coverage
+(Aave/Compound V3/Morpho Blue/Maker), oracle-update front-running, and
+decoded revert reasons — and what remains of the phase is two data-gated
+decisions (W6 UniversalRouter decoding, W4 arb leg count) tracked in
+[`PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md); note that the WETH-funding
+fix reset the sandwich/sniper/JIT funnel baseline, so read those rows from
+that merge forward. The console now tunes the risk envelope at runtime
+(`/api/risk`), walks the go-live deployment checklist, and the ops surface
+ships alerting + Prometheus metrics + systemd/Docker units
+([`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)). The pipeline is still
+simulation-only: the mode switch is layered strictly on top of the
+boot-time two-key arming and can never arm an unarmed bot. Going live is
+Phase 3 and is a separate decision.
 
 ⚠️ Sandwich attacks extract value from other users. This repository is a
 research tool; deploying it against live users is your decision and your

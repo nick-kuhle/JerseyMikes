@@ -90,6 +90,18 @@ Remaining Phase 2 coverage:
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
       (out of scope for this phase)
 
+**Status note (2026-08-22):** Phase 3 ops landed (alerting rules + webhook,
+`/api/metrics`, systemd/Docker units — `DEPLOYMENT.md`), the console tunes
+the risk envelope at runtime and walks the go-live checklist, and the
+simulator now decodes revert reasons (incl. `CallFailed` inner data) and
+funds the fixture executor with WETH — **that fix reset the
+sandwich/sniper/JIT funnel baseline**, so read those rows from that merge
+forward when judging the W6/W4 gates. What remains of Phase 2 is decisions,
+not code: fill `W6_MEMO.md` from the funnel panel's gap card and flip or
+close W6; compare 3-leg `candidatesEmitted` against the 2-leg baseline for
+W4. `PHASE_2_HANDOFF.md` now carries a closeout note and gets deleted once
+those two decisions are written down.
+
 **Status note (2026-08-21):** Liquidation coverage landed: the four new
 strategies default on with the rest (the first run's job is still to measure
 what is reachable); watch each row's `candidatesEmitted` against the added
