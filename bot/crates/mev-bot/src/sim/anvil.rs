@@ -420,6 +420,52 @@ impl AnvilSim {
                 .call_raw("anvil_setBalance", json!([format!("{who:?}"), big]))
                 .await;
         }
+        // WETH inventory for the fixture executor. Sandwich fronts, JIT
+        // mint callbacks and sniper buys all *spend* WETH the batch must
+        // already hold — those strategies are deliberately not flash-funded
+        // — and WETH9's `transfer` is a bare `require(balanceOf >= wad)`,
+        // so an unfunded executor shows up as exactly
+        // `CallFailed(index=0): the leg reverted bare`. A real
+        // `EXECUTOR_ADDRESS` is NOT topped up: its forked balance is the
+        // honest picture of live readiness (fund it for real before live
+        // sandwich/JIT — see docs/GO_LIVE.md).
+        if self.cfg.endpoints.executor.is_none() {
+            use alloy_sol_types::{sol, SolCall};
+            sol! {
+                interface IWETH9 {
+                    function deposit() external payable;
+                }
+            }
+            // The deposit's value plus its gas must fit the balance: bump the
+            // executor first so depositing the full `big` cannot fail its
+            // `gas * price + value` check (probed against a live anvil —
+            // depositing exactly the funded balance is rejected).
+            let _ = self
+                .rpc
+                .call_raw(
+                    "anvil_setBalance",
+                    json!([
+                        format!("{:?}", self.executor),
+                        format!(
+                            "0x{:x}",
+                            U256::from(30_000u64) * U256::from(1_000_000_000_000_000_000u128)
+                        )
+                    ]),
+                )
+                .await;
+            let _ = self
+                .rpc
+                .call_raw(
+                    "eth_sendTransaction",
+                    json!([{
+                        "from": format!("{:?}", self.executor),
+                        "to": format!("{:?}", self.cfg.chain.weth),
+                        "value": big,
+                        "data": format!("0x{}", hex::encode(IWETH9::depositCall {}.abi_encode())),
+                    }]),
+                )
+                .await;
+        }
         self.refresh_block_gas_limit().await;
         Ok(())
     }

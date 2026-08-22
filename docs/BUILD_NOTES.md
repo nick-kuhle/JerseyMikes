@@ -1,5 +1,34 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (fixture-executor WETH funding + console nav/collapse)
+
+**Every sandwich/sniper/JIT leg-0 `CallFailed ... reverted bare`.** Decoded
+chain of evidence: `build_leg`'s first call is `token_in.transfer(pair, …)`
+— WETH for those strategies — the strategies are deliberately not
+flash-funded, and `prepare_state` funded only ETH, never WETH. WETH9's
+`transfer` is a bare `require(balanceOf >= wad)`, reproduced against a live
+anvil fork as `execution reverted, data: "0x"`. Fix: the **fixture**
+executor (no `EXECUTOR_ADDRESS`) is now topped up with 10k WETH via an
+impersonated `WETH.deposit` after every (re)fork. The first version of the
+fix had a bug the live probe caught immediately: depositing *exactly* the
+funded balance fails anvil's `gas * price + value` check — the executor is
+bumped to 30k ETH first. Verified end-to-end on a real fork: setBalance →
+deposit accepted → `balanceOf` = 10,000 → leg-0 transfer admitted. A real
+`EXECUTOR_ADDRESS` is deliberately NOT topped up (its forked balance is the
+honest live-readiness picture — fund it for real before live sandwich/JIT).
+
+**Console declutter** (the "scroll gets stuck inside a card" report): a
+sticky jump nav (P/L · Activity · Transactions · Relay · Funnel · Controls ·
+Go live · Executor) with smooth scrolling, collapsible sections (relay
+blocks and go-live default-collapsed, the rest open), so the page between
+tables is short instead of one endless scroll past embedded scroll areas.
+Also: the transaction-history strategy filter was still missing the four
+new liquidation rows (a leftover from the union widening — the `<select>`
+literal is not a `Record` so tsc never flagged it).
+
+**Verification:** `cargo test --all` 189 passed; clippy clean; tsc clean;
+`next build` succeeds; the WETH sequence proven on a live anvil fork.
+
 ## Session 2026-08-22 (CallFailed inner decoding + risk-panel patch poisoning fix)
 
 Two operator reports, one PR:

@@ -10,6 +10,7 @@ import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
 import Phase1Panel from "./Phase1Panel";
 import ModeSwitch from "./ModeSwitch";
+import Section from "./Section";
 import WalletButton from "./WalletButton";
 import type {
   CompetitionResponse,
@@ -154,6 +155,60 @@ export default function Console() {
         </div>
       </header>
 
+      {/* jump nav — the page is long; this keeps every section one click away */}
+      <nav
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 30,
+          display: "flex",
+          gap: 4,
+          flexWrap: "wrap",
+          alignItems: "center",
+          background: "rgba(4, 6, 8, 0.92)",
+          border: "1px solid var(--line)",
+          borderRadius: 4,
+          padding: "5px 8px",
+        }}
+      >
+        <span className="muted" style={{fontSize: 9, textTransform: "uppercase", letterSpacing: "0.08em"}}>
+          jump
+        </span>
+        {[
+          ["pnl", "P/L"],
+          ["activity", "Activity"],
+          ["history", "Transactions"],
+          ["relay", "Relay blocks"],
+          ["funnel", "Funnel"],
+          ["risk", "Controls"],
+          ["golive", "Go live"],
+          ["executor", "Executor"],
+        ].map(([id, label]) => (
+          <a
+            key={id}
+            href={`#${id}`}
+            style={{
+              fontSize: 11,
+              color: "var(--muted)",
+              textDecoration: "none",
+              padding: "2px 8px",
+              borderRadius: 4,
+              border: "1px solid transparent",
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = "var(--cyan)";
+              e.currentTarget.style.borderColor = "var(--line)";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = "var(--muted)";
+              e.currentTarget.style.borderColor = "transparent";
+            }}
+          >
+            {label}
+          </a>
+        ))}
+      </nav>
+
       {/* stat cards */}
       <section style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12}}>
         <Card
@@ -192,7 +247,10 @@ export default function Console() {
       </section>
 
       {/* equity + strategies */}
-      <section style={{display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", gap: 12}}>
+      <section
+        id="pnl"
+        style={{display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", gap: 12, scrollMarginTop: 56}}
+      >
         <div className="panel">
           <div className="panel-head">
             <span>cumulative simulated P/L (ETH)</span>
@@ -243,6 +301,7 @@ export default function Console() {
       </section>
 
       {/* feed + simulations */}
+      <Section id="activity" title="Activity" subtitle="live tape · events">
       <section style={{display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 12}}>
         <div className="panel">
           <div className="panel-head">
@@ -273,7 +332,19 @@ export default function Console() {
           <div className="panel-head">
             <span>simulated transaction history</span>
             <select value={strategyFilter} onChange={(e) => setStrategyFilter(e.target.value)} style={selectStyle}>
-              {["all", "sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"].map((k) => (
+              {[
+                "all",
+                "sandwich",
+                "sandwich_v3",
+                "jit",
+                "atomic_arb",
+                "liquidation",
+                "liquidation_compound",
+                "liquidation_morpho",
+                "liquidation_maker",
+                "oracle_frontrun",
+                "sniper",
+              ].map((k) => (
                 <option key={k} value={k}>
                   {k}
                 </option>
@@ -342,7 +413,10 @@ export default function Console() {
         </div>
       </section>
 
-      {/* opportunities + relay */}
+      </Section>
+
+      {/* transactions + opportunities */}
+      <Section id="history" title="Simulated transactions & opportunities" subtitle="newest first">
       <section style={{display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", gap: 12}}>
         <div className="panel">
           <div className="panel-head">
@@ -462,10 +536,15 @@ export default function Console() {
         </div>
       </section>
 
+      </Section>
+
       {/* bloXroute Max Profit relay — delivered blocks + their transactions */}
-      <RelayBlocksPanel chainId={chainId} />
+      <Section id="relay" title="Relay — delivered blocks" subtitle="what MEV sold for, block by block" defaultOpen={false}>
+        <RelayBlocksPanel chainId={chainId} />
+      </Section>
 
       {/* strategy funnel — answers "why no opportunities?" with data */}
+      <Section id="funnel" title="Strategy funnel" subtitle="why no opportunities? — with data">
       <FunnelPanel
         funnel={status?.stats.funnel ?? null}
         funnelReplay={status?.stats.funnelReplay ?? null}
@@ -474,34 +553,29 @@ export default function Console() {
         startedAtMs={status?.stats.startedAtMs}
       />
 
+      </Section>
+
       {/* risk & strategy controls */}
-      <section className="panel" style={{padding: 12}}>
-        <div className="panel-head" style={{marginBottom: 12}}>
-          <span>Risk Management & Searcher Tuning</span>
-          <span className="muted">Live Parameters & Diagnostics</span>
-        </div>
+      <Section id="risk" title="Risk & strategy controls" subtitle="applies instantly — no restart">
         <RiskPanel status={status} />
-      </section>
+      </Section>
 
       {/* go-live checklist — deploying MevExecutor (Phase 3 readiness) */}
-      <section className="panel">
-        <div className="panel-head">
-          <span>Go live — deploy MevExecutor to mainnet</span>
-          <span className="muted">six-step checklist · docs/GO_LIVE.md</span>
-        </div>
-        <div style={{padding: 12}}>
+      <Section
+        id="golive"
+        title="Go live — deploy MevExecutor to mainnet"
+        subtitle="six-step checklist · docs/GO_LIVE.md"
+        defaultOpen={false}
+      >
+        <div style={{padding: 4}}>
           <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} />
         </div>
-      </section>
+      </Section>
 
       {/* contract */}
-      <section className="panel">
-        <div className="panel-head">
-          <span>MevExecutor — on-chain control</span>
-          <span className="muted">{status ? shortHash(status.executor, 8) : "—"}</span>
-        </div>
+      <Section id="executor" title="MevExecutor — on-chain control" subtitle={status ? shortHash(status.executor, 8) : "—"}>
         <ContractPanel executor={status?.executor ?? ""} chainId={chainId} />
-      </section>
+      </Section>
 
       <footer className="muted" style={{padding: "4px 2px 20px", fontSize: 11}}>
         Simulation-only build. The bot reads live mainnet data and scores bundles against a forked EVM; nothing is

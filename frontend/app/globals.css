@@ -121,3 +121,9 @@ table.grid tr:hover td {
 .live {
   animation: pulse 2s ease-in-out infinite;
 }
+
+/* Jump-nav + collapsible sections: smooth jumps, and headings land below
+   the sticky nav instead of underneath it. */
+html {
+  scroll-behavior: smooth;
+}
