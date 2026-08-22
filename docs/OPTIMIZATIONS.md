@@ -525,6 +525,13 @@ The fix is three independent layers, so no single mistake re-opens it:
 Reads are deliberately still unauthenticated: they are what the dashboard
 renders, and gating them would break the demo flow for no security gain.
 
+**Scope of the boot check.** Only the commands that actually bind the port
+(`run`, `api`) call `validate()`. The first cut called it from
+`Config::from_env`, which meant every subcommand inherited the rule —
+including `doctor`, the command you run *precisely* to diagnose a bad config,
+and `replay`, which opens no socket. `doctor` now reports the problem as a
+`✗ api bind` check line alongside the RPC and relay checks and still exits 0.
+
 Verified after the fix, same external interface:
 
 | Case | Result |
