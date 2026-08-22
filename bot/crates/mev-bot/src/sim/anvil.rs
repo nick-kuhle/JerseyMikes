@@ -61,6 +61,9 @@ pub struct AnvilSim {
     block_gas_limit: Mutex<u64>,
     /// Warns once per process when `MAX_GAS_PER_BUNDLE` had to be clamped.
     clamp_warned: std::sync::atomic::AtomicBool,
+    /// The runtime risk envelope — `minProfit`/`bribeBps` guards and the gas
+    /// cap follow dashboard changes immediately, not at the next restart.
+    risk: crate::risk::RuntimeRisk,
     /// Serialises access: one simulation at a time per fork.
     lock: Mutex<()>,
 }
@@ -231,9 +234,13 @@ pub fn decode_revert_data(data: &[u8]) -> String {
 
 impl AnvilSim {
     /// Start a local anvil forked at `block` on the configured primary port.
-    pub async fn spawn(cfg: Arc<Config>, block: u64) -> Result<Self> {
+    pub async fn spawn(
+        cfg: Arc<Config>,
+        block: u64,
+        risk: crate::risk::RuntimeRisk,
+    ) -> Result<Self> {
         let port = cfg.sim.anvil_port;
-        Self::spawn_on(cfg, block, port).await
+        Self::spawn_on(cfg, block, port, risk).await
     }
 
     /// Start a local anvil forked at `block` on an explicit port.
@@ -241,7 +248,12 @@ impl AnvilSim {
     /// A second instance on a second port is what keeps replay work off the
     /// live fork: the two pin to different heights and would otherwise reset
     /// each other on every alternating simulation.
-    pub async fn spawn_on(cfg: Arc<Config>, block: u64, port: u16) -> Result<Self> {
+    pub async fn spawn_on(
+        cfg: Arc<Config>,
+        block: u64,
+        port: u16,
+        risk: crate::risk::RuntimeRisk,
+    ) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(&cfg.sim.anvil_bin);
         cmd.arg("--fork-url")
             .arg(&cfg.endpoints.http_url)
@@ -289,6 +301,7 @@ impl AnvilSim {
             executor,
             block_gas_limit: Mutex::new(0),
             clamp_warned: std::sync::atomic::AtomicBool::new(false),
+            risk,
             lock: Mutex::new(()),
         };
         sim.prepare_state().await?;
@@ -296,7 +309,11 @@ impl AnvilSim {
     }
 
     /// Attach to an already-running anvil (useful in CI / docker-compose).
-    pub async fn attach(cfg: Arc<Config>, url: &str) -> Result<Self> {
+    pub async fn attach(
+        cfg: Arc<Config>,
+        url: &str,
+        risk: crate::risk::RuntimeRisk,
+    ) -> Result<Self> {
         let rpc = RpcClient::new(url.to_string())?;
         let block = parse_u64(&rpc.call_raw("eth_blockNumber", json!([])).await?);
         let executor = cfg.endpoints.executor.unwrap_or(SIM_EXECUTOR);
@@ -309,6 +326,7 @@ impl AnvilSim {
             executor,
             block_gas_limit: Mutex::new(0),
             clamp_warned: std::sync::atomic::AtomicBool::new(false),
+            risk,
             lock: Mutex::new(()),
         };
         sim.prepare_state().await?;
@@ -374,10 +392,11 @@ impl AnvilSim {
             .map(|g| parse_u64(&g))
             .unwrap_or(0);
         *self.block_gas_limit.lock().await = limit;
-        if limit > 0 && self.cfg.risk.max_gas_per_bundle > limit.saturating_sub(limit / 20) {
+        let configured = self.risk.risk().max_gas_per_bundle;
+        if limit > 0 && configured > limit.saturating_sub(limit / 20) {
             tracing::warn!(
                 target: "sim",
-                configured = self.cfg.risk.max_gas_per_bundle,
+                configured = configured,
                 fork_limit = limit,
                 "MAX_GAS_PER_BUNDLE is at/above the fork's block gas limit — executor txs are clamped to 95% of the limit; lower MAX_GAS_PER_BUNDLE if you did not intend this"
             );
@@ -655,9 +674,10 @@ impl AnvilSim {
         base_fee: U256,
         front: bool,
     ) -> Result<(String, Value)> {
-        let data = crate::bundle::encode_execute(opp, calls, front, &self.cfg.risk);
+        let risk = self.risk.risk();
+        let data = crate::bundle::encode_execute(opp, calls, front, &risk);
         let gas = self.executor_gas_limit().await;
-        if gas < self.cfg.risk.max_gas_per_bundle
+        if gas < risk.max_gas_per_bundle
             && !self
                 .clamp_warned
                 .swap(true, std::sync::atomic::Ordering::Relaxed)

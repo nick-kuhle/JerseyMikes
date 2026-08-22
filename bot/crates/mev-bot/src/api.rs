@@ -12,7 +12,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::Stream;
 use serde::Deserialize;
@@ -20,6 +20,7 @@ use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::engine::Engine;
+use crate::risk::RiskPatch;
 use crate::types::Strategy;
 
 #[derive(Clone)]
@@ -46,6 +47,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
         .route("/api/mode", get(mode).post(set_mode))
+        .route("/api/risk", get(risk_state).post(set_risk))
+        .route("/api/risk/reset", post(reset_risk))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -78,12 +81,19 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         // Boot-time arming (`LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`).
         // The runtime switch can only narrow this, never widen it.
         "liveArmed": e.mode.armed(),
-        "strategies": crate::engine::enabled_strategies(&e.cfg),
+        // Runtime-effective enablement (already intersected with what was
+        // constructed at boot); the boot set is in `bootStrategies` and
+        // /api/config.
+        "strategies": e.runtime.enabled_names(),
+        "bootStrategies": crate::engine::enabled_strategies(&e.cfg),
         "risk": {
-            "minNetProfitWei": e.cfg.risk.min_net_profit_wei.to_string(),
-            "maxPositionWei": e.cfg.risk.max_position_wei.to_string(),
-            "maxBaseFeeWei": e.cfg.risk.max_base_fee_wei.to_string(),
-            "bribeBps": e.cfg.risk.bribe_bps,
+            "minNetProfitWei": e.runtime.risk().min_net_profit_wei.to_string(),
+            "maxPositionWei": e.runtime.risk().max_position_wei.to_string(),
+            "maxBaseFeeWei": e.runtime.risk().max_base_fee_wei.to_string(),
+            "maxDrawdownWei": e.runtime.risk().max_drawdown_wei.to_string(),
+            "bribeBps": e.runtime.risk().bribe_bps,
+            "maxGasPerBundle": e.runtime.risk().max_gas_per_bundle,
+            "maxInflightPerStrategy": e.runtime.risk().max_inflight_per_strategy,
             "killSwitchTripped": e.risk.is_tripped(),
             "cumulativeNetWei": e.risk.cumulative_net().to_string(),
         },
@@ -106,6 +116,9 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         "chainId": e.cfg.chain.chain_id,
         "weth": format!("{:?}", e.cfg.chain.weth),
         "executor": format!("{:?}", e.ctx.executor),
+        // The bot's signer EOA — prefills the go-live panel's setSearcher
+        // step and the executor-allowlist check.
+        "searcher": format!("{:?}", e.cfg.endpoints.searcher_address),
         "liveExecution": e.mode.live(),
         "liveArmed": e.mode.armed(),
         "endpoints": {
@@ -318,4 +331,82 @@ pub async fn serve(engine: Arc<Engine>, bind: &str) -> anyhow::Result<()> {
     tracing::info!(target: "api", "listening on http://{bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Effective + boot risk envelope and strategy enablement.
+async fn risk_state(State(s): State<ApiState>) -> impl IntoResponse {
+    let e = &s.engine;
+    let rt = &e.runtime;
+    let effective = rt.risk();
+    let boot = e.cfg.risk.clone();
+    let serialize = |r: crate::config::RiskConfig| {
+        json!({
+            "minNetProfitWei": r.min_net_profit_wei.to_string(),
+            "maxPositionWei": r.max_position_wei.to_string(),
+            "maxBaseFeeWei": r.max_base_fee_wei.to_string(),
+            "maxDrawdownWei": r.max_drawdown_wei.to_string(),
+            "bribeBps": r.bribe_bps,
+            "maxGasPerBundle": r.max_gas_per_bundle,
+            "maxInflightPerStrategy": r.max_inflight_per_strategy,
+        })
+    };
+    Json(json!({
+        "effective": serialize(effective),
+        "boot": serialize(boot),
+        // `{name, enabled, bootEnabled}`: runtime vs what was constructed.
+        // A strategy can be re-enabled at runtime only if bootEnabled.
+        "strategies": Strategy::all().iter().map(|s| json!({
+            "name": s.as_str(),
+            "enabled": rt.enabled(*s),
+            "bootEnabled": crate::engine::enabled_strategies(&e.cfg).contains(&s.as_str()),
+        })).collect::<Vec<_>>(),
+        "killSwitch": {
+            "tripped": e.risk.is_tripped(),
+            "cumulativeNetWei": e.risk.cumulative_net().to_string(),
+        },
+    }))
+}
+
+/// Apply a partial risk update. Validation failures return 400 with the
+/// human-readable reason and change nothing.
+async fn set_risk(State(s): State<ApiState>, Json(patch): Json<RiskPatch>) -> Response {
+    let e = &s.engine;
+    match e.runtime.apply(patch) {
+        Ok(()) => {
+            tracing::info!(target: "api", "risk envelope updated at runtime");
+            let effective = e.runtime.risk();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "effective": {
+                        "minNetProfitWei": effective.min_net_profit_wei.to_string(),
+                        "maxPositionWei": effective.max_position_wei.to_string(),
+                        "maxBaseFeeWei": effective.max_base_fee_wei.to_string(),
+                        "maxDrawdownWei": effective.max_drawdown_wei.to_string(),
+                        "bribeBps": effective.bribe_bps,
+                        "maxGasPerBundle": effective.max_gas_per_bundle,
+                        "maxInflightPerStrategy": effective.max_inflight_per_strategy,
+                    },
+                    "strategies": e.runtime.enabled_names(),
+                })),
+            )
+                .into_response()
+        }
+        Err(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": reason})),
+        )
+            .into_response(),
+    }
+}
+
+/// Clear the drawdown kill switch and zero the cumulative PnL it tracks.
+/// Deliberately explicit: it re-arms a bot that stopped itself.
+async fn reset_risk(State(s): State<ApiState>) -> impl IntoResponse {
+    let e = &s.engine;
+    let was = e.risk.is_tripped();
+    e.risk.reset();
+    tracing::warn!(target: "api", was_tripped = was, "kill switch reset from the dashboard");
+    Json(json!({"ok": true, "wasTripped": was, "tripped": false}))
 }

@@ -178,6 +178,17 @@ cargo run --release --bin mev-bot    # run
 - **Block-explorer links** on every transaction, block and address the console
   renders — victim txs in the simulation history, opportunities, the live
   tape, delivered-block transactions, and the executor's addresses
+- **Risk envelope, instant**: every control in the risk panel applies at
+  runtime (`POST /api/risk`) — the next opportunity is gated, the next
+  bundle's guards priced, with the values you just set. No restart; the
+  `.env` snippet remains for persisting values as boot defaults. Strategy
+  toggles narrow only (boot set is the ceiling), and a tripped drawdown
+  kill switch can be re-armed from the panel.
+- **Go-live checklist**: the six-step MevExecutor deployment panel
+  (`docs/GO_LIVE.md` Path A) — connect wallet, gas check, deploy (CI-checked
+  bytecode, free cost estimate), fund, `setSearcher`, verify + copy the
+  `EXECUTOR_ADDRESS` line. Deploying still changes nothing about bot
+  behaviour: two-key arming stays the gate.
 - **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
   (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
   7-day sample gate) that decides whether UniversalRouter decoding gets

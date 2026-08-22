@@ -18,6 +18,9 @@ export const dynamic = "force-dynamic";
 
 const READ_METHODS = new Set([
   "eth_call",
+  // Dry-run only: executes against a simulated block, publishes nothing.
+  // The go-live panel uses it to price the MevExecutor deployment.
+  "eth_estimateGas",
   "eth_chainId",
   "eth_blockNumber",
   "eth_getBalance",

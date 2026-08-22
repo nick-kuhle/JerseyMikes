@@ -43,6 +43,15 @@ jobs:
         working-directory: contracts
       - run: node script/compile-check.js
         working-directory: contracts
+      - name: fail if the frontend bytecode copy drifted
+        run: |
+          a=$(tr -d '[:space:]' < bot/crates/mev-bot/artifacts/MevExecutor.creation.hex)
+          b=$(tr -d '[:space:]' < frontend/lib/MevExecutor.creation.hex)
+          if [ "$a" != "$b" ]; then
+            echo 'frontend/lib/MevExecutor.creation.hex differs from the bot artifact'
+            echo 'the go-live panel would deploy stale bytecode; re-copy it'
+            exit 1
+          fi
       - name: fail if the checked-in artifact drifted
         run: git diff --exit-code -- bot/crates/mev-bot/artifacts contracts/abi
 

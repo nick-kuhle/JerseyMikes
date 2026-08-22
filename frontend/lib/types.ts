@@ -10,6 +10,24 @@ export type Strategy =
   | "oracle_frontrun"
   | "sniper";
 
+/** GET /api/risk — the runtime risk envelope vs its boot values. */
+export interface RiskStateResponse {
+  effective: RiskValues;
+  boot: RiskValues;
+  strategies: {name: Strategy; enabled: boolean; bootEnabled: boolean}[];
+  killSwitch: {tripped: boolean; cumulativeNetWei: string};
+}
+
+export interface RiskValues {
+  minNetProfitWei: string;
+  maxPositionWei: string;
+  maxBaseFeeWei: string;
+  maxDrawdownWei: string;
+  bribeBps: number;
+  maxGasPerBundle: number;
+  maxInflightPerStrategy: number;
+}
+
 export interface StatusResponse {
   chain: {id: number; name: string};
   head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number};
@@ -22,6 +40,8 @@ export interface StatusResponse {
    */
   liveArmed?: boolean;
   strategies: Strategy[];
+  /** Boot-time set (env toggles); `strategies` is the runtime-effective set. */
+  bootStrategies?: Strategy[];
   risk: {
     minNetProfitWei: string;
     maxPositionWei: string;
@@ -29,6 +49,9 @@ export interface StatusResponse {
     bribeBps: number;
     killSwitchTripped: boolean;
     cumulativeNetWei: string;
+    maxGasPerBundle?: number;
+    maxInflightPerStrategy?: number;
+    maxDrawdownWei?: string;
   };
   executor: string;
   pools: number;

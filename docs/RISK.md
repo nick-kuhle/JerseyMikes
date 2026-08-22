@@ -115,3 +115,26 @@ tightening order once there is data:
 - `mev-bot doctor` verifies every endpoint before a run.
 - The kill switch is per-process; restarting clears it unless the drawdown is
   recomputed from the database.
+
+## Runtime risk surface (`GET/POST /api/risk`)
+
+The risk envelope is **no longer boot-only**. The console's risk panel
+applies changes instantly: the risk engine gates the next opportunity, the
+fork simulator prices the next bundle's `minProfit`/`bribeBps` guards, and
+the signed-bundle gas cap — all from the same shared runtime state. A
+`POST /api/risk/reset` re-arms a tripped drawdown kill switch (explicitly,
+from the dashboard).
+
+What stays boot-only, deliberately:
+
+| Boundary | Why |
+| --- | --- |
+| **Strategy enablement can only narrow at runtime** | A strategy whose env toggle was off was never constructed (zero RPC cost by design); "enabling" it at runtime would silently do nothing, so the API refuses with the restart instructions — same shape as the live-mode switch. Re-enabling a boot-on strategy that was disabled at runtime is allowed. |
+| **Live arming (`LIVE_EXECUTION` + `I_UNDERSTAND_LIVE_RISK`)** | Unchanged: two independent keys read once at boot; `POST /api/mode` can only narrow what they allow. |
+| Everything else in `Config` (endpoints, chain, sim settings) | Not runtime state; change requires a restart. |
+
+Validation: patches are all-or-nothing; `bribeBps ≤ 10000`, gas cap in
+`[21000, 30M]` (the simulator ceiling), wei amounts must parse. A rejected
+patch changes nothing and returns its reason with a 400. The `.env` snippet
+in the panel is demoted to what it always really was: persisting the current
+values as **boot defaults**.

@@ -20,6 +20,34 @@ export const dynamic = "force-dynamic";
 /** Demo runtime mode. Flipped by POST /api/bot/mode in demo mode only. */
 let demoLive = false;
 
+/** Demo runtime risk envelope — the shape of GET /api/risk. */
+let demoRisk = {
+  effective: {
+    minNetProfitWei: "1",
+    maxPositionWei: "100000000000000000000",
+    maxBaseFeeWei: "500000000000",
+    maxDrawdownWei: "0",
+    bribeBps: 9000,
+    maxGasPerBundle: 3000000,
+    maxInflightPerStrategy: 32,
+  },
+  boot: {
+    minNetProfitWei: "1",
+    maxPositionWei: "100000000000000000000",
+    maxBaseFeeWei: "500000000000",
+    maxDrawdownWei: "0",
+    bribeBps: 9000,
+    maxGasPerBundle: 3000000,
+    maxInflightPerStrategy: 32,
+  },
+  strategies: [
+    "sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation",
+    "liquidation_compound", "liquidation_morpho", "liquidation_maker",
+    "oracle_frontrun", "sniper",
+  ].map((name) => ({name, enabled: true, bootEnabled: true})),
+  killSwitch: {tripped: false, cumulativeNetWei: "-1200000000000000"},
+};
+
 /** Fallbacks keyed by the bot's own route names. */
 function demoFor(path: string, search: URLSearchParams): unknown {
   const limit = Number(search.get("limit") ?? 100);
@@ -51,10 +79,15 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return {
         chainId: 1,
         executor: demoStatus().executor,
+        searcher: "0x00000000000000000000000000000000000f0000",
         liveExecution: demoLive,
         liveArmed: true,
         demo: true,
       };
+    case "risk":
+      return demoRisk;
+    case "risk/reset":
+      return {ok: true, wasTripped: demoRisk.killSwitch.tripped, tripped: false};
     case "funnel":
       // The funnel is also embedded in `/api/bot/status` under `stats.funnel`,
       // but exposing it as a standalone endpoint makes polling cheaper for
@@ -103,6 +136,64 @@ export async function GET(req: NextRequest, {params}: {params: Promise<{path: st
 export async function POST(req: NextRequest, {params}: {params: Promise<{path: string[]}>}) {
   const {path} = await params;
   const route = path.join("/");
+
+  // The runtime risk endpoints are forwarded verbatim (bar JSON parsing) —
+  // validation is the bot's job and its 400 reason must reach the panel.
+  if (route === "risk" || route === "risk/reset") {
+    let body: unknown = {};
+    try {
+      body = await req.json();
+    } catch {
+      return jsonResponse({ok: false, error: "invalid JSON body"}, true);
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const upstream = await fetch(`${BOT_API_URL}/api/${route}`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      clearTimeout(timer);
+      if (upstream.ok || upstream.status === 400) {
+        const data = (await upstream.json()) as Record<string, unknown>;
+        return jsonResponse({...data, ok: upstream.ok}, false);
+      }
+    } catch {
+      /* fall through to demo */
+    }
+    // Demo fallback: apply to the in-memory demo envelope so the instant-
+    // apply flow is exercisable without a running bot (flagged demo:true).
+    if (route === "risk/reset") {
+      demoRisk = {...demoRisk, killSwitch: {...demoRisk.killSwitch, tripped: false}};
+      return jsonResponse({ok: true, wasTripped: false, tripped: false}, true);
+    }
+    const patch = (body ?? {}) as Record<string, unknown>;
+    if (typeof patch.minNetProfitWei === "string") {
+      demoRisk.effective.minNetProfitWei = patch.minNetProfitWei;
+    }
+    if (typeof patch.bribeBps === "number") {
+      demoRisk.effective.bribeBps = patch.bribeBps;
+    }
+    if (typeof patch.maxPositionWei === "string") {
+      demoRisk.effective.maxPositionWei = patch.maxPositionWei;
+    }
+    if (typeof patch.maxBaseFeeWei === "string") {
+      demoRisk.effective.maxBaseFeeWei = patch.maxBaseFeeWei;
+    }
+    if (typeof patch.maxGasPerBundle === "number") {
+      demoRisk.effective.maxGasPerBundle = patch.maxGasPerBundle;
+    }
+    if (patch.strategies && typeof patch.strategies === "object") {
+      for (const [name, on] of Object.entries(patch.strategies as Record<string, boolean>)) {
+        const row = demoRisk.strategies.find((r) => r.name === name);
+        if (row) row.enabled = Boolean(on);
+      }
+    }
+    return jsonResponse({ok: true, effective: demoRisk.effective, demo: true}, true);
+  }
+
   if (route !== "mode") {
     return jsonResponse({error: `unknown endpoint ${route}`}, true);
   }
