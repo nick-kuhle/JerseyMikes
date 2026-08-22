@@ -1,15 +1,20 @@
 "use client";
 
+import {memo, useMemo} from "react";
 import {LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid} from "recharts";
 import type {SeriesPoint} from "@/lib/types";
 
 /** Cumulative simulated PnL, in ETH, bucketed by target block. */
-export default function EquityChart({series}: {series: SeriesPoint[]}) {
-  let cum = 0;
-  const data = series.map((p) => {
-    cum += p.netWei;
-    return {block: p.block, eth: cum / 1e18, blockNet: p.netWei / 1e18, count: p.count};
-  });
+function EquityChart({series}: {series: SeriesPoint[]}) {
+  // Up to 250 points reduced on every render otherwise — and recharts then
+  // re-renders the whole SVG because `data` is a new array identity.
+  const data = useMemo(() => {
+    let cum = 0;
+    return series.map((p) => {
+      cum += p.netWei;
+      return {block: p.block, eth: cum / 1e18, blockNet: p.netWei / 1e18, count: p.count};
+    });
+  }, [series]);
 
   const last = data.length ? data[data.length - 1].eth : 0;
   const color = last >= 0 ? "#35d07f" : "#ff5c5c";
@@ -58,3 +63,9 @@ export default function EquityChart({series}: {series: SeriesPoint[]}) {
     </div>
   );
 }
+
+/**
+ * Memoized: an SVG chart is one of the most expensive things on the page, and
+ * its input only changes on the 4s status poll — never on an SSE flush.
+ */
+export default memo(EquityChart);

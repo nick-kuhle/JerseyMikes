@@ -10,7 +10,7 @@
  * `/api/funnel` and `/api/status.stats.funnel`.
  */
 
-import {useEffect, useState} from "react";
+import {memo, useMemo, useState} from "react";
 import type {FunnelCounters, Strategy} from "@/lib/types";
 import {STRATEGY_COLOR, STRATEGY_LABEL} from "@/lib/format";
 
@@ -72,22 +72,63 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-export default function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, startedAtMs}: Props) {
+function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, startedAtMs}: Props) {
   // Which lane is on screen. Live is the default: it is the one that answers
   // "should I change something?". Replay answers "what did we miss?".
   const [lane, setLane] = useState<"live" | "replay">("live");
-  // Auto-refresh every 5s. The funnel counter is monotonically
-  // increasing, so the dashboard just shows the latest values; the user
-  // can spot deltas visually.
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setTick((x) => x + 1), 5_000);
-    return () => clearInterval(t);
-  }, []);
-  // Touch `tick` so React registers the dependency.
-  void tick;
+  // No self-refresh timer here. `funnel` is a prop fed by Console's 4s status
+  // poll, so new counters already arrive as a prop change. The old 5s
+  // `setTick` re-rendered this whole panel — the summary reduce, ten strategy
+  // rows and the W6 card — on a cadence unrelated to the data actually
+  // changing, and re-rendered it *again* whenever the poll landed.
 
   const active = lane === "live" ? funnel : funnelReplay;
+
+  // Both derivations run before the early return: hooks must be called
+  // unconditionally and in the same order on every render.
+  //
+  // Recomputed only when the active lane's counters actually change. These
+  // used to re-run on every render of the parent console — ten strategy rows
+  // plus an eight-field reduce, four times a second.
+  const rows = useMemo(
+    () =>
+      ALL_STRATEGIES.map((s) => {
+        const f = row((active ?? {})[s] ?? ZERO);
+        const seen = f.invocationsWithOutput + f.invocationsEmpty;
+        const simulated = f.simulationsSucceeded + f.simulationsReverted;
+        const revertRate = simulated > 0 ? f.simulationsReverted / simulated : 0;
+        return {s, f, seen, simulated, revertRate};
+      }),
+    [active],
+  );
+
+  const total = useMemo(
+    () =>
+      rows.reduce(
+        (acc, r) => {
+          acc.invocationsWithOutput += r.f.invocationsWithOutput;
+          acc.invocationsEmpty += r.f.invocationsEmpty;
+          acc.candidatesEmitted += r.f.candidatesEmitted;
+          acc.gatedByRisk += r.f.gatedByRisk;
+          acc.missingVictimRaw += r.f.missingVictimRaw;
+          acc.simulationsSucceeded += r.f.simulationsSucceeded;
+          acc.simulationsReverted += r.f.simulationsReverted;
+          acc.submittable += r.f.submittable;
+          return acc;
+        },
+        {
+          invocationsWithOutput: 0,
+          invocationsEmpty: 0,
+          candidatesEmitted: 0,
+          gatedByRisk: 0,
+          missingVictimRaw: 0,
+          simulationsSucceeded: 0,
+          simulationsReverted: 0,
+          submittable: 0,
+        } as Omit<FunnelCounters, "simulationsFailed">,
+      ),
+    [rows],
+  );
 
   if (!active) {
     return (
@@ -109,40 +150,6 @@ export default function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hint
       </div>
     );
   }
-
-  // Per-strategy table.
-  const rows = ALL_STRATEGIES.map((s) => {
-    const f = row(active[s] ?? ZERO);
-    const seen = f.invocationsWithOutput + f.invocationsEmpty;
-    const simulated = f.simulationsSucceeded + f.simulationsReverted;
-    const revertRate = simulated > 0 ? f.simulationsReverted / simulated : 0;
-    return {s, f, seen, simulated, revertRate};
-  });
-
-  // Aggregate summary.
-  const total = rows.reduce(
-    (acc, r) => {
-      acc.invocationsWithOutput += r.f.invocationsWithOutput;
-      acc.invocationsEmpty += r.f.invocationsEmpty;
-      acc.candidatesEmitted += r.f.candidatesEmitted;
-      acc.gatedByRisk += r.f.gatedByRisk;
-      acc.missingVictimRaw += r.f.missingVictimRaw;
-      acc.simulationsSucceeded += r.f.simulationsSucceeded;
-      acc.simulationsReverted += r.f.simulationsReverted;
-      acc.submittable += r.f.submittable;
-      return acc;
-    },
-    {
-      invocationsWithOutput: 0,
-      invocationsEmpty: 0,
-      candidatesEmitted: 0,
-      gatedByRisk: 0,
-      missingVictimRaw: 0,
-      simulationsSucceeded: 0,
-      simulationsReverted: 0,
-      submittable: 0,
-    } as Omit<FunnelCounters, "simulationsFailed">,
-  );
 
   return (
     <div className="panel" style={{padding: 14, display: "grid", gap: 14}}>
@@ -323,6 +330,14 @@ export default function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hint
 }
 
 /**
+ * Memoized on its props. The parent console re-renders on every SSE flush
+ * (~8/s) and every 4s status poll; the funnel props only change on the poll,
+ * so without this the whole panel — summary reduce, ten rows, W6 card —
+ * rebuilt at feed rate for no reason.
+ */
+export default memo(FunnelPanel);
+
+/**
  * W6 go/no-go: is there a public-mempool gap worth decoding UniversalRouter
  * calldata for?
  *
@@ -346,17 +361,27 @@ function W6GapCard({
   startedAtMs?: number;
 }) {
   const [copied, setCopied] = useState(false);
-  const live = funnel ?? {};
-  const emptyOf = (s: Strategy) => live[s]?.invocationsEmpty ?? 0;
-  const callsOf = (s: Strategy) => {
-    const f = live[s];
-    return f ? f.invocationsWithOutput + f.invocationsEmpty : 0;
-  };
-  const candOf = (s: Strategy) => live[s]?.candidatesEmitted ?? 0;
-  const watch: Strategy[] = ["sandwich", "sandwich_v3", "jit"];
-  const emptySum = watch.reduce((a, s) => a + emptyOf(s), 0);
-  const candSum = watch.reduce((a, s) => a + candOf(s), 0);
-  const callsSum = watch.reduce((a, s) => a + callsOf(s), 0);
+
+  // Three passes over the watched strategies, only when the funnel changes.
+  const {emptySum, candSum, callsSum} = useMemo(() => {
+    const live = funnel ?? {};
+    const watch: Strategy[] = ["sandwich", "sandwich_v3", "jit"];
+    let e = 0;
+    let c = 0;
+    let calls = 0;
+    for (const s of watch) {
+      const f = live[s];
+      if (!f) continue;
+      e += f.invocationsEmpty;
+      c += f.candidatesEmitted;
+      calls += f.invocationsWithOutput + f.invocationsEmpty;
+    }
+    return {emptySum: e, candSum: c, callsSum: calls};
+  }, [funnel]);
+
+  // `Date.now()` makes this impure, so it is deliberately NOT memoized on
+  // startedAtMs alone — it recomputes with the parent, which is what keeps the
+  // "collecting (n/7 days)" badge honest.
   const uptimeDays = startedAtMs ? (Date.now() - startedAtMs) / 86_400_000 : 0;
   const sampleReady = uptimeDays >= 7 && pendingSeen > 0;
 
@@ -439,7 +464,7 @@ Uptime: ${uptimeDays.toFixed(2)} days (${sampleReady ? "sample complete" : "COLL
   );
 }
 
-function SummaryStat({
+const SummaryStat = memo(function SummaryStat({
   label,
   value,
   color,
@@ -465,4 +490,4 @@ function SummaryStat({
       <div style={{fontSize: 16, fontWeight: "bold", color}}>{value}</div>
     </div>
   );
-}
+});

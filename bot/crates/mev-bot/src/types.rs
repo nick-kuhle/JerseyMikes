@@ -103,6 +103,11 @@ pub enum TxSource {
     Sequencer,
     /// Third-party mempool stream (bloXroute, Blocknative, ...).
     ExternalStream,
+    /// MEV Blocker's searcher feed: *unsigned* pending transactions from
+    /// private orderflow (`mevblocker_partialPendingTransactions`). Real
+    /// pre-inclusion flow the public mempool never shows, but the payload has
+    /// no signature, so it can only ever be back-run — see [`TxSource::backrun_only`].
+    MevBlocker,
     /// Delivered inside a winning MEV-Boost block, discovered via a relay's
     /// `proposer_payload_delivered` bid traces (the bloXroute Max Profit relay).
     /// Already mined; used for post-mortem / back-run replay analysis.
@@ -118,9 +123,22 @@ impl TxSource {
             TxSource::MevShare => "mev_share",
             TxSource::Sequencer => "sequencer",
             TxSource::ExternalStream => "external_stream",
+            TxSource::MevBlocker => "mev_blocker",
             TxSource::RelayDelivered => "bloxroute_relay",
             TxSource::Mined => "mined",
         }
+    }
+
+    /// Whether this source hands us transactions we cannot re-sign or reorder.
+    ///
+    /// MEV Blocker and MEV-Share publish the *contents* of a pending
+    /// transaction without its signature. We can construct a bundle that runs
+    /// **after** it (referenced by hash, which is exactly what MEV Blocker's
+    /// `eth_sendBundle` expects), but we can never place a transaction in
+    /// front of it — a sandwich needs the victim's signed bytes to replay the
+    /// victim leg, and those do not exist here.
+    pub fn backrun_only(&self) -> bool {
+        matches!(self, TxSource::MevBlocker | TxSource::MevShare)
     }
 }
 

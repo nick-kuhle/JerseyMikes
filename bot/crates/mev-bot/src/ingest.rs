@@ -82,6 +82,10 @@ impl Ingest {
             spawn_external_mempool(url, tx.clone());
         }
 
+        if let Some(url) = cfg.endpoints.mev_blocker_ws.clone() {
+            spawn_mev_blocker(url, tx.clone());
+        }
+
         if let Some(feed) = cfg.endpoints.sequencer_feed.clone() {
             spawn_sequencer_feed(feed, tx.clone());
         }
@@ -158,6 +162,14 @@ fn spawn_head_poller(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<Inges
 // Public mempool
 // ---------------------------------------------------------------------------
 
+/// Hashes buffered awaiting hydration. At ~200 pending transactions per block
+/// this is several blocks of slack; past that the feed is outrunning the RPC
+/// and the oldest entries are stale anyway.
+const PENDING_RING_CAPACITY: usize = 2_048;
+
+/// Hashes hydrated per `eth_getTransactionByHash` batch.
+const HYDRATION_BATCH: usize = 64;
+
 /// Subscribe to pending hashes and hydrate them in batches.
 ///
 /// Hydration is batched (up to 64 hashes per round trip, flushed every 25 ms) —
@@ -165,7 +177,20 @@ fn spawn_head_poller(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<Inges
 fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>) {
     let mut sub = WsSubscription::spawn(ws_url, json!(["newPendingTransactions"]), "pendingTxs");
     tokio::spawn(async move {
-        let mut pending: Vec<String> = Vec::with_capacity(128);
+        // Fixed-capacity ring buffer instead of a `Vec` that is drained from
+        // the front. `drain(..64)` shifts every remaining element left on each
+        // flush — O(n) memmove per batch, on the ingest task, at mempool rate.
+        // `VecDeque` pops from the front in O(1) and never reallocates here
+        // because the capacity is fixed up front.
+        //
+        // It is also *bounded*: if hydration cannot keep up with the feed, the
+        // old code grew this vector without limit until the process died. Now
+        // the oldest hash is evicted, which is the correct one to lose — a
+        // pending transaction we have not hydrated in a full buffer's worth of
+        // time is almost certainly mined or replaced already.
+        let mut pending: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(PENDING_RING_CAPACITY);
+        let mut dropped: u64 = 0;
         let mut ticker = tokio::time::interval(Duration::from_millis(25));
         loop {
             tokio::select! {
@@ -178,7 +203,18 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
                                     if tx.send(IngestEvent::Pending(ptx)).await.is_err() { return; }
                                 }
                             } else if let Some(h) = v.as_str() {
-                                pending.push(h.to_string());
+                                if pending.len() == PENDING_RING_CAPACITY {
+                                    pending.pop_front();
+                                    dropped += 1;
+                                    if dropped % 1_000 == 1 {
+                                        tracing::warn!(
+                                            target: "ingest",
+                                            dropped,
+                                            "pending hydration buffer full — evicting oldest hashes"
+                                        );
+                                    }
+                                }
+                                pending.push_back(h.to_string());
                             }
                         }
                         None => return,
@@ -190,9 +226,9 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
             if pending.is_empty() {
                 continue;
             }
-            let batch: Vec<String> = pending.drain(..pending.len().min(64)).collect();
-            let calls: Vec<(String, Value)> = batch
-                .iter()
+            let take = pending.len().min(HYDRATION_BATCH);
+            let calls: Vec<(String, Value)> = pending
+                .drain(..take)
                 .map(|h| ("eth_getTransactionByHash".to_string(), json!([h])))
                 .collect();
             let results = match http.batch(&calls).await {
@@ -235,7 +271,11 @@ pub fn parse_tx_object(v: &Value, source: TxSource) -> Option<PendingTx> {
                 .unwrap_or(&Value::Null),
         ),
         nonce: parse_u64(v.get("nonce").unwrap_or(&Value::Null)),
-        input: parse_bytes(v.get("input").or_else(|| v.get("data")).unwrap_or(&Value::Null)),
+        input: parse_bytes(
+            v.get("input")
+                .or_else(|| v.get("data"))
+                .unwrap_or(&Value::Null),
+        ),
         raw: v
             .get("raw")
             .or_else(|| v.get("rawTransaction"))
@@ -264,7 +304,11 @@ fn spawn_mev_share(url: String, tx: mpsc::Sender<IngestEvent>) {
                 Some(h) => h,
                 None => continue,
             };
-            let logs = v.get("logs").and_then(|l| l.as_array()).map(|a| a.len()).unwrap_or(0);
+            let logs = v
+                .get("logs")
+                .and_then(|l| l.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
             let mut selectors = Vec::new();
             let mut to = None;
             if let Some(txsv) = v.get("txs").and_then(|t| t.as_array()) {
@@ -295,11 +339,48 @@ fn spawn_mev_share(url: String, tx: mpsc::Sender<IngestEvent>) {
 // Third-party streams & L2 sequencer feeds
 // ---------------------------------------------------------------------------
 
+/// MEV Blocker's searcher feed.
+///
+/// `wss://searchers.mevblocker.io` streams *unsigned* pending transactions
+/// (`mevblocker_partialPendingTransactions`) — private orderflow that never
+/// reaches the public mempool, which is where a growing share of retail swap
+/// volume now goes. The payload is a normal transaction object minus `v`,
+/// `r`, `s`, so `parse_tx_object` already handles it; what it cannot give us
+/// is `raw`, and the engine's existing "victim raw bytes required" gate is
+/// what keeps that honest: sandwiches self-reject, back-runs go through.
+///
+/// This is deliberately a separate source from `spawn_external_mempool`: the
+/// subscription name differs, and the transactions need their own `TxSource`
+/// so the funnel can show what private flow is actually worth.
+fn spawn_mev_blocker(url: String, tx: mpsc::Sender<IngestEvent>) {
+    let mut sub = WsSubscription::spawn(
+        url,
+        json!(["mevblocker_partialPendingTransactions"]),
+        "mevBlocker",
+    );
+    tokio::spawn(async move {
+        while let Some(v) = sub.rx.recv().await {
+            // The feed sends the transaction object directly; tolerate a
+            // `txContents` wrapper the way the external-stream path does.
+            let obj = v.get("txContents").unwrap_or(&v);
+            if let Some(ptx) = parse_tx_object(obj, TxSource::MevBlocker) {
+                if tx.send(IngestEvent::Pending(ptx)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_external_mempool(url: String, tx: mpsc::Sender<IngestEvent>) {
     // Third-party streams differ in their subscribe payload; the common
     // denominator (bloXroute "newTxs", Blocknative "pendingTransactions") is an
     // eth_subscribe-shaped request, which is what WsSubscription sends.
-    let mut sub = WsSubscription::spawn(url, json!(["newPendingTransactions", {"includeTransactions": true}]), "external");
+    let mut sub = WsSubscription::spawn(
+        url,
+        json!(["newPendingTransactions", {"includeTransactions": true}]),
+        "external",
+    );
     tokio::spawn(async move {
         while let Some(v) = sub.rx.recv().await {
             let obj = v.get("txContents").unwrap_or(&v);
@@ -343,7 +424,10 @@ fn spawn_relay_data(base: String, block_time_ms: u64, tx: mpsc::Sender<IngestEve
             Ok(c) => c,
             Err(_) => return,
         };
-        let url = format!("{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=20", base.trim_end_matches('/'));
+        let url = format!(
+            "{}/relay/v1/data/bidtraces/proposer_payload_delivered?limit=20",
+            base.trim_end_matches('/')
+        );
         let mut last_slot = 0u64;
         loop {
             match client.get(&url).send().await {
@@ -383,7 +467,9 @@ fn spawn_relay_data(base: String, block_time_ms: u64, tx: mpsc::Sender<IngestEve
                         }
                     }
                 }
-                Err(e) => tracing::debug!(target: "ingest", relay = %base, error = %e, "relay data poll failed"),
+                Err(e) => {
+                    tracing::debug!(target: "ingest", relay = %base, error = %e, "relay data poll failed")
+                }
             }
             tokio::time::sleep(Duration::from_millis(block_time_ms.max(4_000))).await;
         }
@@ -433,8 +519,7 @@ fn spawn_relay_blocks(
                                 continue;
                             }
                             last_block = block_number;
-                            let Some(block_hash) =
-                                item.get("block_hash").and_then(parse_b256)
+                            let Some(block_hash) = item.get("block_hash").and_then(parse_b256)
                             else {
                                 continue;
                             };
@@ -457,7 +542,11 @@ fn spawn_relay_blocks(
                                 num_tx: decimal_u64(&item["num_tx"]),
                             };
                             let txs = fetch_block_txs(&http, block_hash).await;
-                            if tx.send(IngestEvent::RelayBlock { block, txs }).await.is_err() {
+                            if tx
+                                .send(IngestEvent::RelayBlock { block, txs })
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -480,7 +569,10 @@ fn spawn_relay_blocks(
 /// still recorded, only its transaction backfill is skipped.
 async fn fetch_block_txs(http: &RpcClient, block_hash: alloy_primitives::B256) -> Vec<PendingTx> {
     let Ok(v) = http
-        .call_raw("eth_getBlockByHash", json!([format!("{block_hash:?}"), true]))
+        .call_raw(
+            "eth_getBlockByHash",
+            json!([format!("{block_hash:?}"), true]),
+        )
         .await
     else {
         return Vec::new();

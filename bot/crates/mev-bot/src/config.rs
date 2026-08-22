@@ -163,6 +163,31 @@ pub struct Config {
     /// latency-critical (the block is already mined), so it runs behind this
     /// bound.
     pub relay_tx_concurrency: usize,
+    /// How many transactions may be inside the strategy fan-out at once.
+    ///
+    /// The live mempool path acquires this without waiting: when the engine is
+    /// already saturated the transaction is shed and counted in
+    /// `evaluationsShed` rather than queued. Queueing is the worse failure —
+    /// the work would complete after the block it was aimed at.
+    pub strategy_concurrency: usize,
+    /// How many delivered blocks may be replayed concurrently.
+    ///
+    /// Each lane resets the shared replay fork to its own parent block, so
+    /// lanes are only safe when the operator has provisioned one isolated
+    /// replay fork each. Default 1 — the historical, always-correct value.
+    pub replay_lanes: usize,
+    /// How many delivered blocks may wait in the replay queue. Small on
+    /// purpose: a deep queue only means scoring blocks long after they are
+    /// interesting.
+    pub replay_queue_depth: usize,
+    /// Minimum blocks between pool-discovery passes. 1 = every block.
+    pub pool_discovery_interval_blocks: u64,
+    /// Minimum blocks between searcher inventory refreshes. 1 = every block.
+    pub inventory_refresh_blocks: u64,
+    /// Wall-clock budget for one atomic-arb cycle enumeration pass.
+    pub arb_enumeration_budget: Duration,
+    /// How many pools the arb search may consider in one pass.
+    pub arb_max_pools: usize,
     /// When true, opportunities whose notional exceeds the searcher's ETH+WETH
     /// balance are skipped. Off by default so a dummy searcher in simulation
     /// mode does not silence the tape; forced on when live execution is on.
@@ -199,6 +224,10 @@ pub struct Endpoints {
     pub sequencer_feed: Option<String>,
     /// Optional Blocknative / Blockstream-style mempool stream.
     pub extra_mempool_ws: Vec<String>,
+    /// MEV Blocker searcher websocket (`wss://searchers.mevblocker.io`).
+    /// Off unless set: it is private orderflow, and the transactions it
+    /// carries are unsigned, so only back-runs can act on them.
+    pub mev_blocker_ws: Option<String>,
     /// Flashbots reputation key. Only used to sign the `X-Flashbots-Signature`
     /// header for read-only `eth_callBundle` requests.
     pub flashbots_signer_key: Option<String>,
@@ -280,6 +309,10 @@ pub struct ApiConfig {
     pub db_path: String,
     /// How many events to keep in the in-memory ring buffer served to the UI.
     pub feed_capacity: usize,
+    /// Depth of the deferred-write queue feeding the background SQLite
+    /// writer. When it fills, telemetry writes are dropped (and counted)
+    /// rather than blocking the searcher.
+    pub write_queue_capacity: usize,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -382,6 +415,7 @@ impl Config {
                 ),
                 sequencer_feed: env_opt("SEQUENCER_FEED_URL"),
                 extra_mempool_ws: env_list("EXTRA_MEMPOOL_WS"),
+                mev_blocker_ws: env_opt("MEV_BLOCKER_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
                 executor: env_opt("EXECUTOR_ADDRESS").and_then(|v| v.parse().ok()),
                 searcher_address: env_addr(
@@ -477,6 +511,7 @@ impl Config {
                 bind: env_or("API_BIND", "0.0.0.0:8080"),
                 db_path: env_or("DB_PATH", "data/mev.sqlite"),
                 feed_capacity: env_u64("FEED_CAPACITY", 2_000) as usize,
+                write_queue_capacity: (env_u64("WRITE_QUEUE_CAPACITY", 8_192) as usize).max(64),
             },
             // Infrastructure toggle (not a strategy): scan PairCreated each block.
             pool_discovery: env_bool("POOL_DISCOVERY", true),
@@ -490,6 +525,21 @@ impl Config {
             // bloXroute Max Profit relay and score them for extractable value.
             relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
             relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
+            // Sized for the live path: enough in-flight transactions to keep
+            // the runtime busy, low enough that a mempool burst sheds instead
+            // of building a queue of work that is stale on arrival.
+            strategy_concurrency: (env_u64("STRATEGY_CONCURRENCY", 64) as usize).max(1),
+            // Only raise past 1 with one isolated replay fork per lane.
+            replay_lanes: (env_u64("REPLAY_LANES", 1) as usize).max(1),
+            replay_queue_depth: (env_u64("REPLAY_QUEUE_DEPTH", 4) as usize).max(1),
+            pool_discovery_interval_blocks: env_u64("POOL_DISCOVERY_INTERVAL_BLOCKS", 1).max(1),
+            inventory_refresh_blocks: env_u64("INVENTORY_REFRESH_BLOCKS", 1).max(1),
+            // Discovery plus strategies share a ~50 ms/block budget on the
+            // block task; enumeration gets half of it by default.
+            arb_enumeration_budget: Duration::from_millis(
+                env_u64("ARB_ENUMERATION_BUDGET_MS", 25).max(1),
+            ),
+            arb_max_pools: (env_u64("ARB_MAX_POOLS", 200) as usize).max(2),
             inventory_gate: {
                 let live = env_bool("LIVE_EXECUTION", false)
                     && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes";

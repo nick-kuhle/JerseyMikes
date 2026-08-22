@@ -1,6 +1,6 @@
 "use client";
 
-import {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {useCallback, useEffect, useMemo, useState} from "react";
 import EquityChart from "./EquityChart";
 import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
@@ -14,7 +14,6 @@ import Section from "./Section";
 import WalletButton from "./WalletButton";
 import type {
   CompetitionResponse,
-  FeedEvent,
   OpportunityRow,
   PnlResponse,
   RelayBid,
@@ -33,6 +32,7 @@ import {
   weiToEth,
 } from "@/lib/format";
 import {blockUrl, txUrl} from "@/lib/explorer";
+import {useFeed} from "@/lib/feed";
 
 const FEED_MAX = 400;
 const POLL_MS = 4000;
@@ -46,11 +46,11 @@ export default function Console() {
   const [bids, setBids] = useState<RelayBid[]>([]);
   const [competition, setCompetition] = useState<CompetitionResponse | null>(null);
   const [reorgs, setReorgs] = useState<ReorgRow[]>([]);
-  const [events, setEvents] = useState<FeedEvent[]>([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [strategyFilter, setStrategyFilter] = useState("all");
-  const [connected, setConnected] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
+  // Batched + typed SSE consumption: frames accumulate off-render and flush
+  // together, so a 200-event burst costs one render instead of 200.
+  const {events, connected} = useFeed("/api/bot/stream", FEED_MAX);
 
   const load = useCallback(async () => {
     const get = async <T,>(p: string, fallback: T): Promise<T> => {
@@ -71,14 +71,22 @@ export default function Console() {
       get<CompetitionResponse | null>("competition?limit=25", null),
       get<ReorgRow[]>("reorgs?limit=15", []),
     ]);
-    if (s) setStatus(s);
-    if (p) setPnl(p);
-    setSeries(Array.isArray(se) ? se : []);
-    setSims(Array.isArray(si) ? si : []);
-    setOpps(Array.isArray(op) ? op : []);
-    setBids(Array.isArray(rb) ? rb : []);
-    if (comp) setCompetition(comp);
-    setReorgs(Array.isArray(rg) ? rg : []);
+    // Identity-preserving updates.
+    //
+    // Every poll used to hand each `useState` a brand new array or object,
+    // even on the ~95% of ticks where the bot returned exactly the same rows.
+    // A new identity re-renders every consumer and defeats `memo` /
+    // `useMemo` downstream — the equity chart re-rendered its SVG four times
+    // a second against unchanged data. `keepIfSame` swaps in the new value
+    // only when the serialised payload actually differs.
+    if (s) setStatus((prev) => keepIfSame(prev, s));
+    if (p) setPnl((prev) => keepIfSame(prev, p));
+    setSeries((prev) => keepIfSame(prev, Array.isArray(se) ? se : []));
+    setSims((prev) => keepIfSame(prev, Array.isArray(si) ? si : []));
+    setOpps((prev) => keepIfSame(prev, Array.isArray(op) ? op : []));
+    setBids((prev) => keepIfSame(prev, Array.isArray(rb) ? rb : []));
+    if (comp) setCompetition((prev) => keepIfSame(prev, comp));
+    setReorgs((prev) => keepIfSame(prev, Array.isArray(rg) ? rg : []));
   }, []);
 
   useEffect(() => {
@@ -86,22 +94,6 @@ export default function Console() {
     const t = setInterval(load, POLL_MS);
     return () => clearInterval(t);
   }, [load]);
-
-  useEffect(() => {
-    const es = new EventSource("/api/bot/stream");
-    esRef.current = es;
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
-    es.onmessage = (m) => {
-      try {
-        const ev = JSON.parse(m.data) as FeedEvent;
-        setEvents((prev) => [ev, ...prev].slice(0, FEED_MAX));
-      } catch {
-        /* ignore malformed frames */
-      }
-    };
-    return () => es.close();
-  }, []);
 
   const demo = Boolean(status?.demo);
   const chainId = status?.chain.id;
@@ -111,11 +103,17 @@ export default function Console() {
     [sims, strategyFilter]
   );
 
-  const winRate = useMemo(() => {
+  // One pass over the strategy rows for both the win rate and the sim total,
+  // instead of two `reduce`s plus a third inline in the card below.
+  const {winRate, totalSims} = useMemo(() => {
     const rows = pnl?.byStrategy ?? [];
-    const w = rows.reduce((a, r) => a + r.wins, 0);
-    const n = rows.reduce((a, r) => a + r.simulations, 0);
-    return n ? (100 * w) / n : 0;
+    let w = 0;
+    let n = 0;
+    for (const r of rows) {
+      w += r.wins;
+      n += r.simulations;
+    }
+    return {winRate: n ? (100 * w) / n : 0, totalSims: n};
   }, [pnl]);
 
   return (
@@ -217,7 +215,7 @@ export default function Console() {
           tone={totalNet >= 0 ? "pos" : "neg"}
           sub="fork simulations only"
         />
-        <Card title="win rate" value={`${winRate.toFixed(1)}%`} sub={`${pnl?.byStrategy.reduce((a, r) => a + r.simulations, 0) ?? 0} sims`} />
+        <Card title="win rate" value={`${winRate.toFixed(1)}%`} sub={`${totalSims} sims`} />
         <Card
           title="opportunities"
           value={String(status?.stats.opportunities ?? 0)}
@@ -558,7 +556,7 @@ export default function Console() {
 
       {/* risk & strategy controls */}
       <Section id="risk" title="Risk & strategy controls" subtitle="applies instantly — no restart">
-        <RiskPanel status={status} />
+        <RiskPanel killSwitchTripped={status?.risk.killSwitchTripped} />
       </Section>
 
       {/* go-live checklist — deploying MevExecutor (Phase 3 readiness) */}
@@ -584,6 +582,24 @@ export default function Console() {
       </footer>
     </main>
   );
+}
+
+/**
+ * Return `prev` when it is structurally equal to `next`, so React can bail out
+ * of the update and memoized children keep their previous render.
+ *
+ * The payloads here are small (≤250 rows) and already came off the wire as
+ * JSON, so re-serialising is far cheaper than the cascade of re-renders it
+ * prevents. This is deliberately a value comparison rather than a shallow one:
+ * the arrays are rebuilt by `JSON.parse` every poll, so every element is a new
+ * object and a shallow check would never match.
+ */
+function keepIfSame<T>(prev: T, next: T): T {
+  try {
+    return JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+  } catch {
+    return next;
+  }
 }
 
 function safeHost(url: string): string {

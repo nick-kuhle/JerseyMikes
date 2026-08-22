@@ -50,12 +50,16 @@ impl StrategyImpl for AtomicArbStrategy {
         // at its default of 2 this reproduces the original pair-to-pair scan;
         // raising it adds longer cycles through the pools discovery brings in.
         let pools = ctx.pools.all();
-        let (selected, edges, candidates) = graph::search(
+        // Both search budgets come from config now: the wall-clock deadline
+        // and the graph width. Defaults reproduce the previous hard-coded
+        // 25 ms / 200 pools exactly.
+        let (selected, edges, candidates) = graph::search_with(
             &pools,
             weth,
             ctx.max_position(),
             ctx.cfg.arb_max_cycle_len,
-            graph::ENUMERATION_BUDGET,
+            ctx.cfg.arb_enumeration_budget,
+            ctx.cfg.arb_max_pools,
         );
 
         let mut out = Vec::new();
@@ -82,7 +86,11 @@ impl StrategyImpl for AtomicArbStrategy {
         // block started from, not the state a hundred blocks later.
         let state_block = tx.state_block(&head);
 
-        let Some(victim_pair) = ctx.pools.pair_for(intent.token_in, intent.token_out, Venue::UniV2).await else {
+        let Some(victim_pair) = ctx
+            .pools
+            .pair_for(intent.token_in, intent.token_out, Venue::UniV2)
+            .await
+        else {
             return Vec::new();
         };
         let Some(victim_pool) = ctx.pool_at(victim_pair, Venue::UniV2, state_block).await else {
@@ -185,7 +193,13 @@ fn build_cycle_opportunity(
 }
 
 /// Try `token_in → mid → token_in` buying on `a` and selling on `b`.
-fn try_cycle(ctx: &StrategyCtx, a: &V2Pool, b: &V2Pool, token_in: Address, head: &BlockHead) -> Option<Opportunity> {
+fn try_cycle(
+    ctx: &StrategyCtx,
+    a: &V2Pool,
+    b: &V2Pool,
+    token_in: Address,
+    head: &BlockHead,
+) -> Option<Opportunity> {
     if a.other_token(token_in).is_none() {
         return None;
     }
@@ -276,7 +290,9 @@ mod tests {
         let a = pool(Venue::UniV2, 1_000e18 as u128, 2_000_000e6 as u128);
         let b = pool(Venue::SushiV2, 1_000e18 as u128, 2_000_000e6 as u128);
         // identical pricing -> the fee makes every size a loss
-        assert!(dex::optimal_two_leg_arb(&a, &b, known::WETH, U256::from(10u128.pow(20))).is_none());
+        assert!(
+            dex::optimal_two_leg_arb(&a, &b, known::WETH, U256::from(10u128.pow(20))).is_none()
+        );
     }
 
     #[test]
