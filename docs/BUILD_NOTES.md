@@ -1,5 +1,33 @@
 # Local build & sandbox notes
 
+## Session 2026-08-22 (CallFailed inner decoding + risk-panel patch poisoning fix)
+
+Two operator reports, one PR:
+
+1. **`CallFailed(index=0)` stopped one level short.** The executor reverts
+   with the failed leg's *raw* revert bytes (`revert CallFailed(i, ret)`),
+   and the decoder discarded them. It now unpacks the `bytes returndata`
+   argument (tuple-head offset/length, all bounds-checked — a decoder must
+   never panic on hostile bytes) and decodes it recursively (depth-capped
+   at 3). Sniper funnel rows now read e.g. `CallFailed(index=0):
+   Error("UniswapV2: K")` — which is exactly how a honeypot, a transfer
+   tax and a timing miss are told apart.
+2. **One bad env value vetoed every dashboard edit.** `MAX_GAS_PER_BUNDLE`
+   set above the 30M ceiling (the same fat-fingered value behind the
+   earlier "intrinsic gas too high" session) flowed from `.env` into
+   `GET /api/risk`, and the panel re-sent *every* field on each edit — so
+   each patch failed validation ("outside [21000, 30000000]"), nothing
+   applied, and the form snapped back. Fixed on both sides: the env value
+   is clamped into the validator's range at boot (with a warning naming
+   the variable), and the panel now sends **only the fields that moved**
+   since the last applied state, so a stale value can never veto an
+   unrelated edit.
+
+**Verification:** `cargo test --all` 189 passed (4 new: inner
+Error(string), inner custom error, bare/short inner data, malformed
+offsets never panic); clippy clean; `tsc --noEmit` clean; `next build`
+succeeds.
+
 ## Session 2026-08-22 (runtime risk envelope + go-live console surface)
 
 Operator request: make the risk envelope instant from the console (it was

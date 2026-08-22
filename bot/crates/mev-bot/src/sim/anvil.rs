@@ -88,6 +88,13 @@ struct SentTx {
 /// revert back into "custom error 0x…" and the whole point of the decoder
 /// would be lost.
 pub fn decode_revert_data(data: &[u8]) -> String {
+    decode_revert_data_at(data, 0)
+}
+
+/// Depth-bounded worker — `CallFailed` carries the failed leg's own revert
+/// data, which is decoded recursively; three levels is deeper than anything
+/// real protocols produce.
+fn decode_revert_data_at(data: &[u8], depth: u8) -> String {
     use alloy_sol_types::{sol, SolError};
     sol! {
         interface MevExecutorErrors {
@@ -211,10 +218,25 @@ pub fn decode_revert_data(data: &[u8]) -> String {
     }
     if selector == MevExecutorErrors::CallFailed::SELECTOR {
         let w = words(0);
-        return format!(
-            "CallFailed(index={}) — a leg reverted inside the batch",
-            w.first().copied().unwrap_or_default()
-        );
+        let index = w.first().copied().unwrap_or_default();
+        return match decode_callfailed_inner(data) {
+            Some(inner) if inner.is_empty() => format!(
+                "CallFailed(index={index}): the leg reverted bare (a require() without a message)"
+            ),
+            Some(inner) if inner.len() >= 4 && depth < 3 => format!(
+                "CallFailed(index={}): {}",
+                index,
+                decode_revert_data_at(&inner, depth + 1)
+            ),
+            Some(inner) => format!(
+                "CallFailed(index={}): raw 0x{}…",
+                index,
+                hex::encode(&inner[..inner.len().min(8)])
+            ),
+            // Malformed length/offset — unreachable from the contract's own
+            // encoding, but a decoder must never panic on hostile bytes.
+            None => format!("CallFailed(index={index}) — a leg reverted inside the batch"),
+        };
     }
     let w = words(0);
     let args = if w.is_empty() {
@@ -230,6 +252,32 @@ pub fn decode_revert_data(data: &[u8]) -> String {
         )
     };
     format!("custom error 0x{}{args}", hex::encode(selector))
+}
+
+/// Pull the `bytes returndata` argument out of a `CallFailed(uint256, bytes)`
+/// payload. Layout after the 4-byte selector (a standard tuple head):
+/// word0 = index, word1 = byte offset of the bytes data (relative to the
+/// head start), then at that offset: a length word and the bytes themselves.
+/// The executor reverts with the leg's *raw* revert bytes here
+/// (`revert CallFailed(i, ret)`), so the payload is itself decodable.
+fn decode_callfailed_inner(data: &[u8]) -> Option<Vec<u8>> {
+    // selector(4) + index(32) + offset(32), then at least the length word.
+    if data.len() < 4 + 64 + 32 {
+        return None;
+    }
+    let offset = usize::try_from(U256::from_be_slice(&data[4 + 32..4 + 64])).ok()?;
+    let len = usize::try_from(U256::from_be_slice(&data[4 + 64..4 + 96])).ok()?;
+    // The bytes offset is relative to the tuple head and the encoder emits
+    // it right after the two head words; anything else is malformed.
+    if offset != 64 {
+        return None;
+    }
+    let start = 4usize.checked_add(offset)?.checked_add(32)?;
+    let end = start.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    Some(data[start..end].to_vec())
 }
 
 impl AnvilSim {
@@ -886,6 +934,112 @@ mod tests {
         let text = decode_revert_data(&data);
         assert!(text.starts_with("custom error 0xdeadbeef"), "{text}");
         assert!(text.contains("(7)"), "{text}");
+    }
+
+    /// `Error("UniswapV2: K")` — the classic constant-product sentinel.
+    fn error_string(message: &str) -> Vec<u8> {
+        use alloy_sol_types::SolType;
+        let mut out = vec![0x08, 0xc3, 0x79, 0xa0];
+        out.extend_from_slice(&[0u8; 32]); // string offset
+        let mut len = [0u8; 32];
+        len[24..].copy_from_slice(&(message.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        out.extend_from_slice(message.as_bytes());
+        let _ = alloy_sol_types::sol_data::String::abi_encode_packed(&message.to_string());
+        out
+    }
+
+    #[test]
+    fn decodes_callfailed_with_inner_error_string() {
+        use alloy_sol_types::{sol, SolError};
+        sol! {
+            interface E {
+                error CallFailed(uint256 index, bytes returndata);
+            }
+        }
+        let data = E::CallFailed {
+            index: U256::ZERO,
+            returndata: alloy_primitives::Bytes::from(error_string("UniswapV2: K")),
+        }
+        .abi_encode();
+        let text = decode_revert_data(&data);
+        assert!(text.contains("CallFailed(index=0)"), "{text}");
+        assert!(text.contains("UniswapV2: K"), "{text}");
+    }
+
+    #[test]
+    fn decodes_callfailed_with_inner_custom_error() {
+        use alloy_sol_types::{sol, SolError};
+        sol! {
+            interface E {
+                error CallFailed(uint256 index, bytes returndata);
+                error HEALTHY_POSITION();
+            }
+        }
+        let data = E::CallFailed {
+            index: U256::from(2u8),
+            returndata: alloy_primitives::Bytes::from(E::HEALTHY_POSITION {}.abi_encode()),
+        }
+        .abi_encode();
+        let text = decode_revert_data(&data);
+        assert!(text.contains("CallFailed(index=2)"), "{text}");
+        assert!(text.contains("HEALTHY_POSITION"), "{text}");
+    }
+
+    #[test]
+    fn decodes_callfailed_with_bare_and_short_inner_reverts() {
+        use alloy_sol_types::{sol, SolError};
+        sol! {
+            interface E {
+                error CallFailed(uint256 index, bytes returndata);
+            }
+        }
+        let bare = E::CallFailed {
+            index: U256::ZERO,
+            returndata: alloy_primitives::Bytes::new(),
+        }
+        .abi_encode();
+        let text = decode_revert_data(&bare);
+        assert!(text.contains("bare"), "{text}");
+
+        let short = E::CallFailed {
+            index: U256::from(1u8),
+            returndata: alloy_primitives::Bytes::from(vec![0xde, 0xad]),
+        }
+        .abi_encode();
+        let text = decode_revert_data(&short);
+        assert!(text.contains("raw 0xdead"), "{text}");
+    }
+
+    #[test]
+    fn callfailed_with_malformed_inner_bytes_never_panics() {
+        // Right selector, truncated/trash tail — the decoder must produce a
+        // string, not a panic, whatever a hostile contract returns.
+        let mut data = vec![0x5c, 0x0d, 0xee, 0x00]; // wrong-case selector is fine, ignored
+        data.extend_from_slice(&[0u8; 128]);
+        let mut bogus_offset = [0u8; 32];
+        bogus_offset[24..].copy_from_slice(&999u64.to_be_bytes());
+        data[4 + 32..4 + 64].copy_from_slice(&bogus_offset);
+        let _ = decode_revert_data(&data); // must not panic
+                                           // Exact selector with a length that overruns the payload.
+        use alloy_sol_types::{sol, SolError};
+        sol! {
+            interface E {
+                error CallFailed(uint256 index, bytes returndata);
+            }
+        }
+        let mut overrun = E::CallFailed {
+            index: U256::ZERO,
+            returndata: alloy_primitives::Bytes::new(),
+        }
+        .abi_encode();
+        // length word sits at head offset 64 + 4: blow it up
+        let len_pos = 4 + 64;
+        let mut bogus_len = [0u8; 32];
+        bogus_len[24..].copy_from_slice(&(1u64 << 40).to_be_bytes());
+        overrun[len_pos..len_pos + 32].copy_from_slice(&bogus_len);
+        let text = decode_revert_data(&overrun);
+        assert!(text.contains("CallFailed"), "{text}");
     }
 
     #[test]

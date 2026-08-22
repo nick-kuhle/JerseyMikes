@@ -360,7 +360,22 @@ impl Config {
                 max_position_wei: env_u256("MAX_POSITION_WEI", 100_000_000_000_000_000_000), // 100 ETH
                 max_base_fee_wei: env_u256("MAX_BASE_FEE_WEI", 500_000_000_000),             // 500 gwei
                 bribe_bps: env_u64("BRIBE_BPS", 9_000) as u16,
-                max_gas_per_bundle: env_u64("MAX_GAS_PER_BUNDLE", 3_000_000),
+                // Clamped into the same range the runtime patch validator
+                // enforces — an out-of-range env value would otherwise be
+                // echoed back by GET /api/risk and poison every dashboard
+                // patch that re-sends it ("outside [21000, 30000000]").
+                max_gas_per_bundle: {
+                    let raw = env_u64("MAX_GAS_PER_BUNDLE", 3_000_000);
+                    let clamped = raw.clamp(21_000, crate::sim::anvil::MAX_TX_GAS_CEILING);
+                    if clamped != raw {
+                        eprintln!(
+                            "MAX_GAS_PER_BUNDLE={raw} outside [21000, {}] — clamped to {clamped} \
+                             (the value is a per-bundle gas cap, not a gas price)",
+                            crate::sim::anvil::MAX_TX_GAS_CEILING
+                        );
+                    }
+                    clamped
+                },
                 max_drawdown_wei: env_u256("MAX_DRAWDOWN_WEI", 0),
                 max_inflight_per_strategy: env_u64("MAX_INFLIGHT_PER_STRATEGY", 32) as usize,
                 max_revert_rate: env_f64("MAX_REVERT_RATE", 1.0),
