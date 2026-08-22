@@ -79,8 +79,12 @@ export default function RiskPanel({status}: Props) {
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skipFirst = useRef(true);
+  /** Last authoritative effective values — patches send only what differs,
+   * so one stale/invalid field can never block the others. */
+  const lastApplied = useRef<RiskValues | null>(null);
 
   const seed = useCallback((v: RiskValues) => {
+    lastApplied.current = v;
     setValues(v);
     try {
       setMinProfitEth(formatMinimalEther(BigInt(v.minNetProfitWei)));
@@ -174,7 +178,7 @@ export default function RiskPanel({status}: Props) {
       } catch {
         /* keep */
       }
-      const patch = {
+      const candidate: RiskValues = {
         minNetProfitWei: minWei,
         maxPositionWei: posWei,
         maxBaseFeeWei: String(BigInt(maxBaseFeeGwei) * 1_000_000_000n),
@@ -183,6 +187,20 @@ export default function RiskPanel({status}: Props) {
         maxGasPerBundle: maxGas,
         maxInflightPerStrategy: maxInflight,
       };
+      // Send ONLY the fields that moved since the last applied state.
+      // Re-sending unchanged fields would let one stale value (e.g. a
+      // fat-fingered MAX_GAS_PER_BUNDLE from .env) veto every edit.
+      const ref = lastApplied.current;
+      const patch: Partial<RiskValues> = {};
+      for (const key of Object.keys(candidate) as (keyof RiskValues)[]) {
+        if (!ref || candidate[key] !== ref[key]) {
+          (patch as Record<string, unknown>)[key] = candidate[key];
+        }
+      }
+      if (Object.keys(patch).length === 0) {
+        setApply({kind: "idle"});
+        return;
+      }
       pushPatch(patch);
     }, 500);
     return () => {
