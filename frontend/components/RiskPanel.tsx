@@ -9,7 +9,18 @@ interface Props {
   status: StatusResponse | null;
 }
 
-const ALL_STRATEGIES: Strategy[] = ["sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"];
+const ALL_STRATEGIES: Strategy[] = [
+  "sandwich",
+  "sandwich_v3",
+  "jit",
+  "atomic_arb",
+  "liquidation",
+  "liquidation_compound",
+  "liquidation_morpho",
+  "liquidation_maker",
+  "oracle_frontrun",
+  "sniper",
+];
 
 export default function RiskPanel({status}: Props) {
   const [minProfitEth, setMinProfitEth] = useState("0.002");
@@ -23,6 +34,10 @@ export default function RiskPanel({status}: Props) {
     jit: true,
     atomic_arb: true,
     liquidation: true,
+    liquidation_compound: true,
+    liquidation_morpho: true,
+    liquidation_maker: true,
+    oracle_frontrun: true,
     sniper: true,
   });
   const [copied, setCopied] = useState(false);
@@ -47,6 +62,10 @@ export default function RiskPanel({status}: Props) {
         jit: current.includes("jit"),
         atomic_arb: current.includes("atomic_arb"),
         liquidation: current.includes("liquidation"),
+        liquidation_compound: current.includes("liquidation_compound"),
+        liquidation_morpho: current.includes("liquidation_morpho"),
+        liquidation_maker: current.includes("liquidation_maker"),
+        oracle_frontrun: current.includes("oracle_frontrun"),
         sniper: current.includes("sniper"),
       });
     }
@@ -79,6 +98,10 @@ STRATEGY_SANDWICH_V3=${enabledStrats.sandwich_v3}
 STRATEGY_JIT=${enabledStrats.jit}
 STRATEGY_ATOMIC_ARB=${enabledStrats.atomic_arb}
 STRATEGY_LIQUIDATION=${enabledStrats.liquidation}
+STRATEGY_LIQUIDATION_COMPOUND=${enabledStrats.liquidation_compound}
+STRATEGY_LIQUIDATION_MORPHO=${enabledStrats.liquidation_morpho}
+STRATEGY_LIQUIDATION_MAKER=${enabledStrats.liquidation_maker}
+STRATEGY_ORACLE_FRONTRUN=${enabledStrats.oracle_frontrun}
 STRATEGY_SNIPER=${enabledStrats.sniper}`;
   };
 

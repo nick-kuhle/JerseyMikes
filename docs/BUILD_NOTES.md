@@ -66,11 +66,17 @@ watched Vat `frob` LogNotes that the live Vat never emits (live RPC probe;
 urns now come from the gem joins' *anonymous* LogNotes with the urn in
 topics[2]).
 
+**Frontend:** CI's first run caught what the sandbox had not — widening the
+`Strategy` union breaks every `Record<Strategy, …>` consumer, not just the
+funnel panel: `RiskPanel`'s toggle state/env snippet and two demo-data
+Records needed the new rows too, plus `demoNote`'s exhaustive switch
+(`TS2366`). Fixed and then verified locally end-to-end: `npm install`,
+`npx tsc --noEmit` clean, `npm run build` succeeds.
+
 **Not verified in this sandbox:** contracts (unchanged — the executor's
 generic `Call[]` covers every new leg, so the artifact-drift job stays green
-by construction), the frontend build (two-line type-union/funnel-list
-change; CI runs `tsc --noEmit` + `next build`), and end-to-end anvil
-simulation of a live liquidation (needs an archive endpoint + anvil).
+by construction; its CI job confirms) and end-to-end anvil simulation of a
+live liquidation (needs an archive endpoint + anvil).
 
 ## Session 2026-08-21 (console + mode-switch pass)
 

@@ -45,7 +45,11 @@ export const STRATEGY_LABEL: Record<string, string> = {
   sandwich_v3: "Sandwich V3",
   jit: "JIT liquidity",
   atomic_arb: "Atomic arb",
-  liquidation: "Liquidation",
+  liquidation: "Liquidation (Aave)",
+  liquidation_compound: "Liquidation (Compound V3)",
+  liquidation_morpho: "Liquidation (Morpho)",
+  liquidation_maker: "Liquidation (Maker)",
+  oracle_frontrun: "Oracle front-run",
   sniper: "Token sniper",
 };
 
@@ -55,5 +59,9 @@ export const STRATEGY_COLOR: Record<string, string> = {
   jit: "#a855f7",
   atomic_arb: "#22d3ee",
   liquidation: "#ef4444",
+  liquidation_compound: "#f87171",
+  liquidation_morpho: "#fb923c",
+  liquidation_maker: "#eab308",
+  oracle_frontrun: "#38bdf8",
   sniper: "#84cc16",
 };

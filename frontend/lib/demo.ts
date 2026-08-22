@@ -20,7 +20,18 @@ import type {
   Strategy,
 } from "./types";
 
-const STRATEGIES: Strategy[] = ["sandwich", "sandwich_v3", "jit", "atomic_arb", "liquidation", "sniper"];
+const STRATEGIES: Strategy[] = [
+  "sandwich",
+  "sandwich_v3",
+  "jit",
+  "atomic_arb",
+  "liquidation",
+  "liquidation_compound",
+  "liquidation_morpho",
+  "liquidation_maker",
+  "oracle_frontrun",
+  "sniper",
+];
 const START_BLOCK = 23_180_000;
 
 // Deterministic PRNG so server and client stay consistent within a run.
@@ -226,6 +237,48 @@ export function demoFunnel(): Record<Strategy, FunnelCounters> {
       simulationsFailed: 1,
       submittable: 5,
     }),
+    liquidation_compound: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 36_542,
+      candidatesEmitted: 2,
+      gatedByRisk: 1,
+      simulationsSucceeded: 0,
+      simulationsReverted: 2,
+      simulationsFailed: 0,
+      submittable: 0,
+    }),
+    liquidation_morpho: f({
+      invocationsWithOutput: 1,
+      invocationsEmpty: 36_541,
+      candidatesEmitted: 3,
+      gatedByRisk: 1,
+      missingVictimRaw: 0,
+      simulationsSucceeded: 1,
+      simulationsReverted: 1,
+      simulationsFailed: 0,
+      submittable: 1,
+    }),
+    liquidation_maker: f({
+      invocationsWithOutput: 0,
+      invocationsEmpty: 36_542,
+      candidatesEmitted: 1,
+      gatedByRisk: 0,
+      simulationsSucceeded: 0,
+      simulationsReverted: 1,
+      simulationsFailed: 0,
+      submittable: 0,
+    }),
+    oracle_frontrun: f({
+      invocationsWithOutput: 3,
+      invocationsEmpty: 41_204,
+      candidatesEmitted: 6,
+      gatedByRisk: 2,
+      missingVictimRaw: 1,
+      simulationsSucceeded: 1,
+      simulationsReverted: 2,
+      simulationsFailed: 0,
+      submittable: 1,
+    }),
     sniper: f({
       invocationsWithOutput: 0,
       invocationsEmpty: 47,
@@ -291,6 +344,10 @@ export function demoFunnelReplay(): Record<Strategy, FunnelCounters> {
       simulationsFailed: 2,
       submittable: 17,
     }),
+    liquidation_compound: f({invocationsEmpty: 73_608, invocationsWithOutput: 4, candidatesEmitted: 4}),
+    liquidation_morpho: f({invocationsEmpty: 73_610, invocationsWithOutput: 6, candidatesEmitted: 9}),
+    liquidation_maker: f({invocationsEmpty: 73_611, invocationsWithOutput: 2, candidatesEmitted: 2}),
+    oracle_frontrun: f({invocationsEmpty: 82_408, invocationsWithOutput: 12, candidatesEmitted: 24}),
     sniper: f({invocationsEmpty: 123_806, invocationsWithOutput: 194, candidatesEmitted: 194}),
   };
 }
@@ -337,6 +394,14 @@ function demoNote(s: Strategy): string {
       return "arb 0xb4e… -> 0x397… (univ2 -> sushiv2) in 12.4 WETH gross 0.031 WETH";
     case "liquidation":
       return "aave v3 liquidation user 0x51a… hf 0.972 cover 18,400 USDC";
+    case "liquidation_compound":
+      return "compound v3 absorb+buyCollateral account 0x77c… storefront discount on 3 assets";
+    case "liquidation_morpho":
+      return "morpho blue liquidate market 0xf8c… borrower 0x2b6… full close repay 41,200 USDC";
+    case "liquidation_maker":
+      return "maker ETH-A bark urn 0x824… + clip.take id 34,882 slice 6.1 WETH";
+    case "oracle_frontrun":
+      return "back-run ETH/USD transmit 0x41f… via chainlink: 2 near-miss liquidations rebuilt";
     case "sniper":
       return "new pair 0x71c… token 0xdd2…; atomic round-trip probe (honeypot/tax check)";
   }
