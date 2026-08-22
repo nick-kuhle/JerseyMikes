@@ -224,6 +224,27 @@ cp .env.example .env
 $EDITOR .env           # set ETH_HTTP_URL and ETH_WS_URL
 ```
 
+### Every simulation rejected with `intrinsic gas too high -- tx.gas_limit > env.block.gas_limit`
+
+`MAX_GAS_PER_BUNDLE` is above the fork's block gas limit, so anvil refuses
+every executor transaction before it runs. Mainnet's limit is 60M (2026) and
+the bot clamps + warns at boot since the fix, but the underlying config is
+still wrong: **the value is a per-bundle gas cap, not a gas price** — the
+default 3,000,000 is correct and generous (the biggest bundle — Maker
+bark+take — uses well under 1M). Check `.env` for a fat-fingered
+`MAX_GAS_PER_BUNDLE`, or, if you attach to your own anvil
+(`ANVIL_BIN`/attach mode), a low `--gas-limit` on that instance.
+
+### All the simulations say `reverted` with no reason
+
+That is the funnel doing its job *after* the fix landed: revert reasons are
+now decoded (`Unprofitable(realised=…, required=…)` is the executor's profit
+guard — gross profit did not clear `minProfit`, i.e. the bundle was correctly
+unprofitable; `HEALTHY_POSITION`/`NotLiquidatable`/`Dog/not-unsafe` mean the
+position recovered between the off-chain read and the fork). Before the fix
+these showed as `tx 0x… reverted` with a fork-local hash — see
+`docs/BUILD_NOTES.md` for the diagnosis session.
+
 ### No opportunities appearing
 
 Almost always a **missing `ETH_WS_URL`**. The bot reads the mempool from the
