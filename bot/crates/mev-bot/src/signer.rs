@@ -29,6 +29,17 @@ impl std::fmt::Debug for Signer {
 }
 
 impl Signer {
+    /// Public Anvil/Hardhat development key used only when the process is not
+    /// armed for broadcasting and no funded searcher key was configured.
+    /// Keeping it deterministic makes the signed payload executed by Anvil
+    /// reproducible. `Config::validate` forbids this identity in live mode.
+    pub const SIMULATION_KEY: &'static str =
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    pub fn simulation() -> Self {
+        Self::from_hex(Self::SIMULATION_KEY).expect("the built-in simulation key is valid")
+    }
+
     pub fn from_hex(key: &str) -> Result<Self> {
         let clean = key.trim().strip_prefix("0x").unwrap_or(key.trim());
         let bytes = hex::decode(clean).map_err(|e| anyhow!("bad private key hex: {e}"))?;
@@ -176,7 +187,10 @@ mod tests {
     #[test]
     fn derives_the_right_address() {
         let s = Signer::from_hex(KEY).unwrap();
-        assert_eq!(format!("{:?}", s.address()).to_lowercase(), ADDR.to_lowercase());
+        assert_eq!(
+            format!("{:?}", s.address()).to_lowercase(),
+            ADDR.to_lowercase()
+        );
     }
 
     #[test]

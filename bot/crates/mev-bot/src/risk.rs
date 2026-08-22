@@ -344,7 +344,8 @@ impl RiskEngine {
     /// Would we have sent this bundle? Simulation-only builds never actually do.
     pub fn submittable(&self, sim: &SimulationResult) -> bool {
         let risk = self.runtime.risk();
-        sim.success
+        sim.strategy.live_candidate()
+            && sim.success
             && sim.net_profit_wei > 0
             && U256::from(sim.net_profit_wei.max(0) as u128) >= risk.min_net_profit_wei
             && sim.gas_used <= risk.max_gas_per_bundle
@@ -372,12 +373,14 @@ mod tests {
                 ws_url: None,
                 mev_share_sse: String::new(),
                 relay_url: String::new(),
+                bundle_relay_urls: vec![],
                 relay_data_urls: vec![],
                 bloxroute_relay_url: String::new(),
                 sequencer_feed: None,
                 extra_mempool_ws: vec![],
                 mev_blocker_ws: None,
                 flashbots_signer_key: None,
+                searcher_private_key: None,
                 executor: None,
                 searcher_address: Address::ZERO,
             },
@@ -447,6 +450,9 @@ mod tests {
             arb_max_pools: 200,
             inventory_gate: false,
             live_execution: false,
+            broadcast_enabled: false,
+            qualification_hours: 168,
+            qualification_min_actual_matches: 30,
         })
     }
 

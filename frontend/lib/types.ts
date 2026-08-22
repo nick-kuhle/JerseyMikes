@@ -39,6 +39,19 @@ export interface StatusResponse {
    * instead of a toggle it cannot honour.
    */
   liveArmed?: boolean;
+  broadcastEnabled?: boolean;
+  qualification?: {
+    pass: boolean;
+    startedAtMs: number;
+    elapsedHours: number;
+    requiredHours: number;
+    liveCandidateSimulations: number;
+    relayCrossChecks: number;
+    highConfidenceActualMatches: number;
+    minimumActualMatches: number;
+    persistenceDropped: number;
+    reasons: string[];
+  };
   strategies: Strategy[];
   /** Boot-time set (env toggles); `strategies` is the runtime-effective set. */
   bootStrategies?: Strategy[];
@@ -120,7 +133,7 @@ export interface ReconciliationRow {
   blockNumber: number;
   opportunityId: string;
   strategy: string;
-  simNetWei: number;
+  simNetWei: string;
   ourBribeWei: string;
   winningBidWei: string;
   victimLanded: boolean;
@@ -144,6 +157,24 @@ export interface CompetitionSummary {
 export interface CompetitionResponse {
   summary: CompetitionSummary;
   recent: ReconciliationRow[];
+  demo?: boolean;
+}
+
+export interface ActualMevResponse {
+  summary: {matches: number; highConfidence: number};
+  matches: {
+    opportunityId: string;
+    blockNumber: number;
+    victimHash: string;
+    mevTxHashes: string[];
+    actor: string | null;
+    grossWethWei: string;
+    gasCostWei: string;
+    netWethWei: string;
+    confidence: "high" | "medium" | string;
+    evidence: Record<string, unknown>;
+    createdAtMs: number;
+  }[];
   demo?: boolean;
 }
 
@@ -178,15 +209,15 @@ export interface PnlRow {
   losses: number;
   gross_profit_wei: string;
   gas_spent_wei: string;
-  net_profit_wei: number;
-  best_net_wei: number;
-  worst_net_wei: number;
+  net_profit_wei: string;
+  best_net_wei: string;
+  worst_net_wei: string;
   avg_latency_ms: number;
 }
 
 export interface PnlResponse {
   byStrategy: PnlRow[];
-  totalNetWei: number;
+  totalNetWei: string;
   demo?: boolean;
 }
 
@@ -199,7 +230,7 @@ export interface SimulationRow {
   gasUsed: number;
   gasCostWei: string;
   bribeWei: string;
-  netWei: number;
+  netWei: string;
   revertReason: string | null;
   targetBlock: number;
   latencyMs: number;
@@ -237,7 +268,7 @@ export interface OpportunityRow {
 
 export interface SeriesPoint {
   block: number;
-  netWei: number;
+  netWei: string;
   count: number;
 }
 
@@ -318,7 +349,7 @@ export type FeedEvent =
       strategy: Strategy;
       backend: string;
       success: boolean;
-      net_profit_wei: number;
+      net_profit_wei: string;
       gas_used: number;
       gross_profit_wei: string;
       revert_reason: string | null;

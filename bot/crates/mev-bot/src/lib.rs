@@ -17,6 +17,7 @@
 
 pub mod alerts;
 pub mod api;
+pub mod attribution;
 pub mod bundle;
 pub mod competition;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod ingest;
 pub mod inventory;
 pub mod latency;
 pub mod metrics;
+pub mod qualification;
 pub mod replay;
 pub mod risk;
 pub mod rlp;
@@ -34,4 +36,5 @@ pub mod signer;
 pub mod sim;
 pub mod store;
 pub mod strategies;
+pub mod submission;
 pub mod types;

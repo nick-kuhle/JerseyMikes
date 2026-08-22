@@ -18,7 +18,7 @@
 //! The oracle front-runner reuses the same composition reader at trigger
 //! time, so a feed update back-runs the position as it stands then.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -56,6 +56,10 @@ sol! {
         ) external;
         function getReservesList() external view returns (address[] memory);
         function getUserConfiguration(address user) external view returns (uint256 data);
+    }
+
+    interface IAaveOracle {
+        function getAssetPrice(address asset) external view returns (uint256);
     }
 
     interface IAaveDataProvider {
@@ -102,7 +106,8 @@ const NEAR_MISS_HF_CEILING: u128 = 1_050_000_000_000_000_000;
 
 pub struct LiquidationStrategy {
     /// Borrowers we know about, harvested from logs.
-    watchlist: RwLock<HashSet<Address>>,
+    watchlist: RwLock<HashMap<Address, u64>>,
+    watch_cap: usize,
     last_log_block: RwLock<u64>,
     /// Shared near-miss registry (see `leads.rs`).
     leads: LiquidationLeads,
@@ -111,9 +116,10 @@ pub struct LiquidationStrategy {
 }
 
 impl LiquidationStrategy {
-    pub fn new(leads: LiquidationLeads) -> Self {
+    pub fn new(leads: LiquidationLeads, watch_cap: usize) -> Self {
         Self {
-            watchlist: RwLock::new(HashSet::new()),
+            watchlist: RwLock::new(HashMap::new()),
+            watch_cap: watch_cap.max(1),
             last_log_block: RwLock::new(0),
             leads,
             cache: AaveCache::default(),
@@ -153,12 +159,22 @@ impl LiquidationStrategy {
                         if let Some(t) = log["topics"].get(2).and_then(|t| t.as_str()) {
                             if let Ok(bytes) = hex::decode(t.trim_start_matches("0x")) {
                                 if bytes.len() == 32 {
-                                    set.insert(Address::from_slice(&bytes[12..32]));
+                                    set.insert(Address::from_slice(&bytes[12..32]), head.number);
                                 }
                             }
                         }
                     }
                 }
+                if set.len() > self.watch_cap {
+                    let mut by_age: Vec<(Address, u64)> = set
+                        .iter()
+                        .map(|(address, seen)| (*address, *seen))
+                        .collect();
+                    by_age.sort_unstable_by_key(|(_, seen)| std::cmp::Reverse(*seen));
+                    by_age.truncate(self.watch_cap);
+                    set.retain(|address, _| by_age.iter().any(|(keep, _)| keep == address));
+                }
+                drop(set);
                 *self.last_log_block.write() = head.number;
             }
             Err(e) => {
@@ -171,7 +187,7 @@ impl LiquidationStrategy {
     /// liquidation band (HF < 1.05): below 1 is actionable now, 1..1.05
     /// feeds the oracle front-runner.
     async fn unhealthy(&self, ctx: &StrategyCtx) -> Vec<(Address, U256, U256)> {
-        let users: Vec<Address> = self.watchlist.read().iter().copied().collect();
+        let users: Vec<Address> = self.watchlist.read().keys().copied().collect();
         let mut out = Vec::new();
         for chunk in users.chunks(100) {
             let calls: Vec<(String, serde_json::Value)> = chunk
@@ -284,6 +300,9 @@ pub struct AavePosition {
     pub collateral_amount: U256,
     pub debt_asset: Address,
     pub debt_amount_total: U256,
+    /// Collateral raw units expected from repaying `debt_amount_total`, priced
+    /// with Aave's own oracle and both reserves' decimals.
+    pub seized_amount: U256,
     /// The reserve's liquidation bonus, in bps over 1e4 (10500 == 5%).
     pub bonus_bps: u64,
     /// Close factor applied to size the repay, in bps.
@@ -319,7 +338,11 @@ pub async fn compose(
         ]))
         .await
         .ok()?;
-    let bitmap = U256::from_be_slice(&crate::types::parse_bytes(&cfg)[0..32]);
+    let cfg_bytes = crate::types::parse_bytes(&cfg);
+    if cfg_bytes.len() < 32 {
+        return None;
+    }
+    let bitmap = U256::from_be_slice(&cfg_bytes[0..32]);
 
     // Which reserves does this user touch?
     let mut assets = Vec::new();
@@ -331,7 +354,10 @@ pub async fn compose(
     if assets.is_empty() {
         return None;
     }
-    let assets: Vec<Address> = assets.into_iter().take(8).collect();
+    // Aave currently has a bounded reserve list and the user bitmap already
+    // filters it. Truncating the first eight touched reserves could silently
+    // omit the actual largest debt or collateral.
+    let assets: Vec<Address> = assets;
 
     let calls: Vec<(String, serde_json::Value)> = assets
         .iter()
@@ -347,12 +373,27 @@ pub async fn compose(
         .collect();
     let results = ctx.rpc.batch(&calls).await.ok()?;
 
-    let mut debts: Vec<(Address, U256)> = Vec::new();
-    let mut collaterals: Vec<(Address, U256)> = Vec::new();
+    // Compare reserves by Aave oracle value, not raw token units. A raw
+    // WETH balance and a raw USDC balance differ by twelve decimal places.
+    let mut debts: Vec<(Address, U256, U256, ReserveCfg, U256)> = Vec::new();
+    let mut collaterals: Vec<(Address, U256, U256, ReserveCfg, U256)> = Vec::new();
     for (asset, res) in assets.iter().zip(results) {
         let Ok(v) = res else { continue };
         let raw = crate::types::parse_bytes(&v);
         if raw.len() < 96 {
+            continue;
+        }
+        let Some(reserve_cfg) = aave_reserve_cfg(ctx, cache, *asset).await else {
+            continue;
+        };
+        if !reserve_cfg.active {
+            continue;
+        }
+        let Some(price) = aave_asset_price(ctx, *asset).await else {
+            continue;
+        };
+        let scale = decimal_scale(reserve_cfg.decimals);
+        if scale.is_zero() {
             continue;
         }
         let a_balance = U256::from_be_slice(&raw[0..32]);
@@ -360,24 +401,22 @@ pub async fn compose(
         let variable = U256::from_be_slice(&raw[64..96]);
         let debt = stable.saturating_add(variable);
         if !debt.is_zero() {
-            debts.push((*asset, debt));
+            let value = debt.saturating_mul(price) / scale;
+            debts.push((*asset, debt, value, reserve_cfg, price));
         }
         if !a_balance.is_zero() {
-            collaterals.push((*asset, a_balance));
+            let value = a_balance.saturating_mul(price) / scale;
+            collaterals.push((*asset, a_balance, value, reserve_cfg, price));
         }
     }
-    debts.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
-    collaterals.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    let (debt_asset, debt_total) = debts.first().copied()?;
-    let (collateral, collateral_amount) = collaterals.first().copied()?;
+    debts.sort_by_key(|(_, _, value, _, _)| std::cmp::Reverse(*value));
+    collaterals.sort_by_key(|(_, _, value, _, _)| std::cmp::Reverse(*value));
+    let (debt_asset, debt_total, _, debt_cfg, debt_price) = debts.first().copied()?;
+    let (collateral, collateral_amount, _, collateral_cfg, collateral_price) =
+        collaterals.first().copied()?;
 
-    let cfg = aave_reserve_cfg(ctx, cache, collateral).await?;
-    if !cfg.active {
-        return None;
-    }
     // HF-based close factor as before: 100% when deeply under, else 50%.
-    // (v3.1 has a per-reserve close factor; this stays the documented
-    // simplification and the simulation corrects any residue.)
+    // Aave's fork execution remains the final close-factor authority.
     let close_factor_bps = if health < U256::from(950_000_000_000_000_000u128) {
         10_000
     } else {
@@ -385,7 +424,17 @@ pub async fn compose(
     };
     let debt_amount =
         debt_total.saturating_mul(U256::from(close_factor_bps)) / U256::from(10_000u64);
-    if debt_amount.is_zero() {
+    if debt_amount.is_zero() || collateral_price.is_zero() {
+        return None;
+    }
+    let debt_value = debt_amount.saturating_mul(debt_price) / decimal_scale(debt_cfg.decimals);
+    let seized_amount = debt_value
+        .saturating_mul(U256::from(collateral_cfg.bonus_bps.max(10_000)))
+        .saturating_mul(decimal_scale(collateral_cfg.decimals))
+        / U256::from(10_000u64)
+        / collateral_price;
+    let seized_amount = seized_amount.min(collateral_amount);
+    if seized_amount.is_zero() {
         return None;
     }
     Some(AavePosition {
@@ -394,9 +443,34 @@ pub async fn compose(
         collateral_amount,
         debt_asset,
         debt_amount_total: debt_amount,
-        bonus_bps: cfg.bonus_bps.max(10_000),
+        seized_amount,
+        bonus_bps: collateral_cfg.bonus_bps.max(10_000),
         close_factor_bps,
     })
+}
+
+fn decimal_scale(decimals: u8) -> U256 {
+    let mut scale = U256::ONE;
+    for _ in 0..decimals {
+        scale = scale.saturating_mul(U256::from(10u8));
+    }
+    scale
+}
+
+async fn aave_asset_price(ctx: &StrategyCtx, asset: Address) -> Option<U256> {
+    let value = ctx
+        .rpc
+        .call_raw(
+            "eth_call",
+            serde_json::json!([{
+                "to": format!("{:?}", known::AAVE_V3_ORACLE),
+                "data": format!("0x{}", hex::encode(IAaveOracle::getAssetPriceCall { asset }.abi_encode()))
+            }, "latest"]),
+        )
+        .await
+        .ok()?;
+    let raw = crate::types::parse_bytes(&value);
+    (raw.len() >= 32).then(|| U256::from_be_slice(&raw[0..32]))
 }
 
 /// The pool's reserve list, cached per strategy instance (refreshed if a
@@ -509,9 +583,9 @@ pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<
         ),
     ];
 
-    // Seized estimate from the reserve's actual bonus; the fork simulation
-    // produces the real number.
-    let seized = debt_amount.saturating_mul(U256::from(pos.bonus_bps)) / U256::from(10_000u64);
+    // Oracle- and decimal-normalised collateral amount. The fork simulation
+    // remains authoritative for rounding and protocol caps.
+    let seized = pos.seized_amount;
     let mut notes = format!(
         "aave v3 liquidation user {:?} hf-derived close {}/{} repay {} {:?} seize ~{} {:?} (bonus {} bps)",
         pos.user, pos.close_factor_bps, 10_000, debt_amount, debt_asset, seized, collateral, pos.bonus_bps
@@ -537,7 +611,8 @@ pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<
         vec![debt_asset],
         vec![debt_amount],
         debt_asset,
-        seized.saturating_sub(debt_amount),
+        debt_amount.saturating_mul(U256::from(pos.bonus_bps.saturating_sub(10_000)))
+            / U256::from(10_000u64),
         debt_amount,
         ctx.target_block(),
         notes,
@@ -623,7 +698,7 @@ mod tests {
 
     #[test]
     fn watchlist_starts_empty() {
-        let s = LiquidationStrategy::new(LiquidationLeads::new());
+        let s = LiquidationStrategy::new(LiquidationLeads::new(), 200);
         assert_eq!(s.watchlist_size(), 0);
     }
 }

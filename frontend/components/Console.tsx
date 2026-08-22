@@ -13,6 +13,7 @@ import ModeSwitch from "./ModeSwitch";
 import Section from "./Section";
 import WalletButton from "./WalletButton";
 import type {
+  ActualMevResponse,
   CompetitionResponse,
   OpportunityRow,
   PnlResponse,
@@ -45,6 +46,7 @@ export default function Console() {
   const [opps, setOpps] = useState<OpportunityRow[]>([]);
   const [bids, setBids] = useState<RelayBid[]>([]);
   const [competition, setCompetition] = useState<CompetitionResponse | null>(null);
+  const [actualMev, setActualMev] = useState<ActualMevResponse | null>(null);
   const [reorgs, setReorgs] = useState<ReorgRow[]>([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [strategyFilter, setStrategyFilter] = useState("all");
@@ -61,7 +63,7 @@ export default function Console() {
         return fallback;
       }
     };
-    const [s, p, se, si, op, rb, comp, rg] = await Promise.all([
+    const [s, p, se, si, op, rb, comp, actual, rg] = await Promise.all([
       get<StatusResponse | null>("status", null),
       get<PnlResponse | null>("pnl", null),
       get<SeriesPoint[]>("pnl/series?limit=250", []),
@@ -69,6 +71,7 @@ export default function Console() {
       get<OpportunityRow[]>("opportunities?limit=60", []),
       get<RelayBid[]>("relay-bids?limit=25", []),
       get<CompetitionResponse | null>("competition?limit=25", null),
+      get<ActualMevResponse | null>("actual-mev?limit=25", null),
       get<ReorgRow[]>("reorgs?limit=15", []),
     ]);
     // Identity-preserving updates.
@@ -86,6 +89,7 @@ export default function Console() {
     setOpps((prev) => keepIfSame(prev, Array.isArray(op) ? op : []));
     setBids((prev) => keepIfSame(prev, Array.isArray(rb) ? rb : []));
     if (comp) setCompetition((prev) => keepIfSame(prev, comp));
+    if (actual) setActualMev((prev) => keepIfSame(prev, actual));
     setReorgs((prev) => keepIfSame(prev, Array.isArray(rg) ? rg : []));
   }, []);
 
@@ -97,7 +101,7 @@ export default function Console() {
 
   const demo = Boolean(status?.demo);
   const chainId = status?.chain.id;
-  const totalNet = pnl?.totalNetWei ?? 0;
+  const totalNet = pnl?.totalNetWei ?? "0";
   const filteredSims = useMemo(
     () => (strategyFilter === "all" ? sims : sims.filter((s) => s.strategy === strategyFilter)),
     [sims, strategyFilter]
@@ -212,7 +216,7 @@ export default function Console() {
         <Card
           title="simulated net P/L"
           value={`${signedEth(totalNet)} ETH`}
-          tone={totalNet >= 0 ? "pos" : "neg"}
+          tone={BigInt(totalNet) >= 0n ? "pos" : "neg"}
           sub="fork simulations only"
         />
         <Card title="win rate" value={`${winRate.toFixed(1)}%`} sub={`${totalSims} sims`} />
@@ -281,7 +285,7 @@ export default function Console() {
                   <td style={{textAlign: "right"}}>
                     {r.simulations ? `${((100 * r.wins) / r.simulations).toFixed(0)}%` : "—"}
                   </td>
-                  <td style={{textAlign: "right"}} className={r.net_profit_wei >= 0 ? "pos" : "neg"}>
+                  <td style={{textAlign: "right"}} className={BigInt(r.net_profit_wei) >= 0n ? "pos" : "neg"}>
                     {signedEth(r.net_profit_wei)}
                   </td>
                 </tr>
@@ -375,7 +379,7 @@ export default function Console() {
                       <td className="muted">{s.backend}</td>
                       <td style={{textAlign: "right"}}>{s.gasUsed.toLocaleString()}</td>
                       <td style={{textAlign: "right"}}>{weiToEth(s.grossWei, 5)}</td>
-                      <td style={{textAlign: "right"}} className={s.netWei >= 0 ? "pos" : "neg"}>
+                      <td style={{textAlign: "right"}} className={BigInt(s.netWei) >= 0n ? "pos" : "neg"}>
                         {signedEth(s.netWei)}
                       </td>
                       <td>
@@ -535,6 +539,10 @@ export default function Console() {
         </div>
       </section>
 
+      </Section>
+
+      <Section id="validation" title="Validation — latency & on-chain evidence" subtitle="decision-time simulations vs canonical blocks">
+        <Phase1Panel latency={status?.latency} competition={competition} actualMev={actualMev} reorgs={reorgs} />
       </Section>
 
       {/* bloXroute Max Profit relay — delivered blocks + their transactions */}

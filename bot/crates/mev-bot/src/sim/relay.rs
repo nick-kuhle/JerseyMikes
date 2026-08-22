@@ -18,7 +18,6 @@ use crate::types::{now_ms, parse_u256, BundleRecord, SimBackend, SimulationResul
 pub struct RelaySim {
     rpc: RpcClient,
     signer: Arc<Signer>,
-    bribe_bps: u16,
 }
 
 impl RelaySim {
@@ -26,7 +25,6 @@ impl RelaySim {
         Ok(Self {
             rpc: RpcClient::new(cfg.endpoints.relay_url.clone())?,
             signer,
-            bribe_bps: cfg.risk.bribe_bps,
         })
     }
 
@@ -88,7 +86,10 @@ impl RelaySim {
                 U256::ZERO
             },
             gas_cost_wei: gas_fees,
-            bribe_wei: eth_sent.max(coinbase_diff * U256::from(self.bribe_bps) / U256::from(10_000u32)),
+            // Report only what the relay actually observed. Reconstructing a
+            // configured percentage here double-counted the contract bribe and
+            // drifted after runtime risk edits.
+            bribe_wei: eth_sent,
             net_profit_wei: net,
             revert_reason,
             target_block: bundle.target_block,

@@ -366,7 +366,7 @@ impl MorphoLiquidationStrategy {
     async fn poll(
         &self,
         ctx: &StrategyCtx,
-    ) -> Vec<(B256, IMorpho::MarketParams, Address, U256, U256, U256)> {
+    ) -> Vec<(B256, IMorpho::MarketParams, Address, U256, U256, U256, U256)> {
         let snapshot: Vec<(B256, IMorpho::MarketParams, Vec<Address>)> = {
             let ms = self.markets.read();
             ms.values()
@@ -477,6 +477,7 @@ impl MorphoLiquidationStrategy {
                         borrow_shares,
                         total_borrow_assets,
                         total_borrow_shares,
+                        price,
                     ));
                 } else {
                     // Near-miss band for the oracle front-runner: health
@@ -512,6 +513,23 @@ impl MorphoLiquidationStrategy {
     }
 }
 
+/// Read a Morpho oracle price in its protocol-defined 1e36 scale.
+pub async fn oracle_price(ctx: &StrategyCtx, oracle: Address) -> Option<U256> {
+    let value = ctx
+        .rpc
+        .call_raw(
+            "eth_call",
+            json!([{
+                "to": format!("{oracle:?}"),
+                "data": format!("0x{}", hex::encode(IMorphoOracle::priceCall {}.abi_encode()))
+            }, "latest"]),
+        )
+        .await
+        .ok()?;
+    let raw = crate::types::parse_bytes(&value);
+    (raw.len() >= 32).then(|| U256::from_be_slice(&raw[0..32]))
+}
+
 /// Build a full-close liquidation for a Morpho position. Public: the oracle
 /// front-runner rebuilds the same bundle from a stale [`LeadAction::Morpho`]
 /// (the simulation is the arbiter of whether it still lands).
@@ -522,6 +540,7 @@ pub async fn build_opportunity(
     borrower: Address,
     borrow_shares: U256,
     totals: (U256, U256),
+    oracle_price: U256,
     target_block: u64,
 ) -> Option<Opportunity> {
     if borrow_shares.is_zero() {
@@ -560,7 +579,12 @@ pub async fn build_opportunity(
 
     // Seized estimate: floor(floor(repaid * incentive) * 1e36 / price) — only
     // for the expected-profit line; the chain computes the real number.
-    let seized_est = repaid_assets.saturating_mul(liquidation_incentive(params.lltv)) / WAD;
+    if oracle_price.is_zero() {
+        return None;
+    }
+    let seized_est = (repaid_assets.saturating_mul(liquidation_incentive(params.lltv)) / WAD)
+        .saturating_mul(PRICE_SCALE)
+        / oracle_price;
 
     if let Some(pair) = ctx
         .pools
@@ -623,7 +647,7 @@ impl StrategyImpl for MorphoLiquidationStrategy {
             "unhealthy Morpho positions found"
         );
         let mut out = Vec::new();
-        for (id, params, user, borrow_shares, tba, tbs) in candidates {
+        for (id, params, user, borrow_shares, tba, tbs, price) in candidates {
             if let Some(opp) = build_opportunity(
                 ctx,
                 &params,
@@ -631,6 +655,7 @@ impl StrategyImpl for MorphoLiquidationStrategy {
                 user,
                 borrow_shares,
                 (tba, tbs),
+                price,
                 ctx.target_block(),
             )
             .await

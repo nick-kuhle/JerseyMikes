@@ -71,7 +71,13 @@ impl SniperStrategy {
 
     /// The core primitive: buy `size` of WETH worth of the token and
     /// immediately sell it all back, in one atomic batch.
-    fn round_trip(&self, ctx: &StrategyCtx, pool: &dex::V2Pool, weth: Address, size: U256) -> Option<Vec<Call>> {
+    fn round_trip(
+        &self,
+        ctx: &StrategyCtx,
+        pool: &dex::V2Pool,
+        weth: Address,
+        size: U256,
+    ) -> Option<Vec<Call>> {
         let token = pool.other_token(weth)?;
         let bought = pool.amount_out(weth, size)?;
         if bought.is_zero() {
@@ -127,7 +133,9 @@ impl StrategyImpl for SniperStrategy {
             // handled by PoolDiscovery, which periodically rechecks liquidity.
             self.seen_pairs.write().insert(pair);
             // Only WETH-quoted pools, and only once they actually hold liquidity.
-            let Some(token) = pool.other_token(weth) else { continue };
+            let Some(token) = pool.other_token(weth) else {
+                continue;
+            };
             if self.is_blacklisted(token) {
                 continue;
             }
@@ -178,7 +186,9 @@ impl StrategyImpl for SniperStrategy {
         if !GO_LIVE_SELECTORS.contains(&sel_hex.as_str()) {
             return Vec::new();
         }
-        let Some(target) = tx.to else { return Vec::new() };
+        let Some(target) = tx.to else {
+            return Vec::new();
+        };
 
         let weth = ctx.cfg.chain.weth;
         let head = ctx.head();
@@ -190,7 +200,11 @@ impl StrategyImpl for SniperStrategy {
         } else {
             target
         };
-        let token = if token == Address::ZERO { target } else { token };
+        let token = if token == Address::ZERO {
+            target
+        } else {
+            token
+        };
         if self.is_blacklisted(token) {
             return Vec::new();
         }
@@ -245,8 +259,8 @@ pub fn classify(spent: U256, returned: U256) -> TokenVerdict {
     let bps = returned * U256::from(10_000u64) / spent;
     let bps = bps.min(U256::from(u64::MAX)).to::<u64>();
     match bps {
-        0..=5_000 => TokenVerdict::Honeypot,   // lost more than half: trap or extreme tax
-        5_001..=9_800 => TokenVerdict::Taxed,  // 2%+ round-trip cost beyond fees
+        0..=5_000 => TokenVerdict::Honeypot, // lost more than half: trap or extreme tax
+        5_001..=9_800 => TokenVerdict::Taxed, // 2%+ round-trip cost beyond fees
         9_801..=10_000 => TokenVerdict::Clean, // just the 2×30bps AMM fee
         _ => TokenVerdict::Profitable,
     }
@@ -269,10 +283,16 @@ mod tests {
     fn classifies_round_trips() {
         let one = U256::from(1_000_000u64);
         assert_eq!(classify(one, U256::ZERO), TokenVerdict::Honeypot);
-        assert_eq!(classify(one, U256::from(400_000u64)), TokenVerdict::Honeypot);
+        assert_eq!(
+            classify(one, U256::from(400_000u64)),
+            TokenVerdict::Honeypot
+        );
         assert_eq!(classify(one, U256::from(900_000u64)), TokenVerdict::Taxed);
         assert_eq!(classify(one, U256::from(994_000u64)), TokenVerdict::Clean);
-        assert_eq!(classify(one, U256::from(1_100_000u64)), TokenVerdict::Profitable);
+        assert_eq!(
+            classify(one, U256::from(1_100_000u64)),
+            TokenVerdict::Profitable
+        );
     }
 
     #[test]

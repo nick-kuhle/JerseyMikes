@@ -609,7 +609,11 @@ mod tests {
         let err_in = r_in.abs_diff(p.reserve0) * U256::from(100u64) / p.reserve0;
         let err_out = r_out.abs_diff(p.reserve1) * U256::from(100u64) / p.reserve1;
         assert!(err_in <= U256::from(1u64), "r_in {r_in} vs {}", p.reserve0);
-        assert!(err_out <= U256::from(1u64), "r_out {r_out} vs {}", p.reserve1);
+        assert!(
+            err_out <= U256::from(1u64),
+            "r_out {r_out} vs {}",
+            p.reserve1
+        );
     }
 
     #[tokio::test]
@@ -620,9 +624,14 @@ mod tests {
         };
         let victim = U256::from(50_000u128) * U256::from(10u128.pow(18));
         let max_in = U256::from(100_000u128) * U256::from(10u128.pow(18));
-        let s = size_v3_sandwich(&q, &intent(victim, U256::ZERO), max_in, MAX_QUOTES_PER_CANDIDATE)
-            .await
-            .expect("should find a sandwich");
+        let s = size_v3_sandwich(
+            &q,
+            &intent(victim, U256::ZERO),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await
+        .expect("should find a sandwich");
         assert!(s.gross_profit > U256::ZERO);
         assert!(s.amount_in > U256::ZERO);
         assert!(s.quotes_used <= MAX_QUOTES_PER_CANDIDATE);
@@ -641,9 +650,13 @@ mod tests {
             calls: AtomicU32::new(0),
         };
         let max_in = U256::from(100_000u128) * U256::from(10u128.pow(18));
-        let res =
-            size_v3_sandwich(&q, &intent(victim, strict_min), max_in, MAX_QUOTES_PER_CANDIDATE)
-                .await;
+        let res = size_v3_sandwich(
+            &q,
+            &intent(victim, strict_min),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await;
         assert!(res.is_none(), "must not sandwich a zero-slippage victim");
         assert!(q.calls.load(Ordering::Relaxed) <= MAX_QUOTES_PER_CANDIDATE);
     }

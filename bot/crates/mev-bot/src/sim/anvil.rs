@@ -18,16 +18,22 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::rpc::RpcClient;
-use crate::types::{now_ms, parse_u64, Call, Opportunity, SimBackend, SimulationResult};
+use crate::types::{now_ms, parse_u64, Opportunity, SimBackend, SimulationResult};
 
 /// Runtime bytecode of `MevExecutor`, produced by `contracts/script/compile-check.js`.
 /// Injected into the fork with `anvil_setCode` so simulation works before the
 /// contract is deployed anywhere.
 pub const EXECUTOR_RUNTIME_BYTECODE: &str = include_str!("../../artifacts/MevExecutor.runtime.hex");
+/// Compiler-emitted immutable byte ranges. They let the simulator patch the
+/// runtime fixture with constructor-equivalent values without mining setup
+/// transactions that would move the fork past the target block.
+pub const EXECUTOR_IMMUTABLE_REFS: &str =
+    include_str!("../../artifacts/MevExecutor.immutables.json");
 
-/// Address the executor is mounted at inside the fork when no real deployment exists.
+/// Address where the constructor-equivalent fixture is mounted.
 pub const SIM_EXECUTOR: Address =
     alloy_primitives::address!("00000000000000000000000000000000000e0000");
+const EXECUTED_TOPIC: &str = "0x920d3a9c5eb5759e8895809a65dae03c9336ebf6f554de8cdc90e3bcb4404121";
 
 /// Ceiling for the *signed* bundle transactions (the relay `eth_callBundle`
 /// path, which has no fork to read a live limit from): comfortably below any
@@ -54,29 +60,13 @@ pub struct AnvilSim {
     child: Mutex<Option<tokio::process::Child>>,
     /// Block the fork is currently pinned to.
     forked_at: Mutex<u64>,
-    executor: Address,
+    executor: parking_lot::RwLock<Address>,
     searcher: Address,
-    /// Block gas limit of the forked chain, read after every (re)fork. The
-    /// executor transactions are clamped below it — see [`Self::executor_gas_limit`].
-    block_gas_limit: Mutex<u64>,
-    /// Warns once per process when `MAX_GAS_PER_BUNDLE` had to be clamped.
-    clamp_warned: std::sync::atomic::AtomicBool,
     /// The runtime risk envelope — `minProfit`/`bribeBps` guards and the gas
     /// cap follow dashboard changes immediately, not at the next restart.
     risk: crate::risk::RuntimeRisk,
     /// Serialises access: one simulation at a time per fork.
     lock: Mutex<()>,
-}
-
-/// A transaction the simulator injected into the fork, kept around so a
-/// status-0 receipt can be re-executed via `eth_call` and its revert data
-/// decoded. Victim replay targets (`eth_sendRawTransaction`) have no local
-/// call params, so they carry `replay: None` and get the plain label.
-struct SentTx {
-    /// "front-run" | "back-run" | "victim"
-    label: &'static str,
-    /// `eth_call` params reproducing the transaction (executor legs only).
-    replay: Option<Value>,
 }
 
 /// Decode revert bytes into something a human can triage: the executor's own
@@ -377,9 +367,7 @@ impl AnvilSim {
             rpc,
             child: Mutex::new(Some(child)),
             forked_at: Mutex::new(block),
-            executor,
-            block_gas_limit: Mutex::new(0),
-            clamp_warned: std::sync::atomic::AtomicBool::new(false),
+            executor: parking_lot::RwLock::new(executor),
             risk,
             lock: Mutex::new(()),
         };
@@ -402,9 +390,7 @@ impl AnvilSim {
             rpc,
             child: Mutex::new(None),
             forked_at: Mutex::new(block),
-            executor,
-            block_gas_limit: Mutex::new(0),
-            clamp_warned: std::sync::atomic::AtomicBool::new(false),
+            executor: parking_lot::RwLock::new(executor),
             risk,
             lock: Mutex::new(()),
         };
@@ -413,127 +399,103 @@ impl AnvilSim {
     }
 
     pub fn executor(&self) -> Address {
-        self.executor
+        *self.executor.read()
     }
 
     /// Install the executor bytecode, make the searcher the owner and give both
     /// accounts a spending balance inside the fork.
     async fn prepare_state(&self) -> Result<()> {
-        let code = EXECUTOR_RUNTIME_BYTECODE.trim();
-        if self.cfg.endpoints.executor.is_none() && !code.is_empty() {
+        if self.cfg.endpoints.executor.is_none() {
+            #[derive(serde::Deserialize)]
+            struct ImmutableRef {
+                start: usize,
+                length: usize,
+            }
+            let refs: std::collections::HashMap<String, Vec<ImmutableRef>> =
+                serde_json::from_str(EXECUTOR_IMMUTABLE_REFS)
+                    .context("decode executor immutable references")?;
+            let mut runtime =
+                hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
+                    .context("decode embedded executor runtime bytecode")?;
+            for (name, value) in [
+                ("BALANCER_VAULT", crate::config::known::BALANCER_VAULT),
+                ("WETH", self.cfg.chain.weth),
+            ] {
+                let positions = refs.get(name).ok_or_else(|| {
+                    anyhow!("compiler artifact has no {name} immutable references")
+                })?;
+                let mut word = [0u8; 32];
+                word[12..].copy_from_slice(value.as_slice());
+                for position in positions {
+                    if position.length > 32 || position.start + position.length > runtime.len() {
+                        bail!("invalid immutable range for {name}");
+                    }
+                    runtime[position.start..position.start + position.length]
+                        .copy_from_slice(&word[32 - position.length..]);
+                }
+            }
+
             self.rpc
                 .call_raw(
                     "anvil_setCode",
                     json!([
-                        format!("{:?}", self.executor),
-                        format!("0x{}", code.trim_start_matches("0x"))
+                        format!("{SIM_EXECUTOR:?}"),
+                        format!("0x{}", hex::encode(runtime))
                     ]),
                 )
                 .await
-                .context("anvil_setCode for the simulated executor")?;
-            // storage slot 0 == `owner`
+                .context("install constructor-equivalent executor fixture")?;
+            *self.executor.write() = SIM_EXECUTOR;
+
+            // Storage slot 0 is owner. The owner is also accepted by
+            // `onlySearcher`, so no mapping slot needs to be fabricated.
             self.rpc
                 .call_raw(
                     "anvil_setStorageAt",
                     json!([
-                        format!("{:?}", self.executor),
+                        format!("{SIM_EXECUTOR:?}"),
                         "0x0",
                         format!("0x{:064x}", U256::from_be_slice(self.searcher.as_slice()))
                     ]),
                 )
                 .await
-                .context("anvil_setStorageAt owner")?;
-        }
-        let big = "0x21e19e0c9bab2400000"; // 10_000 ETH
-        for who in [self.searcher, self.executor] {
-            let _ = self
-                .rpc
-                .call_raw("anvil_setBalance", json!([format!("{who:?}"), big]))
-                .await;
-        }
-        // WETH inventory for the fixture executor. Sandwich fronts, JIT
-        // mint callbacks and sniper buys all *spend* WETH the batch must
-        // already hold — those strategies are deliberately not flash-funded
-        // — and WETH9's `transfer` is a bare `require(balanceOf >= wad)`,
-        // so an unfunded executor shows up as exactly
-        // `CallFailed(index=0): the leg reverted bare`. A real
-        // `EXECUTOR_ADDRESS` is NOT topped up: its forked balance is the
-        // honest picture of live readiness (fund it for real before live
-        // sandwich/JIT — see docs/GO_LIVE.md).
-        if self.cfg.endpoints.executor.is_none() {
-            use alloy_sol_types::{sol, SolCall};
-            sol! {
-                interface IWETH9 {
-                    function deposit() external payable;
-                }
+                .context("set fixture owner/searcher")?;
+
+            let rich = U256::from(30_000u64) * U256::from(1_000_000_000_000_000_000u128);
+            for who in [self.searcher, SIM_EXECUTOR] {
+                self.rpc
+                    .call_raw(
+                        "anvil_setBalance",
+                        json!([format!("{who:?}"), format!("0x{rich:x}")]),
+                    )
+                    .await
+                    .with_context(|| format!("fund fixture account {who:?}"))?;
             }
-            // The deposit's value plus its gas must fit the balance: bump the
-            // executor first so depositing the full `big` cannot fail its
-            // `gas * price + value` check (probed against a live anvil —
-            // depositing exactly the funded balance is rejected).
-            let _ = self
-                .rpc
+
+            // Mainnet WETH9's `balanceOf` mapping is storage slot 3. Setting
+            // the fixture executor's entry directly avoids mining a setup
+            // deposit and therefore keeps the fork pinned to the exact parent
+            // block the opportunity targets.
+            let mut key = [0u8; 64];
+            key[12..32].copy_from_slice(SIM_EXECUTOR.as_slice());
+            key[63] = 3;
+            let slot = alloy_primitives::keccak256(key);
+            let weth_inventory = U256::from(10_000u64) * U256::from(1_000_000_000_000_000_000u128);
+            self.rpc
                 .call_raw(
-                    "anvil_setBalance",
+                    "anvil_setStorageAt",
                     json!([
-                        format!("{:?}", self.executor),
-                        format!(
-                            "0x{:x}",
-                            U256::from(30_000u64) * U256::from(1_000_000_000_000_000_000u128)
-                        )
+                        format!("{:?}", self.cfg.chain.weth),
+                        format!("{slot:?}"),
+                        format!("0x{weth_inventory:064x}")
                     ]),
                 )
-                .await;
-            let _ = self
-                .rpc
-                .call_raw(
-                    "eth_sendTransaction",
-                    json!([{
-                        "from": format!("{:?}", self.executor),
-                        "to": format!("{:?}", self.cfg.chain.weth),
-                        "value": big,
-                        "data": format!("0x{}", hex::encode(IWETH9::depositCall {}.abi_encode())),
-                    }]),
-                )
-                .await;
+                .await
+                .context("fund fixture executor with WETH")?;
+        } else {
+            *self.executor.write() = self.cfg.endpoints.executor.expect("checked above");
         }
-        self.refresh_block_gas_limit().await;
         Ok(())
-    }
-
-    /// Read the fork's block gas limit and warn when the configured bundle
-    /// gas cannot fit inside it. An executor tx with `gas > block gas
-    /// limit` is rejected by anvil before it ever runs — surfaced as the
-    /// cryptic `intrinsic gas too high -- tx.gas_limit > env.block.gas_limit`
-    /// on **every** simulation — so this is checked once per (re)fork rather
-    /// than discovered one back-run at a time.
-    async fn refresh_block_gas_limit(&self) {
-        let limit = self
-            .rpc
-            .call_raw("eth_getBlockByNumber", json!(["latest", false]))
-            .await
-            .ok()
-            .and_then(|b| b.get("gasLimit").cloned())
-            .map(|g| parse_u64(&g))
-            .unwrap_or(0);
-        *self.block_gas_limit.lock().await = limit;
-        let configured = self.risk.risk().max_gas_per_bundle;
-        if limit > 0 && configured > limit.saturating_sub(limit / 20) {
-            tracing::warn!(
-                target: "sim",
-                configured = configured,
-                fork_limit = limit,
-                "MAX_GAS_PER_BUNDLE is at/above the fork's block gas limit — executor txs are clamped to 95% of the limit; lower MAX_GAS_PER_BUNDLE if you did not intend this"
-            );
-        }
-    }
-
-    /// Gas for an injected executor tx: the configured bundle gas, clamped to
-    /// 95% of the fork's block gas limit so the tx is always admissible (and
-    /// leaves headroom for the victim txs sharing the same mined block).
-    async fn executor_gas_limit(&self) -> u64 {
-        let limit = *self.block_gas_limit.lock().await;
-        clamp_gas(self.cfg.risk.max_gas_per_bundle, limit)
     }
 
     /// Re-fork at `block` if we have drifted.
@@ -573,6 +535,11 @@ impl AnvilSim {
     }
 
     pub async fn ensure_fork_at(&self, block: u64) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        self.ensure_fork_at_locked(block).await
+    }
+
+    async fn ensure_fork_at_locked(&self, block: u64) -> Result<()> {
         let mut at = self.forked_at.lock().await;
         if block <= *at || block - *at < self.cfg.sim.refork_every_blocks {
             return Ok(());
@@ -589,19 +556,20 @@ impl AnvilSim {
         self.prepare_state().await
     }
 
-    /// Simulate one opportunity end to end.
-    ///
-    /// Ordering inside the fork mirrors the bundle we would submit:
-    ///   `[front-run] → [victim tx…] → [back-run]`
-    pub async fn simulate(
+    /// Execute the exact signed bytes that would be sent to a relay. The old
+    /// simulator independently rebuilt impersonated transactions, which could
+    /// pass locally while the signed payload failed nonce, sender or allowlist
+    /// checks at the relay.
+    pub async fn simulate_at_head(
         &self,
+        block: u64,
         opp: &Opportunity,
-        victims_raw: &[Vec<u8>],
+        bundle: &crate::types::BundleRecord,
         victim_sender_nonce: Option<(Address, u64)>,
-        base_fee: U256,
     ) -> Result<SimulationResult> {
-        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee)
-            .await
+        let _guard = self.lock.lock().await;
+        self.ensure_fork_at_locked(block).await?;
+        self.simulate_locked(opp, bundle, victim_sender_nonce).await
     }
 
     /// Pin and simulate while holding the same mutex. This prevents a reset
@@ -610,27 +578,24 @@ impl AnvilSim {
         &self,
         block: u64,
         opp: &Opportunity,
-        victims_raw: &[Vec<u8>],
+        bundle: &crate::types::BundleRecord,
         victim_sender_nonce: Option<(Address, u64)>,
-        base_fee: U256,
     ) -> Result<SimulationResult> {
         let _guard = self.lock.lock().await;
         self.ensure_fork_exact_locked(block).await?;
-        self.simulate_locked(opp, victims_raw, victim_sender_nonce, base_fee)
-            .await
+        self.simulate_locked(opp, bundle, victim_sender_nonce).await
     }
 
     async fn simulate_locked(
         &self,
         opp: &Opportunity,
-        victims_raw: &[Vec<u8>],
+        bundle: &crate::types::BundleRecord,
         victim_sender_nonce: Option<(Address, u64)>,
-        base_fee: U256,
     ) -> Result<SimulationResult> {
         let started = Instant::now();
         let snapshot: Value = self.rpc.call_raw("evm_snapshot", json!([])).await?;
         let result = self
-            .simulate_inner(opp, victims_raw, victim_sender_nonce, base_fee, started)
+            .simulate_inner(opp, bundle, victim_sender_nonce, started)
             .await;
         // Always roll the fork back, even if the simulation blew up.
         let _ = self.rpc.call_raw("evm_revert", json!([snapshot])).await;
@@ -640,99 +605,50 @@ impl AnvilSim {
     async fn simulate_inner(
         &self,
         opp: &Opportunity,
-        victims_raw: &[Vec<u8>],
+        bundle: &crate::types::BundleRecord,
         victim_sender_nonce: Option<(Address, u64)>,
-        base_fee: U256,
         started: Instant,
     ) -> Result<SimulationResult> {
-        // Manual mining so the whole bundle lands in one block, like a real bundle.
         let _ = self.rpc.call_raw("evm_setAutomine", json!([false])).await;
-
         let before = self.balance_of(opp.profit_token).await?;
-        let mut gas_used = 0u64;
-        let mut revert_reason: Option<String> = None;
         let mut ok = true;
-        let mut tx_hashes: Vec<String> = Vec::new();
-        let mut sent: Vec<SentTx> = Vec::new();
+        let mut revert_reason: Option<String> = None;
+        let mut sent: Vec<(String, bool)> = Vec::with_capacity(bundle.txs.len());
 
-        // 1. front-run
-        if !opp.front_calls.is_empty() {
-            match self
-                .send_executor_tx(opp, &opp.front_calls, base_fee, true)
-                .await
-            {
-                Ok((h, replay)) => {
-                    tx_hashes.push(h);
-                    sent.push(SentTx {
-                        label: "front-run",
-                        replay: Some(replay),
-                    });
-                }
-                Err(e) => {
-                    ok = false;
-                    revert_reason = Some(format!("front-run rejected: {e}"));
-                }
-            }
+        // A pending transaction can race the fork head. Restoring the nonce it
+        // carried when observed is fork-local and keeps verbatim replay valid.
+        if let Some((sender, nonce)) = victim_sender_nonce {
+            let _ = self
+                .rpc
+                .call_raw(
+                    "anvil_setNonce",
+                    json!([format!("{sender:?}"), format!("0x{nonce:x}")]),
+                )
+                .await;
         }
 
-        // 2. victim transactions, replayed verbatim
-        if ok {
-            // A pending transaction may have landed between observation and
-            // forking. Reset the impersonated sender's nonce so Anvil can
-            // replay the signed victim at the nonce it carried when observed.
-            // This is fork-local state and is reverted with the snapshot below.
-            if let Some((sender, nonce)) = victim_sender_nonce {
-                let _ = self
-                    .rpc
-                    .call_raw(
-                        "anvil_setNonce",
-                        json!([format!("{sender:?}"), format!("0x{nonce:x}")]),
-                    )
-                    .await;
-            }
-            for raw in victims_raw {
-                let hex_raw = format!("0x{}", hex::encode(raw));
-                match self
-                    .rpc
-                    .call_raw("eth_sendRawTransaction", json!([hex_raw]))
-                    .await
-                {
-                    Ok(h) => {
-                        if let Some(s) = h.as_str() {
-                            tx_hashes.push(s.to_string());
-                            sent.push(SentTx {
-                                label: "victim",
-                                replay: None,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        // A victim we cannot replay (missing raw bytes, nonce gap,
-                        // already mined) invalidates the whole observation.
+        for (index, tx) in bundle.txs.iter().enumerate() {
+            let raw = format!("0x{}", hex::encode(&tx.raw));
+            match self
+                .rpc
+                .call_raw("eth_sendRawTransaction", json!([raw]))
+                .await
+            {
+                Ok(hash) => match hash.as_str() {
+                    Some(hash) => sent.push((hash.to_string(), tx.foreign)),
+                    None => {
                         ok = false;
-                        revert_reason = Some(format!("victim replay failed: {e}"));
+                        revert_reason = Some(format!("bundle tx {index} returned no hash"));
                         break;
                     }
-                }
-            }
-        }
-
-        // 3. back-run
-        if ok && !opp.back_calls.is_empty() {
-            match self
-                .send_executor_tx(opp, &opp.back_calls, base_fee, false)
-                .await
-            {
-                Ok((h, replay)) => {
-                    tx_hashes.push(h);
-                    sent.push(SentTx {
-                        label: "back-run",
-                        replay: Some(replay),
-                    });
-                }
-                Err(e) => {
+                },
+                Err(error) => {
                     ok = false;
-                    revert_reason = Some(format!("back-run rejected: {e}"));
+                    revert_reason = Some(format!(
+                        "{} tx {index} rejected before mining: {error}",
+                        if tx.foreign { "victim" } else { "searcher" }
+                    ));
+                    break;
                 }
             }
         }
@@ -740,50 +656,109 @@ impl AnvilSim {
         let _ = self.rpc.call_raw("evm_mine", json!([])).await;
         let _ = self.rpc.call_raw("evm_setAutomine", json!([true])).await;
 
-        // Collect receipts. Status-0 txs are re-executed via eth_call against
-        // the still-live fork state (we are inside the snapshot) so the revert
-        // data can be decoded — "reverted" without a reason is untriageable.
-        for (h, what) in tx_hashes.iter().zip(&sent) {
-            let receipt: Value = self
+        let mut gas_used = 0u64;
+        let mut gas_cost = U256::ZERO;
+        let mut event_gross = U256::ZERO;
+        let mut event_bribe = U256::ZERO;
+        for (hash, foreign) in &sent {
+            let receipt = self
                 .rpc
-                .call_raw("eth_getTransactionReceipt", json!([h]))
+                .call_raw("eth_getTransactionReceipt", json!([hash]))
                 .await
                 .unwrap_or(Value::Null);
             if receipt.is_null() {
                 ok = false;
-                revert_reason.get_or_insert_with(|| format!("{} {h} was not mined", what.label));
+                revert_reason.get_or_insert_with(|| format!("tx {hash} was not mined"));
                 continue;
             }
-            gas_used += parse_u64(&receipt["gasUsed"]);
+            let used = parse_u64(&receipt["gasUsed"]);
+            if !*foreign {
+                let price = crate::types::parse_u256(&receipt["effectiveGasPrice"]);
+                gas_used = gas_used.saturating_add(used);
+                gas_cost = gas_cost.saturating_add(price.saturating_mul(U256::from(used)));
+                if let Some(logs) = receipt.get("logs").and_then(Value::as_array) {
+                    for log in logs {
+                        let Some(address) =
+                            log.get("address").and_then(crate::types::parse_address)
+                        else {
+                            continue;
+                        };
+                        if address != self.executor() {
+                            continue;
+                        }
+                        let topics = log.get("topics").and_then(Value::as_array);
+                        let is_executed = topics
+                            .and_then(|v| v.first())
+                            .and_then(Value::as_str)
+                            .map(|t| t.eq_ignore_ascii_case(EXECUTED_TOPIC))
+                            .unwrap_or(false);
+                        if !is_executed {
+                            continue;
+                        }
+                        let data = log
+                            .get("data")
+                            .map(crate::types::parse_bytes)
+                            .unwrap_or_default();
+                        if data.len() >= 64 {
+                            event_gross =
+                                event_gross.saturating_add(U256::from_be_slice(&data[0..32]));
+                            event_bribe =
+                                event_bribe.saturating_add(U256::from_be_slice(&data[32..64]));
+                        }
+                    }
+                }
+            }
             if parse_u64(&receipt["status"]) != 1 {
                 ok = false;
-                let reason = match &what.replay {
-                    Some(replay) => self.revert_reason_of(replay).await,
-                    None => format!(
-                        "victim {h} reverted — the target's own protection fired (slippage / pause / guard); the bundle is invalid by design"
-                    ),
-                };
-                revert_reason.get_or_insert_with(|| format!("{} reverted: {reason}", what.label));
+                revert_reason.get_or_insert_with(|| {
+                    format!(
+                        "{} {hash} reverted while executing the exact signed payload",
+                        if *foreign { "victim" } else { "searcher" }
+                    )
+                });
             }
         }
 
         let after = self.balance_of(opp.profit_token).await?;
-        let gross = after.saturating_sub(before);
-        let gas_price = base_fee + U256::from(1_000_000_000u64); // +1 gwei tip floor
-        let gas_cost = gas_price * U256::from(gas_used);
-        let bribe = gross * U256::from(self.cfg.risk.bribe_bps) / U256::from(10_000u32);
-        let net = to_i128(gross) - to_i128(gas_cost) - to_i128(bribe);
+        let retained = after.saturating_sub(before);
+        let gross = if event_gross.is_zero() {
+            retained.saturating_add(event_bribe)
+        } else {
+            event_gross
+        };
+        let gas_price = if gas_used == 0 {
+            U256::ZERO
+        } else {
+            gas_cost / U256::from(gas_used)
+        };
+
+        // Gas is ETH-denominated. Until a block-pinned token valuation is
+        // available, subtracting it from USDC/DAI/etc. would fabricate a unit.
+        // Such strategies remain visible in shadow mode but fail closed at the
+        // submittable boundary.
+        let native_accounting =
+            opp.profit_token == Address::ZERO || opp.profit_token == self.cfg.chain.weth;
+        let net = if native_accounting {
+            to_i128(retained) - to_i128(gas_cost)
+        } else {
+            ok = false;
+            revert_reason.get_or_insert_with(|| {
+                "uncertified accounting: non-WETH profit cannot be netted against ETH gas without a block-pinned valuation"
+                    .to_string()
+            });
+            0
+        };
 
         Ok(SimulationResult {
             opportunity_id: opp.id.clone(),
             strategy: opp.strategy,
             backend: SimBackend::AnvilFork,
-            success: ok && gross > U256::ZERO,
+            success: ok && retained > U256::ZERO && native_accounting,
             gross_profit_wei: gross,
             gas_used,
             gas_price_wei: gas_price,
             gas_cost_wei: gas_cost,
-            bribe_wei: bribe,
+            bribe_wei: event_bribe,
             net_profit_wei: net,
             revert_reason,
             target_block: opp.target_block,
@@ -792,56 +767,19 @@ impl AnvilSim {
         })
     }
 
-    async fn send_executor_tx(
-        &self,
-        opp: &Opportunity,
-        calls: &[Call],
-        base_fee: U256,
-        front: bool,
-    ) -> Result<(String, Value)> {
-        let risk = self.risk.risk();
-        let data = crate::bundle::encode_execute(opp, calls, front, &risk);
-        let gas = self.executor_gas_limit().await;
-        if gas < risk.max_gas_per_bundle
-            && !self
-                .clamp_warned
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            tracing::warn!(
-                target: "sim",
-                configured = self.cfg.risk.max_gas_per_bundle,
-                clamped_to = gas,
-                "clamping executor tx gas below the fork's block gas limit (see MAX_GAS_PER_BUNDLE)"
-            );
-        }
-        let tx = json!([{
-            "from": format!("{:?}", self.searcher),
-            "to": format!("{:?}", self.executor),
-            "data": format!("0x{}", hex::encode(data)),
-            "gas": format!("0x{gas:x}"),
-            "maxFeePerGas": format!("0x{:x}", base_fee * U256::from(2u8) + U256::from(2_000_000_000u64)),
-            "maxPriorityFeePerGas": format!("0x{:x}", 1_000_000_000u64),
-        }]);
-        let replay = tx[0].clone();
-        let h: Value = self.rpc.call_raw("eth_sendTransaction", tx).await?;
-        h.as_str()
-            .map(|s| (s.to_string(), replay))
-            .ok_or_else(|| anyhow!("eth_sendTransaction returned no hash"))
-    }
-
     async fn balance_of(&self, token: Address) -> Result<U256> {
         if token == Address::ZERO {
             let v = self
                 .rpc
                 .call_raw(
                     "eth_getBalance",
-                    json!([format!("{:?}", self.executor), "latest"]),
+                    json!([format!("{:?}", self.executor()), "latest"]),
                 )
                 .await?;
             return Ok(crate::types::parse_u256(&v));
         }
         let data = crate::dex::IERC20::balanceOfCall {
-            account: self.executor,
+            account: self.executor(),
         };
         use alloy_sol_types::SolCall;
         let v = self
@@ -870,49 +808,6 @@ pub fn to_i128(v: U256) -> i128 {
         i128::MAX
     } else {
         v.to::<u128>() as i128
-    }
-}
-
-impl AnvilSim {
-    /// Re-execute an injected tx via `eth_call` against the current fork
-    /// state and decode the revert. Called while the simulation snapshot is
-    /// still live: the reverted tx's own state changes were discarded, and
-    /// everything before it (the victim) is in place, so the call reverts
-    /// the same way it did when it was mined.
-    async fn revert_reason_of(&self, call: &Value) -> String {
-        match self
-            .rpc
-            .call_raw_with_error("eth_call", json!([call, "latest"]))
-            .await
-        {
-            // A revert comes back as the JSON-RPC error object; anvil puts
-            // the raw revert bytes in `data` (and any Error(string) text in
-            // `message`).
-            Err(err) => {
-                let data = err.get("data").and_then(|d| d.as_str()).unwrap_or("");
-                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                if let Ok(bytes) = hex::decode(data.trim_start_matches("0x")) {
-                    if bytes.len() >= 4 {
-                        return decode_revert_data(&bytes);
-                    }
-                }
-                match msg.strip_prefix("execution reverted") {
-                    Some(rest) => {
-                        let text = rest.trim_start_matches(':').trim();
-                        if text.is_empty() {
-                            "reverted (no data)".to_string()
-                        } else {
-                            text.to_string()
-                        }
-                    }
-                    None => "reverted (no data)".to_string(),
-                }
-            }
-            // The re-execution succeeded: the revert depended on tx-level
-            // context we cannot reproduce with eth_call (nonce-driven
-            // guards, block properties). Rare; the label stays generic.
-            Ok(_) => "reverted (context-dependent; not reproducible via eth_call)".to_string(),
-        }
     }
 }
 

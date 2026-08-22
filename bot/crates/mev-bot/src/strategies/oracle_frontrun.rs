@@ -274,6 +274,7 @@ impl OracleFrontrunStrategy {
                     irm: *irm,
                     lltv: *lltv,
                 };
+                let price = morpho::oracle_price(ctx, *oracle).await?;
                 morpho::build_opportunity(
                     ctx,
                     &params,
@@ -281,6 +282,7 @@ impl OracleFrontrunStrategy {
                     *borrower,
                     *borrow_shares,
                     (*total_borrow_assets, *total_borrow_shares),
+                    price,
                     ctx.target_block(),
                 )
                 .await

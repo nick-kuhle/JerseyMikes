@@ -21,12 +21,41 @@ pub struct ReplayCandidate {
     pub opportunity_id: String,
     pub strategy: String,
     pub success: bool,
-    pub net_wei: i64,
+    pub net_wei: i128,
     pub bribe_wei: String,
     pub block_number: u64,
     /// Comma-separated `0x…` hashes; empty means the opportunity had no victim
     /// (arb / liquidation / sniper).
     pub victims: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpportunityVictim {
+    pub opportunity_id: String,
+    pub strategy: String,
+    pub victim_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubmittedBundle {
+    pub bundle_id: String,
+    pub opportunity_id: String,
+    pub target_block: u64,
+    pub tx_hashes: Vec<alloy_primitives::B256>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActualMevMatch {
+    pub opportunity_id: String,
+    pub block_number: u64,
+    pub victim_hash: String,
+    pub mev_tx_hashes: Vec<String>,
+    pub actor: Option<String>,
+    pub gross_weth_wei: U256,
+    pub gas_cost_wei: U256,
+    pub net_weth_wei: i128,
+    pub confidence: String,
+    pub evidence: serde_json::Value,
 }
 
 pub struct Store {
@@ -44,9 +73,9 @@ pub struct PnlSummary {
     pub losses: i64,
     pub gross_profit_wei: String,
     pub gas_spent_wei: String,
-    pub net_profit_wei: i64,
-    pub best_net_wei: i64,
-    pub worst_net_wei: i64,
+    pub net_profit_wei: String,
+    pub best_net_wei: String,
+    pub worst_net_wei: String,
     pub avg_latency_ms: f64,
 }
 
@@ -117,7 +146,7 @@ impl Store {
                 gas_used       INTEGER NOT NULL,
                 gas_cost_wei   TEXT NOT NULL,
                 bribe_wei      TEXT NOT NULL,
-                net_wei        INTEGER NOT NULL,
+                net_wei        TEXT NOT NULL,
                 revert_reason  TEXT,
                 target_block   INTEGER NOT NULL,
                 latency_ms     INTEGER NOT NULL,
@@ -161,7 +190,7 @@ impl Store {
                 block_number    INTEGER NOT NULL,
                 opportunity_id  TEXT NOT NULL,
                 strategy        TEXT NOT NULL,
-                sim_net_wei     INTEGER NOT NULL,
+                sim_net_wei     TEXT NOT NULL,
                 our_bribe_wei   TEXT NOT NULL,
                 winning_bid_wei TEXT NOT NULL,
                 victim_landed   INTEGER NOT NULL,
@@ -172,6 +201,46 @@ impl Store {
                 reorged         INTEGER NOT NULL DEFAULT 0,
                 created_at_ms   INTEGER NOT NULL,
                 UNIQUE(opportunity_id, block_number)
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_outcomes (
+                bundle_id TEXT PRIMARY KEY,
+                opportunity_id TEXT NOT NULL,
+                block_number INTEGER NOT NULL,
+                tx_hashes TEXT NOT NULL,
+                gross_profit_wei TEXT NOT NULL,
+                bribe_wei TEXT NOT NULL,
+                retained_profit_wei TEXT NOT NULL,
+                gas_cost_wei TEXT NOT NULL,
+                net_profit_wei TEXT NOT NULL,
+                canonical INTEGER NOT NULL DEFAULT 1,
+                created_at_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS relay_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bundle_id TEXT NOT NULL,
+                opportunity_id TEXT NOT NULL,
+                relay TEXT NOT NULL,
+                accepted INTEGER NOT NULL,
+                response TEXT NOT NULL,
+                submitted_at_ms INTEGER NOT NULL,
+                UNIQUE(bundle_id, relay)
+            );
+
+            CREATE TABLE IF NOT EXISTS actual_mev_matches (
+                opportunity_id TEXT PRIMARY KEY,
+                block_number INTEGER NOT NULL,
+                victim_hash TEXT NOT NULL,
+                mev_tx_hashes TEXT NOT NULL,
+                actor TEXT,
+                gross_weth_wei TEXT NOT NULL,
+                gas_cost_wei TEXT NOT NULL,
+                net_weth_wei TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                canonical INTEGER NOT NULL DEFAULT 1,
+                created_at_ms INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS relay_bids (
@@ -218,6 +287,8 @@ impl Store {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_block_slot ON relay_blocks(relay, slot);
             CREATE INDEX IF NOT EXISTS idx_relay_block_txs_block ON relay_block_txs(block_number);
             CREATE INDEX IF NOT EXISTS idx_recon_block ON reconciliations(block_number);
+            CREATE INDEX IF NOT EXISTS idx_actual_mev_block ON actual_mev_matches(block_number);
+            CREATE INDEX IF NOT EXISTS idx_submission_bundle ON relay_submissions(bundle_id);
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -226,6 +297,9 @@ impl Store {
         self.add_column("blocks", "parent_hash", "TEXT NOT NULL DEFAULT ''");
         self.add_column("blocks", "canonical", "INTEGER NOT NULL DEFAULT 1");
         self.add_column("simulations", "reorged", "INTEGER NOT NULL DEFAULT 0");
+        self.add_column("bundles", "included", "INTEGER");
+        self.add_column("bundles", "included_block", "INTEGER");
+        self.add_column("bundles", "inclusion_checked_ms", "INTEGER");
         Ok(())
     }
 
@@ -449,7 +523,7 @@ fn write_simulation(conn: &Connection, s: &SimulationResult) -> Result<()> {
                 s.gas_used as i64,
                 s.gas_cost_wei.to_string(),
                 s.bribe_wei.to_string(),
-                clamp_i64(s.net_profit_wei),
+                s.net_profit_wei.to_string(),
                 s.revert_reason,
                 s.target_block as i64,
                 s.sim_latency_ms as i64,
@@ -516,6 +590,16 @@ impl Store {
         conn.execute(
             "UPDATE reconciliations SET reorged = 1
              WHERE block_number >= ?1 AND block_number <= ?2 AND COALESCE(reorged, 0) = 0",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE execution_outcomes SET canonical = 0
+             WHERE block_number >= ?1 AND block_number <= ?2 AND canonical = 1",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE actual_mev_matches SET canonical = 0
+             WHERE block_number >= ?1 AND block_number <= ?2 AND canonical = 1",
             params![from_block as i64, to_block as i64],
         )?;
         conn.execute(
@@ -609,7 +693,7 @@ impl Store {
     ) -> Result<Vec<ReplayCandidate>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT s.opportunity_id, s.strategy, s.success, s.net_wei, s.bribe_wei,
+            "SELECT s.opportunity_id, s.strategy, s.success, CAST(s.net_wei AS TEXT), s.bribe_wei,
                     s.target_block, COALESCE(o.victims, '')
              FROM simulations s
              LEFT JOIN opportunities o ON o.id = s.opportunity_id
@@ -627,7 +711,7 @@ impl Store {
                 opportunity_id: row.get(0)?,
                 strategy: row.get(1)?,
                 success: row.get::<_, i64>(2)? == 1,
-                net_wei: row.get(3)?,
+                net_wei: parse_i128_decimal(&row.get::<_, String>(3)?),
                 bribe_wei: row.get(4)?,
                 block_number: row.get::<_, i64>(5)? as u64,
                 victims: row.get(6)?,
@@ -642,7 +726,7 @@ impl Store {
         block_number: u64,
         opportunity_id: &str,
         strategy: &str,
-        sim_net_wei: i64,
+        sim_net_wei: i128,
         our_bribe_wei: &str,
         winning_bid_wei: &str,
         victim_landed: bool,
@@ -660,7 +744,7 @@ impl Store {
                 block_number as i64,
                 opportunity_id,
                 strategy,
-                sim_net_wei,
+                sim_net_wei.to_string(),
                 our_bribe_wei,
                 winning_bid_wei,
                 victim_landed as i32,
@@ -677,7 +761,7 @@ impl Store {
     pub fn recent_reconciliations(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT block_number, opportunity_id, strategy, sim_net_wei, our_bribe_wei, winning_bid_wei,
+            "SELECT block_number, opportunity_id, strategy, CAST(sim_net_wei AS TEXT), our_bribe_wei, winning_bid_wei,
                     victim_landed, would_outbid, inclusion_p, true_positive, false_positive, reorged, created_at_ms
              FROM reconciliations
              WHERE COALESCE(reorged, 0) = 0
@@ -688,7 +772,7 @@ impl Store {
                 "blockNumber": row.get::<_, i64>(0)?,
                 "opportunityId": row.get::<_, String>(1)?,
                 "strategy": row.get::<_, String>(2)?,
-                "simNetWei": row.get::<_, i64>(3)?,
+                "simNetWei": row.get::<_, String>(3)?,
                 "ourBribeWei": row.get::<_, String>(4)?,
                 "winningBidWei": row.get::<_, String>(5)?,
                 "victimLanded": row.get::<_, i64>(6)? == 1,
@@ -748,6 +832,255 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn submitted_bundles_through(&self, block_number: u64) -> Result<Vec<SubmittedBundle>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, opportunity_id, target_block, payload FROM bundles
+             WHERE submitted = 1 AND included IS NULL AND target_block <= ?1
+             ORDER BY target_block ASC LIMIT 500",
+        )?;
+        let rows = stmt.query_map(params![block_number as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for (bundle_id, opportunity_id, target_block, payload) in rows.flatten() {
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+            let tx_hashes = value
+                .get(0)
+                .and_then(|entry| entry.get("txs"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|raw| hex::decode(raw.trim_start_matches("0x")).ok())
+                .map(alloy_primitives::keccak256)
+                .collect::<Vec<_>>();
+            if !tx_hashes.is_empty() {
+                out.push(SubmittedBundle {
+                    bundle_id,
+                    opportunity_id,
+                    target_block,
+                    tx_hashes,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_execution_outcome(
+        &self,
+        bundle: &SubmittedBundle,
+        block_number: u64,
+        gross_profit: U256,
+        bribe: U256,
+        retained_profit: U256,
+        gas_cost: U256,
+        net_profit: i128,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let txn = conn.transaction()?;
+        txn.execute(
+            "INSERT OR REPLACE INTO execution_outcomes
+             (bundle_id, opportunity_id, block_number, tx_hashes, gross_profit_wei,
+              bribe_wei, retained_profit_wei, gas_cost_wei, net_profit_wei,
+              canonical, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",
+            params![
+                bundle.bundle_id,
+                bundle.opportunity_id,
+                block_number as i64,
+                serde_json::to_string(
+                    &bundle
+                        .tx_hashes
+                        .iter()
+                        .map(|hash| format!("{hash:?}"))
+                        .collect::<Vec<_>>()
+                )?,
+                gross_profit.to_string(),
+                bribe.to_string(),
+                retained_profit.to_string(),
+                gas_cost.to_string(),
+                net_profit.to_string(),
+                now_ms() as i64,
+            ],
+        )?;
+        txn.execute(
+            "UPDATE bundles SET included = 1, included_block = ?2, inclusion_checked_ms = ?3 WHERE id = ?1",
+            params![bundle.bundle_id, block_number as i64, now_ms() as i64],
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_bundle_not_included(&self, bundle_id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE bundles SET included = 0, inclusion_checked_ms = ?2 WHERE id = ?1",
+            params![bundle_id, now_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_relay_submission(
+        &self,
+        bundle_id: &str,
+        opportunity_id: &str,
+        relay: &str,
+        accepted: bool,
+        response: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO relay_submissions
+             (bundle_id, opportunity_id, relay, accepted, response, submitted_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                bundle_id,
+                opportunity_id,
+                relay,
+                accepted as i32,
+                response.to_string(),
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Decision-time opportunities that targeted this block and named a victim.
+    /// Called before replay scoring starts, so post-mortem opportunities cannot
+    /// be mistaken for observations that were actionable before inclusion.
+    pub fn victim_opportunities_for_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<OpportunityVictim>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, strategy, victims FROM opportunities
+             WHERE target_block = ?1 AND victims != '' ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![block_number as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            for victim_hash in row.2.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+                out.push(OpportunityVictim {
+                    opportunity_id: row.0.clone(),
+                    strategy: row.1.clone(),
+                    victim_hash: victim_hash.to_string(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn record_actual_mev_match(&self, matched: &ActualMevMatch) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO actual_mev_matches
+             (opportunity_id, block_number, victim_hash, mev_tx_hashes, actor,
+              gross_weth_wei, gas_cost_wei, net_weth_wei, confidence, evidence,
+              canonical, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11)",
+            params![
+                matched.opportunity_id,
+                matched.block_number as i64,
+                matched.victim_hash,
+                serde_json::to_string(&matched.mev_tx_hashes)?,
+                matched.actor,
+                matched.gross_weth_wei.to_string(),
+                matched.gas_cost_wei.to_string(),
+                matched.net_weth_wei.to_string(),
+                matched.confidence,
+                matched.evidence.to_string(),
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn qualification_counts(&self, since_ms: u64) -> Result<(u64, u64, u64)> {
+        let conn = self.conn.lock();
+        let live_candidates: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT opportunity_id) FROM simulations
+             WHERE backend = 'anvil_fork' AND success = 1 AND created_at_ms >= ?1
+               AND strategy IN ('sandwich','sandwich_v3','atomic_arb')
+               AND COALESCE(reorged, 0) = 0",
+            params![since_ms as i64],
+            |row| row.get(0),
+        )?;
+        let relay_cross_checks: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT opportunity_id) FROM simulations
+             WHERE backend = 'relay_call_bundle' AND success = 1 AND created_at_ms >= ?1
+               AND strategy IN ('sandwich','sandwich_v3','atomic_arb')
+               AND COALESCE(reorged, 0) = 0",
+            params![since_ms as i64],
+            |row| row.get(0),
+        )?;
+        let actual_matches: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM actual_mev_matches
+             WHERE canonical = 1 AND confidence = 'high' AND created_at_ms >= ?1",
+            params![since_ms as i64],
+            |row| row.get(0),
+        )?;
+        Ok((
+            live_candidates.max(0) as u64,
+            relay_cross_checks.max(0) as u64,
+            actual_matches.max(0) as u64,
+        ))
+    }
+
+    pub fn actual_mev_summary(&self) -> Result<serde_json::Value> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM actual_mev_matches WHERE canonical = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let high: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM actual_mev_matches WHERE canonical = 1 AND confidence = 'high'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::json!({"matches": total, "highConfidence": high}))
+    }
+
+    pub fn recent_actual_mev_matches(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT opportunity_id, block_number, victim_hash, mev_tx_hashes, actor,
+                    gross_weth_wei, gas_cost_wei, CAST(net_weth_wei AS TEXT),
+                    confidence, evidence, created_at_ms
+             FROM actual_mev_matches WHERE canonical = 1
+             ORDER BY block_number DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let hashes: String = row.get(3)?;
+            let evidence: String = row.get(9)?;
+            Ok(serde_json::json!({
+                "opportunityId": row.get::<_, String>(0)?,
+                "blockNumber": row.get::<_, i64>(1)?,
+                "victimHash": row.get::<_, String>(2)?,
+                "mevTxHashes": serde_json::from_str::<serde_json::Value>(&hashes).unwrap_or_default(),
+                "actor": row.get::<_, Option<String>>(4)?,
+                "grossWethWei": row.get::<_, String>(5)?,
+                "gasCostWei": row.get::<_, String>(6)?,
+                "netWethWei": row.get::<_, String>(7)?,
+                "confidence": row.get::<_, String>(8)?,
+                "evidence": serde_json::from_str::<serde_json::Value>(&evidence).unwrap_or_default(),
+                "createdAtMs": row.get::<_, i64>(10)?,
+            }))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// Record a delivered block (deduplicated per relay + slot).
@@ -856,51 +1189,84 @@ impl Store {
         Ok(())
     }
 
-    /// PnL per strategy, computed over the primary (fork) simulations only so
-    /// the relay cross-check never double counts.
+    /// PnL per strategy, computed with integer arithmetic over decimal
+    /// strings. SQLite `REAL` loses wei precision and signed 64-bit integers
+    /// saturate above ~9.22 ETH.
     pub fn pnl(&self) -> Result<Vec<PnlSummary>> {
+        #[derive(Default)]
+        struct Aggregate {
+            simulations: i64,
+            wins: i64,
+            losses: i64,
+            gross: U256,
+            gas: U256,
+            net: i128,
+            best: Option<i128>,
+            worst: Option<i128>,
+            latency_sum: u128,
+        }
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT strategy,
-                    COUNT(*),
-                    SUM(CASE WHEN net_wei > 0 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN net_wei <= 0 THEN 1 ELSE 0 END),
-                    COALESCE(SUM(CAST(gross_wei AS REAL)), 0),
-                    COALESCE(SUM(CAST(gas_cost_wei AS REAL)), 0),
-                    COALESCE(SUM(net_wei), 0),
-                    COALESCE(MAX(net_wei), 0),
-                    COALESCE(MIN(net_wei), 0),
-                    COALESCE(AVG(latency_ms), 0)
+            "SELECT strategy, CAST(gross_wei AS TEXT), CAST(gas_cost_wei AS TEXT),
+                    CAST(net_wei AS TEXT), latency_ms
              FROM simulations
-             WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0
-             GROUP BY strategy",
+             WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(PnlSummary {
-                strategy: row.get(0)?,
-                simulations: row.get(1)?,
-                wins: row.get(2)?,
-                losses: row.get(3)?,
-                gross_profit_wei: format!("{:.0}", row.get::<_, f64>(4)?),
-                gas_spent_wei: format!("{:.0}", row.get::<_, f64>(5)?),
-                net_profit_wei: row.get(6)?,
-                best_net_wei: row.get(7)?,
-                worst_net_wei: row.get(8)?,
-                avg_latency_ms: row.get(9)?,
+        let mut rows = stmt.query([])?;
+        let mut by_strategy: std::collections::BTreeMap<String, Aggregate> =
+            std::collections::BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let strategy: String = row.get(0)?;
+            let gross = parse_u256_decimal(&row.get::<_, String>(1)?);
+            let gas = parse_u256_decimal(&row.get::<_, String>(2)?);
+            let net = parse_i128_decimal(&row.get::<_, String>(3)?);
+            let latency = row.get::<_, i64>(4)?.max(0) as u128;
+            let aggregate = by_strategy.entry(strategy).or_default();
+            aggregate.simulations += 1;
+            if net > 0 {
+                aggregate.wins += 1;
+            } else {
+                aggregate.losses += 1;
+            }
+            aggregate.gross = aggregate.gross.saturating_add(gross);
+            aggregate.gas = aggregate.gas.saturating_add(gas);
+            aggregate.net = aggregate.net.saturating_add(net);
+            aggregate.best = Some(aggregate.best.map_or(net, |value| value.max(net)));
+            aggregate.worst = Some(aggregate.worst.map_or(net, |value| value.min(net)));
+            aggregate.latency_sum = aggregate.latency_sum.saturating_add(latency);
+        }
+        Ok(by_strategy
+            .into_iter()
+            .map(|(strategy, aggregate)| PnlSummary {
+                strategy,
+                simulations: aggregate.simulations,
+                wins: aggregate.wins,
+                losses: aggregate.losses,
+                gross_profit_wei: aggregate.gross.to_string(),
+                gas_spent_wei: aggregate.gas.to_string(),
+                net_profit_wei: aggregate.net.to_string(),
+                best_net_wei: aggregate.best.unwrap_or(0).to_string(),
+                worst_net_wei: aggregate.worst.unwrap_or(0).to_string(),
+                avg_latency_ms: if aggregate.simulations == 0 {
+                    0.0
+                } else {
+                    aggregate.latency_sum as f64 / aggregate.simulations as f64
+                },
             })
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+            .collect())
     }
 
-    /// Cumulative net PnL in wei across every fork simulation.
-    pub fn cumulative_net(&self) -> Result<i64> {
+    /// Cumulative net PnL in exact signed wei across every fork simulation.
+    pub fn cumulative_net(&self) -> Result<i128> {
         let conn = self.conn.lock();
-        let v: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(net_wei), 0) FROM simulations WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0",
-            [],
-            |r| r.get(0),
+        let mut stmt = conn.prepare(
+            "SELECT CAST(net_wei AS TEXT) FROM simulations
+             WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0",
         )?;
-        Ok(v)
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).fold(0i128, |sum, value| {
+            sum.saturating_add(parse_i128_decimal(&value))
+        }))
     }
 
     pub fn recent_simulations(
@@ -910,7 +1276,7 @@ impl Store {
     ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let sql = "SELECT s.opportunity_id, s.strategy, s.backend, s.success, s.gross_wei, s.gas_used,
-                          s.gas_cost_wei, s.bribe_wei, s.net_wei, s.revert_reason, s.target_block,
+                          s.gas_cost_wei, s.bribe_wei, CAST(s.net_wei AS TEXT), s.revert_reason, s.target_block,
                           s.latency_ms, s.created_at_ms, COALESCE(o.notes, ''), COALESCE(o.victims, '')
                    FROM simulations s
                    LEFT JOIN opportunities o ON o.id = s.opportunity_id
@@ -928,7 +1294,7 @@ impl Store {
                 "gasUsed": row.get::<_, i64>(5)?,
                 "gasCostWei": row.get::<_, String>(6)?,
                 "bribeWei": row.get::<_, String>(7)?,
-                "netWei": row.get::<_, i64>(8)?,
+                "netWei": row.get::<_, String>(8)?,
                 "revertReason": row.get::<_, Option<String>>(9)?,
                 "targetBlock": row.get::<_, i64>(10)?,
                 "latencyMs": row.get::<_, i64>(11)?,
@@ -966,24 +1332,33 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Net PnL bucketed by block, for the equity curve.
+    /// Net PnL bucketed by block, preserving signed integer precision.
     pub fn pnl_series(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT target_block, SUM(net_wei), COUNT(*)
+            "SELECT target_block, CAST(net_wei AS TEXT)
              FROM simulations WHERE backend = 'anvil_fork' AND COALESCE(reorged, 0) = 0
-             GROUP BY target_block ORDER BY target_block DESC LIMIT ?1",
+             ORDER BY target_block ASC, id ASC",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(serde_json::json!({
-                "block": row.get::<_, i64>(0)?,
-                "netWei": row.get::<_, i64>(1)?,
-                "count": row.get::<_, i64>(2)?,
-            }))
-        })?;
-        let mut v: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
-        v.reverse();
-        Ok(v)
+        let mut rows = stmt.query([])?;
+        let mut blocks: std::collections::BTreeMap<i64, (i128, i64)> =
+            std::collections::BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let block: i64 = row.get(0)?;
+            let net = parse_i128_decimal(&row.get::<_, String>(1)?);
+            let entry = blocks.entry(block).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(net);
+            entry.1 += 1;
+        }
+        let keep = limit.max(0) as usize;
+        let skip = blocks.len().saturating_sub(keep);
+        Ok(blocks
+            .into_iter()
+            .skip(skip)
+            .map(|(block, (net, count))| {
+                serde_json::json!({"block": block, "netWei": net.to_string(), "count": count})
+            })
+            .collect())
     }
 
     pub fn recent_relay_bids(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
@@ -1060,14 +1435,18 @@ impl Store {
     }
 }
 
-fn clamp_i64(v: i128) -> i64 {
-    if v > i64::MAX as i128 {
-        i64::MAX
-    } else if v < i64::MIN as i128 {
-        i64::MIN
-    } else {
-        v as i64
-    }
+fn parse_i128_decimal(value: &str) -> i128 {
+    value.parse::<i128>().unwrap_or_else(|_| {
+        if value.trim_start().starts_with('-') {
+            i128::MIN
+        } else {
+            i128::MAX
+        }
+    })
+}
+
+fn parse_u256_decimal(value: &str) -> U256 {
+    value.parse::<U256>().unwrap_or(U256::ZERO)
 }
 
 #[cfg(test)]
@@ -1109,7 +1488,7 @@ mod tests {
         assert_eq!(sandwich.simulations, 2);
         assert_eq!(sandwich.wins, 1);
         assert_eq!(sandwich.losses, 1);
-        assert_eq!(sandwich.net_profit_wei, 300);
+        assert_eq!(sandwich.net_profit_wei, "300");
         assert_eq!(s.cumulative_net().unwrap(), 1_300);
     }
 
@@ -1335,7 +1714,7 @@ mod tests {
         let pnl = store.pnl().unwrap();
         let sandwich = pnl.iter().find(|p| p.strategy == "sandwich").unwrap();
         assert_eq!(sandwich.simulations, 3);
-        assert_eq!(sandwich.net_profit_wei, 950);
+        assert_eq!(sandwich.net_profit_wei, "950");
     }
 
     #[tokio::test]

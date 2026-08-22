@@ -96,7 +96,9 @@ impl StrategyImpl for JitStrategy {
 
         let base_fee = tx.base_fee(&head);
         let target_block = tx.target_block(&head, ctx.cfg.sim.target_block_offset);
-        let capital = ctx.max_position().min(U256::from(MIN_VICTIM_NOTIONAL) * U256::from(10u8));
+        let capital = ctx
+            .max_position()
+            .min(U256::from(MIN_VICTIM_NOTIONAL) * U256::from(10u8));
         let Some(plan) = size_position(&state, capital, p.zero_for_one) else {
             return Vec::new();
         };
@@ -178,7 +180,13 @@ impl StrategyImpl for JitStrategy {
             created_at_ms: now_ms(),
             notes: format!(
                 "jit {:?} fee {} ticks [{}, {}] L {} victim_in {} expected_fee {}",
-                state.pool, p.fee, plan.tick_lower, plan.tick_upper, plan.liquidity, p.amount_in, expected_fee
+                state.pool,
+                p.fee,
+                plan.tick_lower,
+                plan.tick_upper,
+                plan.liquidity,
+                p.amount_in,
+                expected_fee
             ),
         }]
     }
@@ -212,7 +220,11 @@ pub fn decode_v3_swap(tx: &PendingTx) -> Option<V3SwapIntent> {
             token_in: p.tokenIn,
             token_out: p.tokenOut,
             fee: p.fee.to::<u32>(),
-            amount_in: if p.amountIn.is_zero() { tx.value } else { p.amountIn },
+            amount_in: if p.amountIn.is_zero() {
+                tx.value
+            } else {
+                p.amountIn
+            },
             amount_out_min: p.amountOutMinimum,
             zero_for_one: p.tokenIn < p.tokenOut,
         });
@@ -226,7 +238,11 @@ pub fn decode_v3_swap(tx: &PendingTx) -> Option<V3SwapIntent> {
             token_in: p.tokenIn,
             token_out: p.tokenOut,
             fee: p.fee.to::<u32>(),
-            amount_in: if p.amountIn.is_zero() { tx.value } else { p.amountIn },
+            amount_in: if p.amountIn.is_zero() {
+                tx.value
+            } else {
+                p.amountIn
+            },
             amount_out_min: p.amountOutMinimum,
             zero_for_one: p.tokenIn < p.tokenOut,
         });
@@ -292,11 +308,17 @@ async fn pool_state(
             ),
             (
                 "eth_call".into(),
-                call(pool, crate::dex::IUniswapV3Pool::liquidityCall {}.abi_encode()),
+                call(
+                    pool,
+                    crate::dex::IUniswapV3Pool::liquidityCall {}.abi_encode(),
+                ),
             ),
             (
                 "eth_call".into(),
-                call(pool, crate::dex::IUniswapV3Pool::tickSpacingCall {}.abi_encode()),
+                call(
+                    pool,
+                    crate::dex::IUniswapV3Pool::tickSpacingCall {}.abi_encode(),
+                ),
             ),
             (
                 "eth_call".into(),
@@ -309,7 +331,10 @@ async fn pool_state(
         ])
         .await?;
 
-    let slot0 = results.first().and_then(|r| r.as_ref().ok()).map(crate::types::parse_bytes);
+    let slot0 = results
+        .first()
+        .and_then(|r| r.as_ref().ok())
+        .map(crate::types::parse_bytes);
     let Some(slot0) = slot0 else { return Ok(None) };
     if slot0.len() < 64 {
         return Ok(None);
@@ -448,7 +473,10 @@ mod tests {
         assert_eq!(plan.tick_upper % 60, 0);
         assert_eq!(plan.tick_upper - plan.tick_lower, 120);
         // int24 packing round-trips through two's complement.
-        assert_eq!(to_i24(-120).into_raw(), alloy_primitives::aliases::U24::from(0xff_ff88u32));
+        assert_eq!(
+            to_i24(-120).into_raw(),
+            alloy_primitives::aliases::U24::from(0xff_ff88u32)
+        );
     }
 
     #[test]

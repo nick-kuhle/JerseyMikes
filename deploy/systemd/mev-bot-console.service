@@ -11,7 +11,8 @@ WorkingDirectory=/opt/jerseymikes/console
 EnvironmentFile=/etc/jerseymikes/env
 Environment=PORT=3000
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/npm run start
+# Loopback only: this server holds BOT_API_TOKEN and proxies privileged writes.
+ExecStart=/usr/bin/npm run start:loopback
 Restart=always
 RestartSec=3
 

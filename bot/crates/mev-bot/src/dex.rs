@@ -17,10 +17,10 @@ use serde_json::json;
 
 use crate::rpc::RpcClient;
 
-/// Multi-leg cycle search over the pool graph.
-pub mod graph;
 /// Router calldata decoders (V2, UniversalRouter).
 pub mod calldata;
+/// Multi-leg cycle search over the pool graph.
+pub mod graph;
 
 sol! {
     interface IUniswapV2Factory {
@@ -506,7 +506,11 @@ pub async fn get_pair(
         return Ok(None);
     }
     let addr = Address::from_slice(&raw[12..32]);
-    Ok(if addr == Address::ZERO { None } else { Some(addr) })
+    Ok(if addr == Address::ZERO {
+        None
+    } else {
+        Some(addr)
+    })
 }
 
 /// Price an exact-in UniswapV3 swap using the on-chain QuoterV2.
@@ -598,9 +602,15 @@ mod tests {
         assert!(s.gross_profit > U256::ZERO);
         assert!(s.amount_in > U256::ZERO);
         // Profit must beat any naive fixed size.
-        let naive = optimal_sandwich_in(&p, p.token0, victim, U256::ZERO, s.amount_in / U256::from(4u8))
-            .map(|x| x.gross_profit)
-            .unwrap_or(U256::ZERO);
+        let naive = optimal_sandwich_in(
+            &p,
+            p.token0,
+            victim,
+            U256::ZERO,
+            s.amount_in / U256::from(4u8),
+        )
+        .map(|x| x.gross_profit)
+        .unwrap_or(U256::ZERO);
         assert!(s.gross_profit >= naive);
     }
 

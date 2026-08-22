@@ -1,6 +1,6 @@
 "use client";
 
-import type {CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
+import type {ActualMevResponse, CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
 
 /**
  * Phase 1 instrumentation: latency histograms, competition ranking, re-orgs.
@@ -8,10 +8,12 @@ import type {CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
 export default function Phase1Panel({
   latency,
   competition,
+  actualMev,
   reorgs,
 }: {
   latency: LatencySnapshot | null | undefined;
   competition: CompetitionResponse | null | undefined;
+  actualMev: ActualMevResponse | null | undefined;
   reorgs: ReorgRow[] | null | undefined;
 }) {
   const total = latency?.stages?.total;
@@ -71,14 +73,14 @@ export default function Phase1Panel({
 
       <div className="panel" style={{padding: 12}}>
         <div className="panel-head">
-          <span>competition vs builder payment</span>
-          <span className="muted">inclusion model</span>
+          <span>target & on-chain MEV evidence</span>
+          <span className="muted">block bid is context, not a forecast</span>
         </div>
         <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10}}>
-          <Stat label="true-positive rate" value={summary ? `${(100 * tpr).toFixed(0)}%` : "—"} />
-          <Stat label="mean inclusion p" value={summary ? Number(summary.meanInclusionP ?? 0).toFixed(2) : "—"} />
-          <Stat label="would outbid" value={String(summary?.wouldOutbid ?? 0)} />
-          <Stat label="victims landed" value={String(summary?.victimsLanded ?? 0)} />
+          <Stat label="target-observed rate" value={summary ? `${(100 * tpr).toFixed(0)}%` : "—"} />
+          <Stat label="MEV matches" value={String(actualMev?.summary.matches ?? 0)} />
+          <Stat label="high confidence" value={String(actualMev?.summary.highConfidence ?? 0)} />
+          <Stat label="block-bid rank only" value={String(summary?.wouldOutbid ?? 0)} />
         </div>
         <div style={{maxHeight: 180, overflowY: "auto"}}>
           <table className="grid">
@@ -97,20 +99,26 @@ export default function Phase1Panel({
                   <td>{r.strategy}</td>
                   <td style={{textAlign: "right"}}>{r.inclusionP.toFixed(2)}</td>
                   <td className={r.truePositive ? "pos" : r.falsePositive ? "neg" : "muted"}>
-                    {r.truePositive ? "TP" : r.falsePositive ? "FP" : r.wouldOutbid ? "WIN" : "—"}
+                    {r.truePositive ? "TARGET" : r.falsePositive ? "MISSING" : r.wouldOutbid ? "BID>" : "—"}
                   </td>
                 </tr>
               ))}
               {!(competition?.recent ?? []).length && (
                 <tr>
                   <td colSpan={4} className="muted" style={{textAlign: "center", padding: 12}}>
-                    no reconciliations yet — run `mev-bot replay` or wait for a delivered block
+                    no target observations yet — wait for a delivered block
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        {(actualMev?.matches ?? []).slice(0, 3).map((match) => (
+          <div key={match.opportunityId} style={{fontSize: 10, marginTop: 5}}>
+            <span className={match.confidence === "high" ? "pos" : "muted"}>{match.confidence}</span>{" "}
+            #{match.blockNumber} · {match.mevTxHashes.length} MEV tx · net {match.netWethWei.slice(0, 10)} wei
+          </div>
+        ))}
       </div>
 
       <div className="panel" style={{padding: 12}}>

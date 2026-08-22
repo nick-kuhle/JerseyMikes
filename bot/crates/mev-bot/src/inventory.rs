@@ -84,26 +84,39 @@ impl Inventory {
         self.nonce()
     }
 
-    /// Flash-funded opportunities need no inventory. Everything else needs
-    /// `notional_wei` of ETH+WETH on the searcher — but only when [`Self::gate`]
-    /// is on, so a dummy searcher in simulation mode does not silence the tape.
+    /// The signer pays gas in ETH; non-flash strategies spend WETH held by the
+    /// executor. Treating the searcher's ETH+WETH as one interchangeable pool
+    /// let the live gate pass while the account that actually performs the
+    /// transfer was empty.
     pub fn can_fund(&self, opp: &Opportunity) -> bool {
         if !self.gate {
             return true;
         }
+        if self.eth().is_zero() {
+            return false;
+        }
         if !opp.flash_tokens.is_empty() {
             return true;
         }
-        opp.notional_wei <= self.available()
+        opp.notional_wei <= self.weth()
     }
 
     /// Pull nonce + balances from the execution node. Failures are logged and
     /// leave the last known values in place: a stale nonce is better than a
     /// panic on a flaky RPC, and the next block will try again.
-    pub async fn refresh(&self, http: &RpcClient, searcher: Address, weth: Address) -> Result<()> {
+    pub async fn refresh(
+        &self,
+        http: &RpcClient,
+        searcher: Address,
+        weth: Address,
+        executor: Option<Address>,
+    ) -> Result<()> {
         let who = format!("{searcher:?}");
         if let Ok(v) = http
-            .call_raw("eth_getTransactionCount", serde_json::json!([who.clone(), "latest"]))
+            .call_raw(
+                "eth_getTransactionCount",
+                serde_json::json!([who.clone(), "latest"]),
+            )
             .await
         {
             self.set_nonce(crate::types::parse_u64(&v));
@@ -114,8 +127,12 @@ impl Inventory {
         {
             *self.eth_wei.write() = crate::types::parse_u256(&v);
         }
-        if let Ok(bal) = erc20_balance(http, weth, searcher).await {
-            *self.weth_wei.write() = bal;
+        if let Some(executor) = executor {
+            if let Ok(bal) = erc20_balance(http, weth, executor).await {
+                *self.weth_wei.write() = bal;
+            }
+        } else {
+            *self.weth_wei.write() = U256::ZERO;
         }
         Ok(())
     }
@@ -123,6 +140,9 @@ impl Inventory {
     pub fn snapshot(&self) -> Value {
         json!({
             "nonce": self.nonce(),
+            "searcherGasEthWei": self.eth().to_string(),
+            "executorWethWei": self.weth().to_string(),
+            // Backward-compatible aliases for the current dashboard.
             "ethWei": self.eth().to_string(),
             "wethWei": self.weth().to_string(),
             "availableWei": self.available().to_string(),

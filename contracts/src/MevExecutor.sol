@@ -31,12 +31,31 @@ contract MevExecutor is IFlashLoanRecipient {
     /// @param bribeBps    Share of realised profit (in bps) paid to `block.coinbase`.
     /// @param blockDeadline Last block this batch may execute in (0 = no deadline).
     /// @param maxBaseFee  Reverts if `block.basefee` exceeds this (0 = no cap).
+    /// @notice Settlement policy for one executor leg.
+    /// @dev `phase` makes two-transaction strategies (front → victim → back)
+    ///      economically atomic at the contract boundary:
+    ///
+    ///      * 0 — single transaction; measure from this call's entry balance.
+    ///      * 1 — opening leg; persist the pre-strategy balance under `tag`.
+    ///      * 2 — closing leg; settle against the balance persisted by phase 1.
+    ///
+    ///      A closing leg must execute in the same block as its opener. Private
+    ///      bundle relays already reject a bundle containing an unexpected
+    ///      revert; this stateful baseline additionally prevents a back leg
+    ///      from calling returned principal "profit".
     struct Guard {
         address profitToken;
         uint256 minProfit;
         uint16 bribeBps;
         uint64 blockDeadline;
         uint256 maxBaseFee;
+        uint8 phase;
+    }
+
+    struct Baseline {
+        address profitToken;
+        uint64 blockNumber;
+        uint256 balance;
     }
 
     // Transient-storage (EIP-1153) guard slots.
@@ -65,9 +84,16 @@ contract MevExecutor is IFlashLoanRecipient {
 
     address public owner;
     mapping(address => bool) public searchers;
+    mapping(bytes32 => Baseline) private _baselines;
 
+    event PhaseOpened(bytes32 indexed tag, address indexed profitToken, uint256 referenceBalance);
     event Executed(
-        bytes32 indexed tag, address indexed profitToken, uint256 profit, uint256 bribe, uint256 gasUsed
+        bytes32 indexed tag,
+        address indexed profitToken,
+        uint256 grossProfit,
+        uint256 bribe,
+        uint256 retainedProfit,
+        uint256 gasUsed
     );
     event SearcherSet(address indexed searcher, bool allowed);
     event OwnerChanged(address indexed previousOwner, address indexed newOwner);
@@ -82,6 +108,10 @@ contract MevExecutor is IFlashLoanRecipient {
     error CallFailed(uint256 index, bytes returndata);
     error BadFlashCallback();
     error BadBribe();
+    error BadPhase();
+    error BaselineExists();
+    error BaselineMissing();
+    error BaselineMismatch();
     /// @notice `sweep` could not deliver native ETH to `to`.
     error SweepFailed();
     /// @notice The coinbase transfer of the builder bribe reverted.
@@ -185,10 +215,34 @@ contract MevExecutor is IFlashLoanRecipient {
     {
         uint256 gasStart = gasleft();
         _checkGuards(g);
-        uint256 balBefore = _balance(g.profitToken);
+
+        if (g.phase == 1) {
+            if (_baselines[tag].blockNumber != 0) revert BaselineExists();
+            uint256 referenceBalance = _balance(g.profitToken);
+            _baselines[tag] = Baseline({
+                profitToken: g.profitToken, blockNumber: uint64(block.number), balance: referenceBalance
+            });
+            _run(calls);
+            emit PhaseOpened(tag, g.profitToken, referenceBalance);
+            return 0;
+        }
+
+        uint256 balBefore;
+        if (g.phase == 2) {
+            Baseline memory baseline = _baselines[tag];
+            if (baseline.blockNumber == 0) revert BaselineMissing();
+            if (baseline.blockNumber != block.number || baseline.profitToken != g.profitToken) {
+                revert BaselineMismatch();
+            }
+            balBefore = baseline.balance;
+            // Delete before the external calls. A later revert restores it; a
+            // successful close can never be replayed against a stale baseline.
+            delete _baselines[tag];
+        } else {
+            balBefore = _balance(g.profitToken);
+        }
 
         _run(calls);
-
         profit = _settle(tag, g, balBefore, gasStart);
     }
 
@@ -202,6 +256,9 @@ contract MevExecutor is IFlashLoanRecipient {
         Guard calldata g
     ) external onlySearcher nonReentrant {
         _checkGuards(g);
+        // A flash loan cannot span two transactions. Flash-funded strategies
+        // are therefore always single-transaction settlements.
+        if (g.phase != 0) revert BadPhase();
         _flash(tokens, amounts, _encodeFlashData(tag, calls, g));
     }
 
@@ -371,6 +428,8 @@ contract MevExecutor is IFlashLoanRecipient {
         if (g.blockDeadline != 0 && block.number > g.blockDeadline) revert Deadline();
         if (g.maxBaseFee != 0 && block.basefee > g.maxBaseFee) revert BaseFeeTooHigh();
         if (g.bribeBps > 10_000) revert BadBribe();
+        if (g.phase > 2) revert BadPhase();
+        if (g.phase == 1 && (g.minProfit != 0 || g.bribeBps != 0)) revert BadPhase();
     }
 
     function _settle(bytes32 tag, Guard memory g, uint256 balBefore, uint256 gasStart)
@@ -378,9 +437,9 @@ contract MevExecutor is IFlashLoanRecipient {
         returns (uint256 profit)
     {
         uint256 balAfter = _balance(g.profitToken);
-        // Underflow-safe: a negative delta is a zero profit and will fail the check below.
+        // Underflow-safe: a negative delta is zero gross profit and fails any
+        // non-zero retained-profit requirement below.
         profit = balAfter > balBefore ? balAfter - balBefore : 0;
-        if (profit < g.minProfit) revert Unprofitable(profit, g.minProfit);
 
         uint256 bribe;
         if (g.bribeBps != 0 && profit != 0) {
@@ -401,7 +460,10 @@ contract MevExecutor is IFlashLoanRecipient {
             }
         }
 
-        emit Executed(tag, g.profitToken, profit, bribe, gasStart - gasleft());
+        uint256 retained = profit - bribe;
+        if (retained < g.minProfit) revert Unprofitable(retained, g.minProfit);
+
+        emit Executed(tag, g.profitToken, profit, bribe, retained, gasStart - gasleft());
     }
 
     function _run(Call[] calldata calls) private returns (bytes[] memory out) {

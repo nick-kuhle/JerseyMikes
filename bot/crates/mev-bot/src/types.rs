@@ -254,6 +254,34 @@ impl Strategy {
         }
     }
 
+    /// Strategies whose current bundle shape settles into WETH/ETH and has a
+    /// contract-level retained-profit invariant. This is only the engineering
+    /// eligibility ceiling; the seven-day qualification gate can narrow it
+    /// further and broadcasting remains independently disabled by default.
+    pub fn live_candidate(&self) -> bool {
+        matches!(
+            self,
+            Strategy::Sandwich | Strategy::SandwichV3 | Strategy::AtomicArb
+        )
+    }
+
+    pub fn shadow_only_reason(&self) -> Option<&'static str> {
+        match self {
+            Strategy::Jit => Some("position is not yet unwound to one profit token"),
+            Strategy::Sniper => {
+                Some("round-trip probe is not a certified profitable execution strategy")
+            }
+            Strategy::Liquidation
+            | Strategy::LiquidationCompound
+            | Strategy::LiquidationMorpho
+            | Strategy::LiquidationMaker
+            | Strategy::OracleFrontrun => {
+                Some("non-WETH profit needs block-pinned token valuation before gas can be netted")
+            }
+            _ => None,
+        }
+    }
+
     pub fn all() -> [Strategy; 10] {
         [
             Strategy::Sandwich,
@@ -308,7 +336,9 @@ pub struct SimulationResult {
     pub gas_price_wei: U256,
     pub gas_cost_wei: U256,
     pub bribe_wei: U256,
-    /// gross - gas - bribe. Signed: negative means the bundle would have lost money.
+    /// Retained profit minus searcher gas, in signed wei. Serialized as a
+    /// decimal string so JavaScript and SQLite never round it.
+    #[serde(with = "crate::types::i128_decimal")]
     pub net_profit_wei: i128,
     pub revert_reason: Option<String>,
     pub target_block: u64,
@@ -431,6 +461,19 @@ pub fn now_ms() -> u64 {
 
 /// Hex helpers: we store byte blobs as `0x…` strings everywhere so the JSON that
 /// reaches the frontend is directly usable by viem.
+pub mod i128_decimal {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &i128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i128, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse::<i128>().map_err(serde::de::Error::custom)
+    }
+}
+
 pub mod bytes_hex {
     use serde::{Deserialize, Deserializer, Serializer};
 

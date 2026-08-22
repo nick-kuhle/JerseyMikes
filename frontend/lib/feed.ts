@@ -118,7 +118,11 @@ export function parseFeedEvent(raw: unknown): FeedEvent | null {
         success: bool(raw.success) ? raw.success : false,
         // Signed and can legitimately be negative — a losing simulation is a
         // result, not an error.
-        net_profit_wei: num(raw.net_profit_wei) ? raw.net_profit_wei : 0,
+        net_profit_wei: str(raw.net_profit_wei)
+          ? raw.net_profit_wei
+          : num(raw.net_profit_wei)
+            ? String(raw.net_profit_wei)
+            : "0",
         gas_used: num(raw.gas_used) ? raw.gas_used : 0,
         gross_profit_wei: str(raw.gross_profit_wei) ? raw.gross_profit_wei : "0",
         revert_reason: strOrNull(raw.revert_reason) ? raw.revert_reason : null,

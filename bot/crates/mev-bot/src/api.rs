@@ -76,6 +76,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/funnel", get(funnel))
         .route("/api/latency", get(latency))
         .route("/api/competition", get(competition))
+        .route("/api/actual-mev", get(actual_mev))
+        .route("/api/qualification", get(qualification))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
         .route("/api/mode", get(mode))
@@ -163,6 +165,8 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         // Boot-time arming (`LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`).
         // The runtime switch can only narrow this, never widen it.
         "liveArmed": e.mode.armed(),
+        "broadcastEnabled": e.cfg.broadcast_enabled,
+        "qualification": e.qualification_status(),
         // Runtime-effective enablement (already intersected with what was
         // constructed at boot); the boot set is in `bootStrategies` and
         // /api/config.
@@ -210,6 +214,13 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         "searcher": format!("{:?}", e.cfg.endpoints.searcher_address),
         "liveExecution": e.mode.live(),
         "liveArmed": e.mode.armed(),
+        "broadcastEnabled": e.cfg.broadcast_enabled,
+        "qualification": e.qualification_status(),
+        "strategyEligibility": Strategy::all().iter().map(|strategy| json!({
+            "name": strategy.as_str(),
+            "liveCandidate": strategy.live_candidate(),
+            "shadowOnlyReason": strategy.shadow_only_reason(),
+        })).collect::<Vec<_>>(),
         "endpoints": {
             "ws": e.cfg.endpoints.ws_url.is_some(),
             "mevShare": !e.cfg.endpoints.mev_share_sse.is_empty(),
@@ -227,8 +238,10 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
 async fn pnl(State(s): State<ApiState>) -> impl IntoResponse {
     match s.engine.store.pnl() {
         Ok(rows) => {
-            let total: i64 = rows.iter().map(|r| r.net_profit_wei).sum();
-            Json(json!({"byStrategy": rows, "totalNetWei": total}))
+            let total = rows.iter().fold(0i128, |sum, row| {
+                sum.saturating_add(row.net_profit_wei.parse::<i128>().unwrap_or(0))
+            });
+            Json(json!({"byStrategy": rows, "totalNetWei": total.to_string()}))
         }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -323,6 +336,30 @@ async fn competition(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> 
         .recent_reconciliations(limit)
         .unwrap_or_default();
     Json(json!({"summary": summary, "recent": rows}))
+}
+
+async fn qualification(State(s): State<ApiState>) -> impl IntoResponse {
+    Json(json!({
+        "status": s.engine.qualification_status(),
+        "broadcastEnabled": s.engine.cfg.broadcast_enabled,
+        "runtimeLive": s.engine.mode.live(),
+        "armed": s.engine.mode.armed(),
+    }))
+}
+
+async fn actual_mev(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
+    let matches = s
+        .engine
+        .store
+        .recent_actual_mev_matches(limit)
+        .unwrap_or_default();
+    let summary = s
+        .engine
+        .store
+        .actual_mev_summary()
+        .unwrap_or_else(|_| json!({"matches": 0, "highConfidence": 0}));
+    Json(json!({"summary": summary, "matches": matches}))
 }
 
 async fn reorgs(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {

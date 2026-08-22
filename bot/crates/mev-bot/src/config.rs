@@ -192,9 +192,15 @@ pub struct Config {
     /// balance are skipped. Off by default so a dummy searcher in simulation
     /// mode does not silence the tape; forced on when live execution is on.
     pub inventory_gate: bool,
-    /// Master switch. When false (the default and the only supported value today)
-    /// the bot will *never* broadcast a transaction to a public node or a relay.
+    /// Boot arming for the runtime mode switch.
     pub live_execution: bool,
+    /// Third, independent capability gate. Even an armed + runtime-live process
+    /// only shadow-records bundles unless this is true and qualification passes.
+    pub broadcast_enabled: bool,
+    /// Minimum uninterrupted shadow duration.
+    pub qualification_hours: u64,
+    /// Minimum high-confidence on-chain MEV matches before any strategy may send.
+    pub qualification_min_actual_matches: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,6 +224,9 @@ pub struct Endpoints {
     pub mev_share_sse: String,
     /// Bundle relay used for `eth_callBundle` cross-checks.
     pub relay_url: String,
+    /// Relays/builders that receive live bundles after every independent safety
+    /// and qualification gate passes.
+    pub bundle_relay_urls: Vec<String>,
     /// Additional relays for data queries (bid traces / payloads delivered).
     pub relay_data_urls: Vec<String>,
     /// The bloXroute Max Profit relay used to pull delivered blocks and their
@@ -240,6 +249,10 @@ pub struct Endpoints {
     /// otherwise print a live key.
     #[serde(skip_serializing, default)]
     pub flashbots_signer_key: Option<String>,
+    /// Funded EOA key that signs the bundle transactions themselves. This is
+    /// deliberately distinct from the unfunded Flashbots reputation key.
+    #[serde(skip_serializing, default)]
+    pub searcher_private_key: Option<String>,
     /// Executor contract address, if deployed.
     pub executor: Option<Address>,
     /// Address the simulated searcher trades from.
@@ -258,6 +271,7 @@ impl std::fmt::Debug for Endpoints {
             .field("ws_url", &self.ws_url)
             .field("mev_share_sse", &self.mev_share_sse)
             .field("relay_url", &self.relay_url)
+            .field("bundle_relay_urls", &self.bundle_relay_urls)
             .field("relay_data_urls", &self.relay_data_urls)
             .field("bloxroute_relay_url", &self.bloxroute_relay_url)
             .field("sequencer_feed", &self.sequencer_feed)
@@ -266,6 +280,10 @@ impl std::fmt::Debug for Endpoints {
             .field(
                 "flashbots_signer_key",
                 &self.flashbots_signer_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "searcher_private_key",
+                &self.searcher_private_key.as_ref().map(|_| "<redacted>"),
             )
             .field("executor", &self.executor)
             .field("searcher_address", &self.searcher_address)
@@ -459,6 +477,41 @@ impl Config {
 
         let chain_id = env_u64("CHAIN_ID", 1);
 
+        // Relay authentication and transaction signing are different trust
+        // domains. Derive the searcher address from the funded transaction key
+        // so nonce, balance, allowlist and raw signatures cannot drift apart.
+        let searcher_private_key = env_opt("SEARCHER_PRIVATE_KEY");
+        let tx_signer = match searcher_private_key.as_deref() {
+            Some(key) => crate::signer::Signer::from_hex(key)
+                .context("SEARCHER_PRIVATE_KEY is not a valid secp256k1 private key")?,
+            None => crate::signer::Signer::simulation(),
+        };
+        let searcher_address = tx_signer.address();
+        if let Some(raw) = env_opt("SEARCHER_ADDRESS") {
+            if let Ok(configured) = raw.parse::<Address>() {
+                // The old example shipped a dummy 0x…f0000 address. Ignore it
+                // when migrating an unarmed simulation; any other mismatch is
+                // a configuration error rather than something to guess around.
+                let legacy_dummy = address!("00000000000000000000000000000000000f0000");
+                if configured != legacy_dummy && configured != searcher_address {
+                    anyhow::bail!(
+                        "SEARCHER_ADDRESS ({configured:?}) does not match the address derived from \
+                         SEARCHER_PRIVATE_KEY ({searcher_address:?}); remove SEARCHER_ADDRESS or fix the key"
+                    );
+                }
+            }
+        }
+
+        let relay_url = env_or("FLASHBOTS_RELAY_URL", "https://relay.flashbots.net");
+        let bundle_relay_urls = {
+            let configured = env_list("BUNDLE_RELAY_URLS");
+            if configured.is_empty() {
+                vec![relay_url.clone()]
+            } else {
+                configured
+            }
+        };
+
         let cfg = Self {
             chain: ChainConfig {
                 chain_id,
@@ -471,7 +524,8 @@ impl Config {
                 http_url,
                 ws_url: env_opt("ETH_WS_URL"),
                 mev_share_sse: env_or("MEV_SHARE_SSE_URL", "https://mev-share.flashbots.net"),
-                relay_url: env_or("FLASHBOTS_RELAY_URL", "https://relay.flashbots.net"),
+                relay_url,
+                bundle_relay_urls,
                 relay_data_urls: {
                     let v = env_list("RELAY_DATA_URLS");
                     if v.is_empty() {
@@ -492,11 +546,9 @@ impl Config {
                 extra_mempool_ws: env_list("EXTRA_MEMPOOL_WS"),
                 mev_blocker_ws: env_opt("MEV_BLOCKER_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
+                searcher_private_key,
                 executor: env_opt("EXECUTOR_ADDRESS").and_then(|v| v.parse().ok()),
-                searcher_address: env_addr(
-                    "SEARCHER_ADDRESS",
-                    address!("00000000000000000000000000000000000f0000"),
-                ),
+                searcher_address,
             },
             risk: RiskConfig {
                 // Liberal defaults: record anything at all that is net positive.
@@ -632,6 +684,9 @@ impl Config {
             // Guarded by two independent switches so it cannot be flipped by accident.
             live_execution: env_bool("LIVE_EXECUTION", false)
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
+            broadcast_enabled: env_bool("BROADCAST_ENABLED", false),
+            qualification_hours: env_u64("QUALIFICATION_HOURS", 168).max(1),
+            qualification_min_actual_matches: env_u64("QUALIFICATION_MIN_ACTUAL_MATCHES", 30).max(1),
         };
         // NOTE: `validate()` is deliberately NOT called here. `doctor` and
         // `replay` load the config without ever binding a port, and they must
@@ -659,7 +714,24 @@ impl Config {
     /// when it would listen on a non-loopback address without
     /// `API_AUTH_TOKEN`. Loopback-only setups are unaffected.
     pub fn validate(&self) -> Result<()> {
-        validate_api(&self.api)
+        validate_api(&self.api)?;
+        if self.broadcast_enabled && !self.live_execution {
+            anyhow::bail!(
+                "BROADCAST_ENABLED=true requires both LIVE_EXECUTION=true and I_UNDERSTAND_LIVE_RISK=yes"
+            );
+        }
+        if self.live_execution {
+            if self.endpoints.searcher_private_key.is_none() {
+                anyhow::bail!(
+                    "live execution was armed without SEARCHER_PRIVATE_KEY; \
+                     FLASHBOTS_SIGNER_KEY is an unfunded relay-authentication key and can never sign trades"
+                );
+            }
+            if self.endpoints.executor.is_none() {
+                anyhow::bail!("live execution was armed without EXECUTOR_ADDRESS");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -805,12 +877,14 @@ mod tests {
             ws_url: None,
             mev_share_sse: String::new(),
             relay_url: String::new(),
+            bundle_relay_urls: vec![],
             relay_data_urls: vec![],
             bloxroute_relay_url: String::new(),
             sequencer_feed: None,
             extra_mempool_ws: vec![],
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
+            searcher_private_key: None,
             executor: None,
             searcher_address: Address::ZERO,
         };
@@ -829,12 +903,14 @@ mod tests {
             ws_url: None,
             mev_share_sse: String::new(),
             relay_url: String::new(),
+            bundle_relay_urls: vec![],
             relay_data_urls: vec![],
             bloxroute_relay_url: String::new(),
             sequencer_feed: None,
             extra_mempool_ws: vec![],
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
+            searcher_private_key: None,
             executor: None,
             searcher_address: Address::ZERO,
         };

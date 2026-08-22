@@ -124,6 +124,9 @@ pub struct Engine {
     strategy_gate: Arc<tokio::sync::Semaphore>,
     pub latency: Arc<Latency>,
     pub inventory: Arc<Inventory>,
+    /// Private relay transport. Calling it is still gated by broadcast
+    /// capability, qualification, runtime mode, risk and strategy eligibility.
+    pub submission: Arc<crate::submission::SubmissionGateway>,
     last_head: parking_lot::Mutex<Option<BlockHead>>,
     /// Block number of the last pool-discovery pass (`u64::MAX` = never run).
     last_discovery_block: std::sync::atomic::AtomicU64,
@@ -451,16 +454,32 @@ impl Engine {
         let runtime = crate::risk::RuntimeRisk::new(cfg.risk.clone(), cfg.strategies.clone());
         let risk = Arc::new(RiskEngine::new(cfg.clone(), runtime.clone()));
 
-        let signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
+        let relay_signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
             Some(k) => Signer::from_hex(k)?,
             None => {
                 tracing::warn!(
                     target: "engine",
-                    "no FLASHBOTS_SIGNER_KEY set — using an ephemeral key (relay cross-checks may be rate limited)"
+                    "no FLASHBOTS_SIGNER_KEY set — using an ephemeral relay-auth key (cross-checks may be rate limited)"
                 );
                 Signer::ephemeral()
             }
         });
+        let submission = Arc::new(crate::submission::SubmissionGateway::new(
+            &cfg.endpoints.bundle_relay_urls,
+            relay_signer.clone(),
+            store.clone(),
+        ));
+        let transaction_signer = Arc::new(match &cfg.endpoints.searcher_private_key {
+            Some(k) => Signer::from_hex(k)?,
+            None => Signer::simulation(),
+        });
+        if transaction_signer.address() != cfg.endpoints.searcher_address {
+            anyhow::bail!(
+                "transaction signer {:?} does not match configured searcher {:?}",
+                transaction_signer.address(),
+                cfg.endpoints.searcher_address
+            );
+        }
 
         // Current head, needed before anything else can be sized.
         let head = fetch_head(&http).await?;
@@ -516,7 +535,7 @@ impl Engine {
         };
 
         let relay = if cfg.sim.use_call_bundle {
-            crate::sim::relay::RelaySim::new(&cfg, signer.clone()).ok()
+            crate::sim::relay::RelaySim::new(&cfg, relay_signer.clone()).ok()
         } else {
             None
         };
@@ -532,7 +551,7 @@ impl Engine {
             fork,
             replay_fork,
             relay,
-            signer,
+            transaction_signer,
             runtime.clone(),
         ));
         let ctx = Arc::new(StrategyCtx::new(
@@ -541,6 +560,11 @@ impl Engine {
             executor,
             head.clone(),
         ));
+        let pool_discovery = PoolDiscovery::new();
+        if cfg.pool_discovery_v3 {
+            let loaded = pool_discovery.seed_core_v3(&ctx).await;
+            tracing::info!(target: "discovery", loaded, "seeded established core V3 pools");
+        }
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
@@ -566,7 +590,10 @@ impl Engine {
         // reads it when a price update appears in the mempool.
         let leads = LiquidationLeads::new();
         if cfg.strategies.liquidation {
-            strategies.push(Arc::new(LiquidationStrategy::new(leads.clone())));
+            strategies.push(Arc::new(LiquidationStrategy::new(
+                leads.clone(),
+                cfg.liquidation.watch_cap,
+            )));
         }
         if cfg.strategies.liquidation_compound {
             strategies.push(Arc::new(CompoundLiquidationStrategy::new(
@@ -613,13 +640,17 @@ impl Engine {
             .started_at_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 
-        let pool_discovery = PoolDiscovery::new();
         let inventory = Arc::new(Inventory::new(cfg.inventory_gate));
         // Best-effort: a dummy searcher will read as nonce 0 / zero balances,
         // which is the honest picture of mainnet and does not gate unless
         // `INVENTORY_GATE` is on.
         if let Err(e) = inventory
-            .refresh(&http, cfg.endpoints.searcher_address, cfg.chain.weth)
+            .refresh(
+                &http,
+                cfg.endpoints.searcher_address,
+                cfg.chain.weth,
+                cfg.endpoints.executor,
+            )
             .await
         {
             tracing::debug!(target: "engine", error = %e, "inventory refresh failed at boot");
@@ -660,12 +691,25 @@ impl Engine {
             strategy_gate: Arc::new(tokio::sync::Semaphore::new(strategy_concurrency)),
             latency: Arc::new(Latency::default()),
             inventory,
+            submission,
             last_head: parking_lot::Mutex::new(Some(head)),
             // The boot-time refresh above already ran; the cooldowns start
             // unset so the first observed block always does a full pass.
             last_discovery_block: std::sync::atomic::AtomicU64::new(NEVER),
             last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
         })
+    }
+
+    pub fn qualification_status(&self) -> crate::qualification::QualificationStatus {
+        crate::qualification::evaluate(
+            &self.cfg,
+            &self.store,
+            &self.writes,
+            self.stats
+                .started_at_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            now_ms(),
+        )
     }
 
     /// Run forever.
@@ -774,6 +818,18 @@ impl Engine {
             tx_count: txs.len(),
             txs: summaries,
         });
+
+        // Match decision-time opportunities before replay scoring creates its
+        // own post-mortem rows for this block. Matches carry explicit evidence
+        // and confidence; competitor total economics are never called exact.
+        crate::attribution::reconcile_block(
+            &self.store,
+            &self.http,
+            block_number,
+            &txs,
+            self.cfg.chain.weth,
+        )
+        .await;
 
         // Score each transaction: strategies propose opportunities (sandwich,
         // back-run, liquidation, sniper) and the simulator decides whether value
@@ -916,6 +972,15 @@ impl Engine {
         }
         *self.last_head.lock() = Some(head.clone());
 
+        crate::attribution::reconcile_own_submissions(
+            &self.store,
+            &self.http,
+            head.number,
+            self.cfg.endpoints.searcher_address,
+            self.ctx.executor,
+        )
+        .await;
+
         // Both of these sit *in front of* the strategies on the block task, so
         // every millisecond they spend is a millisecond the strategies do not
         // get. Neither needs to run on every block: the searcher's nonce and
@@ -935,6 +1000,7 @@ impl Engine {
                     &self.http,
                     self.cfg.endpoints.searcher_address,
                     self.cfg.chain.weth,
+                    self.cfg.endpoints.executor,
                 )
                 .await;
             self.latency
@@ -1262,7 +1328,11 @@ impl Engine {
             self.latency
                 .observe(Stage::Total, now_ms().saturating_sub(seen_at_ms));
         }
-        self.risk.observe(&outcome.primary);
+        // Post-mortem replay is evidence, not capital at risk; it must never
+        // trip the live drawdown switch.
+        if lane == FunnelLane::Live {
+            self.risk.observe(&outcome.primary);
+        }
         self.writes.record_simulation(&outcome.primary);
         let _ = self
             .feed
@@ -1293,11 +1363,18 @@ impl Engine {
                 live = self.mode.live(),
                 "PROFITABLE bundle"
             );
-            // Whether the bundle is marked submitted follows the effective
-            // mode (boot-time arming && runtime switch). Flipping either of
-            // the env keys requires a restart by design — the runtime switch
-            // can only narrow what the environment allowed, never widen it.
-            bundle.submitted = self.mode.live();
+            if lane == FunnelLane::Live && self.mode.live() && self.cfg.broadcast_enabled {
+                let qualification = self.qualification_status();
+                if qualification.pass {
+                    bundle.submitted = self.submission.submit(&bundle).await;
+                } else {
+                    tracing::warn!(
+                        target: "submission",
+                        reasons = ?qualification.reasons,
+                        "live mode requested but qualification has not passed — shadow-recording only"
+                    );
+                }
+            }
         }
         self.writes.record_bundle(&bundle);
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
