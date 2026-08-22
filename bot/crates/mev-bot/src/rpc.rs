@@ -66,8 +66,61 @@ impl RpcClient {
         self.send(body).await
     }
 
+    /// Like [`RpcClient::call_raw`], but surfaces the JSON-RPC **error
+    /// object** (code/message/data) instead of flattening it into a string.
+    ///
+    /// The simulator needs this to read revert *data* out of an `eth_call`
+    /// that reverted: anvil returns the raw revert bytes (custom-error
+    /// selector and args) in the error's `data` field, which is exactly what
+    /// turns "tx 0x… reverted" into "back-run reverted:
+    /// Unprofitable(realised=0, required=1)".
+    pub async fn call_raw_with_error(&self, method: &str, params: Value) -> Result<Value, Value> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": method,
+            "params": params,
+        });
+        let mut req = self
+            .http
+            .post(&self.url)
+            .header("content-type", "application/json");
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = match req.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => return Err(json!({"code": -1, "message": e.to_string()})),
+        };
+        let status = resp.status();
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => return Err(json!({"code": -1, "message": e.to_string()})),
+        };
+        if !status.is_success() {
+            return Err(
+                json!({"code": -1, "message": format!("http {status}: {}", truncate(&text, 512))}),
+            );
+        }
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return Err(json!({"code": -1, "message": truncate(&text, 512)})),
+        };
+        if let Some(err) = v.get("error") {
+            return Err(err.clone());
+        }
+        v.get("result")
+            .cloned()
+            .ok_or_else(|| json!({"code": -1, "message": truncate(&text, 512)}))
+    }
+
     /// Same as [`call_raw`] but signs the payload with the Flashbots searcher key.
-    pub async fn call_signed(&self, method: &str, params: Value, signer: &crate::signer::Signer) -> Result<Value> {
+    pub async fn call_signed(
+        &self,
+        method: &str,
+        params: Value,
+        signer: &crate::signer::Signer,
+    ) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": self.next_id(),
@@ -207,16 +260,21 @@ impl WsSubscription {
 async fn run_subscription(url: &str, params: &Value, tx: &mpsc::Sender<Value>) -> Result<()> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await?;
     let sub = json!({"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":params});
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(sub.to_string()))
-        .await?;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        sub.to_string(),
+    ))
+    .await?;
 
     while let Some(msg) = ws.next().await {
         let msg = msg?;
         let text = match msg {
             tokio_tungstenite::tungstenite::Message::Text(t) => t,
-            tokio_tungstenite::tungstenite::Message::Binary(b) => String::from_utf8_lossy(&b).to_string(),
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                String::from_utf8_lossy(&b).to_string()
+            }
             tokio_tungstenite::tungstenite::Message::Ping(p) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(p)).await?;
+                ws.send(tokio_tungstenite::tungstenite::Message::Pong(p))
+                    .await?;
                 continue;
             }
             tokio_tungstenite::tungstenite::Message::Close(_) => break,
@@ -253,7 +311,9 @@ pub fn sse_stream(url: String, label: &'static str) -> mpsc::Receiver<String> {
         let mut backoff_ms = 500u64;
         loop {
             match run_sse(&client, &url, &tx).await {
-                Ok(()) => tracing::warn!(target: "ingest", %label, "sse stream ended, reconnecting"),
+                Ok(()) => {
+                    tracing::warn!(target: "ingest", %label, "sse stream ended, reconnecting")
+                }
                 Err(e) => tracing::warn!(target: "ingest", %label, error = %e, "sse stream failed"),
             }
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;

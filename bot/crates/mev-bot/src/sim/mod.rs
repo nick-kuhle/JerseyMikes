@@ -85,7 +85,13 @@ impl Simulator {
             nonce,
             base_fee,
             priority_fee: U256::from(1_000_000_000u64),
-            gas_limit: self.cfg.risk.max_gas_per_bundle,
+            // Clamped below any block gas limit: relays reject an over-limit tx
+            // before simulating it, exactly like the fork does.
+            gas_limit: self
+                .cfg
+                .risk
+                .max_gas_per_bundle
+                .min(anvil::MAX_TX_GAS_CEILING),
         };
         let bundle = bundle::build_bundle(opp, victims_raw, &ctx, &self.cfg.risk, &self.signer);
 
@@ -96,7 +102,8 @@ impl Simulator {
                     // Exact pin: the parent of the victim's own block. Anything
                     // else and the victim's nonce, the pool reserves and the
                     // oracle prices all belong to a different chain state.
-                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee).await?
+                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee)
+                        .await?
                 }
                 // Refusing to score is the honest outcome. Simulating a mined
                 // transaction on the live fork answers a question nobody asked
@@ -111,7 +118,8 @@ impl Simulator {
             match &self.fork {
                 Some(fork) => {
                     fork.ensure_fork_at(parent).await.ok();
-                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee).await?
+                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee)
+                        .await?
                 }
                 None => crate::sim::empty_result(opp, "no simulation backend configured"),
             }
