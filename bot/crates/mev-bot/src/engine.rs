@@ -91,6 +91,9 @@ impl LiveMode {
 pub struct Engine {
     pub cfg: Arc<Config>,
     pub store: Arc<Store>,
+    /// Batching, off-hot-path front end to `store` for the append-only
+    /// telemetry writes (opportunities, simulations, bundles, blocks).
+    pub writes: Arc<crate::store::AsyncStore>,
     /// Rule evaluation over live engine state (kill switch, stalls,
     /// conversion collapse); served on /api/alerts, pushed to the feed.
     pub alerts: Arc<crate::alerts::Alerts>,
@@ -110,10 +113,109 @@ pub struct Engine {
     http: RpcClient,
     /// Prevent replay blocks from resetting the shared replay lane concurrently.
     replay_gate: Arc<tokio::sync::Semaphore>,
+    /// Bounded hand-off to the dedicated replay worker. `None` when relay
+    /// transaction ingest is off.
+    replay_tx: Option<ReplayQueueTx>,
+    /// Receiver, parked here until `run` starts the worker that owns it.
+    replay_rx: parking_lot::Mutex<Option<ReplayQueueRx>>,
+    /// Caps how many transactions are inside the strategy fan-out at once.
+    /// Acquired with `try_acquire` on the live path, so a mempool burst sheds
+    /// load instead of queueing work that would be stale by the time it ran.
+    strategy_gate: Arc<tokio::sync::Semaphore>,
     pub latency: Arc<Latency>,
     pub inventory: Arc<Inventory>,
     last_head: parking_lot::Mutex<Option<BlockHead>>,
+    /// Block number of the last pool-discovery pass (`u64::MAX` = never run).
+    last_discovery_block: std::sync::atomic::AtomicU64,
+    /// Block number of the last inventory refresh (`u64::MAX` = never run).
+    last_inventory_block: std::sync::atomic::AtomicU64,
 }
+
+/// A delivered block waiting to be scored: the block and its transactions.
+type ReplayJob = (crate::types::RelayBlock, Vec<PendingTx>);
+type ReplayQueueTx = tokio::sync::mpsc::Sender<ReplayJob>;
+type ReplayQueueRx = tokio::sync::mpsc::Receiver<ReplayJob>;
+
+/// Cooldown gate for per-block maintenance work.
+///
+/// Returns true when `block` is at least `every` blocks past the last run,
+/// and records `block` as the new last run. `every <= 1` always runs.
+/// A rewind (re-org to a lower height) also runs: the cached state was built
+/// against a chain that no longer exists.
+fn should_run(last: &std::sync::atomic::AtomicU64, block: u64, every: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if every <= 1 {
+        last.store(block, Relaxed);
+        return true;
+    }
+    let prev = last.load(Relaxed);
+    // NEVER sentinel: nothing has run yet, so this block is the first pass.
+    if prev == NEVER || block < prev || block.saturating_sub(prev) >= every {
+        last.store(block, Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Sentinel for "this maintenance pass has never run".
+const NEVER: u64 = u64::MAX;
+
+/// Token-bucket-ish rate limiter for log lines on hot paths.
+///
+/// The per-opportunity rejection logs are the highest-frequency `debug!` calls
+/// in the engine: every risk gate, inventory gate and missing-victim skip
+/// emitted one, which on a busy block is thousands of lines that say the same
+/// thing. The *counts* already live in the funnel (`gatedByRisk`,
+/// `missingVictimRaw`), so the log line's only job is to show a representative
+/// example — which one per interval does just as well, without the formatting
+/// cost or the risk of the log becoming the bottleneck.
+pub struct LogLimiter {
+    last_ms: std::sync::atomic::AtomicU64,
+    suppressed: std::sync::atomic::AtomicU64,
+    every_ms: u64,
+}
+
+impl LogLimiter {
+    pub const fn new(every_ms: u64) -> Self {
+        Self {
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+            every_ms,
+        }
+    }
+
+    /// Returns `Some(suppressed_since_last)` when the caller should log.
+    pub fn allow(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = now_ms();
+        let last = self.last_ms.load(Relaxed);
+        if now.saturating_sub(last) < self.every_ms {
+            self.suppressed.fetch_add(1, Relaxed);
+            return None;
+        }
+        // Racing threads may both pass the check; the loser just logs twice,
+        // which is harmless and cheaper than a lock on this path.
+        self.last_ms.store(now, Relaxed);
+        Some(self.suppressed.swap(0, Relaxed))
+    }
+}
+
+/// One limiter per hot-path log site, so a flood of one kind cannot hide
+/// the others.
+static RISK_REJECT_LOG: LogLimiter = LogLimiter::new(1_000);
+static INVENTORY_REJECT_LOG: LogLimiter = LogLimiter::new(1_000);
+static MISSING_VICTIM_LOG: LogLimiter = LogLimiter::new(1_000);
+static SIM_FAILED_LOG: LogLimiter = LogLimiter::new(1_000);
+static SHED_LOG: LogLimiter = LogLimiter::new(1_000);
+
+/// Per-strategy funnel counters, sharded by strategy.
+///
+/// The funnel is written on every single strategy invocation — the hottest
+/// write path in the engine — and read only by the dashboard. A
+/// `RwLock<HashMap>` serialised all ten strategies behind one writer lock for
+/// updates that never touch the same key; `DashMap` shards the map so those
+/// updates are genuinely concurrent.
+pub type FunnelMap = dashmap::DashMap<Strategy, FunnelCounters>;
 
 #[derive(Default)]
 pub struct Stats {
@@ -129,19 +231,33 @@ pub struct Stats {
     pub simulations: std::sync::atomic::AtomicU64,
     pub submittable: std::sync::atomic::AtomicU64,
     pub rejected: std::sync::atomic::AtomicU64,
+    /// Transactions dropped before the strategy fan-out because
+    /// `STRATEGY_CONCURRENCY` was already saturated. A non-zero value here is
+    /// the signal that the bot is CPU/RPC bound and the cap needs raising (or
+    /// a strategy needs to get cheaper) — previously this backlog was
+    /// invisible, hidden inside an unbounded task queue.
+    pub evaluations_shed: std::sync::atomic::AtomicU64,
     pub reorgs_seen: std::sync::atomic::AtomicU64,
+    /// Delivered blocks skipped because the replay worker was still busy.
+    /// Replay is post-mortem analysis, so dropping the block is preferable to
+    /// letting a backlog build behind the live path.
+    pub replay_blocks_dropped: std::sync::atomic::AtomicU64,
     pub started_at_ms: std::sync::atomic::AtomicU64,
     /// Per-strategy funnel for **live** flow: how many candidates each
     /// strategy emitted, how many were gated by risk, and how many
     /// simulated successfully. If the bot is seeing opportunities but not
     /// submitting any, the question "where did they die?" gets an
     /// immediate answer here.
-    pub funnel: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
+    /// Lock-free: every strategy invocation bumps this on the hot path, and a
+    /// single `RwLock<HashMap>` made all of them contend on one writer lock
+    /// even though they touch disjoint keys. `DashMap` shards by key, so
+    /// per-strategy updates proceed in parallel.
+    pub funnel: FunnelMap,
     /// The same funnel for **replayed** flow — transactions that were
     /// already mined when the bot scored them (the relay delivered-block
     /// backfill). Kept separate so it cannot drown out the live signal;
     /// see [`FunnelLane`].
-    pub funnel_replay: parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
+    pub funnel_replay: FunnelMap,
 }
 
 /// Which measurement lane a funnel observation belongs to.
@@ -173,6 +289,7 @@ impl FunnelLane {
             TxSource::RelayDelivered | TxSource::Mined => FunnelLane::Replay,
             TxSource::PublicMempool
             | TxSource::MevShare
+            | TxSource::MevBlocker
             | TxSource::Sequencer
             | TxSource::ExternalStream => FunnelLane::Live,
         }
@@ -245,9 +362,9 @@ impl Stats {
             FunnelLane::Live => &self.funnel,
             FunnelLane::Replay => &self.funnel_replay,
         };
-        let mut guard = map.write();
-        let entry = guard.entry(strategy).or_default();
-        f(entry);
+        // Only the shard owning `strategy` is locked, so concurrent strategies
+        // do not serialise against each other.
+        f(&mut map.entry(strategy).or_default());
     }
 
     /// Record one strategy invocation together with the number of
@@ -272,12 +389,10 @@ impl Stats {
     }
 
     /// Serialise one funnel lane as `{strategy: counters}`.
-    pub fn funnel_json(
-        map: &parking_lot::RwLock<std::collections::HashMap<Strategy, FunnelCounters>>,
-    ) -> serde_json::Map<String, serde_json::Value> {
-        map.read()
-            .iter()
-            .map(|(k, v)| {
+    pub fn funnel_json(map: &FunnelMap) -> serde_json::Map<String, serde_json::Value> {
+        map.iter()
+            .map(|entry| {
+                let (k, v) = (entry.key(), entry.value());
                 (
                     k.as_str().to_string(),
                     serde_json::json!({
@@ -310,6 +425,8 @@ impl Stats {
             "simulations": self.simulations.load(Relaxed),
             "submittable": self.submittable.load(Relaxed),
             "rejected": self.rejected.load(Relaxed),
+            "evaluationsShed": self.evaluations_shed.load(Relaxed),
+            "replayBlocksDropped": self.replay_blocks_dropped.load(Relaxed),
             "reorgsSeen": self.reorgs_seen.load(Relaxed),
             "startedAtMs": self.started_at_ms.load(Relaxed),
             // Live flow only. Post-mortem scoring of already-mined relay
@@ -324,6 +441,9 @@ impl Engine {
     pub async fn new(cfg: Arc<Config>) -> Result<Self> {
         let http = RpcClient::new(cfg.endpoints.http_url.clone())?;
         let store = Arc::new(Store::open(&cfg.api.db_path)?);
+        // Hot-path writes go through the batching writer; the store handle
+        // stays for reads and for the off-path synchronous writes.
+        let writes = crate::store::AsyncStore::spawn(store.clone(), cfg.api.write_queue_capacity);
         let alerts = Arc::new(crate::alerts::Alerts::new(cfg.alerts.clone()));
 
         // Runtime risk envelope: boot values from the environment, mutable
@@ -507,10 +627,22 @@ impl Engine {
 
         // Built before the struct literal below moves `cfg`.
         let mode = LiveMode::armed_at_boot(cfg.live_execution);
+        // Only wire the replay queue when there is a relay feed to fill it.
+        let (replay_tx, replay_rx) = if cfg.relay_tx_ingest {
+            let (t, r) = tokio::sync::mpsc::channel(cfg.replay_queue_depth);
+            (Some(t), Some(r))
+        } else {
+            (None, None)
+        };
+        let strategy_concurrency = cfg.strategy_concurrency;
+        // The replay lane count stays at 1 unless the operator provisioned
+        // more isolated replay forks; see `Config::replay_lanes`.
+        let replay_lanes = cfg.replay_lanes;
 
         Ok(Self {
             cfg,
             store,
+            writes,
             alerts,
             runtime,
             risk,
@@ -522,16 +654,26 @@ impl Engine {
             strategies,
             pool_discovery,
             http,
-            replay_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            replay_rx: parking_lot::Mutex::new(replay_rx),
+            replay_tx,
+            replay_gate: Arc::new(tokio::sync::Semaphore::new(replay_lanes)),
+            strategy_gate: Arc::new(tokio::sync::Semaphore::new(strategy_concurrency)),
             latency: Arc::new(Latency::default()),
             inventory,
             last_head: parking_lot::Mutex::new(Some(head)),
+            // The boot-time refresh above already ran; the cooldowns start
+            // unset so the first observed block always does a full pass.
+            last_discovery_block: std::sync::atomic::AtomicU64::new(NEVER),
+            last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
         })
     }
 
     /// Run forever.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         self.spawn_alert_evaluator();
+        if let Some(rx) = self.replay_rx.lock().take() {
+            self.spawn_replay_worker(rx);
+        }
         let mut ingest = Ingest::start(self.cfg.clone());
         tracing::info!(target: "engine", "ingest started: {}", self.cfg.summary());
 
@@ -576,7 +718,13 @@ impl Engine {
                     });
                 }
                 IngestEvent::RelayBlock { block, txs } => {
-                    self.clone().on_relay_block(block, txs).await;
+                    // Handed to the replay worker rather than scored inline.
+                    // Scoring a delivered block means ~200 transactions
+                    // through every strategy plus fork resets; doing that on
+                    // this task stalled *ingestion itself* — live mempool
+                    // transactions sat unread in the channel for as long as a
+                    // post-mortem of an already-mined block took.
+                    self.enqueue_replay_block(block, txs);
                 }
             }
         }
@@ -592,9 +740,19 @@ impl Engine {
             .relay_txs_seen
             .fetch_add(txs.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
-        let _ = self.store.record_relay_block(&block);
-        for (i, t) in txs.iter().enumerate() {
-            let _ = self.store.record_relay_block_tx(&block, t, i);
+        // One transaction for the block and all ~200 of its transactions,
+        // rather than one commit per row. Runs on a blocking thread so the
+        // insert never occupies a runtime worker.
+        {
+            let store = self.store.clone();
+            let block = block.clone();
+            let txs = txs.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || store.record_relay_block_with_txs(&block, &txs))
+                    .await
+            {
+                tracing::debug!(target: "engine", error = %e, "relay block persist task failed");
+            }
         }
 
         // A compact summary goes to the live feed; the full records (calldata
@@ -623,33 +781,94 @@ impl Engine {
         // replay is a post-mortem of what *could* have been captured.
         //
         // Bounded on purpose. A mainnet block carries ~150-200 transactions and
-        // each fans out to one task per strategy, so scoring a block unbounded
-        // queues ~1000 tasks and a matching burst of RPC every 12 seconds —
-        // which starves the live mempool path and gets the bot rate limited off
-        // its provider. `RELAY_TX_CONCURRENCY` caps how many are in flight; the
-        // work still completes, it just does not stampede.
-        // Hold one permit until every transaction in this block has finished.
-        // Otherwise the per-transaction semaphore only limits a block, while
-        // delivered blocks can still reset the replay fork over one another.
+        // each fans out across every strategy, so scoring a block unbounded
+        // queues a matching burst of RPC every 12 seconds — which starves the
+        // live mempool path and gets the bot rate limited off its provider.
+        // `RELAY_TX_CONCURRENCY` caps how many are in flight; the work still
+        // completes, it just does not stampede.
+        //
+        // The whole-block guard is held for the duration: the replay fork is
+        // reset to each victim's parent, so two delivered blocks interleaving
+        // would reset it out from under each other. `REPLAY_LANES` is how many
+        // may run at once, and stays at 1 unless the operator provisioned one
+        // isolated replay fork per lane.
         let _block_guard = self.replay_gate.clone().acquire_owned().await.ok();
         let permits = Arc::new(tokio::sync::Semaphore::new(self.cfg.relay_tx_concurrency));
-        let mut tasks = Vec::with_capacity(txs.len());
+        let mut set = tokio::task::JoinSet::new();
         for t in txs {
             let Ok(permit) = permits.clone().acquire_owned().await else {
                 break;
             };
             let this = self.clone();
-            tasks.push(tokio::spawn(async move {
+            set.spawn(async move {
                 let _permit = permit;
                 this.evaluate_awaited(t).await;
-            }));
+            });
         }
-        for task in tasks {
-            let _ = task.await;
+        while let Some(res) = set.join_next().await {
+            if let Err(e) = res {
+                if !e.is_cancelled() {
+                    tracing::debug!(target: "engine", error = %e, "replay scoring task failed");
+                }
+            }
         }
         // Scoring is done: we now have simulations for this block sitting next
         // to the relay's realised builder payment. Reconcile them.
-        self.reconcile_block(block_number);
+        self.reconcile_block_off_thread(block_number).await;
+    }
+
+    /// Hand a delivered block to the replay worker.
+    ///
+    /// Non-blocking and bounded: when the replay queue is full the **oldest**
+    /// pending block is the one that should lose, so a backlog cannot delay
+    /// fresher post-mortems indefinitely. `try_send` failing means the worker
+    /// is still busy, and the block is dropped with a counter rather than
+    /// applying back-pressure all the way up into ingestion.
+    fn enqueue_replay_block(&self, block: crate::types::RelayBlock, txs: Vec<PendingTx>) {
+        if let Some(q) = &self.replay_tx {
+            if q.try_send((block, txs)).is_err() {
+                let n = self
+                    .stats
+                    .replay_blocks_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if n % 100 == 1 {
+                    tracing::warn!(
+                        target: "engine",
+                        dropped = n,
+                        "replay queue full — delivered block skipped; \
+                         raise REPLAY_QUEUE_DEPTH or lower RELAY_TX_CONCURRENCY"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Start the dedicated replay worker.
+    ///
+    /// Isolation is the point: replay work is post-mortem scoring of
+    /// already-mined transactions, so it must never compete with the live
+    /// mempool path for the event loop. It gets its own task, its own bounded
+    /// queue, and its own concurrency bound.
+    fn spawn_replay_worker(self: &Arc<Self>, mut rx: ReplayQueueRx) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            while let Some((block, txs)) = rx.recv().await {
+                this.clone().on_relay_block(block, txs).await;
+            }
+            tracing::info!(target: "engine", "replay worker stopped");
+        });
+    }
+
+    /// `reconcile_block` on a blocking thread.
+    ///
+    /// It is a synchronous SQLite read-and-write of up to 500 rows; running it
+    /// directly on a runtime worker blocks that worker for the whole query.
+    async fn reconcile_block_off_thread(self: &Arc<Self>, block: u64) {
+        let this = self.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || this.reconcile_block(block)).await {
+            tracing::debug!(target: "engine", error = %e, block, "reconciliation task failed");
+        }
     }
 
     async fn on_block(self: Arc<Self>, head: BlockHead) {
@@ -689,59 +908,107 @@ impl Engine {
                 // single new head can make it. Reconcile it against relay traces.
                 let this = self.clone();
                 let n = prev.number;
-                tokio::spawn(async move {
+                // Synchronous SQLite work belongs on the blocking pool.
+                tokio::task::spawn_blocking(move || {
                     this.reconcile_block(n);
                 });
             }
         }
         *self.last_head.lock() = Some(head.clone());
 
-        let _ = self
-            .inventory
-            .refresh(
-                &self.http,
-                self.cfg.endpoints.searcher_address,
-                self.cfg.chain.weth,
-            )
-            .await;
+        // Both of these sit *in front of* the strategies on the block task, so
+        // every millisecond they spend is a millisecond the strategies do not
+        // get. Neither needs to run on every block: the searcher's nonce and
+        // balances only move when the bot transacts, and new pools appear far
+        // slower than 12 s. Each is gated on a block-count cooldown that
+        // defaults to 1 (the previous every-block behaviour) so the default
+        // build is unchanged and operators can dial it back on a busy chain.
+        if should_run(
+            &self.last_inventory_block,
+            head.number,
+            self.cfg.inventory_refresh_blocks,
+        ) {
+            let started = std::time::Instant::now();
+            let _ = self
+                .inventory
+                .refresh(
+                    &self.http,
+                    self.cfg.endpoints.searcher_address,
+                    self.cfg.chain.weth,
+                )
+                .await;
+            self.latency
+                .observe(Stage::Inventory, started.elapsed().as_millis() as u64);
+        }
 
         self.ctx.set_head(head.clone());
-        let _ = self.store.record_block(&head);
+        self.writes.record_block(&head);
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
 
-        if self.cfg.pool_discovery || self.cfg.pool_discovery_v3 {
+        if (self.cfg.pool_discovery || self.cfg.pool_discovery_v3)
+            && should_run(
+                &self.last_discovery_block,
+                head.number,
+                self.cfg.pool_discovery_interval_blocks,
+            )
+        {
             let discovery = &self.pool_discovery;
             let ctx = self.ctx.clone();
             let head = head.clone();
             // Discovery is a single eth_getLogs + a few pool loads; run it on the
             // block task before strategies spawn. It feeds the cache that all
-            // strategies read on their next tick.
+            // strategies read on their next tick. The log cursor inside
+            // `PoolDiscovery` is range-based, so skipping a block widens the
+            // next scan window rather than losing pools.
+            let started = std::time::Instant::now();
             let _new_pools = discovery.discover(&ctx, &head).await;
+            self.latency
+                .observe(Stage::Discovery, started.elapsed().as_millis() as u64);
         }
 
-        for s in &self.strategies {
-            let strat = s.clone();
-            let this = self.clone();
-            let head = head.clone();
-            let kind = s.kind();
-            tokio::spawn(async move {
-                let opps = strat.on_block(&this.ctx, &head).await;
-                this.stats
-                    .record_invocation(FunnelLane::Live, kind, opps.len());
-                for opp in opps {
-                    this.clone()
-                        .consider(
-                            FunnelLane::Live,
-                            opp,
-                            Vec::new(),
-                            None,
-                            head.base_fee_per_gas,
-                            now_ms(),
-                        )
-                        .await;
+        // One task for the whole block tick rather than one per strategy: the
+        // block cadence is 12 s, so the fan-out does not need its own spawn
+        // per strategy to stay responsive, and keeping it in a single task
+        // means a slow block never leaves orphaned work behind.
+        let this = self.clone();
+        tokio::spawn(async move {
+            // Block-cadence opportunities have no victim transaction.
+            let no_victims: Arc<Vec<Vec<u8>>> = Arc::new(Vec::new());
+            let mut set = tokio::task::JoinSet::new();
+            for s in &this.strategies {
+                let strat = s.clone();
+                let engine = this.clone();
+                let head = head.clone();
+                let kind = s.kind();
+                let no_victims = no_victims.clone();
+                set.spawn(async move {
+                    let opps = strat.on_block(&engine.ctx, &head).await;
+                    engine
+                        .stats
+                        .record_invocation(FunnelLane::Live, kind, opps.len());
+                    for opp in opps {
+                        engine
+                            .clone()
+                            .consider(
+                                FunnelLane::Live,
+                                opp,
+                                no_victims.clone(),
+                                None,
+                                head.base_fee_per_gas,
+                                now_ms(),
+                            )
+                            .await;
+                    }
+                });
+            }
+            while let Some(res) = set.join_next().await {
+                if let Err(e) = res {
+                    if !e.is_cancelled() {
+                        tracing::debug!(target: "engine", error = %e, "block strategy task failed");
+                    }
                 }
-            });
-        }
+            }
+        });
     }
 
     async fn on_pending(self: Arc<Self>, tx: PendingTx) {
@@ -771,18 +1038,71 @@ impl Engine {
     /// scored identically — but counted in separate funnel lanes, because one
     /// is an opportunity and the other is a post-mortem.
     ///
-    /// Fan-out form: one task per strategy, returns immediately. The live
-    /// mempool path is latency-critical, so it does not wait.
+    /// Fan-out form: the strategies for one transaction run concurrently
+    /// inside a **single** spawned task, and the live path returns immediately.
+    ///
+    /// The previous shape spawned one task *per strategy per transaction*. With
+    /// ten strategies enabled and a busy block that is 10 × ~200 = 2000+ task
+    /// spawns per block, each carrying a cloned `PendingTx` (calldata included)
+    /// and all of them landing on the runtime at once. The scheduler spends its
+    /// time on queue churn instead of the one transaction that actually
+    /// matters, and the burst is what starves the latency-critical path.
+    ///
+    /// Now: one spawn per transaction. Inside it a `JoinSet` runs the
+    /// strategies concurrently — the same parallelism, since these are IO-bound
+    /// futures — but the fan-out is bounded and owned by one task that can be
+    /// dropped as a unit. A global semaphore caps how many transactions are
+    /// being evaluated at once (`STRATEGY_CONCURRENCY`), so a mempool spike
+    /// applies back-pressure instead of unbounded queueing.
     async fn evaluate(self: Arc<Self>, tx: PendingTx) {
         let lane = FunnelLane::for_source(tx.source);
+        // Try to claim a slot without waiting: the live mempool path must not
+        // block ingestion. When the engine is already saturated the
+        // transaction is dropped and counted, which is the honest outcome —
+        // queueing it would only add latency to work that is already late.
+        let Ok(permit) = self.strategy_gate.clone().try_acquire_owned() else {
+            Stats::bump(&self.stats.evaluations_shed);
+            if let Some(suppressed) = SHED_LOG.allow() {
+                tracing::warn!(
+                    target: "engine",
+                    hash = %format!("{:?}", tx.hash),
+                    suppressed,
+                    "strategy fan-out saturated — shedding transaction; \
+                     raise STRATEGY_CONCURRENCY if this is sustained"
+                );
+            }
+            return;
+        };
+        tokio::spawn(async move {
+            let _permit = permit;
+            self.fan_out(tx, lane).await;
+        });
+    }
+
+    /// Run every strategy against one transaction concurrently, and wait for
+    /// them. Shared by the live path (inside its own task) and the replay path
+    /// (which awaits it directly for back-pressure).
+    async fn fan_out(self: Arc<Self>, tx: PendingTx, lane: FunnelLane) {
+        // `Arc` the transaction once instead of cloning the calldata per
+        // strategy: with ten strategies that is nine fewer copies of every
+        // pending transaction's input bytes.
+        let tx = Arc::new(tx);
+        let mut set = tokio::task::JoinSet::new();
         for s in &self.strategies {
             let strat = s.clone();
             let this = self.clone();
             let tx = tx.clone();
             let kind = s.kind();
-            tokio::spawn(async move {
+            set.spawn(async move {
                 this.run_strategy(strat, kind, tx, lane).await;
             });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Err(e) = res {
+                if !e.is_cancelled() {
+                    tracing::debug!(target: "engine", error = %e, "strategy task failed");
+                }
+            }
         }
     }
 
@@ -794,13 +1114,12 @@ impl Engine {
     /// latency for a bounded task and RPC footprint is free.
     async fn evaluate_awaited(self: Arc<Self>, tx: PendingTx) {
         let lane = FunnelLane::for_source(tx.source);
-        for s in &self.strategies {
-            let strat = s.clone();
-            let kind = s.kind();
-            self.clone()
-                .run_strategy(strat, kind, tx.clone(), lane)
-                .await;
-        }
+        // Same fan-out as the live path, but awaited: completion is what makes
+        // the caller's per-block semaphore real back-pressure. The strategies
+        // still run concurrently with each other — the bound that matters for
+        // the replay lane is how many *transactions* are in flight, which
+        // `on_relay_block` owns.
+        self.fan_out(tx, lane).await;
     }
 
     /// One strategy against one transaction: propose, then hand each proposal
@@ -809,7 +1128,7 @@ impl Engine {
         self: Arc<Self>,
         strat: Arc<dyn StrategyImpl>,
         kind: Strategy,
-        tx: PendingTx,
+        tx: Arc<PendingTx>,
         lane: FunnelLane,
     ) {
         let started = std::time::Instant::now();
@@ -826,7 +1145,10 @@ impl Engine {
             Some(r) => Some(r.clone()),
             None => ingest::fetch_raw_tx(&self.http, tx.hash).await,
         };
-        let victims = raw.map(|r| vec![r]).unwrap_or_default();
+        // Shared, not cloned per opportunity: a raw signed transaction is
+        // hundreds of bytes to a few KB, and a widened search (multi-leg arb,
+        // V3 victims) emits many opportunities from one victim.
+        let victims: Arc<Vec<Vec<u8>>> = Arc::new(raw.map(|r| vec![r]).unwrap_or_default());
         let base_fee = tx.base_fee(&self.ctx.head());
         for opp in opps {
             self.clone()
@@ -847,7 +1169,7 @@ impl Engine {
         self: Arc<Self>,
         lane: FunnelLane,
         opp: Opportunity,
-        victims_raw: Vec<Vec<u8>>,
+        victims_raw: Arc<Vec<Vec<u8>>>,
         victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
         base_fee: U256,
         seen_at_ms: u64,
@@ -861,7 +1183,15 @@ impl Engine {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
-            tracing::debug!(target: "engine", strategy = opp.strategy.as_str(), reason = reject.as_str(), "rejected");
+            if let Some(suppressed) = RISK_REJECT_LOG.allow() {
+                tracing::debug!(
+                    target: "engine",
+                    strategy = opp.strategy.as_str(),
+                    reason = reject.as_str(),
+                    suppressed,
+                    "rejected"
+                );
+            }
             return;
         }
         self.latency
@@ -870,23 +1200,33 @@ impl Engine {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
-            tracing::debug!(
-                target: "engine",
-                strategy = opp.strategy.as_str(),
-                "rejected: insufficient inventory"
-            );
+            if let Some(suppressed) = INVENTORY_REJECT_LOG.allow() {
+                tracing::debug!(
+                    target: "engine",
+                    strategy = opp.strategy.as_str(),
+                    suppressed,
+                    "rejected: insufficient inventory"
+                );
+            }
             return;
         }
         // A sandwich or JIT without the victim's bytes cannot be simulated faithfully.
         if !opp.victim_hashes.is_empty() && victims_raw.is_empty() {
             self.stats
                 .record_funnel(lane, kind, |f| f.missing_victim_raw += 1);
-            tracing::debug!(target: "engine", "skipping: victim raw transaction unavailable");
+            if let Some(suppressed) = MISSING_VICTIM_LOG.allow() {
+                tracing::debug!(
+                    target: "engine",
+                    strategy = kind.as_str(),
+                    suppressed,
+                    "skipping: victim raw transaction unavailable"
+                );
+            }
             return;
         }
 
         Stats::bump(&self.stats.opportunities);
-        let _ = self.store.record_opportunity(&opp);
+        self.writes.record_opportunity(&opp);
         let _ = self.feed.send(FeedEvent::Opportunity(opp.clone()));
 
         self.risk.begin(opp.strategy);
@@ -906,7 +1246,9 @@ impl Engine {
         let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
-                tracing::debug!(target: "engine", error = %e, "simulation failed");
+                if let Some(suppressed) = SIM_FAILED_LOG.allow() {
+                    tracing::debug!(target: "engine", error = %e, suppressed, "simulation failed");
+                }
                 self.stats
                     .record_funnel(lane, kind, |f| f.simulations_failed += 1);
                 return;
@@ -921,12 +1263,12 @@ impl Engine {
                 .observe(Stage::Total, now_ms().saturating_sub(seen_at_ms));
         }
         self.risk.observe(&outcome.primary);
-        let _ = self.store.record_simulation(&outcome.primary);
+        self.writes.record_simulation(&outcome.primary);
         let _ = self
             .feed
             .send(FeedEvent::Simulation(outcome.primary.clone()));
         if let Some(relay) = &outcome.relay {
-            let _ = self.store.record_simulation(relay);
+            self.writes.record_simulation(relay);
             let _ = self.feed.send(FeedEvent::Simulation(relay.clone()));
         }
 
@@ -957,7 +1299,7 @@ impl Engine {
             // can only narrow what the environment allowed, never widen it.
             bundle.submitted = self.mode.live();
         }
-        let _ = self.store.record_bundle(&bundle);
+        self.writes.record_bundle(&bundle);
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
     }
 
@@ -1073,10 +1415,14 @@ impl Engine {
             loop {
                 tick.tick().await;
                 let risk = this.runtime.risk();
-                let funnel = this.stats.funnel.read().clone();
-                let conversion = funnel
+                let conversion = this
+                    .stats
+                    .funnel
                     .iter()
-                    .map(|(s, c)| (s.as_str(), c.candidates_emitted, c.submittable))
+                    .map(|e| {
+                        let (s, c) = (e.key(), e.value());
+                        (s.as_str(), c.candidates_emitted, c.submittable)
+                    })
                     .collect::<Vec<_>>();
                 let signals = crate::alerts::AlertSignals {
                     now_ms: now_ms(),
@@ -1342,5 +1688,128 @@ mod tests {
         let prev = head(10, 1, 0);
         let next = head(10, 2, 0);
         assert_eq!(detect_reorg(&prev, &next), Some((10, 10)));
+    }
+
+    // --- maintenance cooldown -------------------------------------------
+
+    #[test]
+    fn a_cooldown_of_one_runs_on_every_block() {
+        // The default. Must reproduce the old unconditional behaviour
+        // exactly, so upgrading without setting anything changes nothing.
+        let last = std::sync::atomic::AtomicU64::new(NEVER);
+        for n in 100..110 {
+            assert!(should_run(&last, n, 1), "block {n} should run");
+        }
+    }
+
+    #[test]
+    fn a_cooldown_skips_until_the_interval_has_passed() {
+        let last = std::sync::atomic::AtomicU64::new(NEVER);
+        // Never run before: the first block always runs.
+        assert!(should_run(&last, 100, 5));
+        // Inside the window.
+        assert!(!should_run(&last, 101, 5));
+        assert!(!should_run(&last, 104, 5));
+        // Exactly at the interval.
+        assert!(should_run(&last, 105, 5));
+        assert!(!should_run(&last, 106, 5));
+        // A gap larger than the interval (missed blocks) still runs.
+        assert!(should_run(&last, 200, 5));
+    }
+
+    #[test]
+    fn a_rewind_always_refreshes() {
+        // After a re-org to a lower height the cached state was built against
+        // a chain that no longer exists, so the cooldown must not suppress
+        // the refresh.
+        let last = std::sync::atomic::AtomicU64::new(NEVER);
+        assert!(should_run(&last, 500, 10));
+        assert!(!should_run(&last, 502, 10));
+        assert!(should_run(&last, 495, 10), "a rewind must re-run");
+    }
+
+    // --- hot-path log limiting ------------------------------------------
+
+    #[test]
+    fn the_log_limiter_passes_one_and_counts_the_rest() {
+        let l = LogLimiter::new(60_000);
+        // First call in the window is allowed, with nothing suppressed yet.
+        assert_eq!(l.allow(), Some(0));
+        // Everything else in the window is suppressed...
+        for _ in 0..50 {
+            assert_eq!(l.allow(), None);
+        }
+        // ...and the suppressed count is reported by the next allowed call.
+        let l2 = LogLimiter::new(0);
+        assert_eq!(l2.allow(), Some(0));
+        for _ in 0..3 {
+            let _ = l2.allow();
+        }
+        // With a zero interval every call is allowed again.
+        assert!(l2.allow().is_some());
+    }
+
+    #[test]
+    fn a_zero_interval_limiter_never_suppresses() {
+        let l = LogLimiter::new(0);
+        for _ in 0..10 {
+            assert!(l.allow().is_some());
+        }
+    }
+
+    // --- funnel lanes ----------------------------------------------------
+
+    #[test]
+    fn mev_blocker_flow_is_live_not_replay() {
+        // MEV Blocker publishes transactions that have not been mined yet —
+        // they are actionable, so they belong in the live funnel. Getting
+        // this wrong would file real opportunities under post-mortem.
+        assert_eq!(
+            FunnelLane::for_source(TxSource::MevBlocker),
+            FunnelLane::Live
+        );
+        assert_eq!(
+            FunnelLane::for_source(TxSource::RelayDelivered),
+            FunnelLane::Replay
+        );
+        assert_eq!(FunnelLane::for_source(TxSource::Mined), FunnelLane::Replay);
+    }
+
+    #[test]
+    fn the_shed_counter_is_reported_in_the_snapshot() {
+        let s = Stats::default();
+        Stats::bump(&s.evaluations_shed);
+        Stats::bump(&s.evaluations_shed);
+        Stats::bump(&s.replay_blocks_dropped);
+        let snap = s.snapshot();
+        assert_eq!(snap["evaluationsShed"], 2);
+        assert_eq!(snap["replayBlocksDropped"], 1);
+    }
+
+    #[test]
+    fn funnel_updates_from_many_threads_are_not_lost() {
+        // The dashmap swap must stay atomic per counter: this is the
+        // regression guard for the lock-free funnel.
+        let s = std::sync::Arc::new(Stats::default());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = s.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    s.record_funnel(FunnelLane::Live, Strategy::Sandwich, |f| {
+                        f.candidates_emitted += 1
+                    });
+                    s.record_funnel(FunnelLane::Replay, Strategy::AtomicArb, |f| {
+                        f.submittable += 1
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap["funnel"]["sandwich"]["candidatesEmitted"], 8 * 500);
+        assert_eq!(snap["funnelReplay"]["atomic_arb"]["submittable"], 8 * 500);
     }
 }

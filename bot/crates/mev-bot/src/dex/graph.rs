@@ -35,7 +35,12 @@ use super::{ternary_search_max, v2_amount_out, V2Pool};
 /// Hard ceiling on cycle length in legs. Config can lower this, never raise it.
 pub const MAX_CYCLE_LEN: usize = 5;
 
-/// Most pools admitted into the graph, largest WETH reserve first.
+/// Default cap on pools admitted into the graph, largest WETH reserve first.
+///
+/// Runtime-overridable via `ARB_MAX_POOLS` (see [`search_with`]): the right
+/// value depends on how many pools discovery has found and how much of the
+/// block budget the operator wants to spend on arb, neither of which is
+/// knowable at compile time.
 pub const MAX_POOLS: usize = 200;
 
 /// Most candidates handed back from one search. Matches the risk engine's
@@ -47,8 +52,9 @@ pub const MAX_CANDIDATES: usize = 32;
 /// admits far more topological cycles than we could ever simulate.
 const MAX_RAW_CYCLES: usize = 1_024;
 
-/// Wall-clock budget for one enumeration pass. Discovery plus strategies share
-/// a ~50 ms/block budget on the block task; enumeration gets half of it.
+/// Default wall-clock budget for one enumeration pass. Discovery plus
+/// strategies share a ~50 ms/block budget on the block task; enumeration gets
+/// half of it. Runtime-overridable via `ARB_ENUMERATION_BUDGET_MS`.
 pub const ENUMERATION_BUDGET: Duration = Duration::from_millis(25);
 
 /// Base gas for a flash loan plus repayment plus two swaps.
@@ -346,7 +352,20 @@ pub fn search(
     max_len: usize,
     budget: Duration,
 ) -> (Vec<V2Pool>, Vec<DirectedEdge>, Vec<CycleCandidate>) {
-    let selected = select_pools(pools, weth, MAX_POOLS);
+    search_with(pools, weth, max_in, max_len, budget, MAX_POOLS)
+}
+
+/// [`search`] with an explicit pool cap, so both budgets that bound this
+/// search — wall clock and graph width — are runtime configurable.
+pub fn search_with(
+    pools: &[V2Pool],
+    weth: Address,
+    max_in: U256,
+    max_len: usize,
+    budget: Duration,
+    max_pools: usize,
+) -> (Vec<V2Pool>, Vec<DirectedEdge>, Vec<CycleCandidate>) {
+    let selected = select_pools(pools, weth, max_pools.max(2));
     let edges = build_edges(&selected);
     let adj = adjacency(&edges);
     let deadline = Instant::now().checked_add(budget);
@@ -436,8 +455,20 @@ mod tests {
         // Same price on both venues: the 0.30% fee on each leg makes every size
         // a loss, so nothing should survive sizing.
         let pools = vec![
-            pool(1, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_000_000_000_000),
-            pool(2, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_000_000_000_000),
+            pool(
+                1,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_000_000_000_000,
+            ),
+            pool(
+                2,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_000_000_000_000,
+            ),
         ];
         let (_, _, found) = search(
             &pools,
@@ -452,8 +483,20 @@ mod tests {
     #[test]
     fn diverged_pools_produce_a_two_leg_cycle() {
         let pools = vec![
-            pool(1, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_200_000_000_000),
-            pool(2, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_000_000_000_000),
+            pool(
+                1,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_200_000_000_000,
+            ),
+            pool(
+                2,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_000_000_000_000,
+            ),
         ];
         let (_, _, found) = search(
             &pools,
@@ -473,9 +516,21 @@ mod tests {
     fn three_leg_triangle_is_found_and_priced_consistently() {
         // WETH -> A -> B -> WETH, with the WETH/B pool priced so the loop pays.
         let pools = vec![
-            pool(1, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_000_000_000_000),
+            pool(
+                1,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_000_000_000_000,
+            ),
             pool(2, t(1), t(2), 2_000_000_000_000, 2_000_000_000_000),
-            pool(3, t(2), WETH(), 1_600_000_000_000, 1_000_000_000_000_000_000_000),
+            pool(
+                3,
+                t(2),
+                WETH(),
+                1_600_000_000_000,
+                1_000_000_000_000_000_000_000,
+            ),
         ];
         let (selected, edges, found) = search(
             &pools,
@@ -508,9 +563,21 @@ mod tests {
     #[test]
     fn every_cycle_starts_and_ends_on_the_anchor() {
         let pools = vec![
-            pool(1, WETH(), t(1), 1_000_000_000_000_000_000_000, 2_000_000_000_000),
+            pool(
+                1,
+                WETH(),
+                t(1),
+                1_000_000_000_000_000_000_000,
+                2_000_000_000_000,
+            ),
             pool(2, t(1), t(2), 2_000_000_000_000, 2_000_000_000_000),
-            pool(3, t(2), WETH(), 1_600_000_000_000, 1_000_000_000_000_000_000_000),
+            pool(
+                3,
+                t(2),
+                WETH(),
+                1_600_000_000_000,
+                1_000_000_000_000_000_000_000,
+            ),
         ];
         let (edges, adj) = graph(&pools);
         let cycles = enumerate_cycles(&edges, &adj, WETH(), MAX_CYCLE_LEN, None);
@@ -531,7 +598,13 @@ mod tests {
         for i in 0..toks.len() {
             for j in (i + 1)..toks.len() {
                 n += 1;
-                pools.push(pool(n, toks[i], toks[j], 1_000_000_000_000, 1_000_000_000_000));
+                pools.push(pool(
+                    n,
+                    toks[i],
+                    toks[j],
+                    1_000_000_000_000,
+                    1_000_000_000_000,
+                ));
             }
         }
         let (edges, adj) = graph(&pools);
@@ -553,7 +626,13 @@ mod tests {
         for i in 0..toks.len() {
             for j in (i + 1)..toks.len() {
                 n += 1;
-                pools.push(pool(n, toks[i], toks[j], 1_000_000_000_000, 1_000_000_000_000));
+                pools.push(pool(
+                    n,
+                    toks[i],
+                    toks[j],
+                    1_000_000_000_000,
+                    1_000_000_000_000,
+                ));
             }
         }
         let (edges, adj) = graph(&pools);
@@ -599,7 +678,13 @@ mod tests {
         for i in 0..toks.len() {
             for j in (i + 1)..toks.len() {
                 n += 1;
-                pools.push(pool(n, toks[i], toks[j], 1_000_000_000_000, 1_000_000_000_000));
+                pools.push(pool(
+                    n,
+                    toks[i],
+                    toks[j],
+                    1_000_000_000_000,
+                    1_000_000_000_000,
+                ));
             }
         }
         let (edges, adj) = graph(&pools);
@@ -622,7 +707,13 @@ mod tests {
         }
         for i in 1..30u8 {
             n = n.wrapping_add(1);
-            pools.push(pool(n, t(i), t(i + 1), 1_000_000_000_000, 1_000_000_000_000));
+            pools.push(pool(
+                n,
+                t(i),
+                t(i + 1),
+                1_000_000_000_000,
+                1_000_000_000_000,
+            ));
         }
         let started = Instant::now();
         let (_, _, found) = search(

@@ -108,6 +108,13 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
             "relayCallBundle": e.sim.relay.is_some(),
         },
         "inventory": e.inventory.snapshot(),
+        // Persistence queue health: a rising `dropped` means the writer
+        // cannot keep up and telemetry rows are being shed to protect the
+        // hot path.
+        "persistence": {
+            "queued": e.writes.queued(),
+            "dropped": e.writes.dropped(),
+        },
         "latency": e.latency.snapshot(),
     }))
 }
@@ -449,6 +456,13 @@ async fn metrics(State(s): State<ApiState>) -> Response {
         "stats": e.stats.snapshot(),
         "latency": e.latency.snapshot(),
         "inventory": e.inventory.snapshot(),
+        // Persistence queue health: a rising `dropped` means the writer
+        // cannot keep up and telemetry rows are being shed to protect the
+        // hot path.
+        "persistence": {
+            "queued": e.writes.queued(),
+            "dropped": e.writes.dropped(),
+        },
         "alerts_active": e.alerts.active().len(),
     });
     let mut body = crate::metrics::render(&status, "mev");

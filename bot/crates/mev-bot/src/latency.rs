@@ -31,6 +31,11 @@ pub enum Stage {
     Risk,
     /// Fork + relay simulation.
     Simulation,
+    /// Pool discovery (`eth_getLogs` + pool loads) on the block task.
+    /// Runs before strategies, so it is time they do not get.
+    Discovery,
+    /// Searcher nonce/balance refresh on the block task. Same story.
+    Inventory,
     /// Pending observed → bundle recorded. This is the number that has to
     /// clear [`BUDGET_MS`].
     Total,
@@ -43,16 +48,20 @@ impl Stage {
             Stage::Strategy => "strategy",
             Stage::Risk => "risk",
             Stage::Simulation => "simulation",
+            Stage::Discovery => "discovery",
+            Stage::Inventory => "inventory",
             Stage::Total => "total",
         }
     }
 
-    pub fn all() -> [Stage; 5] {
+    pub fn all() -> [Stage; 7] {
         [
             Stage::IngestToStrategy,
             Stage::Strategy,
             Stage::Risk,
             Stage::Simulation,
+            Stage::Discovery,
+            Stage::Inventory,
             Stage::Total,
         ]
     }
@@ -177,6 +186,8 @@ pub struct Latency {
     strategy: Histogram,
     risk: Histogram,
     simulation: Histogram,
+    discovery: Histogram,
+    inventory: Histogram,
     total: Histogram,
 }
 
@@ -187,6 +198,8 @@ impl Latency {
             Stage::Strategy => self.strategy.observe(ms),
             Stage::Risk => self.risk.observe(ms),
             Stage::Simulation => self.simulation.observe(ms),
+            Stage::Discovery => self.discovery.observe(ms),
+            Stage::Inventory => self.inventory.observe(ms),
             Stage::Total => self.total.observe(ms),
         }
     }
@@ -202,6 +215,8 @@ impl Latency {
                 Stage::Strategy.as_str(): self.strategy.snapshot(),
                 Stage::Risk.as_str(): self.risk.snapshot(),
                 Stage::Simulation.as_str(): self.simulation.snapshot(),
+                Stage::Discovery.as_str(): self.discovery.snapshot(),
+                Stage::Inventory.as_str(): self.inventory.snapshot(),
                 Stage::Total.as_str(): total,
             },
         })
@@ -236,16 +251,10 @@ mod tests {
         // 1 ms → first bucket (le 1)
         assert_eq!(buckets[0]["count"], 1);
         // 150 ms → the budget bucket
-        let budget = buckets
-            .iter()
-            .find(|b| b["leMs"] == 150)
-            .unwrap();
+        let budget = buckets.iter().find(|b| b["leMs"] == 150).unwrap();
         assert_eq!(budget["count"], 1);
         // 151 ms → the 200 ms bucket
-        let two_hundred = buckets
-            .iter()
-            .find(|b| b["leMs"] == 200)
-            .unwrap();
+        let two_hundred = buckets.iter().find(|b| b["leMs"] == 200).unwrap();
         assert_eq!(two_hundred["count"], 1);
         // overflow
         assert_eq!(buckets.last().unwrap()["count"], 1);

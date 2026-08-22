@@ -30,7 +30,9 @@ pub struct ReplayCandidate {
 }
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    /// Visible to the module so [`AsyncStore`]'s writer task can hold the
+    /// connection across a whole batch transaction.
+    pub(crate) conn: Mutex<Connection>,
 }
 
 /// Aggregated numbers the dashboard shows.
@@ -56,8 +58,24 @@ impl Store {
             }
         }
         let conn = Connection::open(path)?;
+        // WAL lets readers (the dashboard) run against a snapshot while the
+        // writer task commits, instead of blocking each other.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // NORMAL: the writer does not wait for an fsync on every commit. On a
+        // crash the last few telemetry rows can be lost, which is acceptable
+        // for observability data and is the difference between a commit
+        // costing microseconds and costing a disk revolution.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Keep the WAL from growing without bound between checkpoints while
+        // still letting a batch commit without an immediate checkpoint.
+        conn.pragma_update(None, "wal_autocheckpoint", 1_000)?;
+        // A batch commit briefly contends with dashboard reads; wait rather
+        // than fail with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Larger page cache (~8 MB) and in-memory temp tables: the dashboard's
+        // aggregate queries are the main readers and they scan.
+        conn.pragma_update(None, "cache_size", -8_000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -222,7 +240,178 @@ impl Store {
     }
 
     pub fn record_opportunity(&self, o: &Opportunity) -> Result<()> {
-        self.conn.lock().execute(
+        write_opportunity(&self.conn.lock(), o)
+    }
+
+    pub fn record_simulation(&self, s: &SimulationResult) -> Result<()> {
+        write_simulation(&self.conn.lock(), s)
+    }
+
+    pub fn record_bundle(&self, b: &BundleRecord) -> Result<()> {
+        write_bundle(&self.conn.lock(), b)
+    }
+
+    pub fn record_block(&self, head: &crate::types::BlockHead) -> Result<()> {
+        write_block(&self.conn.lock(), head)
+    }
+}
+
+/// One deferred append-only write.
+///
+/// The hot path produces these and drops them on a channel; the writer task
+/// drains them and commits a whole batch inside a single transaction.
+#[derive(Debug)]
+pub enum WriteOp {
+    Opportunity(Box<Opportunity>),
+    Simulation(Box<SimulationResult>),
+    Bundle(Box<BundleRecord>),
+    Block(Box<crate::types::BlockHead>),
+}
+
+impl WriteOp {
+    fn apply(&self, conn: &Connection) -> Result<()> {
+        match self {
+            WriteOp::Opportunity(o) => write_opportunity(conn, o),
+            WriteOp::Simulation(s) => write_simulation(conn, s),
+            WriteOp::Bundle(b) => write_bundle(conn, b),
+            WriteOp::Block(h) => write_block(conn, h),
+        }
+    }
+}
+
+/// Asynchronous, batching front end to [`Store`].
+///
+/// Every opportunity, simulation and bundle used to be written with a blocking
+/// `INSERT` from whatever task produced it — inside the latency-critical
+/// evaluation path, and with every one of those tasks contending on the single
+/// connection mutex. Each insert is its own implicit transaction, so a busy
+/// block turned into thousands of separate commits, each one taking the mutex
+/// and touching the WAL.
+///
+/// Here the producer does a non-blocking `send` onto a bounded channel and
+/// moves on. One background task drains up to [`BATCH_MAX`] operations and
+/// commits them inside a **single** transaction, which is where nearly all of
+/// the saving is: one fsync-class commit instead of N.
+///
+/// Back-pressure is deliberate: the channel is bounded, and when it is full
+/// the write is dropped and counted rather than blocking the hot path.
+/// Persistence here is observability, not settlement — the bot's decisions do
+/// not depend on these rows, so trading a dropped telemetry row for keeping
+/// the searcher on-time is the right trade. `dropped()` makes it visible.
+pub struct AsyncStore {
+    tx: tokio::sync::mpsc::Sender<WriteOp>,
+    dropped: std::sync::atomic::AtomicU64,
+    queued: std::sync::atomic::AtomicU64,
+}
+
+/// Largest number of operations committed in one transaction.
+const BATCH_MAX: usize = 256;
+
+impl AsyncStore {
+    /// Spawn the writer task against an existing store.
+    ///
+    /// `capacity` bounds the queue; the store handle stays usable for reads
+    /// and for the synchronous writes that are not on the hot path.
+    pub fn spawn(store: std::sync::Arc<Store>, capacity: usize) -> std::sync::Arc<Self> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteOp>(capacity.max(64));
+        let this = std::sync::Arc::new(Self {
+            tx,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            queued: std::sync::atomic::AtomicU64::new(0),
+        });
+        tokio::task::spawn_blocking(move || {
+            let mut batch: Vec<WriteOp> = Vec::with_capacity(BATCH_MAX);
+            // `blocking_recv` parks this dedicated thread, never a runtime
+            // worker, so a slow disk cannot stall async tasks.
+            while let Some(first) = rx.blocking_recv() {
+                batch.push(first);
+                // Opportunistically drain whatever else is already queued:
+                // under load this is what turns N commits into one.
+                while batch.len() < BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(op) => batch.push(op),
+                        Err(_) => break,
+                    }
+                }
+                let mut conn = store.conn.lock();
+                match conn.transaction() {
+                    Ok(txn) => {
+                        for op in &batch {
+                            if let Err(e) = op.apply(&txn) {
+                                tracing::debug!(target: "store", error = %e, "deferred write failed");
+                            }
+                        }
+                        if let Err(e) = txn.commit() {
+                            tracing::warn!(target: "store", error = %e, "batch commit failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "store", error = %e, "could not open write transaction");
+                    }
+                }
+                drop(conn);
+                batch.clear();
+            }
+            tracing::info!(target: "store", "writer task stopped");
+        });
+        this
+    }
+
+    /// Queue a write. Never blocks and never fails the caller: a full queue
+    /// increments `dropped()` instead of stalling the searcher.
+    pub fn send(&self, op: WriteOp) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.tx.try_send(op) {
+            Ok(()) => {
+                self.queued.fetch_add(1, Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let n = self.dropped.fetch_add(1, Relaxed) + 1;
+                // Rate-limited: one line per 1000 drops, so a sustained
+                // overload cannot itself become the bottleneck.
+                if n % 1000 == 1 {
+                    tracing::warn!(
+                        target: "store",
+                        dropped = n,
+                        "persistence queue full — dropping telemetry writes to protect the hot path"
+                    );
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.dropped.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    pub fn record_opportunity(&self, o: &Opportunity) {
+        self.send(WriteOp::Opportunity(Box::new(o.clone())));
+    }
+
+    pub fn record_simulation(&self, s: &SimulationResult) {
+        self.send(WriteOp::Simulation(Box::new(s.clone())));
+    }
+
+    pub fn record_bundle(&self, b: &BundleRecord) {
+        self.send(WriteOp::Bundle(Box::new(b.clone())));
+    }
+
+    pub fn record_block(&self, head: &crate::types::BlockHead) {
+        self.send(WriteOp::Block(Box::new(head.clone())));
+    }
+
+    /// Writes discarded because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes accepted onto the queue.
+    pub fn queued(&self) -> u64 {
+        self.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn write_opportunity(conn: &Connection, o: &Opportunity) -> Result<()> {
+    conn.execute(
             "INSERT OR REPLACE INTO opportunities
              (id, strategy, target_block, profit_token, expected_wei, notional_wei, victims, notes, created_at_ms)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -242,11 +431,11 @@ impl Store {
                 o.created_at_ms as i64,
             ],
         )?;
-        Ok(())
-    }
+    Ok(())
+}
 
-    pub fn record_simulation(&self, s: &SimulationResult) -> Result<()> {
-        self.conn.lock().execute(
+fn write_simulation(conn: &Connection, s: &SimulationResult) -> Result<()> {
+    conn.execute(
             "INSERT INTO simulations
              (opportunity_id, strategy, backend, success, gross_wei, gas_used, gas_cost_wei, bribe_wei,
               net_wei, revert_reason, target_block, latency_ms, created_at_ms)
@@ -267,11 +456,11 @@ impl Store {
                 s.created_at_ms as i64,
             ],
         )?;
-        Ok(())
-    }
+    Ok(())
+}
 
-    pub fn record_bundle(&self, b: &BundleRecord) -> Result<()> {
-        self.conn.lock().execute(
+fn write_bundle(conn: &Connection, b: &BundleRecord) -> Result<()> {
+    conn.execute(
             "INSERT OR REPLACE INTO bundles
              (id, opportunity_id, strategy, target_block, tx_count, submitted, payload, created_at_ms)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -286,27 +475,28 @@ impl Store {
                 b.created_at_ms as i64,
             ],
         )?;
-        Ok(())
-    }
+    Ok(())
+}
 
-    pub fn record_block(&self, head: &crate::types::BlockHead) -> Result<()> {
-        self.conn.lock().execute(
-            "INSERT OR REPLACE INTO blocks
+fn write_block(conn: &Connection, head: &crate::types::BlockHead) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO blocks
              (number, hash, parent_hash, canonical, base_fee_wei, gas_used, timestamp, seen_at_ms)
              VALUES (?1,?2,?3,1,?4,?5,?6,?7)",
-            params![
-                head.number as i64,
-                format!("{:?}", head.hash),
-                format!("{:?}", head.parent_hash),
-                head.base_fee_per_gas.to_string(),
-                head.gas_used as i64,
-                head.timestamp as i64,
-                now_ms() as i64,
-            ],
-        )?;
-        Ok(())
-    }
+        params![
+            head.number as i64,
+            format!("{:?}", head.hash),
+            format!("{:?}", head.parent_hash),
+            head.base_fee_per_gas.to_string(),
+            head.gas_used as i64,
+            head.timestamp as i64,
+            now_ms() as i64,
+        ],
+    )?;
+    Ok(())
+}
 
+impl Store {
     /// Mark simulations (and reconciliations) in `[from_block, to_block]` as
     /// belonging to a discarded fork, and log the re-org.
     pub fn record_reorg(
@@ -539,7 +729,13 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub fn record_relay_bid(&self, relay: &str, slot: u64, builder: &str, value: U256) -> Result<()> {
+    pub fn record_relay_bid(
+        &self,
+        relay: &str,
+        slot: u64,
+        builder: &str,
+        value: U256,
+    ) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR IGNORE INTO relay_bids (relay, slot, builder, value_wei, seen_at_ms)
              VALUES (?1,?2,?3,?4,?5)",
@@ -603,6 +799,63 @@ impl Store {
         Ok(())
     }
 
+    /// Record a delivered block together with all of its transactions in one
+    /// transaction.
+    ///
+    /// A mainnet block carries ~150–200 transactions. Inserting them one at a
+    /// time meant ~200 separate implicit transactions — 200 commits, 200
+    /// mutex acquisitions — every 12 seconds, on the task that also has to
+    /// score the block. One explicit transaction turns that into a single
+    /// commit, and reuses one prepared statement for every row.
+    pub fn record_relay_block_with_txs(
+        &self,
+        b: &crate::types::RelayBlock,
+        txs: &[crate::types::PendingTx],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let txn = conn.transaction()?;
+        txn.execute(
+            "INSERT OR IGNORE INTO relay_blocks
+             (relay, slot, block_number, block_hash, builder, value_wei, gas_used, num_tx, seen_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                b.relay,
+                b.slot as i64,
+                b.block_number as i64,
+                format!("{:?}", b.block_hash),
+                b.builder,
+                b.value_wei.to_string(),
+                b.gas_used as i64,
+                b.num_tx as i64,
+                crate::types::now_ms() as i64,
+            ],
+        )?;
+        {
+            // Prepared once, executed per row.
+            let mut stmt = txn.prepare_cached(
+                "INSERT OR IGNORE INTO relay_block_txs
+                 (block_number, tx_index, hash, from_addr, to_addr, value_wei, nonce, gas, selector, input)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            )?;
+            for (index, tx) in txs.iter().enumerate() {
+                stmt.execute(params![
+                    b.block_number as i64,
+                    index as i64,
+                    format!("{:?}", tx.hash),
+                    tx.from.map(|a| format!("{a:?}")),
+                    tx.to.map(|a| format!("{a:?}")),
+                    tx.value.to_string(),
+                    tx.nonce as i64,
+                    tx.gas as i64,
+                    tx.selector().map(|s| format!("0x{}", hex::encode(s))),
+                    format!("0x{}", hex::encode(&tx.input)),
+                ])?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// PnL per strategy, computed over the primary (fork) simulations only so
     /// the relay cross-check never double counts.
     pub fn pnl(&self) -> Result<Vec<PnlSummary>> {
@@ -650,7 +903,11 @@ impl Store {
         Ok(v)
     }
 
-    pub fn recent_simulations(&self, limit: i64, strategy: Option<Strategy>) -> Result<Vec<serde_json::Value>> {
+    pub fn recent_simulations(
+        &self,
+        limit: i64,
+        strategy: Option<Strategy>,
+    ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let sql = "SELECT s.opportunity_id, s.strategy, s.backend, s.success, s.gross_wei, s.gas_used,
                           s.gas_cost_wei, s.bribe_wei, s.net_wei, s.revert_reason, s.target_block,
@@ -843,7 +1100,8 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         s.record_simulation(&sim(Strategy::Sandwich, 500)).unwrap();
         s.record_simulation(&sim(Strategy::Sandwich, -200)).unwrap();
-        s.record_simulation(&sim(Strategy::AtomicArb, 1_000)).unwrap();
+        s.record_simulation(&sim(Strategy::AtomicArb, 1_000))
+            .unwrap();
 
         let pnl = s.pnl().unwrap();
         assert_eq!(pnl.len(), 2);
@@ -890,8 +1148,8 @@ mod tests {
 
     #[test]
     fn relay_blocks_and_txs_round_trip() {
-        use alloy_primitives::B256;
         use crate::types::{PendingTx, RelayBlock, TxSource};
+        use alloy_primitives::B256;
 
         let s = Store::open_in_memory().unwrap();
         let block = RelayBlock {
@@ -977,7 +1235,124 @@ mod tests {
         a.slot = 2;
         a.value_wei = U256::from(99u64);
         s.record_relay_block(&a).unwrap();
-        assert_eq!(s.winning_bid_for_block(50).unwrap(), Some(U256::from(99u64)));
+        assert_eq!(
+            s.winning_bid_for_block(50).unwrap(),
+            Some(U256::from(99u64))
+        );
         assert_eq!(s.winning_bid_for_block(1).unwrap(), None);
+    }
+
+    // --- batched writes --------------------------------------------------
+
+    fn relay_block(block_number: u64, num_tx: u64) -> crate::types::RelayBlock {
+        use alloy_primitives::B256;
+        crate::types::RelayBlock {
+            relay: "test-relay".into(),
+            slot: block_number,
+            block_number,
+            block_hash: B256::from([3u8; 32]),
+            builder: "0xb".into(),
+            value_wei: U256::from(1u64),
+            gas_used: 1,
+            num_tx,
+        }
+    }
+
+    fn pending(nth: u8) -> crate::types::PendingTx {
+        use alloy_primitives::B256;
+        crate::types::PendingTx {
+            hash: B256::from([nth; 32]),
+            from: Some(Address::with_last_byte(nth)),
+            to: Some(Address::with_last_byte(2)),
+            value: U256::from(1u64),
+            gas: 21_000,
+            max_fee_per_gas: U256::ZERO,
+            max_priority_fee_per_gas: U256::ZERO,
+            nonce: nth as u64,
+            input: vec![0xaa, 0xbb, 0xcc, 0xdd],
+            raw: None,
+            source: crate::types::TxSource::RelayDelivered,
+            mined_at: None,
+            seen_at_ms: now_ms(),
+        }
+    }
+
+    #[test]
+    fn a_delivered_block_and_its_txs_commit_in_one_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        let b = relay_block(21_000_001, 3);
+        let txs: Vec<_> = (1..=3u8).map(pending).collect();
+        s.record_relay_block_with_txs(&b, &txs).unwrap();
+
+        assert_eq!(s.recent_relay_blocks(10).unwrap().len(), 1);
+        let stored = s.relay_block_txs(Some(21_000_001), 100).unwrap();
+        assert_eq!(stored.len(), 3);
+        // Index order is preserved: replay ordering depends on it.
+        assert_eq!(stored[0]["selector"], serde_json::json!("0xaabbccdd"));
+    }
+
+    #[test]
+    fn the_bulk_relay_insert_is_idempotent() {
+        // Delivered blocks can be re-fetched; re-inserting must not duplicate.
+        let s = Store::open_in_memory().unwrap();
+        let b = relay_block(21_000_002, 2);
+        let txs: Vec<_> = (1..=2u8).map(pending).collect();
+        s.record_relay_block_with_txs(&b, &txs).unwrap();
+        s.record_relay_block_with_txs(&b, &txs).unwrap();
+        assert_eq!(s.recent_relay_blocks(10).unwrap().len(), 1);
+        assert_eq!(s.relay_block_txs(Some(21_000_002), 100).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_block_with_no_transactions_still_records_the_block() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_relay_block_with_txs(&relay_block(21_000_003, 0), &[])
+            .unwrap();
+        assert_eq!(s.recent_relay_blocks(10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_async_writer_persists_queued_rows() {
+        let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+        let writes = AsyncStore::spawn(store.clone(), 256);
+        for net in [100i128, -50, 900] {
+            writes.record_simulation(&sim(Strategy::Sandwich, net));
+        }
+        assert_eq!(writes.dropped(), 0);
+        assert_eq!(writes.queued(), 3);
+
+        // The writer is a background task: poll until the batch lands.
+        let mut found = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            found = store.recent_simulations(10, None).unwrap().len();
+            if found == 3 {
+                break;
+            }
+        }
+        assert_eq!(found, 3, "queued simulations should reach the store");
+        // And they aggregate exactly as synchronous writes would.
+        let pnl = store.pnl().unwrap();
+        let sandwich = pnl.iter().find(|p| p.strategy == "sandwich").unwrap();
+        assert_eq!(sandwich.simulations, 3);
+        assert_eq!(sandwich.net_profit_wei, 950);
+    }
+
+    #[tokio::test]
+    async fn a_full_write_queue_drops_instead_of_blocking() {
+        // The guarantee that matters: the hot path is never blocked by
+        // persistence. With a tiny queue and no writer draining it, sends
+        // must return immediately and be counted as dropped.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<WriteOp>(1);
+        let s = AsyncStore {
+            tx,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            queued: std::sync::atomic::AtomicU64::new(0),
+        };
+        for net in 0..50i128 {
+            s.record_simulation(&sim(Strategy::Jit, net));
+        }
+        assert_eq!(s.queued(), 1, "only the buffered slot is accepted");
+        assert_eq!(s.dropped(), 49, "the rest are shed, not blocked");
     }
 }
