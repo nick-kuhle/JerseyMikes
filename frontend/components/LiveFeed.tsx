@@ -1,6 +1,7 @@
 "use client";
 
-import {useEffect, useRef} from "react";
+import {memo, useCallback, useDeferredValue, useEffect, useMemo, useRef} from "react";
+import {useVirtualizer} from "@tanstack/react-virtual";
 import type {FeedEvent} from "@/lib/types";
 import {clock, shortHash, STRATEGY_COLOR, weiToEth} from "@/lib/format";
 import {blockUrl, txUrl} from "@/lib/explorer";
@@ -9,7 +10,31 @@ import {blockUrl, txUrl} from "@/lib/explorer";
  * The live tape: every mempool transaction, MEV-Share hint, block, opportunity
  * and simulation the bot sees, newest first. Every hash that exists on chain
  * links out to the explorer.
+ *
+ * **Virtualized.** The tape holds up to `FEED_MAX` (400) events and used to
+ * mount a `<tr>` for every one of them, each with its own explorer links and
+ * formatting work — 400 rows rebuilt on every batch, of which ~15 are on
+ * screen. Now only the visible window plus a small overscan is mounted, so
+ * render cost is bounded by viewport height rather than buffer depth.
+ *
+ * Rows are `React.memo`'d on the event they render, and the list reads a
+ * deferred copy of the array so a burst of arrivals cannot make the filter
+ * dropdown or the rest of the page feel stuck.
  */
+
+/**
+ * Estimated row height in px.
+ *
+ * Measured from the rendered table: 13px monospace line + 5px vertical
+ * padding top/bottom + 1px border. This is only the *initial* estimate —
+ * rows report their true height back through `measureElement` below, so a
+ * font or padding change corrects itself instead of silently desynchronising
+ * the scrollbar from the content.
+ */
+const ROW_HEIGHT = 31;
+/** Rows rendered beyond the viewport, so fast scrolling does not show gaps. */
+const OVERSCAN = 12;
+
 export default function LiveFeed({
   events,
   filter,
@@ -20,16 +45,47 @@ export default function LiveFeed({
   /** Chain the bot follows; drives explorer links. */
   chainId?: number;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (ref.current) ref.current.scrollTop = 0;
-  }, [events.length]);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
-  const shown = events.filter((e) => filter === "all" || e.kind === filter);
+  // Under a burst the tape is the lowest-priority thing on the page: React may
+  // serve a slightly stale list to keep filter changes and the rest of the
+  // dashboard responsive.
+  const deferred = useDeferredValue(events);
+  const shown = useMemo(
+    () => (filter === "all" ? deferred : deferred.filter((e) => e.kind === filter)),
+    [deferred, filter],
+  );
+
+  const virtualizer = useVirtualizer({
+    count: shown.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: useCallback(() => ROW_HEIGHT, []),
+    overscan: OVERSCAN,
+    // Trust the DOM over the estimate: rows are a single unwrapped line, but
+    // their exact height depends on the font stack the browser resolves.
+    measureElement: (el) => el.getBoundingClientRect().height,
+  });
+
+  // Newest events arrive at the top; keep the viewport pinned there so the
+  // tape reads as a live feed. Only when the user is already at the top —
+  // scrolling back through history should not be yanked away.
+  const count = shown.length;
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && el.scrollTop < ROW_HEIGHT * 2) el.scrollTop = 0;
+  }, [count]);
+
+  const items = virtualizer.getVirtualItems();
+  const totalHeight = virtualizer.getTotalSize();
+  // Absolute positioning inside a table breaks row layout, so the offset is
+  // applied by translating the <tbody> and padding the scroll area to the
+  // full virtual height.
+  const paddingTop = items.length > 0 ? items[0].start : 0;
+  const paddingBottom = items.length > 0 ? totalHeight - items[items.length - 1].end : 0;
 
   return (
-    <div ref={ref} style={{maxHeight: 420, overflowY: "auto"}}>
-      <table className="grid">
+    <div ref={scrollRef} style={{maxHeight: 420, overflowY: "auto"}}>
+      <table className="grid" style={{tableLayout: "fixed", width: "100%"}}>
         <thead>
           <tr>
             <th style={{width: 70}}>time</th>
@@ -38,31 +94,71 @@ export default function LiveFeed({
           </tr>
         </thead>
         <tbody>
-          {shown.length === 0 && (
+          {count === 0 && (
             <tr>
               <td colSpan={3} className="muted" style={{padding: 16, textAlign: "center"}}>
                 waiting for events…
               </td>
             </tr>
           )}
-          {shown.map((e, i) => (
-            <tr key={i}>
-              <td className="muted">{clock(eventTime(e))}</td>
-              <td>
-                <span className="badge" style={{color: kindColor(e)}}>
-                  {label(e)}
-                </span>
-              </td>
-              <td style={{whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 620}}>
-                {detail(e, chainId)}
-              </td>
+          {paddingTop > 0 && (
+            <tr aria-hidden style={{height: paddingTop}}>
+              <td colSpan={3} style={{padding: 0, border: "none"}} />
             </tr>
+          )}
+          {items.map((item) => (
+            <FeedRow
+              key={item.key}
+              event={shown[item.index]}
+              chainId={chainId}
+              index={item.index}
+              measureRef={virtualizer.measureElement}
+            />
           ))}
+          {paddingBottom > 0 && (
+            <tr aria-hidden style={{height: paddingBottom}}>
+              <td colSpan={3} style={{padding: 0, border: "none"}} />
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
   );
 }
+
+/**
+ * One tape row.
+ *
+ * Memoized on the event identity: feed events are immutable once parsed, so a
+ * row that is still in the window after a flush re-uses its previous render
+ * instead of rebuilding its links and formatted numbers.
+ */
+const FeedRow = memo(function FeedRow({
+  event,
+  chainId,
+  index,
+  measureRef,
+}: {
+  event: FeedEvent;
+  chainId?: number;
+  index: number;
+  /** Reports this row's real height back to the virtualizer. */
+  measureRef: (el: HTMLElement | null) => void;
+}) {
+  return (
+    <tr ref={measureRef} data-index={index}>
+      <td className="muted">{clock(eventTime(event))}</td>
+      <td>
+        <span className="badge" style={{color: kindColor(event)}}>
+          {label(event)}
+        </span>
+      </td>
+      <td style={{whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 620}}>
+        {detail(event, chainId)}
+      </td>
+    </tr>
+  );
+});
 
 function eventTime(e: FeedEvent): number {
   if ("seen_at_ms" in e && e.seen_at_ms) return e.seen_at_ms;
@@ -180,7 +276,7 @@ function detail(e: FeedEvent, chainId?: number) {
     case "relay":
       return (
         <span>
-          slot {e.slot} · {weiToEth(e.value_wei, 4)} ETH paid to proposer · {new URL(e.relay).hostname}
+          slot {e.slot} · {weiToEth(e.value_wei, 4)} ETH paid to proposer · {safeHost(e.relay)}
         </span>
       );
     case "relay_block":
@@ -221,5 +317,20 @@ function detail(e: FeedEvent, chainId?: number) {
           {e.to_block !== e.from_block ? `–${e.to_block}` : ""} · {txLink(e.old_hash)} → {txLink(e.new_hash)}
         </span>
       );
+  }
+}
+
+/**
+ * Hostname of a relay URL, tolerating a non-URL string.
+ *
+ * `new URL()` throws on malformed input, and this runs inside the render path
+ * of a row whose data comes off the wire — a bad relay string used to take the
+ * whole tape down with it.
+ */
+function safeHost(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
   }
 }

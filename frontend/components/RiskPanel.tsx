@@ -15,13 +15,23 @@
  * instructions, same shape as the live-mode switch).
  */
 
-import {useCallback, useEffect, useRef, useState} from "react";
+import {memo, useCallback, useEffect, useRef, useState} from "react";
 import {parseEther} from "viem";
-import type {RiskStateResponse, RiskValues, Strategy, StatusResponse} from "@/lib/types";
+import type {RiskStateResponse, RiskValues, Strategy} from "@/lib/types";
 import {STRATEGY_COLOR, STRATEGY_LABEL} from "@/lib/format";
 
 interface Props {
-  status: StatusResponse | null;
+  /**
+   * Only the kill-switch flag is read from the polled status.
+   *
+   * The panel used to take the whole `StatusResponse`. That object is
+   * rebuilt by `Console`'s 4s poll on every tick — a fresh identity even when
+   * nothing inside it changed — so this form, its ten strategy toggles and
+   * three tabs re-rendered four times a second while the user was typing into
+   * it. Narrowing the prop to the one boolean it actually reads means the
+   * memo below can do its job.
+   */
+  killSwitchTripped?: boolean;
 }
 
 const ALL_STRATEGIES: Strategy[] = [
@@ -53,7 +63,7 @@ type ApplyState =
   | {kind: "applied"; at: string; demo?: boolean}
   | {kind: "error"; message: string};
 
-export default function RiskPanel({status}: Props) {
+function RiskPanel({killSwitchTripped}: Props) {
   const [activeTab, setActiveTab] = useState<"controls" | "diagnostics" | "sources">("controls");
 
   // The live form. Seeded from /api/risk once, then edited locally; every
@@ -118,10 +128,10 @@ export default function RiskPanel({status}: Props) {
 
   // Keep the kill-switch badge in sync with the polled status.
   useEffect(() => {
-    if (status?.risk) {
-      setKillSwitch((k) => ({...k, tripped: status.risk.killSwitchTripped}));
+    if (typeof killSwitchTripped === "boolean") {
+      setKillSwitch((k) => (k.tripped === killSwitchTripped ? k : {...k, tripped: killSwitchTripped}));
     }
-  }, [status?.risk?.killSwitchTripped]);
+  }, [killSwitchTripped]);
 
   const pushPatch = useCallback(
     (patch: Record<string, unknown>) => {
@@ -768,3 +778,9 @@ const codeBoxStyle: React.CSSProperties = {
   margin: 0,
   overflowX: "auto",
 };
+
+/**
+ * Memoized on the single boolean it consumes, so the console's status poll and
+ * SSE flushes no longer re-render a form the user may be typing into.
+ */
+export default memo(RiskPanel);

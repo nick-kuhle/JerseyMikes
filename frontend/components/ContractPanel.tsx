@@ -10,7 +10,7 @@
  * hash linked straight to the block explorer.
  */
 
-import {useCallback, useEffect, useMemo, useState} from "react";
+import {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {
   createPublicClient,
   createWalletClient,
@@ -51,47 +51,110 @@ export default function ContractPanel({
     []
   );
 
-  const read = useCallback(async () => {
-    if (!isAddress(target)) {
-      setStatus("not a valid address");
-      return;
-    }
-    setStatus("reading…");
-    try {
-      const client = publicClient;
-      const [o, b] = await Promise.all([
-        client.readContract({address: target as Address, abi: EXECUTOR_ABI, functionName: "owner"}),
-        client.getBalance({address: target as Address}),
-      ]);
-      setOwner(o as string);
-      setBalance(formatEther(b));
-      if (address) {
-        const s = await client.readContract({
-          address: target as Address,
-          abi: EXECUTOR_ABI,
-          functionName: "searchers",
-          args: [address],
-        });
-        setIsSearcher(Boolean(s));
-      } else {
-        setIsSearcher(null);
+  /**
+   * Chain reads are cached per (contract, account).
+   *
+   * `owner` is effectively immutable and `searchers[account]` changes only
+   * when someone sends a transaction — but the previous code re-read all three
+   * whenever the `read` callback's identity changed, and `read` depended on
+   * `target`, `address` and `publicClient`. Any parent re-render that touched
+   * those tore down the 20s interval, rebuilt it, and fired a fresh burst of
+   * RPC immediately. Typing one character into the address box issued a round
+   * of `eth_call`s per keystroke.
+   *
+   * Now: results are cached with a TTL, a read for a key already in flight is
+   * joined rather than duplicated, and only an explicit user action (the read
+   * button, or a completed write) forces a refetch.
+   */
+  const cache = useRef(new Map<string, {at: number; owner: string; balance: string; isSearcher: boolean | null}>());
+  const inflight = useRef(new Map<string, Promise<void>>());
+  /** Latest values, readable from the interval without re-arming it. */
+  const latest = useRef({target, address});
+  latest.current = {target, address};
+
+  const READ_TTL_MS = 15_000;
+
+  const read = useCallback(
+    async (force = false) => {
+      const {target: t, address: who} = latest.current;
+      if (!isAddress(t)) {
+        setStatus("not a valid address");
+        return;
       }
-      setStatus("");
-    } catch (e) {
-      setOwner(null);
-      setBalance(null);
-      setStatus(`read failed: ${(e as Error).message.split("\n")[0]}`);
-    }
-  }, [target, address, publicClient]);
+      const key = `${t.toLowerCase()}:${who?.toLowerCase() ?? "-"}`;
+
+      if (!force) {
+        const hit = cache.current.get(key);
+        if (hit && Date.now() - hit.at < READ_TTL_MS) {
+          setOwner(hit.owner);
+          setBalance(hit.balance);
+          setIsSearcher(hit.isSearcher);
+          setStatus("");
+          return;
+        }
+        // Someone else is already fetching this exact key — wait on them
+        // instead of issuing a second identical round of calls.
+        const pending = inflight.current.get(key);
+        if (pending) return pending;
+      }
+
+      setStatus("reading…");
+      const run = (async () => {
+        try {
+          const client = publicClient;
+          const [o, b] = await Promise.all([
+            client.readContract({address: t as Address, abi: EXECUTOR_ABI, functionName: "owner"}),
+            client.getBalance({address: t as Address}),
+          ]);
+          let searcher: boolean | null = null;
+          if (who) {
+            const s = await client.readContract({
+              address: t as Address,
+              abi: EXECUTOR_ABI,
+              functionName: "searchers",
+              args: [who],
+            });
+            searcher = Boolean(s);
+          }
+          const next = {at: Date.now(), owner: o as string, balance: formatEther(b), isSearcher: searcher};
+          cache.current.set(key, next);
+          setOwner(next.owner);
+          setBalance(next.balance);
+          setIsSearcher(next.isSearcher);
+          setStatus("");
+        } catch (e) {
+          setOwner(null);
+          setBalance(null);
+          setStatus(`read failed: ${(e as Error).message.split("\n")[0]}`);
+        } finally {
+          inflight.current.delete(key);
+        }
+      })();
+      inflight.current.set(key, run);
+      return run;
+    },
+    [publicClient],
+  );
 
   useEffect(() => {
     setTarget(executor);
   }, [executor]);
 
-  // Read on mount, on target/address change, and every 20s while idle.
+  // Read when the contract or account actually changes — not when a callback
+  // identity churns.
   useEffect(() => {
     void read();
-    const t = setInterval(() => void read(), 20_000);
+  }, [read, target, address]);
+
+  // Background refresh. Armed once: the callback reads `latest` through a ref,
+  // so the interval survives re-renders instead of being torn down and
+  // restarted. Skipped while the tab is hidden — a background dashboard has no
+  // reason to keep an RPC busy.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void read(true);
+    }, 20_000);
     return () => clearInterval(t);
   }, [read]);
 
@@ -129,7 +192,8 @@ export default function ContractPanel({
             ? `mined ${shortHash(hash)} in block ${receipt.blockNumber}`
             : `reverted ${shortHash(hash)}`
         );
-        void read();
+        // On-chain state just changed — bypass the cache.
+        void read(true);
       } catch (e) {
         setStatus(`failed: ${(e as Error).message.split("\n")[0]}`);
       } finally {
@@ -152,7 +216,7 @@ export default function ContractPanel({
           style={inputStyle}
           placeholder="MevExecutor address"
         />
-        <button onClick={() => void read()} style={btnStyle}>
+        <button onClick={() => void read(true)} style={btnStyle}>
           read
         </button>
         {address ? (

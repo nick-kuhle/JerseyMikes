@@ -151,7 +151,20 @@ export function WalletProvider({children}: {children: ReactNode}) {
     return () => window.removeEventListener("eip6963:announceProvider", onAnnounce);
   }, [onAnnounce]);
 
-  const readChainAndBalance = useCallback(async (who: string) => {
+  /**
+   * Last balance read, so repeat reads for the same account inside the TTL are
+   * served from memory.
+   *
+   * Wallets fire `accountsChanged` / `chainChanged` more often than the
+   * underlying state actually changes (some emit on every focus, and a chain
+   * switch emits both), and each event used to trigger a fresh `eth_chainId`
+   * plus a proxied `eth_getBalance`. The balance is decoration in this
+   * console — it does not gate any action — so a short cache is free.
+   */
+  const balanceCache = useRef<{who: string; at: number; wei: bigint} | null>(null);
+  const BALANCE_TTL_MS = 10_000;
+
+  const readChainAndBalance = useCallback(async (who: string, force = false) => {
     const prov = bound.current;
     if (!prov) return;
     try {
@@ -160,6 +173,16 @@ export function WalletProvider({children}: {children: ReactNode}) {
     } catch {
       /* wallet did not answer; chain stays unknown */
     }
+    const cached = balanceCache.current;
+    if (
+      !force &&
+      cached &&
+      cached.who.toLowerCase() === who.toLowerCase() &&
+      Date.now() - cached.at < BALANCE_TTL_MS
+    ) {
+      setBalanceWei(cached.wei);
+      return;
+    }
     try {
       const r = await fetch("/api/eth", {
         method: "POST",
@@ -167,7 +190,11 @@ export function WalletProvider({children}: {children: ReactNode}) {
         body: JSON.stringify({jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [who, "latest"]}),
       });
       const j = (await r.json()) as {result?: string};
-      if (typeof j.result === "string") setBalanceWei(BigInt(j.result));
+      if (typeof j.result === "string") {
+        const wei = BigInt(j.result);
+        balanceCache.current = {who, at: Date.now(), wei};
+        setBalanceWei(wei);
+      }
     } catch {
       setBalanceWei(null);
     }
@@ -185,7 +212,8 @@ export function WalletProvider({children}: {children: ReactNode}) {
         return;
       }
       setAddress(list[0]);
-      void readChainAndBalance(list[0]);
+      // The account genuinely changed — do not serve a stale balance.
+      void readChainAndBalance(list[0], true);
     },
     [readChainAndBalance]
   );
@@ -279,6 +307,7 @@ export function WalletProvider({children}: {children: ReactNode}) {
       }
     }
     window.localStorage.removeItem(STORAGE_KEY);
+    balanceCache.current = null;
     bound.current = null;
     setEip1193(null);
     setAddress(null);
@@ -308,8 +337,9 @@ export function WalletProvider({children}: {children: ReactNode}) {
     }
   }, []);
 
+  /** Explicit user action — always hits the network. */
   const refreshBalance = useCallback(async () => {
-    if (address) await readChainAndBalance(address);
+    if (address) await readChainAndBalance(address, true);
   }, [address, readChainAndBalance]);
 
   const value = useMemo<WalletState>(
