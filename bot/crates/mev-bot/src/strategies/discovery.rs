@@ -199,6 +199,9 @@ impl PoolDiscovery {
                     token1,
                     fee,
                     tick_spacing,
+                    // Factory seeding proves the pool exists but does not
+                    // retrieve its historical PoolCreated height.
+                    block: 0,
                 });
                 self.seen_v3.write().insert(pool);
                 loaded += 1;

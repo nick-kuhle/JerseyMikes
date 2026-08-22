@@ -78,8 +78,6 @@ pub fn evaluate(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn elapsed_time_cannot_underflow() {
         assert_eq!(10u64.saturating_sub(20) / 3_600_000, 0);
