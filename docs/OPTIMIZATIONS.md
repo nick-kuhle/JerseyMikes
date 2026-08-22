@@ -481,3 +481,99 @@ buys a genuinely reachable `quoteFrom` plus better diagnostics.
   `from` and reverts `QuoteIsEthCallOnly` with one; `quoteFrom` succeeds for the
   owner and reverts `NotSearcher` for a stranger
 - Browser check of the new dashboard control against that same deployment
+
+---
+
+# Security & dependency audit
+
+A full-repo audit run after the contract work. Two issues were found by
+reading, then **reproduced against a running bot** before being fixed — the
+first one is not theoretical.
+
+## 1. Unauthenticated mutating API on a public bind (HIGH — fixed)
+
+`API_BIND` defaulted to `0.0.0.0:8080` and the API applied
+`CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any)`,
+with no authentication on any route.
+
+Reproduced end-to-end against a live bot bound to `0.0.0.0`, from a
+non-loopback interface, with `Origin: https://evil.example`:
+
+| Request | Result before |
+| --- | --- |
+| `POST /api/risk {"bribeBps":10000}` | **accepted** — 100% of gross profit redirected to the block builder |
+| `POST /api/risk {"maxPositionWei":1}` | **accepted** — sizing throttled to 1 wei |
+| `POST /api/risk` (strategy list) | **accepted** — `sandwich` and `atomic_arb` switched off |
+| `POST /api/risk/reset` | **accepted** — kill switch cleared remotely |
+| response header | `access-control-allow-origin: *` — so any page the operator had open could do all of the above from their browser |
+
+`POST /api/mode {"live":true}` was correctly refused: arming live execution
+needs `LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes` at boot. Remote
+*arming* was never possible; remote *sabotage* was.
+
+The fix is three independent layers, so no single mistake re-opens it:
+
+1. **Safe default** — `API_BIND` is now `127.0.0.1:8080`. The console reaches
+   the bot server-side through its `/api/bot/*` proxy, so nothing breaks.
+2. **Fail-closed boot check** — `Config::validate` refuses to start when the
+   bind is non-loopback and `API_AUTH_TOKEN` is unset, naming both remedies.
+   `bind_is_loopback` treats unparseable binds as exposed.
+3. **Bearer auth + closed CORS** — the three mutating routes sit behind a
+   constant-time bearer check (`API_AUTH_TOKEN`); reads stay open. CORS now
+   reflects only `API_ALLOWED_ORIGINS`, empty by default.
+
+Reads are deliberately still unauthenticated: they are what the dashboard
+renders, and gating them would break the demo flow for no security gain.
+
+Verified after the fix, same external interface:
+
+| Case | Result |
+| --- | --- |
+| `GET /api/status` | 200 — reads unaffected |
+| `POST /api/risk` no token | **401** |
+| `POST /api/risk` wrong token | **401** |
+| `POST /api/risk` correct token | 200, applied |
+| CORS header | absent |
+| loopback, no token | fully open, unchanged — backward compatible |
+| non-loopback, no token | **refuses to boot** with actionable guidance |
+| console proxy + `BOT_API_TOKEN` | drives the bot normally; token absent from `.next/static` and served HTML |
+
+`deploy/docker-compose.yml` needs `0.0.0.0` inside the container for the
+console to reach the bot, so it now sets `API_AUTH_TOKEN` (a `:?` guard fails
+the run with a named error if it is missing) and publishes the port on host
+loopback only.
+
+## 2. Flashbots signer key reachable via `Debug`/`Serialize` (MEDIUM — fixed)
+
+`Endpoints` derived both `Debug` and `Serialize` while holding
+`flashbots_signer_key`. Nothing printed it today, but the struct is cloned
+into every task and one `tracing::debug!(?cfg)` would have put a live key in
+the logs. Now `#[serde(skip_serializing)]` plus a hand-written `Debug` that
+renders `<redacted>`, mirroring the existing treatment in `signer.rs`. Two
+tests lock the behaviour in.
+
+## 3. Dependencies
+
+- **Rust:** `cargo audit` → **0 vulnerabilities** (3 unmaintained transitive
+  crates: `derivative`, `paste`, `proc-macro-error2` — no action available).
+- **Frontend:** `npm audit` 5 → **3** via `next` 15.5.7 → 15.5.23 and
+  `viem` → 2.55.19, both patch-level. That clears the Next.js SSRF, cache
+  poisoning, XSS, DoS and middleware-bypass advisories plus `ws` via viem. The
+  remaining 3 (`postcss`, `sharp`) are nested inside `next`'s own tree, need
+  the breaking `next@16`, and are unreachable here — the app uses no
+  `next/image`.
+
+## Checked and found sound
+
+Parameterised SQL throughout, clamped API `limit`s, thorough `RuntimeRisk::apply`
+validation, the read-only 17-method `/api/eth` proxy, `.gitignore` coverage, and
+no committed secrets (every 64-hex string in the tree is an event topic hash, a
+transient-storage slot constant, or the public anvil test key).
+
+## Verification
+
+- `cargo test --all` → **223 passed** (218 + 5 new security tests)
+- `cargo clippy --all-targets -- -A clippy::too_many_arguments` → clean
+- `rustfmt --check` clean on every file touched
+- `forge test` → **27 passed**; `tsc --noEmit` and `next build` clean
+- Playwright smoke against `next start` → PASS, 0 console errors
