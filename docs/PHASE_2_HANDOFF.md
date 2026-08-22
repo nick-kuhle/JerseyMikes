@@ -38,6 +38,24 @@ baseline resets from that merge), fill `W6_MEMO.md`, flip or close;
 (2) the W4 raise decision (`atomic_arb.candidatesEmitted` at 3 legs vs the
 2-leg baseline, same fresh window). Both are decisions, not code.
 
+**Verification posture (2026-08-22, supersedes the sandbox/CI story
+below):** the automation sandbox no longer depends on the maintainer to
+compile. It installs its own toolchains (rustup; Foundry for `anvil` probes)
+and runs the full battery locally **before every push**: `cargo fmt` /
+`cargo clippy` / `cargo test --all` (199 tests at closeout),
+`tsc --noEmit`, `next build`, and — since the PR #23 mangled-workflow
+incident — a YAML parse of every workflow/compose file it touches. Chain
+interfaces are verified against live mainnet (bytecode dispatchers,
+chainlog, log layouts) before implementation. CI's role has shifted from
+*compiler of last resort* to **merge gate**: the four required jobs stay
+authoritative for what the sandbox cannot reproduce — cross-toolchain
+builds, the byte-for-byte artifact-drift job, and the frontend build on an
+unconstrained runner (the sandbox needs a ~1.5 GB heap cap to fit `next
+build`). Pre-push local runs have caught every regression in the recent
+PRs (the Comet decode offset, the rad-scale `u128` overflow, the deposit
+gas check) before CI ever saw them; CI also stays the authority on
+check-state, since the automation's GitHub-API polling is rate-limit-prone.
+
 **Continuation status (2026-08-21, later session):** Funnel week is done. W4
 default is 3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off
 until a written public-mempool gap memo exists — the funnel panel now renders
@@ -52,6 +70,11 @@ explorer links on every transaction/block/address the console renders.
 Rust-side, `LiveMode` (engine.rs) carries the runtime switch and
 `recent_simulations` now joins the victim hashes so each simulated tx links
 to the tx it reacted to.
+
+*(The two paragraphs that follow are historical — they describe the era
+when the sandbox had no Rust toolchain and no `workflows` permission, which
+ended with W0. See the verification-posture note above for today's
+reality.)*
 
 A follow-up automation session (the same day) re-ran the checks it can run —
 contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
@@ -121,9 +144,9 @@ against; §1.5 covers what has since landed.
 | Multi-leg arb (3–5 legs) | **Not started** | `strategies/arb.rs:48-62` is still the O(n²) pair-pair loop |
 | V3 sandwich sizing | **Not started** | `strategies/sandwich.rs` is V2-only; `dex::quote_v3` exists and is unused by it |
 | Aggregator decoding | **Not started** | `strategies::decode_swap` handles V2 routers; `jit::decode_v3_swap` handles `ISwapRouter02` |
-| Rust build/test verification | **Locally verified by the maintainer** | `make bot-check` and `make bot-test` pass; the authoring sandbox still cannot independently run Rust |
-| Contracts build/test | **Locally verified by the maintainer** | `make contracts` passes; `node contracts/script/compile-check.js` also passes in the sandbox |
-| CI | **Written, not remotely enabled** | `ci/github-actions-ci.yml` remains parked outside `.github/workflows/`; the GitHub App push is still rejected without `workflows` permission |
+| Rust build/test verification | **Verified in the automation sandbox** (since 2026-08-21) | rustup installs locally; `cargo fmt/clippy/test --all` run before every push — 199 tests at closeout |
+| Contracts build/test | **Verified in the automation sandbox** | `compile-check.js` runs there; Foundry installs for `anvil` probes; forge runs in CI |
+| CI | **Green and required** | all four jobs live in `.github/workflows/ci.yml`, required on PRs to `main` since W0 (PR #15) |
 
 Two corrections to the source documents worth calling out, because they change
 the plan:
@@ -135,6 +158,9 @@ the plan:
   maintainer reports green `make bot-check`, `make bot-test`, and
   `make contracts` runs. W0 remains open until the workflow is enabled and the
   checks run as required PR checks.
+  *[Update 2026-08-22: both halves changed — the automation sandbox now runs
+  the full Rust battery itself (see the verification-posture note above), and
+  W0 has long been closed: CI is enabled and required. Kept for history.]*
 
 ---
 
