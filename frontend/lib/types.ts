@@ -1,4 +1,14 @@
-export type Strategy = "sandwich" | "sandwich_v3" | "jit" | "atomic_arb" | "liquidation" | "sniper";
+export type Strategy =
+  | "sandwich"
+  | "sandwich_v3"
+  | "jit"
+  | "atomic_arb"
+  | "liquidation"
+  | "liquidation_compound"
+  | "liquidation_morpho"
+  | "liquidation_maker"
+  | "oracle_frontrun"
+  | "sniper";
 
 export interface StatusResponse {
   chain: {id: number; name: string};

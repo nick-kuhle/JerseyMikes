@@ -79,12 +79,26 @@ Remaining Phase 2 coverage:
       what it did after a week. If the answer is "nothing", 1inch/0x stay
       closed.
 - [ ] Curve / Balancer / Maverick pool math (out of scope for this phase)
-- [ ] Compound V3, Morpho and Maker liquidations; oracle-update front-running
-      (out of scope for this phase)
+- [x] Compound V3, Morpho and Maker liquidations; oracle-update front-running
+      — `liquidation_compound` (absorb + discounted `buyCollateral`),
+      `liquidation_morpho` (v1.1 `liquidate`, full close, share-exact debt
+      math), `liquidation_maker` (bark + atomic clip `take`, deterministic
+      `kicks + 1` auction id), and `oracle_frontrun` (Chainlink
+      `transmit` / Maker OSM `poke` back-runs built from the shared
+      near-miss leads registry). See `docs/STRATEGIES.md` §4b–4e; selectors
+      verified against the live Comet implementation and Morpho bytecode.
 - [ ] MEV-Share backrun bidding (`mev_sendBundle` with privacy hints)
       (out of scope for this phase)
 
-**Status note (2026-08-21):** Funnel-week gates for W4 and W5 are flipped.
+**Status note (2026-08-21):** Liquidation coverage landed: the four new
+strategies default on with the rest (the first run's job is still to measure
+what is reachable); watch each row's `candidatesEmitted` against the added
+per-block `eth_getLogs` + batched sweeps, and cap via
+`LIQUIDATION_WATCH_CAP` / `MORPHO_MARKET_CAP` / `MAKER_ILKS` if the provider
+pushes back. Earlier: funnels are split by lane; W0 CI is required on PRs to
+`main`.
+
+**Earlier status note (2026-08-21):** Funnel-week gates for W4 and W5 are flipped.
 `ARB_MAX_CYCLE_LEN` defaults to 3; `STRATEGY_SANDWICH_V3` and
 `POOL_DISCOVERY_V3` default on as a pair. W6 (`DECODE_UNIVERSAL_ROUTER`)
 stays off until a written public-mempool gap memo exists — if

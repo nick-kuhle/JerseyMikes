@@ -203,6 +203,20 @@ pub enum Strategy {
     Jit,
     AtomicArb,
     Liquidation,
+    /// Compound V3 (Comet) absorb + storefront collateral purchase. Separate
+    /// row: different victim population (Comet accounts), different revert
+    /// modes (`NotForSale`, `TooMuchSlippage`), different reward shape
+    /// (discount, not bonus bps).
+    LiquidationCompound,
+    /// Morpho Blue full-close liquidations. Separate row: share-math debt,
+    /// lltv-proportional incentive, singleton market discovery.
+    LiquidationMorpho,
+    /// Maker bark + atomic clip take. Separate row: vat/clip plumbing, kick
+    /// reward + auction spread instead of a liquidation bonus.
+    LiquidationMaker,
+    /// Back-run of a collateral price-feed update with liquidations of
+    /// near-miss positions (the oracle-update front-run).
+    OracleFrontrun,
     Sniper,
 }
 
@@ -214,17 +228,25 @@ impl Strategy {
             Strategy::Jit => "jit",
             Strategy::AtomicArb => "atomic_arb",
             Strategy::Liquidation => "liquidation",
+            Strategy::LiquidationCompound => "liquidation_compound",
+            Strategy::LiquidationMorpho => "liquidation_morpho",
+            Strategy::LiquidationMaker => "liquidation_maker",
+            Strategy::OracleFrontrun => "oracle_frontrun",
             Strategy::Sniper => "sniper",
         }
     }
 
-    pub fn all() -> [Strategy; 6] {
+    pub fn all() -> [Strategy; 10] {
         [
             Strategy::Sandwich,
             Strategy::SandwichV3,
             Strategy::Jit,
             Strategy::AtomicArb,
             Strategy::Liquidation,
+            Strategy::LiquidationCompound,
+            Strategy::LiquidationMorpho,
+            Strategy::LiquidationMaker,
+            Strategy::OracleFrontrun,
             Strategy::Sniper,
         ]
     }
@@ -464,7 +486,8 @@ pub fn to_bytes(v: &[u8]) -> Bytes {
 /// Format wei as a human readable ETH string with 6 decimals (UI/logging only).
 pub fn format_eth(wei: U256) -> String {
     let whole = wei / U256::from(1_000_000_000_000_000_000u128);
-    let frac = (wei % U256::from(1_000_000_000_000_000_000u128)) / U256::from(1_000_000_000_000u128);
+    let frac =
+        (wei % U256::from(1_000_000_000_000_000_000u128)) / U256::from(1_000_000_000_000u128);
     format!("{}.{:06}", whole, frac.to::<u64>())
 }
 
@@ -481,7 +504,10 @@ mod tests {
 
     #[test]
     fn formats_eth() {
-        assert_eq!(format_eth(U256::from(1_500_000_000_000_000_000u128)), "1.500000");
+        assert_eq!(
+            format_eth(U256::from(1_500_000_000_000_000_000u128)),
+            "1.500000"
+        );
         assert_eq!(format_eth(U256::ZERO), "0.000000");
     }
 
@@ -565,7 +591,7 @@ mod tests {
         // The funnel distinguishes V2 from V3 sandwiches by variant. Dropping
         // SandwichV3 from `all()` would hide it from /api/status.strategies
         // and from the dashboard even when the toggle is on.
-        assert_eq!(Strategy::all().len(), 6);
+        assert_eq!(Strategy::all().len(), 10);
         assert_eq!(Strategy::SandwichV3.as_str(), "sandwich_v3");
         assert!(Strategy::all().contains(&Strategy::SandwichV3));
     }

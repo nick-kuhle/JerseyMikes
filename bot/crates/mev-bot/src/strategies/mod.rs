@@ -3,7 +3,12 @@
 pub mod arb;
 pub mod discovery;
 pub mod jit;
+pub mod leads;
 pub mod liquidation;
+pub mod liquidation_compound;
+pub mod liquidation_maker;
+pub mod liquidation_morpho;
+pub mod oracle_frontrun;
 pub mod sandwich;
 pub mod sandwich_v3;
 pub mod sniper;
@@ -458,7 +463,9 @@ pub async fn scan_pair_created(
     from: u64,
     to: u64,
 ) -> Vec<(crate::dex::Venue, Address)> {
-    try_scan_pair_created(rpc, from, to).await.unwrap_or_default()
+    try_scan_pair_created(rpc, from, to)
+        .await
+        .unwrap_or_default()
 }
 
 /// Fallible form of [`scan_pair_created`]: `None` means the RPC call itself
@@ -658,7 +665,11 @@ mod tests {
 
     #[test]
     fn ignores_unrelated_calldata() {
-        assert!(decode_swap(&tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO), known::WETH).is_none());
+        assert!(decode_swap(
+            &tx_with(vec![0xde, 0xad, 0xbe, 0xef], U256::ZERO),
+            known::WETH
+        )
+        .is_none());
         assert!(decode_swap(&tx_with(vec![], U256::ZERO), known::WETH).is_none());
     }
 
@@ -702,7 +713,9 @@ mod tests {
         );
         // Unknown factory -> None.
         assert_eq!(
-            venue_from_factory(&serde_json::json!("0x0000000000000000000000000000000000000000")),
+            venue_from_factory(&serde_json::json!(
+                "0x0000000000000000000000000000000000000000"
+            )),
             None
         );
         // Non-string -> None.
@@ -768,7 +781,8 @@ mod tests {
         assert_eq!(venue, Venue::UniV2);
         assert_eq!(got, pair);
 
-        let (venue, _) = decode_pair_created(&pair_created_log(known::SUSHI_FACTORY, pair)).unwrap();
+        let (venue, _) =
+            decode_pair_created(&pair_created_log(known::SUSHI_FACTORY, pair)).unwrap();
         assert_eq!(venue, Venue::SushiV2);
     }
 
@@ -778,7 +792,10 @@ mod tests {
         // address come from data. Mixing those up yields addresses that look
         // valid, which is why this is pinned against a real mainnet pool.
         let got = decode_pool_created(&pool_created_log()).expect("PoolCreated decodes");
-        assert_eq!(got.address, address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"));
+        assert_eq!(
+            got.address,
+            address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640")
+        );
         assert_eq!(got.token0, known::USDC);
         assert_eq!(got.token1, known::WETH);
         assert_eq!(got.fee, 500);

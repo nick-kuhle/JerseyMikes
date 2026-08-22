@@ -34,11 +34,54 @@ pub mod known {
     pub const UNIVERSAL_ROUTER: Address = address!("3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD");
     pub const SUSHI_FACTORY: Address = address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac");
 
+    pub const WSTETH: Address = address!("7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0");
+
     pub const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
     pub const AAVE_V3_POOL: Address = address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
     pub const AAVE_V3_ORACLE: Address = address!("54586bE62E3c3580375aE3723C145253060Ca0C2");
     pub const AAVE_V3_DATA_PROVIDER: Address = address!("7B4EB56E7CD4b454BA8ff71E4518426369a138a3");
     pub const COMPOUND_V3_USDC: Address = address!("c3d688B66703497DAA19211EEdff47f25384cdc3");
+
+    /// Chainlink ETH/USD and BTC/USD proxy aggregators — the feeds Aave,
+    /// Compound V3 and Morpho markets most commonly price collateral with.
+    /// The *aggregator* (what `transmit` targets) is resolved at runtime;
+    /// proxies are stable for years, aggregators rotate.
+    pub const CHAINLINK_ETH_USD_PROXY: Address =
+        address!("5f4eC3Df9cbd43714FE2740f5E3616155c5b8419");
+    pub const CHAINLINK_BTC_USD_PROXY: Address =
+        address!("F4030086522a5bEEa4988F8cA5B36dbC97BeE88c");
+
+    /// Collateral tokens whose feeds the oracle front-runner maps leads to.
+    pub fn collateral_universe() -> [Address; 3] {
+        [WETH, WBTC, WSTETH]
+    }
+}
+
+/// Liquidation-strategy tuning (Compound V3, Morpho Blue, Maker — the Aave
+/// strategy predates this and stays untuned).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LiquidationConfig {
+    /// Maximum accounts polled per protocol per block. Bounds the per-block
+    /// `eth_call` fan-out; watchlists evict least-recently-active first.
+    pub watch_cap: usize,
+    /// Maximum Morpho markets tracked (most-recently-active first).
+    pub morpho_market_cap: usize,
+    /// Maximum borrowers tracked per Morpho market.
+    pub morpho_borrower_cap: usize,
+    /// Maker ilks to watch, from the built-in table (`ETH-A`, `WBTC-A`,
+    /// `WSTETH-A`). Each ilk adds a log scan and urn reads per block, which
+    /// is why the default is the single biggest one.
+    pub maker_ilks: Vec<String>,
+}
+
+/// Oracle-update front-runner tuning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OracleConfig {
+    /// `(Chainlink proxy, collateral token)` pairs to watch for updates.
+    pub watch_feeds: Vec<(Address, Address)>,
+    /// Maximum near-miss leads converted per oracle update; each becomes a
+    /// simulation. Bounds the burst when a feed moves.
+    pub max_leads: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +91,10 @@ pub struct Config {
     pub risk: RiskConfig,
     pub strategies: StrategyToggles,
     pub sim: SimConfig,
+    /// Compound V3 / Morpho Blue / Maker liquidation tuning.
+    pub liquidation: LiquidationConfig,
+    /// Oracle-update front-runner tuning.
+    pub oracle: OracleConfig,
     pub api: ApiConfig,
     /// Whether the V2 pool-discovery scan runs each block.
     pub pool_discovery: bool,
@@ -158,6 +205,14 @@ pub struct StrategyToggles {
     pub jit: bool,
     pub atomic_arb: bool,
     pub liquidation: bool,
+    /// Compound V3 (Comet) absorb + storefront buy.
+    pub liquidation_compound: bool,
+    /// Morpho Blue full-close liquidations.
+    pub liquidation_morpho: bool,
+    /// Maker bark + atomic clip take.
+    pub liquidation_maker: bool,
+    /// Back-run oracle updates with near-miss liquidations.
+    pub oracle_frontrun: bool,
     pub sniper: bool,
 }
 
@@ -226,6 +281,20 @@ fn env_addr(key: &str, default: Address) -> Address {
     env_opt(key)
         .and_then(|v| v.parse::<Address>().ok())
         .unwrap_or(default)
+}
+
+/// Parse `proxy:collateral,proxy:collateral` into address pairs. Malformed
+/// entries are dropped with a warning rather than failing the boot — one bad
+/// address should not blind the whole oracle watch.
+fn parse_feed_list(raw: &str) -> Vec<(Address, Address)> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let mut it = pair.trim().split(':');
+            let proxy = it.next()?.trim().parse::<Address>().ok()?;
+            let collateral = it.next()?.trim().parse::<Address>().ok()?;
+            Some((proxy, collateral))
+        })
+        .collect()
 }
 
 fn env_list(key: &str) -> Vec<String> {
@@ -302,6 +371,10 @@ impl Config {
                 jit: env_bool("STRATEGY_JIT", true),
                 atomic_arb: env_bool("STRATEGY_ATOMIC_ARB", true),
                 liquidation: env_bool("STRATEGY_LIQUIDATION", true),
+                liquidation_compound: env_bool("STRATEGY_LIQUIDATION_COMPOUND", true),
+                liquidation_morpho: env_bool("STRATEGY_LIQUIDATION_MORPHO", true),
+                liquidation_maker: env_bool("STRATEGY_LIQUIDATION_MAKER", true),
+                oracle_frontrun: env_bool("STRATEGY_ORACLE_FRONTRUN", true),
                 sniper: env_bool("STRATEGY_SNIPER", true),
             },
             sim: SimConfig {
@@ -324,6 +397,23 @@ impl Config {
                 use_call_bundle: env_bool("USE_CALL_BUNDLE", true),
                 target_block_offset: env_u64("TARGET_BLOCK_OFFSET", 1),
                 timeout: Duration::from_millis(env_u64("SIM_TIMEOUT_MS", 2_500)),
+            },
+            liquidation: LiquidationConfig {
+                watch_cap: (env_u64("LIQUIDATION_WATCH_CAP", 200) as usize).max(1),
+                morpho_market_cap: (env_u64("MORPHO_MARKET_CAP", 24) as usize).max(1),
+                morpho_borrower_cap: (env_u64("MORPHO_BORROWER_CAP", 64) as usize).max(1),
+                maker_ilks: {
+                    let v = env_list("MAKER_ILKS");
+                    if v.is_empty() { vec!["ETH-A".to_string()] } else { v }
+                },
+            },
+            oracle: OracleConfig {
+                watch_feeds: parse_feed_list(&env_or(
+                    "ORACLE_WATCH_FEEDS",
+                    "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,\
+                     0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c:0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+                )),
+                max_leads: (env_u64("ORACLE_FRONTRUN_MAX_LEADS", 3) as usize).max(1),
             },
             api: ApiConfig {
                 bind: env_or("API_BIND", "0.0.0.0:8080"),
@@ -389,6 +479,18 @@ impl StrategyToggles {
         }
         if self.liquidation {
             v.push("liquidation");
+        }
+        if self.liquidation_compound {
+            v.push("liquidation_compound");
+        }
+        if self.liquidation_morpho {
+            v.push("liquidation_morpho");
+        }
+        if self.liquidation_maker {
+            v.push("liquidation_maker");
+        }
+        if self.oracle_frontrun {
+            v.push("oracle_frontrun");
         }
         if self.sniper {
             v.push("sniper");
