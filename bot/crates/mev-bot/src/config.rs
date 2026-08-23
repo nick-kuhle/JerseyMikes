@@ -59,10 +59,9 @@ pub mod known {
         address!("F4030086522a5bEEa4988F8cA5B36dbC97BeE88c");
 
     // ── Base (chain 8453) values ──────────────────────────────────────────
-    // Verified live against Base mainnet 2026-08-23 (code presence +
-    // cross-checked immutable getters; the ⚠ marks the ones whose
-    // verification was doc- or code-presence-based only — re-verify on
-    // deploy, they are env-overridable regardless).
+    // Verified live against Base mainnet 2026-08-23 (code presence,
+    // immutable getters where available, and official deployment registries).
+    // Re-verify before deployment; every entry is env-overridable.
 
     pub const BASE_WETH: Address = address!("4200000000000000000000000000000000000006");
     /// Native (non-bridged) USDC on Base.
@@ -73,19 +72,22 @@ pub mod known {
     /// Circle's USDbC (the USDC bridged through Circle CCTP).
     pub const BASE_USDBC: Address = address!("d9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA");
     pub const BASE_UNIV2_FACTORY: Address = address!("8909Dc15e40173Ff4699343b6eB8132c65e18eC6");
-    /// ⚠ code-presence verified; `WETH()` getter check pending a paid RPC.
+    /// `factory()` + `WETH()` getters verified live 2026-08-23 against Base
+    /// mainnet via dRPC.
     pub const BASE_UNIV2_ROUTER: Address = address!("4752ba5DBc23f44D87826276BF6Fd6b1C372aD24");
     pub const BASE_UNIV3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
-    /// ⚠ `factory()` + `WETH9()` getters verified live 2026-08-23.
+    /// `factory()` + `WETH9()` getters verified live 2026-08-23.
     pub const BASE_UNIV3_QUOTER_V2: Address = address!("3d4e44Eb1374240CE5F1B871ab261CD16335B76a");
     pub const BASE_UNIV3_NPM: Address = address!("03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1");
-    /// ⚠ per Uniswap's official Base deployment doc; code present on chain.
+    /// Code verified live 2026-08-23; address matches Uniswap's official Base
+    /// deployments registry and the Basescan verified source.
     pub const BASE_UNIVERSAL_ROUTER: Address = address!("6fF5693b99212Da76ad316178A184AB56D299b43");
     /// SwapRouter02. `factory()` + `WETH9()` getters verified live 2026-08-23.
     pub const BASE_UNIV3_SWAP_ROUTER_02: Address =
         address!("2626664c2603336E57B271c5C0b26F421741e481");
-    /// Balancer V2 vault — deployed at the *same* address as mainnet
-    /// (verified: code present, identical size/prologue to the mainnet vault).
+    /// Balancer V2 vault — deployed at the *same* address as mainnet. Code,
+    /// non-zero `getProtocolFeesCollector()`, and Base WETH getter verified
+    /// live 2026-08-23.
     pub const BASE_BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
     /// Aerodrome router — registered for the phase-2 integration; unused by
     /// any v1 strategy (its Solidly-style math is out of scope, see the
@@ -217,10 +219,12 @@ pub mod known {
         })
     }
 
-    /// Base mainnet (chain 8453) registry. See the ⚠ notes on the
-    /// individual constants above for the verification state of each row.
+    /// Base mainnet (chain 8453) registry. See the individual constants above
+    /// for the verification state of each row.
     ///
-    /// v1 scope: flash-loan arb on UniV2/UniV3 via the sequencer feed.
+    /// Current Base scope: V2 graph measurement plus shadow-only V3 discovery.
+    /// Pending V2 backruns require two registered V2 venues and raw mode cannot
+    /// yet express a preconfirmed dependency; see the successor work order.
     /// Lending-protocol rows are deliberately `None` (Aave/Morpho exist on
     /// Base; wiring them is the documented phase 2, and until then the
     /// strategies skip at construction with a warning).
@@ -493,6 +497,12 @@ pub struct Config {
     /// ordering currency: this is the number that buys inclusion, and it is
     /// re-derived per chain (gas is ~10⁻⁴× mainnet).
     pub priority_fee_wei: U256,
+    /// Percentage bump applied to both original EIP-1559 fee caps when raw
+    /// cancellation replaces a pending transaction. 1,250 = 12.5%.
+    pub raw_cancel_bump_bps: u64,
+    /// Hard ceiling for a raw cancellation transaction's `maxFeePerGas`.
+    /// If a valid replacement would exceed it, cancellation fails closed.
+    pub raw_cancel_max_fee_wei: U256,
     /// How signed payloads reach the chain (relay bundles vs raw txs).
     /// Default follows the chain profile; `SUBMISSION_MODE` overrides.
     pub submission_mode: SubmissionMode,
@@ -609,9 +619,15 @@ pub struct Config {
     /// 0 (default) = off. Capped at [`LIVE_SMOKE_MAX_CAP`]. Still requires
     /// boot arming, `BROADCAST_ENABLED`, runtime live mode, risk, inventory,
     /// live-candidate engineering, and an exact-payload sim. Counts durable
-    /// `eth_sendBundle` *attempts* in SQLite so a restart cannot refill the
-    /// budget. A persist failure refuses the send.
+    /// submission attempts in SQLite so a restart cannot refill the budget.
+    /// Raw mode additionally reserves worst-case gas exposure. A persist
+    /// failure refuses the send.
     pub live_smoke_max: u64,
+    /// Durable worst-case gas exposure allowed for unqualified raw smoke
+    /// sends, in wei. Raw smoke is disabled when this is zero, even when
+    /// `LIVE_SMOKE_MAX` is non-zero. Bundle-mode smoke remains count-bounded
+    /// because relay bundles have revert protection and are not raw sends.
+    pub live_smoke_max_gas_cost_wei: U256,
 }
 
 /// Hard ceiling on `LIVE_SMOKE_MAX`. The point is one or two proving shots,
@@ -1171,6 +1187,8 @@ impl Config {
                 max_revert_rate: env_f64("MAX_REVERT_RATE", 1.0),
             },
             priority_fee_wei: env_u256("PRIORITY_FEE_WEI", 1_000_000_000), // 1 gwei
+            raw_cancel_bump_bps: env_u64("RAW_CANCEL_BUMP_BPS", 1_250).clamp(1_000, 10_000),
+            raw_cancel_max_fee_wei: env_u256("RAW_CANCEL_MAX_FEE_WEI", 500_000_000_000),
             submission_mode,
             qualification_backend,
             strategies: StrategyToggles {
@@ -1307,6 +1325,7 @@ impl Config {
             submission_retry_ms: env_u64("SUBMISSION_RETRY_MS", 250).max(50),
             submission_max_attempts: env_u64("SUBMISSION_MAX_ATTEMPTS", 2).clamp(1, 5),
             live_smoke_max: env_u64("LIVE_SMOKE_MAX", 0).min(LIVE_SMOKE_MAX_CAP),
+            live_smoke_max_gas_cost_wei: env_u256("LIVE_SMOKE_MAX_GAS_COST_WEI", 0),
         };
         // NOTE: `validate()` is deliberately NOT called here. `doctor` and
         // `replay` load the config without ever binding a port, and they must
@@ -1476,13 +1495,30 @@ impl Config {
     /// every mismatch is named, at boot and in `doctor`, so an inert
     /// strategy is never a silent one.
     pub fn coherence_warnings(&self) -> Vec<String> {
-        coherence_warnings_for(
+        let mut warnings = coherence_warnings_for(
             &self.addresses,
             &self.strategies,
             self.relay_tx_ingest,
             self.endpoints.sequencer_feed.is_some(),
             self.oracle.watch_feeds.is_empty(),
-        )
+        );
+        if self.submission_mode == SubmissionMode::Raw
+            && self.live_smoke_max > 0
+            && self.live_smoke_max_gas_cost_wei.is_zero()
+        {
+            warnings.push(
+                "LIVE_SMOKE_MAX is non-zero in raw mode but LIVE_SMOKE_MAX_GAS_COST_WEI=0; \
+                 unqualified raw sends remain disabled until a wei-denominated exposure cap is set"
+                    .into(),
+            );
+        }
+        if self.addresses.sequencer_only && self.risk.bribe_bps != 0 {
+            warnings.push(format!(
+                "BRIBE_BPS={} on sequencer-only chain {}; set BRIBE_BPS=0 because raw landing power comes from priority fee, not a coinbase transfer",
+                self.risk.bribe_bps, self.chain.chain_id
+            ));
+        }
+        warnings
     }
 
     pub fn summary(&self) -> String {
@@ -1746,7 +1782,7 @@ mod tests {
     #[test]
     fn base_profile_carries_the_verified_addresses() {
         // Pinned against live Base mainnet 2026-08-23 (code presence +
-        // cross-checked immutable getters; see the ⚠ notes on the constants).
+        // cross-checked immutable getters; see the verification notes on the constants).
         let b = known::base();
         assert_eq!(b.weth, known::BASE_WETH);
         assert_eq!(b.usdc, known::BASE_USDC);

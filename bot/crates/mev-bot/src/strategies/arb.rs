@@ -147,6 +147,10 @@ impl StrategyImpl for AtomicArbStrategy {
     }
 }
 
+fn estimated_gas_cost(gas: u64, base_fee: U256, priority_fee: U256) -> U256 {
+    U256::from(gas).saturating_mul(base_fee.saturating_add(priority_fee))
+}
+
 /// Turn a sized cycle into an `Opportunity`, or drop it if gas eats the profit.
 ///
 /// Profit is denominated in the anchor token, which the search guarantees is
@@ -160,8 +164,11 @@ fn build_cycle_opportunity(
     head: &BlockHead,
 ) -> Option<Opportunity> {
     let legs = candidate.cycle.legs();
-    let gas_estimate = U256::from(graph::gas_estimate(legs));
-    let gas_cost = gas_estimate * (head.base_fee_per_gas + U256::from(1_000_000_000u64));
+    let gas_cost = estimated_gas_cost(
+        graph::gas_estimate(legs),
+        head.base_fee_per_gas,
+        ctx.cfg.priority_fee_wei,
+    );
     if candidate.gross_profit <= gas_cost {
         return None;
     }
@@ -222,8 +229,7 @@ fn try_cycle(
     let (amount_in, gross) = dex::optimal_two_leg_arb(a, b, token_in, ctx.max_position())?;
 
     // Flash loan + two swaps + repayment ≈ 320k gas.
-    let gas_estimate = U256::from(320_000u64);
-    let gas_cost = gas_estimate * (head.base_fee_per_gas + U256::from(1_000_000_000u64));
+    let gas_cost = estimated_gas_cost(320_000, head.base_fee_per_gas, ctx.cfg.priority_fee_wei);
     if gross <= gas_cost {
         return None;
     }
@@ -287,6 +293,19 @@ mod tests {
             venue,
             block: 1,
         }
+    }
+
+    #[test]
+    fn configured_priority_fee_changes_the_prefilter_cost() {
+        let base = U256::from(10u64);
+        assert_eq!(
+            estimated_gas_cost(100, base, U256::from(1u64)),
+            U256::from(1_100u64)
+        );
+        assert_eq!(
+            estimated_gas_cost(100, base, U256::from(5u64)),
+            U256::from(1_500u64)
+        );
     }
 
     #[test]

@@ -72,8 +72,8 @@ export interface StatusResponse {
     minimumAccuracyBps: number;
     persistenceDropped: number;
     /** `relay` (fork vs `eth_callBundle`, mainnet) or `sequencer` (fork vs
-     *  included block, Base/L2). The console labels the panel with this so a
-     *  Base verdict is never misread as a relay verdict (work order WS-N). */
+     *  an independent canonical state comparison, Base/L2). Actual route
+     *  matches remain a separate evidence population. */
     comparisonBackend?: string;
     reasons: string[];
     strategies: StrategyQualification[];
@@ -136,7 +136,13 @@ export interface StatusResponse {
     gate: boolean;
   };
   /** Bounded pre-qualification live shots. Absent on older bots. */
-  liveSmoke?: {max: number; used: number; remaining: number};
+  liveSmoke?: {
+    max: number;
+    used: number;
+    remaining: number;
+    gasAtRiskWei?: string;
+    maxGasCostWei?: string;
+  };
   latency?: LatencySnapshot;
   demo?: boolean;
 }

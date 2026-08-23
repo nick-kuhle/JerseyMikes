@@ -514,6 +514,8 @@ impl Engine {
             raw_mode.then_some(cfg.endpoints.searcher_address),
             cfg.chain.chain_id,
             cfg.priority_fee_wei,
+            cfg.raw_cancel_bump_bps,
+            cfg.raw_cancel_max_fee_wei,
         ));
         if transaction_signer.address() != cfg.endpoints.searcher_address {
             anyhow::bail!(
@@ -817,7 +819,18 @@ impl Engine {
             return true;
         }
         let used = self.store.smoke_used().unwrap_or(u64::MAX);
-        crate::config::smoke_allows(used, self.cfg.live_smoke_max)
+        if !crate::config::smoke_allows(used, self.cfg.live_smoke_max) {
+            return false;
+        }
+        // Raw smoke must have a separate durable wei-denominated exposure
+        // budget. Exact per-bundle reservation happens immediately before send.
+        self.cfg.submission_mode != crate::config::SubmissionMode::Raw
+            || (!self.cfg.live_smoke_max_gas_cost_wei.is_zero()
+                && self
+                    .store
+                    .smoke_gas_at_risk_wei()
+                    .map(|used| used < self.cfg.live_smoke_max_gas_cost_wei)
+                    .unwrap_or(false))
     }
 
     fn refresh_qualification(self: &Arc<Self>) {
@@ -1760,13 +1773,40 @@ impl Engine {
         // restart cannot refill the counter. Qualified strategies do not
         // spend a slot.
         if !self.strategy_qualified(opp.strategy) {
-            match self.store.try_consume_smoke_slot(self.cfg.live_smoke_max) {
+            let raw_mode = self.cfg.submission_mode == crate::config::SubmissionMode::Raw;
+            let gas_at_risk = if raw_mode {
+                match crate::submission::raw_bundle_gas_at_risk(&bundle) {
+                    Some(value) => value,
+                    None => {
+                        tracing::error!(
+                            target: "submission",
+                            bundle = %bundle.id,
+                            "raw smoke risk could not be decoded from the exact signed payload; refusing send"
+                        );
+                        let _ = self
+                            .store
+                            .set_nonce_reservation_status(&bundle.id, "cancelled");
+                        let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                        return bundle;
+                    }
+                }
+            } else {
+                U256::ZERO
+            };
+            let raw_cap = raw_mode.then_some(self.cfg.live_smoke_max_gas_cost_wei);
+            match self
+                .store
+                .try_consume_smoke_budget(self.cfg.live_smoke_max, raw_cap, gas_at_risk)
+            {
                 Ok(true) => {
                     tracing::warn!(
                         target: "submission",
                         strategy = opp.strategy.as_str(),
                         used = self.store.smoke_used().unwrap_or(0),
                         max = self.cfg.live_smoke_max,
+                        gas_at_risk_wei = %gas_at_risk,
+                        gas_risk_used_wei = %self.store.smoke_gas_at_risk_wei().unwrap_or(U256::MAX),
+                        gas_risk_cap_wei = %self.cfg.live_smoke_max_gas_cost_wei,
                         bundle = %bundle.id,
                         "consuming a live-smoke slot — sending without qualification PASS"
                     );

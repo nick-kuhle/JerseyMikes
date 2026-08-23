@@ -6,8 +6,8 @@
 
 ## Why broadcasting is fail-closed
 
-The transport exists, but no single switch can invoke it. A bundle reaches a
-relay only after all of these independent checks:
+The transport exists, but no single switch can invoke it. A payload reaches a
+relay or raw RPC only after all of these independent checks:
 
 1. live (not replay) strategy lane;
 2. engineering live-candidate strategy;
@@ -32,7 +32,7 @@ configured relay reputation signer while bundle transactions use the funded
 | --- | --- | --- |
 | Broadcast capability | `BROADCAST_ENABLED` | restart |
 | Boot arming | `LIVE_EXECUTION` + literal `I_UNDERSTAND_LIVE_RISK=yes` | restart |
-| Live smoke | `LIVE_SMOKE_MAX` (0 = off, cap 5) | restart; remaining slots live in SQLite |
+| Live smoke | `LIVE_SMOKE_MAX` (0 = off, cap 5); raw mode also requires `LIVE_SMOKE_MAX_GAS_COST_WEI` | restart; remaining slots and worst-case raw gas exposure live in SQLite |
 | Runtime mode | authenticated `POST /api/mode` | immediate, can only narrow boot arming |
 | Strategy qualification | canonical evidence in SQLite | continuously recomputed |
 | Risk/strategy narrowing | authenticated `POST /api/risk` | immediate |
@@ -53,8 +53,12 @@ per-chain procedure. On a sequencer chain the delivery differs in one respect
 only: `SUBMISSION_MODE=raw` sends the signed transactions straight to the
 chain RPC (there is no relay market to send bundles to) and
 `QUALIFICATION_BACKEND=sequencer` takes the independent second opinion from
-the included block instead of a relay `eth_callBundle`. All nine gates still
-apply, in the same order.
+an explicitly recorded canonical state comparison instead of a relay
+`eth_callBundle`. Corresponding route/outcome matches are a separate evidence
+population and cannot satisfy both thresholds. All nine gates still apply, in
+the same order. At present Base `atomic_arb` does not produce an independent
+victimless state-comparison row and therefore correctly remains unqualified;
+see [`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md).
 
 ## Why a failed opportunity costs nothing
 
@@ -65,6 +69,14 @@ no gas. This is not a guarantee against relay/builder defects or partial
 inclusion; the bot therefore uses non-reverting bundle policy, exact receipt
 reconciliation, explicit partial-inclusion incident states, and a drawdown
 stop. The searcher must still hold gas ETH.
+
+**Raw mode has no relay revert protection.** A losing or reverting transaction
+can be mined and burn gas. Unqualified raw smoke therefore requires two durable
+limits: the attempt count and `LIVE_SMOKE_MAX_GAS_COST_WEI`. Before broadcast,
+the bot decodes the exact signed type-2 payload and reserves worst-case
+`gasLimit × maxFeePerGas`; malformed payloads or a zero/exhausted wei cap are
+refused. This is a conservative exposure reservation, not an estimate of the
+receipt's eventual gas cost.
 
 Additional on-chain guards, all optional per bundle:
 
@@ -90,7 +102,10 @@ Set in the environment; see `.env.example`.
 | `MAX_GAS_PER_BUNDLE` | `3,000,000` | Bundle gas ceiling |
 | `MAX_DRAWDOWN_WEI` | `0` (off) | Cumulative simulated loss that trips the kill switch |
 | `MAX_INFLIGHT_PER_STRATEGY` | `32` | Concurrent simulations per strategy |
-| `LIVE_SMOKE_MAX` | `0` (off; hard cap 5) | Bounded pre-qualification `eth_sendBundle` attempts. Operator-only; not a back door around the seven-day gate. See [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md#live-smoke). |
+| `LIVE_SMOKE_MAX` | `0` (off; hard cap 5) | Bounded pre-qualification submission attempts. Operator-only; not a back door around the seven-day gate. |
+| `LIVE_SMOKE_MAX_GAS_COST_WEI` | `0` (raw smoke off) | Raw mode only: durable cap on the sum of each attempted smoke payload's `gasLimit × maxFeePerGas`. |
+| `RAW_CANCEL_BUMP_BPS` | `1250` | Raw replacement bump over both original EIP-1559 fee caps (12.5%). |
+| `RAW_CANCEL_MAX_FEE_WEI` | `500 gwei` | Hard `maxFeePerGas` ceiling for cancellation; exceeding it fails closed. |
 
 The names are wei- or bps-denominated on purpose. `MIN_NET_PROFIT_ETH`,
 `MAX_BASE_FEE_GWEI`, `MAX_DRAWDOWN_ETH`, and `BUILDER_SHARE_BPS` are **not**

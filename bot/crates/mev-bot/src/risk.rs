@@ -416,6 +416,8 @@ mod tests {
             },
             addresses: *crate::config::known::ethereum(),
             priority_fee_wei: alloy_primitives::U256::from(1_000_000_000u64),
+            raw_cancel_bump_bps: 1_250,
+            raw_cancel_max_fee_wei: alloy_primitives::U256::from(500_000_000_000u64),
             submission_mode: crate::config::SubmissionMode::Bundle,
             qualification_backend: crate::config::QualificationBackend::Relay,
             chain_block_ingest: false,
@@ -513,6 +515,7 @@ mod tests {
             submission_retry_ms: 250,
             submission_max_attempts: 2,
             live_smoke_max: 0,
+            live_smoke_max_gas_cost_wei: alloy_primitives::U256::ZERO,
         })
     }
 

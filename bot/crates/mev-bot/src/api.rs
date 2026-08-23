@@ -8,6 +8,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::U256;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::{header, HeaderValue, Method};
@@ -213,6 +214,8 @@ fn live_smoke(e: &Engine) -> serde_json::Value {
         "max": max,
         "used": used,
         "remaining": crate::config::smoke_remaining(used, max),
+        "gasAtRiskWei": e.store.smoke_gas_at_risk_wei().unwrap_or(U256::MAX).to_string(),
+        "maxGasCostWei": e.cfg.live_smoke_max_gas_cost_wei.to_string(),
     })
 }
 

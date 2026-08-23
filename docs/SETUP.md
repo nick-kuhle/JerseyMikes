@@ -133,20 +133,21 @@ What `CHAIN_ID=8453` selects automatically (no code, all env-overridable):
 | --- | --- | --- |
 | Address registry | Base WETH/USDC/DAI/cbBTC/USDbC, V3 factory/QuoterV2/SwapRouter02, V2 factory, UniversalRouter, Balancer vault (same address as mainnet) | per-chain deployments |
 | `SUBMISSION_MODE` | `raw` | no relay market: signed txs go straight to the RPC, priority fee is the ordering currency |
-| `QUALIFICATION_BACKEND` | `sequencer` | the qualification second opinion is the included block (fork vs canonical), not a relay `eth_callBundle` |
+| `QUALIFICATION_BACKEND` | `sequencer` | the independent second opinion is an explicit canonical state comparison, not a relay `eth_callBundle`; route matches remain separate |
 | `REFORK_EVERY_BLOCKS` | `6` | 2 s blocks: per-block refork would be 6× the mainnet refork rate |
 | `BLOCK_TIME_MS` | `2000` | Base cadence |
 | `CHAIN_BLOCK_INGEST` | `on` | the sequencer's own built blocks are the "delivered blocks" (there is no relay data API) |
 | `RELAY_TX_INGEST` / `MEV_SHARE` / `RELAY_DATA_URLS` | `off` / empty | mainnet-only data sources must not bleed into a Base funnel |
 
 Base is a **sequencer chain**: no public mempool, so the front-run strategies
-(sandwich/sandwich_v3/jit) are off by default in `.env.example.base` and the
-v1 lane is flash-loan `atomic_arb` against the sequencer feed. Lending
-protocols exist on Base but are deliberately unregistered in v1 (phase 2).
-Arming, qualification and the go-live procedure run **per chain** —
-[`PATH_TO_LIVE.md`](PATH_TO_LIVE.md) is a per-chain checklist, and
+(sandwich/sandwich_v3/jit) are off by default in `.env.example.base`. The Base
+instance is currently shadow measurement only: atomic arb prices the V2 graph,
+Base has one V2 venue, and preconfirmed-state raw backruns are not implemented.
+Follow [`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md)
+before any Base arming. Lending protocols exist on Base but are deliberately
+unregistered. Process, DB, qualification and risk controls remain per-chain;
 [`DEPLOYMENT.md`](DEPLOYMENT.md#multi-chain-layout-ethereum--base) covers the
-`mev-bot@base` unit + the console's `CHAINS` registry.
+`mev-bot@base` unit and console `CHAINS` registry.
 
 ---
 

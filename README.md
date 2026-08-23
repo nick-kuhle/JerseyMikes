@@ -174,13 +174,15 @@ address profile (`1` = Ethereum, `8453` = Base); any other id runs with an
 empty profile that the `*_ADDRESS` env vars fill in field-by-field, so a new
 chain needs no code.
 
-Sequencer chains (Base) differ in three env rows: `SUBMISSION_MODE=raw`
-(signed txs go straight to the chain RPC — no relay market — with
-`PRIORITY_FEE_WEI` as the ordering currency), `QUALIFICATION_BACKEND=sequencer`
-(the qualification second opinion is the included block, not a relay
-`eth_callBundle`), and `BRIBE_BPS=0`. Front-run strategies are off by default
-there (no public mempool — it is back-run-only); the v1 lane is flash-loan
-`atomic_arb`. See `.env.example.base` and [`docs/SETUP.md`](docs/SETUP.md).
+Sequencer chains (Base) use `SUBMISSION_MODE=raw`,
+`QUALIFICATION_BACKEND=sequencer`, `BRIBE_BPS=0`, fee-bounded raw cancellation,
+and a separate wei-denominated raw-smoke exposure cap. Front-run strategies
+are off by default (no public mempool). Base is currently a **shadow
+measurement instance**, not a certified revenue lane: atomic arb prices only
+the V2 graph, Base registers one V2 venue, and preconfirmed-state raw backruns
+are not yet implemented. See `.env.example.base`,
+[`docs/BASE_SAFETY_FOUNDATION.md`](docs/BASE_SAFETY_FOUNDATION.md), and
+[`docs/BASE_REVENUE_PATH_WORK_ORDER.md`](docs/BASE_REVENUE_PATH_WORK_ORDER.md).
 
 ## The console
 
@@ -281,6 +283,8 @@ to measure what is reachable, not to be profitable. See
 | [`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md) | Switching a simulating bot over to live: securing the API first, the `.env` upgrade trap, tightening risk, arming last |
 | [`docs/PATH_TO_LIVE.md`](docs/PATH_TO_LIVE.md) | The one-page in-the-room runbook for the live-smoke burst + 7-day soak (a per-chain procedure) |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
+| [`docs/BASE_SAFETY_FOUNDATION.md`](docs/BASE_SAFETY_FOUNDATION.md) | Base upgrade behavior: raw acceptance, cancellation, gas-at-risk smoke, qualification migration |
+| [`docs/BASE_REVENUE_PATH_WORK_ORDER.md`](docs/BASE_REVENUE_PATH_WORK_ORDER.md) | Successor work order for Flashblocks state semantics, V3/Aerodrome execution, independent qualification and Base smoke |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
 
 ## Status
