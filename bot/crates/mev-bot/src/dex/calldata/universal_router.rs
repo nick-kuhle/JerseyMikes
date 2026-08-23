@@ -206,7 +206,7 @@ pub fn decode_v3_path(path: &[u8]) -> Option<Vec<Address>> {
         return None;
     }
     // 20 + n*(3+20) == len, n >= 1
-    if (path.len() - 20) % 23 != 0 {
+    if !(path.len() - 20).is_multiple_of(23) {
         return None;
     }
     let mut tokens = Vec::new();

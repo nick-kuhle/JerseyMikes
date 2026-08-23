@@ -134,7 +134,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         for byte in a.iter().chain(b.iter()) {
             sink |= *byte;
         }
-        return std::hint::black_box(sink) == 0 && false;
+        std::hint::black_box(sink);
+        return false;
     }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
