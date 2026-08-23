@@ -711,6 +711,15 @@ impl Engine {
             now_ms(),
         )));
 
+        if cfg.live_smoke_max > 0 {
+            tracing::warn!(
+                target: "engine",
+                max = cfg.live_smoke_max,
+                used = store.smoke_used().unwrap_or(0),
+                "LIVE_SMOKE_MAX is set — up to that many bundles may be sent without qualification PASS"
+            );
+        }
+
         // Built before the struct literal below moves `cfg`.
         let mode = LiveMode::armed_at_boot(cfg.live_execution);
         // Only wire the replay queue when there is a relay feed to fill it.
@@ -766,6 +775,17 @@ impl Engine {
 
     fn strategy_qualified(&self, strategy: Strategy) -> bool {
         self.qualification.read().strategy_passes(strategy)
+    }
+
+    /// Qualification PASS, or a remaining smoke slot. Smoke never promotes a
+    /// shadow-only strategy — `RiskEngine::submittable` still requires
+    /// `live_candidate()`.
+    fn may_broadcast(&self, strategy: Strategy) -> bool {
+        if self.strategy_qualified(strategy) {
+            return true;
+        }
+        let used = self.store.smoke_used().unwrap_or(u64::MAX);
+        crate::config::smoke_allows(used, self.cfg.live_smoke_max)
     }
 
     fn refresh_qualification(self: &Arc<Self>) {
@@ -1578,7 +1598,8 @@ impl Engine {
         initial_bundle: crate::types::BundleRecord,
     ) -> crate::types::BundleRecord {
         let qualification = self.qualification_status();
-        if !qualification.strategy_passes(opp.strategy) {
+        let qualified = qualification.strategy_passes(opp.strategy);
+        if !qualified && !self.may_broadcast(opp.strategy) {
             let reasons = qualification
                 .strategies
                 .iter()
@@ -1595,12 +1616,25 @@ impl Engine {
         let head = self.ctx.head().number;
         if !self.mode.live()
             || !self.cfg.broadcast_enabled
-            || !self.strategy_qualified(opp.strategy)
+            || !self.may_broadcast(opp.strategy)
             || !self.inventory.broadcast_available(head)
             || initial_bundle.target_block <= head
         {
             return initial_bundle;
         }
+
+        // Re-read the pending nonce immediately before reserving. A stale
+        // inventory (failed refresh, or a tx that landed since the last head)
+        // is exactly how a live send becomes "nonce too low" at the builder.
+        let _ = self
+            .inventory
+            .refresh(
+                &self.http,
+                self.cfg.endpoints.searcher_address,
+                self.cfg.chain.weth,
+                self.cfg.endpoints.executor,
+            )
+            .await;
 
         let nonce_count = Inventory::legs(opp);
         if nonce_count == 0 {
@@ -1642,8 +1676,10 @@ impl Engine {
         }
 
         // Recheck mutable controls after any serialized exact-payload rerun.
+        // `may_broadcast` (not `strategy_qualified`) so a remaining smoke
+        // slot can still proceed; shadow-only strategies never reach here.
         if !self.mode.live()
-            || !self.strategy_qualified(opp.strategy)
+            || !self.may_broadcast(opp.strategy)
             || self.risk.check(opp, base_fee).is_err()
             || !self.inventory.can_fund(opp)
         {
@@ -1665,6 +1701,52 @@ impl Engine {
             let _ = self.inventory.release_nonces(start_nonce, nonce_count);
             tracing::error!(target: "submission", bundle = %bundle.id, "durable nonce reservation failed; refusing broadcast");
             return bundle;
+        }
+
+        // Smoke is a bounded, durable bypass of qualification PASS only.
+        // Consume after every other gate, immediately before the send.
+        // A persist failure or exhausted budget refuses the send; a
+        // restart cannot refill the counter. Qualified strategies do not
+        // spend a slot.
+        if !self.strategy_qualified(opp.strategy) {
+            match self.store.try_consume_smoke_slot(self.cfg.live_smoke_max) {
+                Ok(true) => {
+                    tracing::warn!(
+                        target: "submission",
+                        strategy = opp.strategy.as_str(),
+                        used = self.store.smoke_used().unwrap_or(0),
+                        max = self.cfg.live_smoke_max,
+                        bundle = %bundle.id,
+                        "consuming a live-smoke slot — sending without qualification PASS"
+                    );
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        target: "submission",
+                        strategy = opp.strategy.as_str(),
+                        bundle = %bundle.id,
+                        "live-smoke budget exhausted; refusing send"
+                    );
+                    let _ = self
+                        .store
+                        .set_nonce_reservation_status(&bundle.id, "cancelled");
+                    let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                    return bundle;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "submission",
+                        %error,
+                        bundle = %bundle.id,
+                        "could not persist live-smoke slot; refusing send"
+                    );
+                    let _ = self
+                        .store
+                        .set_nonce_reservation_status(&bundle.id, "cancelled");
+                    let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                    return bundle;
+                }
+            }
         }
 
         bundle.submitted = self.submission.submit(&bundle).await;

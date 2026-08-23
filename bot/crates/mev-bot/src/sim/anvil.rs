@@ -598,6 +598,27 @@ impl AnvilSim {
                 .await;
         }
 
+        // Same restore for *our* legs. Inventory starts at 0 and is only
+        // advanced by a successful `eth_getTransactionCount`; a used searcher
+        // key, a failed refresh, or a previous sim whose `evm_revert` did not
+        // land all produce "searcher tx 0 rejected: nonce too low" against
+        // the fork's real nonce. The signed bytes are the source of truth —
+        // pin the fork to them, exactly as we do for the victim.
+        if let Some(nonce) = bundle
+            .txs
+            .iter()
+            .find(|tx| !tx.foreign)
+            .and_then(|tx| crate::rlp::decode_eip1559_nonce(&tx.raw))
+        {
+            let _ = self
+                .rpc
+                .call_raw(
+                    "anvil_setNonce",
+                    json!([format!("{:?}", self.searcher), format!("0x{nonce:x}")]),
+                )
+                .await;
+        }
+
         for (index, tx) in bundle.txs.iter().enumerate() {
             let raw = format!("0x{}", hex::encode(&tx.raw));
             match self

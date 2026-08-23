@@ -15,7 +15,9 @@ relay only after all of these independent checks:
 4. boot arming (`LIVE_EXECUTION=true` and `I_UNDERSTAND_LIVE_RISK=yes`);
 5. independent capability (`BROADCAST_ENABLED=true`);
 6. authenticated runtime mode is live;
-7. the candidate strategy's own qualification verdict is `PASS`;
+7. the candidate strategy's own qualification verdict is `PASS`, **or** a
+   remaining `LIVE_SMOKE_MAX` slot is consumed (default 0 / off; hard cap 5;
+   durable in SQLite; never promotes a shadow-only strategy);
 8. no unresolved startup nonce-recovery block;
 9. exact reserved-nonce fork simulation succeeds.
 
@@ -30,6 +32,7 @@ configured relay reputation signer while bundle transactions use the funded
 | --- | --- | --- |
 | Broadcast capability | `BROADCAST_ENABLED` | restart |
 | Boot arming | `LIVE_EXECUTION` + literal `I_UNDERSTAND_LIVE_RISK=yes` | restart |
+| Live smoke | `LIVE_SMOKE_MAX` (0 = off, cap 5) | restart; remaining slots live in SQLite |
 | Runtime mode | authenticated `POST /api/mode` | immediate, can only narrow boot arming |
 | Strategy qualification | canonical evidence in SQLite | continuously recomputed |
 | Risk/strategy narrowing | authenticated `POST /api/risk` | immediate |
@@ -73,6 +76,7 @@ Set in the environment; see `.env.example`.
 | `MAX_GAS_PER_BUNDLE` | `3,000,000` | Bundle gas ceiling |
 | `MAX_DRAWDOWN_WEI` | `0` (off) | Cumulative simulated loss that trips the kill switch |
 | `MAX_INFLIGHT_PER_STRATEGY` | `32` | Concurrent simulations per strategy |
+| `LIVE_SMOKE_MAX` | `0` (off; hard cap 5) | Bounded pre-qualification `eth_sendBundle` attempts. Operator-only; not a back door around the seven-day gate. See [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md#live-smoke). |
 
 The names are wei- or bps-denominated on purpose. `MIN_NET_PROFIT_ETH`,
 `MAX_BASE_FEE_GWEI`, `MAX_DRAWDOWN_ETH`, and `BUILDER_SHARE_BPS` are **not**

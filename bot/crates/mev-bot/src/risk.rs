@@ -507,6 +507,7 @@ mod tests {
             finality_depth: 12,
             submission_retry_ms: 250,
             submission_max_attempts: 2,
+            live_smoke_max: 0,
         })
     }
 

@@ -105,6 +105,41 @@ live-eligible lanes; everything else is shadow-only by design
 (`DECODE_UNIVERSAL_ROUTER`) stays `false` until `W6_MEMO.md` is filled in
 from funnel-week data.
 
+## Phase 3b — optional live-smoke burst (one or two real sends)
+
+The 7-day soak still cannot start counting *live* evidence until the
+signing → relay → nonce → executor path has been proven once. Qualification
+cannot be env-knobbed away (`QUALIFICATION_HOURS` is `.max(1)` and still
+needs high-confidence matches). For a bounded proving burst, set these in
+the **operator** `.env` — they are not repository defaults:
+
+```ini
+LIVE_SMOKE_MAX=2
+BROADCAST_ENABLED=true
+LIVE_EXECUTION=true
+I_UNDERSTAND_LIVE_RISK=yes
+MIN_NET_PROFIT_WEI=1
+```
+
+`LIVE_SMOKE_MAX` is hard-capped at 5 and counted in SQLite, so a restart
+cannot refill it. Every other gate still applies: shadow-only strategies
+are never sent. Prefer `atomic_arb` (Balancer flash loan, no executor
+WETH). Sandwich needs WETH in the executor. Fund the searcher with
+~0.05–0.1 ETH for gas and point `BUNDLE_RELAY_URLS` at Titan / Quasar /
+Eureka / Flashbots.
+
+After one or two `eth_sendBundle` attempts (`GET /api/status` →
+`liveSmoke.used`):
+
+```ini
+LIVE_SMOKE_MAX=0
+BROADCAST_ENABLED=false
+LIVE_EXECUTION=false
+I_UNDERSTAND_LIVE_RISK=no
+```
+
+Keep the SQLite file. Then continue Phase 4.
+
 ## Phase 4 — start the 7-day soak (fail-closed)
 
 `/etc/jerseymikes/env`:
@@ -151,8 +186,9 @@ sudo systemctl restart mev-bot
 The broadcast lane engages only when **every** independent gate passes —
 strategy lane, engineering live-candidate, risk/drawdown/gas/inventory,
 boot arming, broadcast capability, authenticated live mode, that strategy's
-own `PASS` verdict, no unresolved nonce recovery, and a reserved-nonce fork
-simulation of the exact bundle. Miss one and nothing is sent.
+own `PASS` verdict (or a remaining `LIVE_SMOKE_MAX` slot), no unresolved
+nonce recovery, and a reserved-nonce fork simulation of the exact bundle.
+Miss one and nothing is sent.
 
 **Rollback (disarm) at any time:** set `LIVE_EXECUTION=false` (or
 `BROADCAST_ENABLED=false`), restart, and/or `POST /api/mode` `{"live": false}`.

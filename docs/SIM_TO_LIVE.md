@@ -135,14 +135,65 @@ A bundle reaches a relay only when all are true:
 4. the process was armed at boot;
 5. runtime mode is live;
 6. `BROADCAST_ENABLED=true`;
-7. that strategy's current qualification verdict is `PASS`;
+7. that strategy's current qualification verdict is `PASS`, **or** a
+   remaining `LIVE_SMOKE_MAX` slot is consumed (see [Live smoke](#live-smoke));
 8. startup nonce recovery is not blocking reuse;
 9. the exact reserved-nonce payload succeeds in simulation.
+
+## Live smoke
+
+Qualification cannot be env-knobbed away: `QUALIFICATION_HOURS` and the sample
+floors are `.max(1)`, and a strategy still needs high-confidence
+`actual_mev_matches`. The 7-day soak is the production path.
+
+Before that soak, operators sometimes need one or two *real*
+`eth_sendBundle`s so the signing, relay, nonce, and executor path is proven
+on chain — even if those shots lose money. That is `LIVE_SMOKE_MAX`:
+
+```ini
+LIVE_SMOKE_MAX=2
+BROADCAST_ENABLED=true
+LIVE_EXECUTION=true
+I_UNDERSTAND_LIVE_RISK=yes
+MIN_NET_PROFIT_WEI=1
+```
+
+Defaults stay fail-closed (`LIVE_SMOKE_MAX=0`). The value is hard-capped at
+5. A smoke send still requires every other gate: boot arming, broadcast
+capability, runtime live mode, risk, inventory, a live-candidate strategy
+(`sandwich` / `sandwich_v3` / `atomic_arb`), and an exact reserved-nonce
+sim. Shadow-only strategies (`jit`, liquidations, sniper) are never
+promoted. `RiskEngine::submittable` is not loosened.
+
+The counter lives in SQLite (`risk_state.live_smoke_used`). A slot is
+consumed after every recheck, immediately before `eth_sendBundle`. A persist
+failure refuses the send. A restart cannot refill the budget.
+
+Prefer `atomic_arb` for the first live shot: it is Balancer-flash-loan
+funded and does not need executor WETH. Sandwich needs WETH already sitting
+in the executor.
+
+After one or two sends, turn it off and keep the database (the qualification
+clock is still running):
+
+```ini
+LIVE_SMOKE_MAX=0
+# or BROADCAST_ENABLED=false
+```
+
+`GET /api/status` reports `liveSmoke: {max, used, remaining}`. `doctor`
+prints the same numbers.
 
 ## Nonce recovery and finality
 
 Live candidates pass through a single serialized nonce lane. The chosen nonce
-is used by both simulations and submission. Before sending, the reservation is
+is used by both simulations and submission. Immediately before reserving, the
+engine re-reads `eth_getTransactionCount(searcher, "pending")` so a stale
+inventory cannot sign a nonce the builders will reject as "too low". The
+anvil fork pins the searcher to the nonce encoded in the signed EIP-1559
+bytes (the same restore already applied to the victim) so a used searcher
+key or a previous sim whose `evm_revert` did not land cannot produce
+`searcher tx 0 rejected: nonce too low`. Before sending, the reservation is
 written synchronously to SQLite. At startup, unresolved replacement UUIDs are
 cancelled at all configured relays. If every cancellation cannot be proven,
 new broadcasts remain blocked through the old target block; nonce reuse is not

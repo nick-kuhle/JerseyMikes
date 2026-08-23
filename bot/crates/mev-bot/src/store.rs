@@ -365,7 +365,8 @@ impl Store {
                 id                    INTEGER PRIMARY KEY CHECK (id = 1),
                 kill_switch_tripped   INTEGER NOT NULL DEFAULT 0,
                 tripped_at_ms         INTEGER,
-                cumulative_net_wei    TEXT NOT NULL DEFAULT '0'
+                cumulative_net_wei    TEXT NOT NULL DEFAULT '0',
+                live_smoke_used       INTEGER NOT NULL DEFAULT 0
             );
             INSERT OR IGNORE INTO risk_state (id, kill_switch_tripped, cumulative_net_wei)
                 VALUES (1, 0, '0');
@@ -396,6 +397,11 @@ impl Store {
             "actual_mev_matches",
             "completeness",
             "TEXT NOT NULL DEFAULT '{}'",
+        );
+        self.add_column(
+            "risk_state",
+            "live_smoke_used",
+            "INTEGER NOT NULL DEFAULT 0",
         );
         Ok(())
     }
@@ -1352,12 +1358,42 @@ impl Store {
         }
     }
 
+    /// How many smoke slots have already been consumed. Missing column/row → 0.
+    pub fn smoke_used(&self) -> Result<u64> {
+        let n: i64 = match self.conn.lock().query_row(
+            "SELECT COALESCE(live_smoke_used, 0) FROM risk_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(n) => n,
+            Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(n.max(0) as u64)
+    }
+
+    /// Atomically consume one smoke slot if `used < max`. Returns whether a
+    /// slot was taken. Fail-closed: a full budget or a write error is `false`
+    /// / `Err`, never a silent extra send.
+    pub fn try_consume_smoke_slot(&self, max: u64) -> Result<bool> {
+        if max == 0 {
+            return Ok(false);
+        }
+        let changed = self.conn.lock().execute(
+            "UPDATE risk_state SET live_smoke_used = live_smoke_used + 1
+             WHERE id = 1 AND live_smoke_used < ?1",
+            params![max as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Persist the kill-switch flag and the cumulative that produced it.
     ///
     /// Synchronous on purpose: this is safety state, not telemetry. A full
     /// `AsyncStore` queue must not be allowed to drop a trip. `tripped_at_ms`
     /// is sticky for the life of a trip so a later persist of the same trip
-    /// does not rewrite the original timestamp.
+    /// does not rewrite the original timestamp. The update list does not
+    /// touch `live_smoke_used`, so a trip cannot refill or wipe the budget.
     pub fn persist_kill_switch(&self, tripped: bool, cumulative_net_wei: i128) -> Result<()> {
         let conn = self.conn.lock();
         let existing_at: Option<i64> = conn
@@ -2320,6 +2356,20 @@ mod tests {
         assert!(!cleared.tripped);
         assert_eq!(cleared.cumulative_net_wei, 0);
         assert!(cleared.tripped_at_ms.is_none());
+    }
+
+    #[test]
+    fn smoke_slots_are_durable_and_capped() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.smoke_used().unwrap(), 0);
+        assert!(s.try_consume_smoke_slot(2).unwrap());
+        assert!(s.try_consume_smoke_slot(2).unwrap());
+        assert!(!s.try_consume_smoke_slot(2).unwrap(), "budget exhausted");
+        assert_eq!(s.smoke_used().unwrap(), 2);
+        assert!(!s.try_consume_smoke_slot(0).unwrap(), "max=0 is off");
+        // A kill-switch persist must not reset the smoke counter.
+        s.persist_kill_switch(true, -1).unwrap();
+        assert_eq!(s.smoke_used().unwrap(), 2);
     }
 
     #[tokio::test]
