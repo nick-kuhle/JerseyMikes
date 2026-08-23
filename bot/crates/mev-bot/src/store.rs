@@ -55,7 +55,34 @@ pub struct ActualMevMatch {
     pub gas_cost_wei: U256,
     pub net_weth_wei: i128,
     pub confidence: String,
+    /// Numeric confidence is explicit and machine-comparable; 10_000 is exact.
+    pub confidence_score_bps: u64,
+    /// Which economic components were observed versus inferred or unavailable.
+    pub completeness: serde_json::Value,
     pub evidence: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QualificationEvidence {
+    pub fork_samples: u64,
+    pub relay_errors_bps: Vec<u64>,
+    pub actual_errors_bps: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ObservationCoverage {
+    pub first_seen_ms: Option<u64>,
+    pub last_seen_ms: Option<u64>,
+    pub maximum_gap_ms: u64,
+    pub observations: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveNonceReservation {
+    pub bundle_id: String,
+    pub start_nonce: u64,
+    pub nonce_count: u64,
+    pub target_block: u64,
 }
 
 pub struct Store {
@@ -228,6 +255,17 @@ impl Store {
                 UNIQUE(bundle_id, relay)
             );
 
+            CREATE TABLE IF NOT EXISTS nonce_reservations (
+                bundle_id TEXT PRIMARY KEY,
+                opportunity_id TEXT NOT NULL,
+                start_nonce INTEGER NOT NULL,
+                nonce_count INTEGER NOT NULL,
+                target_block INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS actual_mev_matches (
                 opportunity_id TEXT PRIMARY KEY,
                 block_number INTEGER NOT NULL,
@@ -300,6 +338,23 @@ impl Store {
         self.add_column("bundles", "included", "INTEGER");
         self.add_column("bundles", "included_block", "INTEGER");
         self.add_column("bundles", "inclusion_checked_ms", "INTEGER");
+        self.add_column(
+            "bundles",
+            "inclusion_state",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        );
+        self.add_column("bundles", "observed_tx_hashes", "TEXT");
+        self.add_column("execution_outcomes", "finalized_block", "INTEGER");
+        self.add_column(
+            "actual_mev_matches",
+            "confidence_score_bps",
+            "INTEGER NOT NULL DEFAULT 0",
+        );
+        self.add_column(
+            "actual_mev_matches",
+            "completeness",
+            "TEXT NOT NULL DEFAULT '{}'",
+        );
         Ok(())
     }
 
@@ -603,6 +658,18 @@ impl Store {
             params![from_block as i64, to_block as i64],
         )?;
         conn.execute(
+            "UPDATE bundles SET included = NULL, inclusion_state = 'reorged_pending'
+             WHERE included_block >= ?1 AND included_block <= ?2",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE nonce_reservations SET status = 'reorged', updated_at_ms = ?3
+             WHERE bundle_id IN (
+               SELECT id FROM bundles WHERE included_block >= ?1 AND included_block <= ?2
+             )",
+            params![from_block as i64, to_block as i64, now_ms() as i64],
+        )?;
+        conn.execute(
             "UPDATE blocks SET canonical = 0 WHERE number >= ?1 AND number <= ?2",
             params![from_block as i64, to_block as i64],
         )?;
@@ -879,6 +946,7 @@ impl Store {
         &self,
         bundle: &SubmittedBundle,
         block_number: u64,
+        finalized_block: u64,
         gross_profit: U256,
         bribe: U256,
         retained_profit: U256,
@@ -891,8 +959,8 @@ impl Store {
             "INSERT OR REPLACE INTO execution_outcomes
              (bundle_id, opportunity_id, block_number, tx_hashes, gross_profit_wei,
               bribe_wei, retained_profit_wei, gas_cost_wei, net_profit_wei,
-              canonical, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",
+              canonical, created_at_ms, finalized_block)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10,?11)",
             params![
                 bundle.bundle_id,
                 bundle.opportunity_id,
@@ -910,22 +978,164 @@ impl Store {
                 gas_cost.to_string(),
                 net_profit.to_string(),
                 now_ms() as i64,
+                finalized_block as i64,
             ],
         )?;
         txn.execute(
-            "UPDATE bundles SET included = 1, included_block = ?2, inclusion_checked_ms = ?3 WHERE id = ?1",
-            params![bundle.bundle_id, block_number as i64, now_ms() as i64],
+            "UPDATE nonce_reservations SET status = 'finalized', updated_at_ms = ?2
+             WHERE bundle_id = ?1",
+            params![bundle.bundle_id, now_ms() as i64],
+        )?;
+        txn.execute(
+            "UPDATE bundles SET included = 1, included_block = ?2,
+                    inclusion_checked_ms = ?3, inclusion_state = 'finalized_included',
+                    observed_tx_hashes = ?4 WHERE id = ?1",
+            params![
+                bundle.bundle_id,
+                block_number as i64,
+                now_ms() as i64,
+                serde_json::to_string(
+                    &bundle
+                        .tx_hashes
+                        .iter()
+                        .map(|hash| format!("{hash:?}"))
+                        .collect::<Vec<_>>()
+                )?
+            ],
         )?;
         txn.commit()?;
         Ok(())
     }
 
     pub fn mark_bundle_not_included(&self, bundle_id: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE bundles SET included = 0, inclusion_checked_ms = ?2 WHERE id = ?1",
+        let mut conn = self.conn.lock();
+        let txn = conn.transaction()?;
+        txn.execute(
+            "UPDATE bundles SET included = 0, inclusion_checked_ms = ?2,
+                    inclusion_state = 'finalized_not_included' WHERE id = ?1",
             params![bundle_id, now_ms() as i64],
         )?;
+        txn.execute(
+            "UPDATE nonce_reservations SET status = 'expired', updated_at_ms = ?2
+             WHERE bundle_id = ?1",
+            params![bundle_id, now_ms() as i64],
+        )?;
+        txn.commit()?;
         Ok(())
+    }
+
+    pub fn mark_bundle_observation(
+        &self,
+        bundle_id: &str,
+        state: &str,
+        observed_hashes: &[alloy_primitives::B256],
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE bundles SET inclusion_state = ?2, observed_tx_hashes = ?3,
+                    inclusion_checked_ms = ?4 WHERE id = ?1",
+            params![
+                bundle_id,
+                state,
+                serde_json::to_string(
+                    &observed_hashes
+                        .iter()
+                        .map(|hash| format!("{hash:?}"))
+                        .collect::<Vec<_>>()
+                )?,
+                now_ms() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finalize_bundle_state(
+        &self,
+        bundle_id: &str,
+        state: &str,
+        included: bool,
+        included_block: Option<u64>,
+        observed_hashes: &[alloy_primitives::B256],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let txn = conn.transaction()?;
+        txn.execute(
+            "UPDATE bundles SET included = ?2, included_block = ?3,
+                    inclusion_state = ?4, observed_tx_hashes = ?5,
+                    inclusion_checked_ms = ?6 WHERE id = ?1",
+            params![
+                bundle_id,
+                included as i32,
+                included_block.map(|value| value as i64),
+                state,
+                serde_json::to_string(
+                    &observed_hashes
+                        .iter()
+                        .map(|hash| format!("{hash:?}"))
+                        .collect::<Vec<_>>()
+                )?,
+                now_ms() as i64
+            ],
+        )?;
+        txn.execute(
+            "UPDATE nonce_reservations SET status = ?2, updated_at_ms = ?3
+             WHERE bundle_id = ?1",
+            params![bundle_id, state, now_ms() as i64],
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn reserve_bundle_nonces(
+        &self,
+        bundle_id: &str,
+        opportunity_id: &str,
+        start_nonce: u64,
+        nonce_count: u64,
+        target_block: u64,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR REPLACE INTO nonce_reservations
+             (bundle_id, opportunity_id, start_nonce, nonce_count, target_block,
+              status, created_at_ms, updated_at_ms)
+             VALUES (?1,?2,?3,?4,?5,'reserved',?6,?6)",
+            params![
+                bundle_id,
+                opportunity_id,
+                start_nonce as i64,
+                nonce_count as i64,
+                target_block as i64,
+                now_ms() as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_nonce_reservation_status(&self, bundle_id: &str, status: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE nonce_reservations SET status = ?2, updated_at_ms = ?3
+             WHERE bundle_id = ?1",
+            params![bundle_id, status, now_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn active_nonce_reservations(&self) -> Result<Vec<ActiveNonceReservation>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT bundle_id, start_nonce, nonce_count, target_block
+             FROM nonce_reservations
+             WHERE status IN ('reserved','accepted','recovery_blocked')
+             ORDER BY start_nonce ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ActiveNonceReservation {
+                bundle_id: row.get(0)?,
+                start_nonce: row.get::<_, i64>(1)?.max(0) as u64,
+                nonce_count: row.get::<_, i64>(2)?.max(0) as u64,
+                target_block: row.get::<_, i64>(3)?.max(0) as u64,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn record_relay_submission(
@@ -988,9 +1198,9 @@ impl Store {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO actual_mev_matches
              (opportunity_id, block_number, victim_hash, mev_tx_hashes, actor,
-              gross_weth_wei, gas_cost_wei, net_weth_wei, confidence, evidence,
-              canonical, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11)",
+              gross_weth_wei, gas_cost_wei, net_weth_wei, confidence,
+              confidence_score_bps, completeness, evidence, canonical, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)",
             params![
                 matched.opportunity_id,
                 matched.block_number as i64,
@@ -1001,6 +1211,8 @@ impl Store {
                 matched.gas_cost_wei.to_string(),
                 matched.net_weth_wei.to_string(),
                 matched.confidence,
+                matched.confidence_score_bps as i64,
+                matched.completeness.to_string(),
                 matched.evidence.to_string(),
                 now_ms() as i64,
             ],
@@ -1008,35 +1220,147 @@ impl Store {
         Ok(())
     }
 
-    pub fn qualification_counts(&self, since_ms: u64) -> Result<(u64, u64, u64)> {
+    /// Canonical observation continuity over the requested qualification window.
+    /// A prior observation at or before `since_ms` anchors the left edge; the
+    /// right edge includes the gap from the newest observation to `now_ms`.
+    pub fn observation_coverage(&self, since_ms: u64, now_ms: u64) -> Result<ObservationCoverage> {
         let conn = self.conn.lock();
-        let live_candidates: i64 = conn.query_row(
+        let first_seen_ms = conn
+            .query_row(
+                "SELECT MIN(seen_at_ms) FROM blocks WHERE canonical = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .map(|value| value.max(0) as u64);
+        let anchor = conn
+            .query_row(
+                "SELECT MAX(seen_at_ms) FROM blocks
+                 WHERE canonical = 1 AND seen_at_ms <= ?1",
+                params![since_ms as i64],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .map(|value| value.max(0) as u64);
+        let mut stmt = conn.prepare(
+            "SELECT seen_at_ms FROM blocks
+             WHERE canonical = 1 AND seen_at_ms > ?1
+             ORDER BY seen_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![since_ms as i64], |row| row.get::<_, i64>(0))?;
+        let mut previous = anchor;
+        let mut maximum_gap_ms = if anchor.is_some() { 0 } else { u64::MAX };
+        let mut last_seen_ms = anchor;
+        let mut observations = 0u64;
+        for seen in rows.flatten().map(|value| value.max(0) as u64) {
+            if let Some(prior) = previous {
+                maximum_gap_ms = maximum_gap_ms.max(seen.saturating_sub(prior));
+            }
+            previous = Some(seen);
+            last_seen_ms = Some(seen);
+            observations = observations.saturating_add(1);
+        }
+        if let Some(last) = last_seen_ms {
+            maximum_gap_ms = maximum_gap_ms.max(now_ms.saturating_sub(last));
+        }
+        Ok(ObservationCoverage {
+            first_seen_ms,
+            last_seen_ms,
+            maximum_gap_ms,
+            observations,
+        })
+    }
+
+    /// Strategy-specific fork, relay and corresponding-chain evidence. The
+    /// comparison vectors contain exact relative errors in basis points.
+    pub fn qualification_evidence(
+        &self,
+        since_ms: u64,
+        strategy: Strategy,
+        minimum_confidence_bps: u64,
+    ) -> Result<QualificationEvidence> {
+        let conn = self.conn.lock();
+        let strategy = strategy.as_str();
+        let fork_samples: i64 = conn.query_row(
             "SELECT COUNT(DISTINCT opportunity_id) FROM simulations
              WHERE backend = 'anvil_fork' AND success = 1 AND created_at_ms >= ?1
-               AND strategy IN ('sandwich','sandwich_v3','atomic_arb')
-               AND COALESCE(reorged, 0) = 0",
-            params![since_ms as i64],
+               AND strategy = ?2 AND COALESCE(reorged, 0) = 0",
+            params![since_ms as i64, strategy],
             |row| row.get(0),
         )?;
-        let relay_cross_checks: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT opportunity_id) FROM simulations
-             WHERE backend = 'relay_call_bundle' AND success = 1 AND created_at_ms >= ?1
-               AND strategy IN ('sandwich','sandwich_v3','atomic_arb')
-               AND COALESCE(reorged, 0) = 0",
-            params![since_ms as i64],
-            |row| row.get(0),
+
+        let mut relay_stmt = conn.prepare(
+            "SELECT CAST(f.net_wei AS TEXT), CAST(r.net_wei AS TEXT)
+             FROM simulations f
+             JOIN simulations r ON r.opportunity_id = f.opportunity_id
+             WHERE f.backend = 'anvil_fork' AND r.backend = 'relay_call_bundle'
+               AND f.success = 1 AND r.success = 1
+               AND f.strategy = ?1 AND f.created_at_ms >= ?2
+               AND COALESCE(f.reorged, 0) = 0 AND COALESCE(r.reorged, 0) = 0
+               AND f.id = (SELECT MAX(f2.id) FROM simulations f2
+                           WHERE f2.opportunity_id = f.opportunity_id
+                             AND f2.backend = 'anvil_fork')
+               AND r.id = (SELECT MAX(r2.id) FROM simulations r2
+                           WHERE r2.opportunity_id = r.opportunity_id
+                             AND r2.backend = 'relay_call_bundle')",
         )?;
-        let actual_matches: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM actual_mev_matches
-             WHERE canonical = 1 AND confidence = 'high' AND created_at_ms >= ?1",
-            params![since_ms as i64],
-            |row| row.get(0),
+        let relay_rows = relay_stmt.query_map(params![strategy, since_ms as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let relay_errors_bps = relay_rows
+            .flatten()
+            .map(|(fork, relay)| {
+                relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&relay))
+            })
+            .collect();
+
+        let mut actual_errors_bps = Vec::new();
+        let mut actual_stmt = conn.prepare(
+            "SELECT CAST(f.net_wei AS TEXT), CAST(a.net_weth_wei AS TEXT)
+             FROM actual_mev_matches a
+             JOIN opportunities o ON o.id = a.opportunity_id
+             JOIN simulations f ON f.opportunity_id = a.opportunity_id
+             WHERE o.strategy = ?1 AND a.canonical = 1
+               AND a.created_at_ms >= ?2 AND a.confidence_score_bps >= ?3
+               AND f.backend = 'anvil_fork' AND f.success = 1
+               AND COALESCE(f.reorged, 0) = 0
+               AND f.id = (SELECT MAX(f2.id) FROM simulations f2
+                           WHERE f2.opportunity_id = f.opportunity_id
+                             AND f2.backend = 'anvil_fork')",
         )?;
-        Ok((
-            live_candidates.max(0) as u64,
-            relay_cross_checks.max(0) as u64,
-            actual_matches.max(0) as u64,
-        ))
+        let actual_rows = actual_stmt.query_map(
+            params![strategy, since_ms as i64, minimum_confidence_bps as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        actual_errors_bps.extend(actual_rows.flatten().map(|(fork, actual)| {
+            relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&actual))
+        }));
+
+        // Once live execution has occurred, exact finalized own outcomes are
+        // also valid corresponding-chain evidence (confidence 10_000).
+        let mut own_stmt = conn.prepare(
+            "SELECT CAST(f.net_wei AS TEXT), CAST(e.net_profit_wei AS TEXT)
+             FROM execution_outcomes e
+             JOIN opportunities o ON o.id = e.opportunity_id
+             JOIN simulations f ON f.opportunity_id = e.opportunity_id
+             WHERE o.strategy = ?1 AND e.canonical = 1
+               AND e.created_at_ms >= ?2 AND e.finalized_block IS NOT NULL
+               AND f.backend = 'anvil_fork' AND f.success = 1
+               AND COALESCE(f.reorged, 0) = 0
+               AND f.id = (SELECT MAX(f2.id) FROM simulations f2
+                           WHERE f2.opportunity_id = f.opportunity_id
+                             AND f2.backend = 'anvil_fork')",
+        )?;
+        let own_rows = own_stmt.query_map(params![strategy, since_ms as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        actual_errors_bps.extend(own_rows.flatten().map(|(fork, actual)| {
+            relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&actual))
+        }));
+
+        Ok(QualificationEvidence {
+            fork_samples: fork_samples.max(0) as u64,
+            relay_errors_bps,
+            actual_errors_bps,
+        })
     }
 
     pub fn actual_mev_summary(&self) -> Result<serde_json::Value> {
@@ -1059,13 +1383,14 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT opportunity_id, block_number, victim_hash, mev_tx_hashes, actor,
                     gross_weth_wei, gas_cost_wei, CAST(net_weth_wei AS TEXT),
-                    confidence, evidence, created_at_ms
+                    confidence, confidence_score_bps, completeness, evidence, created_at_ms
              FROM actual_mev_matches WHERE canonical = 1
              ORDER BY block_number DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
             let hashes: String = row.get(3)?;
-            let evidence: String = row.get(9)?;
+            let completeness: String = row.get(10)?;
+            let evidence: String = row.get(11)?;
             Ok(serde_json::json!({
                 "opportunityId": row.get::<_, String>(0)?,
                 "blockNumber": row.get::<_, i64>(1)?,
@@ -1076,8 +1401,52 @@ impl Store {
                 "gasCostWei": row.get::<_, String>(6)?,
                 "netWethWei": row.get::<_, String>(7)?,
                 "confidence": row.get::<_, String>(8)?,
+                "confidenceScoreBps": row.get::<_, i64>(9)?,
+                "completeness": serde_json::from_str::<serde_json::Value>(&completeness).unwrap_or_default(),
                 "evidence": serde_json::from_str::<serde_json::Value>(&evidence).unwrap_or_default(),
-                "createdAtMs": row.get::<_, i64>(10)?,
+                "createdAtMs": row.get::<_, i64>(12)?,
+            }))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn recent_execution_outcomes(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT b.id, b.opportunity_id, b.strategy, b.target_block,
+                    b.inclusion_state, b.included, b.included_block,
+                    b.observed_tx_hashes, b.created_at_ms,
+                    e.tx_hashes, e.gross_profit_wei, e.bribe_wei,
+                    e.retained_profit_wei, e.gas_cost_wei,
+                    CAST(e.net_profit_wei AS TEXT), e.canonical, e.finalized_block,
+                    e.created_at_ms
+             FROM bundles b
+             LEFT JOIN execution_outcomes e ON e.bundle_id = b.id
+             WHERE b.submitted = 1
+             ORDER BY b.created_at_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let observed = row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "[]".into());
+            let exact_hashes = row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "[]".into());
+            Ok(serde_json::json!({
+                "bundleId": row.get::<_, String>(0)?,
+                "opportunityId": row.get::<_, String>(1)?,
+                "strategy": row.get::<_, String>(2)?,
+                "targetBlock": row.get::<_, i64>(3)?,
+                "state": row.get::<_, String>(4)?,
+                "included": row.get::<_, Option<i64>>(5)?.map(|value| value == 1),
+                "includedBlock": row.get::<_, Option<i64>>(6)?,
+                "observedTxHashes": serde_json::from_str::<serde_json::Value>(&observed).unwrap_or_default(),
+                "submittedAtMs": row.get::<_, i64>(8)?,
+                "txHashes": serde_json::from_str::<serde_json::Value>(&exact_hashes).unwrap_or_default(),
+                "grossProfitWei": row.get::<_, Option<String>>(10)?,
+                "builderPaymentWei": row.get::<_, Option<String>>(11)?,
+                "retainedProfitWei": row.get::<_, Option<String>>(12)?,
+                "gasCostWei": row.get::<_, Option<String>>(13)?,
+                "netProfitWei": row.get::<_, Option<String>>(14)?,
+                "canonical": row.get::<_, Option<i64>>(15)?.map(|value| value == 1),
+                "finalizedBlock": row.get::<_, Option<i64>>(16)?,
+                "reconciledAtMs": row.get::<_, Option<i64>>(17)?,
             }))
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -1433,6 +1802,16 @@ impl Store {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+}
+
+fn relative_error_bps(predicted: i128, observed: i128) -> u64 {
+    let difference = predicted.abs_diff(observed);
+    let denominator = observed.unsigned_abs().max(1);
+    difference
+        .saturating_mul(10_000)
+        .checked_div(denominator)
+        .unwrap_or(u128::MAX)
+        .min(u64::MAX as u128) as u64
 }
 
 fn parse_i128_decimal(value: &str) -> i128 {

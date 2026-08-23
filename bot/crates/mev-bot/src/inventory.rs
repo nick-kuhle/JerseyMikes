@@ -23,7 +23,11 @@ use crate::rpc::RpcClient;
 use crate::types::Opportunity;
 
 pub struct Inventory {
+    /// Next nonce available to this process, including private reservations.
     nonce: AtomicU64,
+    /// Broadcasting remains blocked through this height when startup recovery
+    /// could not prove that every prior private bundle was cancelled.
+    blocked_until_block: AtomicU64,
     eth_wei: RwLock<U256>,
     weth_wei: RwLock<U256>,
     /// When true, opportunities that need more notional than we hold are
@@ -35,6 +39,7 @@ impl Inventory {
     pub fn new(gate: bool) -> Self {
         Self {
             nonce: AtomicU64::new(0),
+            blocked_until_block: AtomicU64::new(0),
             eth_wei: RwLock::new(U256::ZERO),
             weth_wei: RwLock::new(U256::ZERO),
             gate,
@@ -47,6 +52,38 @@ impl Inventory {
 
     pub fn set_nonce(&self, n: u64) {
         self.nonce.store(n, Ordering::Relaxed);
+    }
+
+    /// Chain refreshes may advance the nonce but must never erase a private
+    /// reservation that is not visible in the public pending transaction pool.
+    pub fn advance_chain_nonce(&self, n: u64) {
+        self.nonce.fetch_max(n, Ordering::SeqCst);
+    }
+
+    pub fn reserve_nonces(&self, count: u64) -> u64 {
+        self.nonce.fetch_add(count, Ordering::SeqCst)
+    }
+
+    /// Release only the newest reservation. The submission semaphore makes
+    /// this the normal case; compare-exchange prevents creating a nonce gap if
+    /// a future caller violates that ordering.
+    pub fn release_nonces(&self, start: u64, count: u64) -> bool {
+        self.nonce
+            .compare_exchange(
+                start.saturating_add(count),
+                start,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    pub fn block_broadcast_until(&self, block: u64) {
+        self.blocked_until_block.fetch_max(block, Ordering::SeqCst);
+    }
+
+    pub fn broadcast_available(&self, head: u64) -> bool {
+        head > self.blocked_until_block.load(Ordering::Relaxed)
     }
 
     pub fn eth(&self) -> U256 {
@@ -115,11 +152,11 @@ impl Inventory {
         if let Ok(v) = http
             .call_raw(
                 "eth_getTransactionCount",
-                serde_json::json!([who.clone(), "latest"]),
+                serde_json::json!([who.clone(), "pending"]),
             )
             .await
         {
-            self.set_nonce(crate::types::parse_u64(&v));
+            self.advance_chain_nonce(crate::types::parse_u64(&v));
         }
         if let Ok(v) = http
             .call_raw("eth_getBalance", serde_json::json!([who.clone(), "latest"]))
@@ -140,6 +177,7 @@ impl Inventory {
     pub fn snapshot(&self) -> Value {
         json!({
             "nonce": self.nonce(),
+            "broadcastBlockedUntilBlock": self.blocked_until_block.load(Ordering::Relaxed),
             "searcherGasEthWei": self.eth().to_string(),
             "executorWethWei": self.weth().to_string(),
             // Backward-compatible aliases for the current dashboard.
@@ -224,8 +262,10 @@ mod tests {
         let inv = Inventory::new(true);
         *inv.eth_wei.write() = U256::from(10u64);
         *inv.weth_wei.write() = U256::from(5u64);
-        assert!(inv.can_fund(&opp(false, 15, false)));
-        assert!(!inv.can_fund(&opp(false, 16, false)));
+        // Non-flash principal must already be held by the executor; gas ETH
+        // cannot be counted as interchangeable WETH capital.
+        assert!(inv.can_fund(&opp(false, 5, false)));
+        assert!(!inv.can_fund(&opp(false, 6, false)));
         // Flash-funded trades skip the check.
         assert!(inv.can_fund(&opp(true, 1_000, false)));
     }

@@ -77,6 +77,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/latency", get(latency))
         .route("/api/competition", get(competition))
         .route("/api/actual-mev", get(actual_mev))
+        .route("/api/executions", get(executions))
         .route("/api/qualification", get(qualification))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
@@ -360,6 +361,14 @@ async fn actual_mev(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> i
         .actual_mev_summary()
         .unwrap_or_else(|_| json!({"matches": 0, "highConfidence": 0}));
     Json(json!({"summary": summary, "matches": matches}))
+}
+
+async fn executions(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
+    match s.engine.store.recent_execution_outcomes(limit) {
+        Ok(rows) => Json(json!({"executions": rows, "finalityDepth": s.engine.cfg.finality_depth})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
 }
 
 async fn reorgs(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {

@@ -28,6 +28,20 @@ export interface RiskValues {
   maxInflightPerStrategy: number;
 }
 
+export interface StrategyQualification {
+  strategy: Strategy;
+  liveCandidate: boolean;
+  verdict: "PASS" | "FAIL" | "INSUFFICIENT SAMPLE";
+  forkSamples: number;
+  relayComparisons: number;
+  actualComparisons: number;
+  relayWithinTolerance: number;
+  actualWithinTolerance: number;
+  relayAccuracyBps: number;
+  actualAccuracyBps: number;
+  reasons: string[];
+}
+
 export interface StatusResponse {
   chain: {id: number; name: string};
   head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number};
@@ -48,9 +62,17 @@ export interface StatusResponse {
     liveCandidateSimulations: number;
     relayCrossChecks: number;
     highConfidenceActualMatches: number;
+    observationCount: number;
+    maximumObservationGapSecs: number;
+    allowedObservationGapSecs: number;
+    minimumSamples: number;
+    minimumRelayComparisons: number;
     minimumActualMatches: number;
+    maximumErrorBps: number;
+    minimumAccuracyBps: number;
     persistenceDropped: number;
     reasons: string[];
+    strategies: StrategyQualification[];
   };
   strategies: Strategy[];
   /** Boot-time set (env toggles); `strategies` is the runtime-effective set. */
@@ -172,10 +194,36 @@ export interface ActualMevResponse {
     gasCostWei: string;
     netWethWei: string;
     confidence: "high" | "medium" | string;
+    confidenceScoreBps: number;
+    completeness: Record<string, string>;
     evidence: Record<string, unknown>;
     createdAtMs: number;
   }[];
   demo?: boolean;
+}
+
+export interface ExecutionResponse {
+  finalityDepth: number;
+  executions: {
+    bundleId: string;
+    opportunityId: string;
+    strategy: Strategy;
+    targetBlock: number;
+    state: string;
+    included: boolean | null;
+    includedBlock: number | null;
+    observedTxHashes: string[];
+    submittedAtMs: number;
+    txHashes: string[];
+    grossProfitWei: string | null;
+    builderPaymentWei: string | null;
+    retainedProfitWei: string | null;
+    gasCostWei: string | null;
+    netProfitWei: string | null;
+    canonical: boolean | null;
+    finalizedBlock: number | null;
+    reconciledAtMs: number | null;
+  }[];
 }
 
 export interface ReorgRow {

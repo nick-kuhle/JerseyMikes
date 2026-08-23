@@ -1,6 +1,6 @@
 "use client";
 
-import type {ActualMevResponse, CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
+import type {ActualMevResponse, CompetitionResponse, ExecutionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
 
 /**
  * Phase 1 instrumentation: latency histograms, competition ranking, re-orgs.
@@ -9,11 +9,13 @@ export default function Phase1Panel({
   latency,
   competition,
   actualMev,
+  executions,
   reorgs,
 }: {
   latency: LatencySnapshot | null | undefined;
   competition: CompetitionResponse | null | undefined;
   actualMev: ActualMevResponse | null | undefined;
+  executions: ExecutionResponse | null | undefined;
   reorgs: ReorgRow[] | null | undefined;
 }) {
   const total = latency?.stages?.total;
@@ -123,35 +125,42 @@ export default function Phase1Panel({
 
       <div className="panel" style={{padding: 12}}>
         <div className="panel-head">
-          <span>re-orgs</span>
-          <span className="muted">{reorgs?.length ?? 0} logged</span>
+          <span>own execution outcomes</span>
+          <span className="muted">{executions?.finalityDepth ?? "—"} block finality · {reorgs?.length ?? 0} re-orgs</span>
         </div>
-        <table className="grid">
-          <thead>
-            <tr>
-              <th>range</th>
-              <th>depth</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(reorgs ?? []).map((r, i) => (
-              <tr key={`${r.fromBlock}-${i}`}>
-                <td>
-                  #{r.fromBlock}
-                  {r.toBlock !== r.fromBlock ? `–${r.toBlock}` : ""}
-                </td>
-                <td>{r.depth}</td>
-              </tr>
-            ))}
-            {!(reorgs ?? []).length && (
+        <div style={{maxHeight: 250, overflowY: "auto"}}>
+          <table className="grid">
+            <thead>
               <tr>
-                <td colSpan={2} className="muted" style={{textAlign: "center", padding: 12}}>
-                  none this run
-                </td>
+                <th>target</th>
+                <th>strategy</th>
+                <th>state</th>
+                <th style={{textAlign: "right"}}>exact net</th>
               </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {(executions?.executions ?? []).map((execution) => (
+                <tr key={execution.bundleId} title={execution.bundleId}>
+                  <td>#{execution.targetBlock}</td>
+                  <td>{execution.strategy}</td>
+                  <td className={execution.state === "finalized_included" ? "pos" : execution.state.includes("partial") || execution.state.includes("incoherent") ? "neg" : "muted"}>
+                    {execution.state.replaceAll("_", " ")}
+                  </td>
+                  <td style={{textAlign: "right"}}>
+                    {execution.netProfitWei == null ? "—" : `${execution.netProfitWei.slice(0, 12)} wei`}
+                  </td>
+                </tr>
+              ))}
+              {!(executions?.executions ?? []).length && (
+                <tr>
+                  <td colSpan={4} className="muted" style={{textAlign: "center", padding: 12}}>
+                    no submitted bundles — broadcasting remains gated
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   );

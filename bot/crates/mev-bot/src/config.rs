@@ -197,10 +197,26 @@ pub struct Config {
     /// Third, independent capability gate. Even an armed + runtime-live process
     /// only shadow-records bundles unless this is true and qualification passes.
     pub broadcast_enabled: bool,
-    /// Minimum uninterrupted shadow duration.
+    /// Minimum continuously observed shadow-data window.
     pub qualification_hours: u64,
-    /// Minimum high-confidence on-chain MEV matches before any strategy may send.
+    /// Minimum successful fork samples required independently per strategy.
+    pub qualification_min_samples: u64,
+    /// Minimum relay comparisons required independently per strategy.
+    pub qualification_min_relay_comparisons: u64,
+    /// Minimum corresponding on-chain outcomes required independently per strategy.
     pub qualification_min_actual_matches: u64,
+    /// Maximum relative error allowed for a comparison, in basis points.
+    pub qualification_max_error_bps: u64,
+    /// Fraction of comparisons that must be within tolerance, in basis points.
+    pub qualification_min_accuracy_bps: u64,
+    /// Largest permitted gap between canonical block observations.
+    pub qualification_max_gap_secs: u64,
+    /// Canonical confirmations required before execution outcomes become final.
+    pub finality_depth: u64,
+    /// Delay between same-UUID relay replacement attempts.
+    pub submission_retry_ms: u64,
+    /// Maximum relay submission attempts per bundle.
+    pub submission_max_attempts: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -686,7 +702,22 @@ impl Config {
                 && env_or("I_UNDERSTAND_LIVE_RISK", "no") == "yes",
             broadcast_enabled: env_bool("BROADCAST_ENABLED", false),
             qualification_hours: env_u64("QUALIFICATION_HOURS", 168).max(1),
-            qualification_min_actual_matches: env_u64("QUALIFICATION_MIN_ACTUAL_MATCHES", 30).max(1),
+            qualification_min_samples: env_u64("QUALIFICATION_MIN_SAMPLES", 30).max(1),
+            qualification_min_relay_comparisons: env_u64(
+                "QUALIFICATION_MIN_RELAY_COMPARISONS",
+                30,
+            )
+            .max(1),
+            qualification_min_actual_matches: env_u64("QUALIFICATION_MIN_ACTUAL_MATCHES", 30)
+                .max(1),
+            qualification_max_error_bps: env_u64("QUALIFICATION_MAX_ERROR_BPS", 2_000)
+                .clamp(1, 10_000),
+            qualification_min_accuracy_bps: env_u64("QUALIFICATION_MIN_ACCURACY_BPS", 8_000)
+                .clamp(1, 10_000),
+            qualification_max_gap_secs: env_u64("QUALIFICATION_MAX_GAP_SECS", 120).max(15),
+            finality_depth: env_u64("FINALITY_DEPTH", 12).max(1),
+            submission_retry_ms: env_u64("SUBMISSION_RETRY_MS", 250).max(50),
+            submission_max_attempts: env_u64("SUBMISSION_MAX_ATTEMPTS", 2).clamp(1, 5),
         };
         // NOTE: `validate()` is deliberately NOT called here. `doctor` and
         // `replay` load the config without ever binding a port, and they must

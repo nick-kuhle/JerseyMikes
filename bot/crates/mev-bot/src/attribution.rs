@@ -30,6 +30,7 @@ pub async fn reconcile_own_submissions(
     store: &Store,
     rpc: &RpcClient,
     head: u64,
+    finality_depth: u64,
     searcher: Address,
     executor: Address,
 ) {
@@ -37,36 +38,111 @@ pub async fn reconcile_own_submissions(
         return;
     };
     for bundle in bundles {
-        let mut receipts = Vec::new();
+        let mut found = Vec::new();
         for hash in &bundle.tx_hashes {
             let value = rpc
                 .call_raw("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
                 .await
                 .unwrap_or(Value::Null);
             if !value.is_null() {
-                receipts.push(value);
+                found.push((*hash, value));
             }
         }
-        if receipts.len() != bundle.tx_hashes.len() {
-            if head > bundle.target_block {
-                let _ = store.mark_bundle_not_included(&bundle.bundle_id);
+        let found_hashes = found.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+        if found.len() != bundle.tx_hashes.len() {
+            let state = if found.is_empty() {
+                "pending"
+            } else {
+                "partial_unfinalized"
+            };
+            let _ = store.mark_bundle_observation(&bundle.bundle_id, state, &found_hashes);
+            if head >= bundle.target_block.saturating_add(finality_depth) {
+                if found.is_empty() {
+                    let _ = store.mark_bundle_not_included(&bundle.bundle_id);
+                } else {
+                    let block = found
+                        .first()
+                        .map(|(_, receipt)| parse_u64(&receipt["blockNumber"]))
+                        .filter(|value| *value != 0);
+                    let _ = store.finalize_bundle_state(
+                        &bundle.bundle_id,
+                        "finalized_partial_inclusion",
+                        false,
+                        block,
+                        &found_hashes,
+                    );
+                }
             }
             continue;
         }
+
+        let receipts = found
+            .iter()
+            .map(|(_, receipt)| receipt.clone())
+            .collect::<Vec<_>>();
         let included_block = parse_u64(&receipts[0]["blockNumber"]);
-        if included_block == 0
-            || receipts.iter().any(|value| {
-                parse_u64(&value["status"]) != 1
-                    || parse_u64(&value["blockNumber"]) != included_block
-            })
-        {
-            let _ = store.mark_bundle_not_included(&bundle.bundle_id);
+        let receipt_block_hash = receipts[0].get("blockHash").and_then(parse_b256);
+        let coherent = included_block != 0
+            && receipt_block_hash.is_some()
+            && receipts.iter().all(|value| {
+                parse_u64(&value["status"]) == 1
+                    && parse_u64(&value["blockNumber"]) == included_block
+                    && value.get("blockHash").and_then(parse_b256) == receipt_block_hash
+            });
+        if !coherent {
+            if head >= bundle.target_block.saturating_add(finality_depth) {
+                let _ = store.finalize_bundle_state(
+                    &bundle.bundle_id,
+                    "finalized_incoherent_inclusion",
+                    false,
+                    Some(included_block).filter(|value| *value != 0),
+                    &found_hashes,
+                );
+            } else {
+                let _ = store.mark_bundle_observation(
+                    &bundle.bundle_id,
+                    "incoherent_unfinalized",
+                    &found_hashes,
+                );
+            }
             continue;
         }
+
+        if head < included_block.saturating_add(finality_depth) {
+            let _ = store.mark_bundle_observation(
+                &bundle.bundle_id,
+                "included_unfinalized",
+                &found_hashes,
+            );
+            continue;
+        }
+
+        // Verify that the receipt block hash is still canonical at finality.
+        let canonical = rpc
+            .call_raw(
+                "eth_getBlockByNumber",
+                json!([format!("0x{included_block:x}"), false]),
+            )
+            .await
+            .ok()
+            .and_then(|block| block.get("hash").and_then(parse_b256))
+            == receipt_block_hash;
+        if !canonical {
+            let _ = store.finalize_bundle_state(
+                &bundle.bundle_id,
+                "finalized_noncanonical",
+                false,
+                Some(included_block),
+                &found_hashes,
+            );
+            continue;
+        }
+
         let mut gross = U256::ZERO;
         let mut bribe = U256::ZERO;
         let mut retained = U256::ZERO;
         let mut gas_cost = U256::ZERO;
+        let mut executed_events = 0u64;
         for value in &receipts {
             if value.get("from").and_then(parse_address) == Some(searcher) {
                 gas_cost = gas_cost.saturating_add(
@@ -92,17 +168,29 @@ pub async fn reconcile_own_submissions(
                     .map(crate::types::parse_bytes)
                     .unwrap_or_default();
                 if data.len() >= 96 {
+                    executed_events = executed_events.saturating_add(1);
                     gross = gross.saturating_add(U256::from_be_slice(&data[0..32]));
                     bribe = bribe.saturating_add(U256::from_be_slice(&data[32..64]));
                     retained = retained.saturating_add(U256::from_be_slice(&data[64..96]));
                 }
             }
         }
+        if executed_events == 0 {
+            let _ = store.finalize_bundle_state(
+                &bundle.bundle_id,
+                "finalized_missing_executor_evidence",
+                true,
+                Some(included_block),
+                &found_hashes,
+            );
+            continue;
+        }
         let net = crate::sim::anvil::to_i128(retained)
             .saturating_sub(crate::sim::anvil::to_i128(gas_cost));
         if let Err(error) = store.record_execution_outcome(
             &bundle,
             included_block,
+            head,
             gross,
             bribe,
             retained,
@@ -238,6 +326,15 @@ pub async fn reconcile_block(
             gas_cost_wei: gas_cost,
             net_weth_wei: net,
             confidence: confidence.to_string(),
+            confidence_score_bps: if confidence == "high" { 9_000 } else { 6_500 },
+            completeness: json!({
+                "transactionGas": "exact",
+                "observableWethTransfers": "exact",
+                "bundleBoundary": if confidence == "high" { "strongly_inferred" } else { "inferred" },
+                "internalEthTransfers": "not_observed_without_traces",
+                "offChainLegs": "not_observable",
+                "inventoryMarkToMarket": "not_observable"
+            }),
             evidence: json!({
                 "kind": "on_chain_weth_delta_less_gas",
                 "strategy": opportunity.strategy,

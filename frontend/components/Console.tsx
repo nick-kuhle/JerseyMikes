@@ -15,6 +15,7 @@ import WalletButton from "./WalletButton";
 import type {
   ActualMevResponse,
   CompetitionResponse,
+  ExecutionResponse,
   OpportunityRow,
   PnlResponse,
   RelayBid,
@@ -47,6 +48,7 @@ export default function Console() {
   const [bids, setBids] = useState<RelayBid[]>([]);
   const [competition, setCompetition] = useState<CompetitionResponse | null>(null);
   const [actualMev, setActualMev] = useState<ActualMevResponse | null>(null);
+  const [executions, setExecutions] = useState<ExecutionResponse | null>(null);
   const [reorgs, setReorgs] = useState<ReorgRow[]>([]);
   const [feedFilter, setFeedFilter] = useState("all");
   const [strategyFilter, setStrategyFilter] = useState("all");
@@ -63,7 +65,7 @@ export default function Console() {
         return fallback;
       }
     };
-    const [s, p, se, si, op, rb, comp, actual, rg] = await Promise.all([
+    const [s, p, se, si, op, rb, comp, actual, executionRows, rg] = await Promise.all([
       get<StatusResponse | null>("status", null),
       get<PnlResponse | null>("pnl", null),
       get<SeriesPoint[]>("pnl/series?limit=250", []),
@@ -72,6 +74,7 @@ export default function Console() {
       get<RelayBid[]>("relay-bids?limit=25", []),
       get<CompetitionResponse | null>("competition?limit=25", null),
       get<ActualMevResponse | null>("actual-mev?limit=25", null),
+      get<ExecutionResponse | null>("executions?limit=25", null),
       get<ReorgRow[]>("reorgs?limit=15", []),
     ]);
     // Identity-preserving updates.
@@ -90,6 +93,7 @@ export default function Console() {
     setBids((prev) => keepIfSame(prev, Array.isArray(rb) ? rb : []));
     if (comp) setCompetition((prev) => keepIfSame(prev, comp));
     if (actual) setActualMev((prev) => keepIfSame(prev, actual));
+    if (executionRows) setExecutions((prev) => keepIfSame(prev, executionRows));
     setReorgs((prev) => keepIfSame(prev, Array.isArray(rg) ? rg : []));
   }, []);
 
@@ -542,7 +546,13 @@ export default function Console() {
       </Section>
 
       <Section id="validation" title="Validation — latency & on-chain evidence" subtitle="decision-time simulations vs canonical blocks">
-        <Phase1Panel latency={status?.latency} competition={competition} actualMev={actualMev} reorgs={reorgs} />
+        <Phase1Panel
+          latency={status?.latency}
+          competition={competition}
+          actualMev={actualMev}
+          executions={executions}
+          reorgs={reorgs}
+        />
       </Section>
 
       {/* bloXroute Max Profit relay — delivered blocks + their transactions */}
@@ -574,7 +584,8 @@ export default function Console() {
         subtitle="six-step checklist · docs/GO_LIVE.md"
         defaultOpen={false}
       >
-        <div style={{padding: 4}}>
+        <div style={{padding: 4, display: "grid", gap: 12}}>
+          <QualificationReport qualification={status?.qualification} />
           <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} />
         </div>
       </Section>
@@ -585,10 +596,66 @@ export default function Console() {
       </Section>
 
       <footer className="muted" style={{padding: "4px 2px 20px", fontSize: 11}}>
-        Simulation-only build. The bot reads live mainnet data and scores bundles against a forked EVM; nothing is
-        broadcast. Risk parameters start deliberately liberal — see <code>docs/RISK.md</code>.
+        Broadcasting is disabled by default and remains fail-closed unless every arming, risk, inventory, and
+        strategy-specific qualification gate passes. See <code>docs/GO_LIVE.md</code> and <code>docs/RISK.md</code>.
       </footer>
     </main>
+  );
+}
+
+function QualificationReport({qualification}: {qualification: StatusResponse["qualification"]}) {
+  const rows = qualification?.strategies ?? [];
+  return (
+    <div className="panel" style={{padding: 10}}>
+      <div className="panel-head">
+        <span>strategy qualification</span>
+        <span className={qualification?.pass ? "pos" : "muted"}>
+          {qualification
+            ? `${qualification.elapsedHours}/${qualification.requiredHours}h · max gap ${qualification.maximumObservationGapSecs}s`
+            : "waiting for bot"}
+        </span>
+      </div>
+      <table className="grid">
+        <thead>
+          <tr>
+            <th>strategy</th>
+            <th>verdict</th>
+            <th style={{textAlign: "right"}}>fork</th>
+            <th style={{textAlign: "right"}}>relay</th>
+            <th style={{textAlign: "right"}}>actual</th>
+            <th style={{textAlign: "right"}}>relay accuracy</th>
+            <th style={{textAlign: "right"}}>actual accuracy</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.strategy} title={row.reasons.join("; ")}>
+              <td>{STRATEGY_LABEL[row.strategy] ?? row.strategy}</td>
+              <td className={row.verdict === "PASS" ? "pos" : row.verdict === "FAIL" ? "neg" : "muted"}>
+                {row.verdict}
+              </td>
+              <td style={{textAlign: "right"}}>{row.forkSamples}</td>
+              <td style={{textAlign: "right"}}>{row.relayComparisons}</td>
+              <td style={{textAlign: "right"}}>{row.actualComparisons}</td>
+              <td style={{textAlign: "right"}}>{(row.relayAccuracyBps / 100).toFixed(1)}%</td>
+              <td style={{textAlign: "right"}}>{(row.actualAccuracyBps / 100).toFixed(1)}%</td>
+            </tr>
+          ))}
+          {!rows.length && (
+            <tr>
+              <td colSpan={7} className="muted" style={{textAlign: "center", padding: 10}}>
+                no qualification report yet
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+      {(qualification?.reasons ?? []).map((reason) => (
+        <div key={reason} className="muted" style={{fontSize: 10, marginTop: 4}}>
+          • {reason}
+        </div>
+      ))}
+    </div>
   );
 }
 
