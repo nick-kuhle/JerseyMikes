@@ -136,14 +136,23 @@ or the console service):
 CHAINS="ethereum|http://127.0.0.1:8080,base|http://127.0.0.1:8081"
 # optional third field = per-chain RPC for the /api/eth contract panel:
 # CHAINS="ethereum|http://127.0.0.1:8080|https://eth-rpc,base|http://127.0.0.1:8081|https://base-rpc"
-BOT_API_TOKEN_ETHERIUM=...   # per-chain tokens; fall back to the shared BOT_API_TOKEN
+BOT_API_TOKEN_ETHEREUM=...   # per-chain tokens (suffix is the upper-cased slug from CHAINS); fall back to the shared BOT_API_TOKEN
 ```
 
 With `CHAINS` unset the console is single-chain on `BOT_API_URL`
-(back-compat). The header switcher selects the active chain (persisted in the
-browser); every panel re-keys on the switch, so a panel can never show
+(back-compat). The header always shows an active-chain pill — a
+non-interactive one in single-chain mode, and a switcher (Ethereum | Base)
+once two or more chains are configured. Selection is persisted in the
+browser and every panel re-keys on the switch, so a panel can never show
 another chain's data, and an unreachable bot falls back to the flagged
 DEMO state for that chain only.
+
+The wallet's network and the console's active chain are independent state.
+When they diverge — e.g. the wallet is on Ethereum while the console is
+showing Base — an amber banner appears under the header and the go-live
+panel's step-1 gate follows the console's active chain, offering
+"switch wallet to Base" rather than the old hardcoded "switch to mainnet"
+prompt.
 
 ## Database backups
 
