@@ -964,7 +964,7 @@ impl Store {
             "SELECT id, opportunity_id, target_block, payload,
                     inclusion_state, included_block FROM bundles
              WHERE submitted = 1 AND included IS NULL AND target_block <= ?1
-             ORDER BY target_block ASC LIMIT 500",
+             ORDER BY target_block ASC LIMIT 100",
         )?;
         let rows = stmt.query_map(params![block_number as i64], |row| {
             Ok((

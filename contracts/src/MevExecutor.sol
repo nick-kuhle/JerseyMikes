@@ -454,21 +454,16 @@ contract MevExecutor is IFlashLoanRecipient {
         profit = balAfter > balBefore ? balAfter - balBefore : 0;
 
         uint256 bribe;
-        if (g.bribeBps != 0 && profit != 0) {
-            bribe = (profit * g.bribeBps) / 10_000;
+        // Non-ETH/WETH strategies bid through priority fee; do not perform
+        // irrelevant multiplication on arbitrary token balances.
+        if (g.bribeBps != 0 && profit != 0 && (g.profitToken == address(0) || g.profitToken == WETH)) {
+            // Overflow-safe floor(profit * bps / 10_000). Splitting quotient
+            // and remainder is exact and keeps every intermediate <= profit.
+            bribe = (profit / 10_000) * g.bribeBps + ((profit % 10_000) * g.bribeBps) / 10_000;
             if (bribe != 0) {
-                if (g.profitToken != address(0)) {
-                    // Bribes are always paid in ETH: unwrap WETH profit if needed.
-                    if (g.profitToken == WETH) {
-                        IWETH(WETH).withdraw(bribe);
-                    } else {
-                        bribe = 0; // non-ETH profit: the bot pays the builder via priority fee
-                    }
-                }
-                if (bribe != 0) {
-                    (bool ok,) = block.coinbase.call{value: bribe}("");
-                    if (!ok) revert BribeFailed();
-                }
+                if (g.profitToken == WETH) IWETH(WETH).withdraw(bribe);
+                (bool ok,) = block.coinbase.call{value: bribe}("");
+                if (!ok) revert BribeFailed();
             }
         }
 

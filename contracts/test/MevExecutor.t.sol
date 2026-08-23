@@ -172,6 +172,22 @@ contract MevExecutorTest is Test {
         require(ok, "donate failed");
     }
 
+    function test_nonWethMaxBalanceCannotOverflowIrrelevantBribeMath() public {
+        MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
+        calls[0] = MevExecutor.Call({
+            target: address(usdc),
+            value: 0,
+            data: abi.encodeCall(MockERC20.mint, (address(exec), type(uint256).max))
+        });
+        MevExecutor.Guard memory g = _guard(address(usdc), type(uint256).max);
+        g.bribeBps = 10_000;
+
+        vm.prank(searcher);
+        uint256 profit = exec.execute(keccak256("max-token-profit"), calls, g);
+        assertEq(profit, type(uint256).max);
+        assertEq(usdc.balanceOf(address(exec)), type(uint256).max);
+    }
+
     function test_twoLegSettlementDoesNotCallReturnedPrincipalProfit() public {
         bytes32 tag = keccak256("two-leg-loss");
         MevExecutor.Call[] memory front = new MevExecutor.Call[](1);
