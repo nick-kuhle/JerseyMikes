@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 //! CLI entry point.
 
 use std::sync::Arc;
