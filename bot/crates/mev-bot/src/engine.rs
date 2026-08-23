@@ -750,7 +750,9 @@ impl Engine {
 
     fn refresh_qualification(self: &Arc<Self>) {
         use std::sync::atomic::Ordering;
-        const REFRESH_INTERVAL_MS: u64 = 30_000;
+        // One minute is comfortably below the default 120-second continuity
+        // limit while avoiding repeated seven-day evidence scans.
+        const REFRESH_INTERVAL_MS: u64 = 60_000;
         let now = now_ms();
         let last = self.qualification_refreshed_at_ms.load(Ordering::Acquire);
         if now.saturating_sub(last) < REFRESH_INTERVAL_MS
