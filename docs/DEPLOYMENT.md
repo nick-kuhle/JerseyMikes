@@ -75,10 +75,12 @@ sudo chown -R root:root /opt/jerseymikes/frontend
 sudo install -o root -g jerseymikes -m 0640 .env /etc/jerseymikes/env
 # In /etc/jerseymikes/env use DB_PATH=/var/lib/jerseymikes/mev.sqlite.
 sudo install -o root -g root -m 0755 "$(command -v anvil)" /usr/local/bin/anvil
-sudo cp deploy/systemd/*.service /etc/systemd/system/
-sudo systemd-analyze verify /etc/systemd/system/mev-bot*.service
+sudo install -o root -g root -m 0755 deploy/backup-db.sh /opt/jerseymikes/backup-db.sh
+sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/mev-bot*.service \
+  /etc/systemd/system/mev-db-backup.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now mev-bot mev-bot-console
+sudo systemctl enable --now mev-bot mev-bot-console mev-db-backup.timer
 journalctl -u mev-bot -f
 ```
 
@@ -88,6 +90,27 @@ private temporary/devices namespaces, no new privileges, and only
 `0640` because it holds both signing keys. `Restart=on-failure` does not bypass
 startup nonce recovery; unresolved private bundles are cancelled or keep nonce
 reuse blocked through target expiry.
+
+## Database backups
+
+The qualification clock (168 h of canonical block observations) lives in the
+SQLite database. If the volume is lost or the file is corrupted on Day 6, the
+clock resets to Day 0 — so `mev-db-backup.timer` snapshots it every 15 minutes
+with sqlite3's online-backup API (`.backup`), which is safe against a live WAL
+writer. Never `cp` the `mev.sqlite`/`-wal` files of a running bot.
+
+* `sqlite3` must be installed on the host (`apt install sqlite3`); the backup
+  unit fails loudly when it is missing.
+* Snapshots land in `/var/lib/jerseymikes/backups/quarter/` (newest 96 kept —
+  24 h at 15-minute cadence) with one per UTC day promoted to
+  `backups/daily/` (newest 7 kept). Every snapshot passes
+  `PRAGMA integrity_check` before it is trusted.
+* Restore: stop the bot (`systemctl stop mev-bot`), copy the chosen snapshot
+  over `DB_PATH` (and remove any stale `-wal`/`-shm` siblings), restart.
+  The qualification clock continues from the observations still present in
+  the restored file.
+* Watch it fire: `journalctl -u mev-db-backup.service -f` (first run at the
+  next quarter hour; `Persistent=true` catches up missed runs immediately).
 
 ## Docker Compose
 
