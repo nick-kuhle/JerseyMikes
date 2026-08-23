@@ -131,15 +131,50 @@ export async function GET(req: NextRequest, {params}: {params: Promise<{path: st
 }
 
 /**
+ * Same-site guard for the mutating endpoints below, compared on
+ * **authority** (host[:port]), not on the full origin.
+ *
+ * The previous version rejected any request whose `Origin` header did not
+ * exactly equal `req.nextUrl.origin` — including the scheme. That broke
+ * legitimate control requests the moment the dashboard sat behind a
+ * TLS-terminating reverse proxy or a hosted dev preview: the page is served
+ * over `https://…` while the dev server speaks plain `http://…`, so the two
+ * origins can never be string-equal even though page and route live on the
+ * same host and port.
+ *
+ * What must still hold: the request's site of origin is the dashboard itself.
+ * A browser POSTing from another site always sends an `Origin` whose
+ * authority is *that site*, so comparing the authority against the request
+ * host (or the first `X-Forwarded-Host` hop a proxy sets) rejects cross-site
+ * postings without pinning the scheme. `sec-fetch-site: cross-site` remains
+ * an independent rejection where the browser supplies it.
+ */
+function isAllowedControlOrigin(req: NextRequest): boolean {
+  if (req.headers.get("sec-fetch-site") === "cross-site") return false;
+  const origin = req.headers.get("origin");
+  if (!origin) return true;
+  let authority: string;
+  try {
+    authority = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const candidates = [
+    req.nextUrl.host,
+    req.headers.get("x-forwarded-host")?.split(",")[0].trim(),
+    req.headers.get("host"),
+  ].filter((h): h is string => Boolean(h));
+  return candidates.includes(authority);
+}
+
+/**
  * Mutating bot endpoints. Only `/api/mode` (the simulation ⇄ live switch) is
  * proxied; when the bot is unreachable the demo mode state flips instead so
  * the dashboard's switch flow is exercisable without a running bot — always
  * flagged with `demo: true` so nobody mistakes it for a real mode change.
  */
 export async function POST(req: NextRequest, {params}: {params: Promise<{path: string[]}>}) {
-  const origin = req.headers.get("origin");
-  const fetchSite = req.headers.get("sec-fetch-site");
-  if ((origin && origin !== req.nextUrl.origin) || fetchSite === "cross-site") {
+  if (!isAllowedControlOrigin(req)) {
     return new Response(JSON.stringify({ok: false, error: "cross-origin control request rejected"}), {
       status: 403,
       headers: {"content-type": "application/json"},
