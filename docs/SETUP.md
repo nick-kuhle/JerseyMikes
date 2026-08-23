@@ -16,7 +16,7 @@ a `make` target — see the [Quick reference](#quick-reference) at the bottom.
 
 | Tool | Version | Why you need it | Install |
 | --- | --- | --- | --- |
-| **Rust** (rustc + cargo) | **1.85+** | The searcher, simulator and API (`bot/`) | [rustup](https://rustup.rs) |
+| **Rust** (rustc + cargo) | **1.90+** | The searcher, simulator and API (`bot/`) | [rustup](https://rustup.rs) |
 | **Foundry** (`forge`, `cast`, `anvil`) | latest | Contracts build/tests, **`anvil` is the simulation engine** | [getfoundry.sh](https://getfoundry.sh) |
 | **Node.js** (+ npm) | **22+** | The console (`frontend/`); also the no-Foundry compile fallback | [nodejs.org](https://nodejs.org) / [nvm](https://github.com/nvm-sh/nvm) |
 | **Git** | any recent | Clone with submodules | system package |
@@ -37,11 +37,11 @@ dependencies for you.
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"      # or open a new shell
-rustc --version                # expect 1.85.0 or newer
+rustc --version                # expect 1.90.0 or newer
 cargo --version
 ```
 
-The crate targets `rust-version = "1.85"` and `edition = "2021"`
+The crate targets `rust-version = "1.90"` and `edition = "2021"`
 (see `bot/Cargo.toml`); older toolchains will refuse to build.
 
 ### Foundry (contracts + `anvil`)
@@ -193,12 +193,12 @@ If `anvil` is present but under a different name/path, set `ANVIL_BIN` in `.env`
 
 ### `cargo: not found`
 
-Rust isn't installed or the toolchain is too old (needs 1.85+).
+Rust isn't installed or the toolchain is too old (needs 1.90+).
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-rustc --version          # must be ≥ 1.85.0
+rustc --version          # must be ≥ 1.90.0
 ```
 
 ### Submodule / `forge build` error (`File "lib/forge-std/src/..." not found`)

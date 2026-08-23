@@ -1,5 +1,5 @@
 # Bot: reproducible Rust/Foundry versions, unprivileged runtime.
-FROM rust:1.85.1-slim-bookworm AS build
+FROM rust:1.90.0-slim-bookworm AS build
 WORKDIR /src/bot
 COPY bot/Cargo.toml bot/Cargo.lock ./
 COPY bot/crates ./crates

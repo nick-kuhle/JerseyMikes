@@ -46,7 +46,7 @@ Requirements (install walkthrough + troubleshooting in
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| **Rust** | 1.85+ | searcher, simulator and API (`bot/`) |
+| **Rust** | 1.90+ | searcher, simulator and API (`bot/`) |
 | **[Foundry](https://getfoundry.sh)** | latest | contracts build/tests; `anvil` is the simulation engine |
 | **Node.js** | 22+ | the console (`frontend/`) |
 | Ethereum RPC | archive-capable, mainnet | live + historical state |
