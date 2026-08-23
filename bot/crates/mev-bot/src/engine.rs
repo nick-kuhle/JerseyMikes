@@ -775,6 +775,35 @@ impl Engine {
         });
     }
 
+    /// Atomically narrow/widen runtime mode with respect to the serialized
+    /// submission lane. A transition to simulation cancels active payloads
+    /// before another candidate can reserve a nonce.
+    pub async fn set_runtime_mode(&self, live: bool) -> Result<bool, &'static str> {
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return Ok(false);
+        };
+        let effective = self.mode.set_live(live)?;
+        if !effective {
+            self.cancel_active_submissions_locked("runtime mode changed to simulation")
+                .await;
+        }
+        Ok(effective)
+    }
+
+    /// Apply a risk patch while holding the nonce lane, then cancel every
+    /// payload signed under the previous policy before releasing it.
+    pub async fn apply_runtime_risk(&self, patch: crate::risk::RiskPatch) -> Result<(), String> {
+        let _nonce_lane = self
+            .submission_gate
+            .acquire()
+            .await
+            .map_err(|_| "submission lane is closed".to_string())?;
+        self.runtime.apply(patch)?;
+        self.cancel_active_submissions_locked("runtime risk policy changed")
+            .await;
+        Ok(())
+    }
+
     /// Cancel every unresolved private bundle after an operator/risk policy
     /// change. Nonces are released from highest to lowest only when every relay
     /// acknowledges cancellation; otherwise reuse remains blocked through the
@@ -783,6 +812,10 @@ impl Engine {
         let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
             return;
         };
+        self.cancel_active_submissions_locked(reason).await;
+    }
+
+    async fn cancel_active_submissions_locked(&self, reason: &str) {
         let mut reservations = self.store.active_nonce_reservations().unwrap_or_default();
         reservations.sort_by_key(|reservation| std::cmp::Reverse(reservation.start_nonce));
         for reservation in reservations {
@@ -1405,27 +1438,9 @@ impl Engine {
         self.writes.record_opportunity(&opp);
         let _ = self.feed.send(FeedEvent::Opportunity(opp.clone()));
 
-        // Only qualified live candidates enter the serialized nonce lane. The
-        // reserved nonce is the one used by both fork/relay simulation and the
-        // eventual submission, so no untested payload can reach a relay.
-        let wants_broadcast = lane == FunnelLane::Live
-            && self.mode.live()
-            && self.cfg.broadcast_enabled
-            && self.strategy_qualified(opp.strategy)
-            && self.inventory.broadcast_available(self.ctx.head().number);
-        let submission_permit = if wants_broadcast {
-            self.submission_gate.acquire().await.ok()
-        } else {
-            None
-        };
-        // State may have changed while waiting for the single live nonce lane.
-        let can_reserve = submission_permit.is_some()
-            && self.mode.live()
-            && self.strategy_qualified(opp.strategy)
-            && self.inventory.broadcast_available(self.ctx.head().number);
-        let nonce_count = Inventory::legs(&opp);
-        let reserved_nonce = can_reserve.then(|| self.inventory.reserve_nonces(nonce_count));
-        let simulation_nonce = reserved_nonce.unwrap_or_else(|| self.inventory.nonce_for(&opp));
+        // Shadow simulation stays fully concurrent. Only a profitable,
+        // qualified candidate enters the serialized nonce lane below.
+        let simulation_nonce = self.inventory.nonce_for(&opp);
 
         self.risk.begin(opp.strategy);
         let outcome = self
@@ -1444,9 +1459,6 @@ impl Engine {
         let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
-                if let Some(start) = reserved_nonce {
-                    let _ = self.inventory.release_nonces(start, nonce_count);
-                }
                 if let Some(suppressed) = SIM_FAILED_LOG.allow() {
                     tracing::debug!(target: "engine", error = %e, suppressed, "simulation failed");
                 }
@@ -1494,7 +1506,6 @@ impl Engine {
         }
 
         let mut bundle = outcome.bundle;
-        let mut nonce_committed = false;
         if self.risk.submittable(&outcome.primary) {
             Stats::bump(&self.stats.submittable);
             self.stats.record_funnel(lane, kind, |f| f.submittable += 1);
@@ -1508,65 +1519,18 @@ impl Engine {
                 "PROFITABLE bundle"
             );
             if lane == FunnelLane::Live && self.mode.live() && self.cfg.broadcast_enabled {
-                let qualification = self.qualification_status();
-                if qualification.strategy_passes(opp.strategy) {
-                    if let Some(start_nonce) = reserved_nonce {
-                        if self
-                            .store
-                            .reserve_bundle_nonces(
-                                &bundle.id,
-                                &bundle.opportunity_id,
-                                start_nonce,
-                                nonce_count,
-                                bundle.target_block,
-                            )
-                            .is_ok()
-                        {
-                            bundle.submitted = self.submission.submit(&bundle).await;
-                            if bundle.submitted {
-                                nonce_committed = true;
-                                let _ = self
-                                    .store
-                                    .set_nonce_reservation_status(&bundle.id, "accepted");
-                            } else if self.submission.cancel(&bundle.id).await {
-                                let _ = self
-                                    .store
-                                    .set_nonce_reservation_status(&bundle.id, "cancelled");
-                            } else {
-                                nonce_committed = true;
-                                self.inventory.block_broadcast_until(bundle.target_block);
-                                let _ = self
-                                    .store
-                                    .set_nonce_reservation_status(&bundle.id, "recovery_blocked");
-                            }
-                        } else {
-                            tracing::error!(target: "submission", bundle = %bundle.id, "durable nonce reservation failed; refusing broadcast");
-                        }
-                    } else {
-                        tracing::warn!(target: "submission", bundle = %bundle.id, "candidate did not enter the serialized nonce lane; refusing broadcast");
-                    }
-                } else {
-                    let strategy_reasons = qualification
-                        .strategies
-                        .iter()
-                        .find(|row| row.strategy == opp.strategy.as_str())
-                        .map(|row| row.reasons.clone())
-                        .unwrap_or_else(|| qualification.reasons.clone());
-                    tracing::warn!(
-                        target: "submission",
-                        strategy = opp.strategy.as_str(),
-                        reasons = ?strategy_reasons,
-                        "live mode requested but this strategy has not independently passed qualification"
-                    );
-                }
+                bundle = self
+                    .submit_live_candidate(
+                        &opp,
+                        &victims_raw,
+                        victim_sender_nonce,
+                        base_fee,
+                        simulation_nonce,
+                        bundle,
+                    )
+                    .await;
             }
         }
-        if let Some(start) = reserved_nonce {
-            if !nonce_committed {
-                let _ = self.inventory.release_nonces(start, nonce_count);
-            }
-        }
-        drop(submission_permit);
         if bundle.submitted {
             // Settlement records are safety state, not droppable telemetry.
             if let Err(error) = self.store.record_bundle(&bundle) {
@@ -1577,6 +1541,127 @@ impl Engine {
             self.writes.record_bundle(&bundle);
         }
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
+    }
+
+    /// Serialize only profitable live candidates. Shadow simulations remain
+    /// fully concurrent; when an earlier accepted bundle advanced the nonce,
+    /// this reruns the candidate with the newly reserved nonce before sending.
+    async fn submit_live_candidate(
+        self: &Arc<Self>,
+        opp: &Opportunity,
+        victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
+        base_fee: U256,
+        initially_simulated_nonce: u64,
+        initial_bundle: crate::types::BundleRecord,
+    ) -> crate::types::BundleRecord {
+        let qualification = self.qualification_status();
+        if !qualification.strategy_passes(opp.strategy) {
+            let reasons = qualification
+                .strategies
+                .iter()
+                .find(|row| row.strategy == opp.strategy.as_str())
+                .map(|row| row.reasons.clone())
+                .unwrap_or_else(|| qualification.reasons.clone());
+            tracing::warn!(target: "submission", strategy = opp.strategy.as_str(), ?reasons, "strategy has not independently passed qualification");
+            return initial_bundle;
+        }
+
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return initial_bundle;
+        };
+        let head = self.ctx.head().number;
+        if !self.mode.live()
+            || !self.cfg.broadcast_enabled
+            || !self.strategy_qualified(opp.strategy)
+            || !self.inventory.broadcast_available(head)
+            || initial_bundle.target_block <= head
+        {
+            return initial_bundle;
+        }
+
+        let nonce_count = Inventory::legs(opp);
+        if nonce_count == 0 {
+            return initial_bundle;
+        }
+        let start_nonce = self.inventory.reserve_nonces(nonce_count);
+        let mut bundle = initial_bundle;
+
+        if start_nonce != initially_simulated_nonce {
+            self.risk.begin(opp.strategy);
+            let exact = self
+                .sim
+                .run(
+                    opp,
+                    victims_raw,
+                    victim_sender_nonce,
+                    base_fee,
+                    start_nonce,
+                    false,
+                )
+                .await;
+            self.risk.end(opp.strategy);
+            let Ok(exact) = exact else {
+                let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                return bundle;
+            };
+            Stats::bump(&self.stats.simulations);
+            self.writes.record_simulation(&exact.primary);
+            let _ = self.feed.send(FeedEvent::Simulation(exact.primary.clone()));
+            if let Some(relay) = &exact.relay {
+                self.writes.record_simulation(relay);
+                let _ = self.feed.send(FeedEvent::Simulation(relay.clone()));
+            }
+            if !self.risk.submittable(&exact.primary) {
+                let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                return bundle;
+            }
+            bundle = exact.bundle;
+        }
+
+        // Recheck mutable controls after any serialized exact-payload rerun.
+        if !self.mode.live()
+            || !self.strategy_qualified(opp.strategy)
+            || self.risk.check(opp, base_fee).is_err()
+            || !self.inventory.can_fund(opp)
+        {
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+            return bundle;
+        }
+
+        if self
+            .store
+            .reserve_bundle_nonces(
+                &bundle.id,
+                &bundle.opportunity_id,
+                start_nonce,
+                nonce_count,
+                bundle.target_block,
+            )
+            .is_err()
+        {
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+            tracing::error!(target: "submission", bundle = %bundle.id, "durable nonce reservation failed; refusing broadcast");
+            return bundle;
+        }
+
+        bundle.submitted = self.submission.submit(&bundle).await;
+        if bundle.submitted {
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "accepted");
+        } else if self.submission.cancel(&bundle.id).await {
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "cancelled");
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+        } else {
+            self.inventory.block_broadcast_until(bundle.target_block);
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "recovery_blocked");
+        }
+        bundle
     }
 
     /// Compare stored simulations for `block` against relay bid traces and

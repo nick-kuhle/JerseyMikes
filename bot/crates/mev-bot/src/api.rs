@@ -420,20 +420,13 @@ struct ModeRequest {
 /// that decision is read exactly once at boot. An unarmed process gets a
 /// 409 with the restart instructions rather than a silent mode change.
 async fn set_mode(State(s): State<ApiState>, Json(body): Json<ModeRequest>) -> Response {
-    match s.engine.mode.set_live(body.live) {
-        Ok(live) => {
-            if !live {
-                s.engine
-                    .cancel_active_submissions("runtime mode changed to simulation")
-                    .await;
-            }
-            Json(json!({
-                "ok": true,
-                "mode": if live { "live" } else { "simulation" },
-                "liveArmed": s.engine.mode.armed(),
-            }))
-            .into_response()
-        }
+    match s.engine.set_runtime_mode(body.live).await {
+        Ok(live) => Json(json!({
+            "ok": true,
+            "mode": if live { "live" } else { "simulation" },
+            "liveArmed": s.engine.mode.armed(),
+        }))
+        .into_response(),
         Err(hint) => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -514,11 +507,9 @@ async fn risk_state(State(s): State<ApiState>) -> impl IntoResponse {
 /// human-readable reason and change nothing.
 async fn set_risk(State(s): State<ApiState>, Json(patch): Json<RiskPatch>) -> Response {
     let e = &s.engine;
-    match e.runtime.apply(patch) {
+    match e.apply_runtime_risk(patch).await {
         Ok(()) => {
-            e.cancel_active_submissions("runtime risk policy changed")
-                .await;
-            tracing::info!(target: "api", "risk envelope updated at runtime; active private bundles cancelled");
+            tracing::info!(target: "api", "risk envelope updated atomically; active private bundles cancelled");
             let effective = e.runtime.risk();
             (
                 StatusCode::OK,
