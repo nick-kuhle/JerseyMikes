@@ -246,13 +246,163 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         }
     }
 
+    // Endpoints that will carry eth_sendBundle once the broadcast lane is
+    // armed. A dead relay in the list is silently lost inclusion, so probe
+    // each one the way submission will: a read-only eth_callBundle whose
+    // RPC error response still proves the endpoint is alive and speaks the
+    // API. Nothing is enqueued by eth_callBundle.
+    for relay in &cfg.endpoints.bundle_relay_urls {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_callBundle",
+            "params": [{ "txs": [], "blockNumber": "0x1" }],
+        });
+        match reqwest::Client::new()
+            .post(relay)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+        {
+            Ok(r) => println!("· bundle relay      {relay} -> {}", r.status()),
+            Err(e) => println!("✗ bundle relay      {relay} unreachable: {e}"),
+        }
+    }
+
+    // Two trust domains: the Flashbots signer exists purely for RPC-header
+    // reputation and must never be the funded searcher key.
+    if let Some(fb) = &cfg.endpoints.flashbots_signer_key {
+        match mev_bot::signer::Signer::from_hex(fb) {
+            Ok(s) if s.address() == cfg.endpoints.searcher_address => {
+                println!(
+                    "✗ key separation   FLASHBOTS_SIGNER_KEY and SEARCHER_PRIVATE_KEY derive the \
+                     same address ({}) — split them before arming",
+                    cfg.endpoints.searcher_address
+                );
+            }
+            Ok(_) => println!("✓ key separation   flashbots signer differs from the searcher key"),
+            Err(e) => println!("! key separation   FLASHBOTS_SIGNER_KEY unparseable: {e}"),
+        }
+    }
+
+    // The executor is what the broadcast lane will actually call. If it is
+    // configured, verify it on-chain: deployed code, searcher allowlisted,
+    // and which address owns it (the operator confirms that is the cold
+    // wallet by eye — the bot cannot know which one that is).
+    match cfg.endpoints.executor {
+        Some(executor) => {
+            let addr = format!("{executor:?}");
+            match http.call_raw("eth_getCode", json!([addr, "latest"])).await {
+                Ok(code) if code.as_str().is_some_and(|s| s.len() > 4) => {
+                    println!("✓ executor          {addr} has on-chain code");
+                }
+                _ => println!(
+                    "✗ executor          {addr} has no on-chain code — deploy per docs/GO_LIVE.md"
+                ),
+            }
+
+            // searchers(address) — public mapping getter on MevExecutor.
+            let mut cd = [0u8; 36];
+            cd[..4].copy_from_slice(&alloy_primitives::keccak256("searchers(address)")[..4]);
+            cd[16..].copy_from_slice(cfg.endpoints.searcher_address.as_slice());
+            let data = format!("{:?}", alloy_primitives::Bytes::from(cd.to_vec()));
+            let call = json!([{ "to": addr, "data": data }, "latest"]);
+            match http.call_raw("eth_call", call).await {
+                Ok(v) => {
+                    let allowed = v
+                        .as_str()
+                        .and_then(|s| s.strip_prefix("0x"))
+                        .and_then(|h| alloy_primitives::U256::from_str_radix(h, 16).ok());
+                    match allowed {
+                        Some(w) if !w.is_zero() => println!(
+                            "✓ executor searcher  {:?} is allowlisted",
+                            cfg.endpoints.searcher_address
+                        ),
+                        Some(_) => println!(
+                            "! executor searcher  {:?} NOT allowlisted — call setSearcher from \
+                             the owner wallet (docs/GO_LIVE.md)",
+                            cfg.endpoints.searcher_address
+                        ),
+                        None => println!("! executor searcher  allowlist read returned {v}"),
+                    }
+                }
+                Err(e) => println!("! executor searcher  allowlist read failed: {e}"),
+            }
+
+            // owner() — report who can sweep funds and flip the allowlist.
+            let mut cd = [0u8; 4];
+            cd.copy_from_slice(&alloy_primitives::keccak256("owner()")[..4]);
+            let data = format!("{:?}", alloy_primitives::Bytes::from(cd.to_vec()));
+            let call = json!([{ "to": addr, "data": data }, "latest"]);
+            match http.call_raw("eth_call", call).await {
+                Ok(v) => {
+                    let owner = v.as_str().and_then(|s| s.strip_prefix("0x")).and_then(|h| {
+                        let h = &h[h.len().saturating_sub(40)..];
+                        h.parse::<alloy_primitives::Address>().ok()
+                    });
+                    match owner {
+                        Some(o) => println!("· executor owner    {o:?} (verify: this must be the cold/operator wallet)"),
+                        None => println!("· executor owner    unreadable ({v})"),
+                    }
+                }
+                Err(e) => println!("· executor owner    read failed: {e}"),
+            }
+        }
+        None => println!(
+            "· executor          not set — the simulator mounts the constructor-equivalent fixture"
+        ),
+    }
+
+    // The qualification clock lives in this file; if the directory is not
+    // writable the clock silently never advances.
+    {
+        let db = std::path::Path::new(&cfg.api.db_path);
+        match std::fs::metadata(db) {
+            Ok(m) => println!("· database          {} ({} bytes)", db.display(), m.len()),
+            Err(_) => println!(
+                "· database          {} (created on first run)",
+                db.display()
+            ),
+        }
+        let parent = db
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let probe = parent.join(".doctor-write-probe");
+        match std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe)) {
+            Ok(()) => println!("✓ database dir      {} writable", parent.display()),
+            Err(e) => println!(
+                "✗ database dir      {} not writable: {e} — qualification cannot persist",
+                parent.display()
+            ),
+        }
+    }
+
+    // Day-0 state photograph: everything the money switch depends on.
+    let understands = std::env::var("I_UNDERSTAND_LIVE_RISK").unwrap_or_else(|_| "no".into());
     println!(
-        "\nmode: {}",
+        "\nmode: {} | broadcast: {} | I_UNDERSTAND_LIVE_RISK={understands} | inventory gate: {}",
         if cfg.live_execution {
             "LIVE"
         } else {
             "simulation"
-        }
+        },
+        if cfg.broadcast_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.inventory_gate,
+    );
+    println!(
+        "risk: min net {} wei | base-fee ceiling {} wei | bribe {} bps | drawdown cap {} wei | \
+         bundle gas {}",
+        cfg.risk.min_net_profit_wei,
+        cfg.risk.max_base_fee_wei,
+        cfg.risk.bribe_bps,
+        cfg.risk.max_drawdown_wei,
+        cfg.risk.max_gas_per_bundle
     );
     Ok(())
 }
