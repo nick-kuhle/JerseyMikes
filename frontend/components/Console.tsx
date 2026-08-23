@@ -37,6 +37,20 @@ import {
 import {blockUrl, txUrl} from "@/lib/explorer";
 import {useFeed} from "@/lib/feed";
 import {onChainChange, readActiveChain, withChain} from "@/lib/chain";
+import {useWallet} from "@/lib/wallet";
+
+/** Chain-id → operator-friendly label for the mismatch banner. Kept in sync
+ *  with the switcher's LABELS map in `frontend/lib/chains.ts`. */
+const CHAIN_ID_LABEL: Record<number, string> = {
+  1: "Ethereum",
+  8453: "Base",
+  42161: "Arbitrum",
+  10: "Optimism",
+  137: "Polygon",
+  56: "BNB",
+};
+const labelFor = (id: number | null | undefined) =>
+  id == null ? "an unknown chain" : CHAIN_ID_LABEL[id] ?? `chain ${id}`;
 
 const FEED_MAX = 400;
 const POLL_MS = 4000;
@@ -109,6 +123,10 @@ export default function Console() {
     return onChainChange(setChainSlug);
   }, []);
 
+  // Wallet state for the mismatch banner (WS-H3). `useWallet` is a shared
+  // context so this doesn't spin up another provider subscription.
+  const wallet = useWallet();
+
   useEffect(() => {
     load();
     const t = setInterval(load, POLL_MS);
@@ -117,6 +135,22 @@ export default function Console() {
 
   const demo = Boolean(status?.demo);
   const chainId = status?.chain.id;
+  // Amber banner when the wallet and the console are pointed at different
+  // chains — a real-world source of confusion (WS-H3). Suppressed when the
+  // wallet isn't connected or the bot's chain hasn't come back yet.
+  const walletMismatch =
+    wallet.address !== null &&
+    wallet.chainId !== null &&
+    chainId !== undefined &&
+    wallet.chainId !== chainId;
+
+  // Tab title: prefix the active chain so a screenshot or a browser tab
+  // strip reads "Base · JerseyMikes …" (WS-H4). Runs client-side only.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const name = status?.chain.name ?? (chainSlug ? chainSlug[0].toUpperCase() + chainSlug.slice(1) : "");
+    document.title = name ? `${name} · JerseyMikes console` : "JerseyMikes — MEV simulation console";
+  }, [status?.chain.name, chainSlug]);
   const totalNet = pnl?.totalNetWei ?? "0";
   const filteredSims = useMemo(
     () => (strategyFilter === "all" ? sims : sims.filter((s) => s.strategy === strategyFilter)),
@@ -176,6 +210,28 @@ export default function Console() {
       </header>
 
       <div key={chainSlug ?? "default"}>
+      {/* wallet ↔ console chain mismatch (WS-H3): a wallet on Ethereum while
+          the console shows Base is a real bug source — spell it out.
+          Suppressed when either side is unknown. */}
+      {walletMismatch && (
+        <div
+          role="status"
+          style={{
+            border: "1px solid var(--amber)",
+            background: "rgba(245, 181, 68, 0.08)",
+            color: "var(--amber)",
+            padding: "6px 10px",
+            borderRadius: 4,
+            fontSize: 11,
+            marginBottom: 8,
+          }}
+        >
+          wallet is on <strong>{labelFor(wallet.chainId)}</strong> — console is showing{" "}
+          <strong>{status?.chain.name ?? labelFor(chainId)}</strong>. Chain-scoped actions (deploy,
+          allowlist, fund) will refuse until the wallet switches.
+        </div>
+      )}
+
       {/* jump nav — the page is long; this keeps every section one click away */}
       <nav
         style={{
@@ -602,7 +658,7 @@ export default function Console() {
       >
         <div style={{padding: 4, display: "grid", gap: 12}}>
           <QualificationReport qualification={status?.qualification} />
-          <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} />
+          <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} chainId={chainId} />
         </div>
       </Section>
 
@@ -625,7 +681,18 @@ function QualificationReport({qualification}: {qualification: StatusResponse["qu
   return (
     <div className="panel" style={{padding: 10}}>
       <div className="panel-head">
-        <span>strategy qualification</span>
+        <span>
+          strategy qualification
+          {qualification?.comparisonBackend && (
+            <span
+              className="muted"
+              style={{marginLeft: 8, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em"}}
+              title="the independent second opinion the accuracy numbers below are graded against"
+            >
+              backend: {qualification.comparisonBackend}
+            </span>
+          )}
+        </span>
         <span className={qualification?.pass ? "pos" : "muted"}>
           {qualification
             ? `${qualification.elapsedHours}/${qualification.requiredHours}h · max gap ${qualification.maximumObservationGapSecs}s`

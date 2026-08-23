@@ -71,6 +71,10 @@ export interface StatusResponse {
     maximumErrorBps: number;
     minimumAccuracyBps: number;
     persistenceDropped: number;
+    /** `relay` (fork vs `eth_callBundle`, mainnet) or `sequencer` (fork vs
+     *  included block, Base/L2). The console labels the panel with this so a
+     *  Base verdict is never misread as a relay verdict (work order WS-N). */
+    comparisonBackend?: string;
     reasons: string[];
     strategies: StrategyQualification[];
   };

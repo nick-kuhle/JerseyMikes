@@ -14,7 +14,9 @@ interface Chain {
  * localStorage) and the Console remounts the panel tree on the new slug so
  * no panel can show another chain's data.
  *
- * Single-chain deployments see one pill and the control stays inert.
+ * Single-chain deployments render one **inert** pill labelled with the only
+ * chain, so the console never leaves the operator guessing which chain
+ * they're looking at (work order WS-H1). Only the pre-load flash is silent.
  */
 export default function ChainSwitcher() {
   const [chains, setChains] = useState<Chain[]>([]);
@@ -44,9 +46,38 @@ export default function ChainSwitcher() {
     []
   );
 
-  // Nothing to switch over (single chain or not loaded yet): stay invisible
-  // rather than render one dead pill.
-  if (!loaded || chains.length < 2) return null;
+  // Not loaded yet: stay silent for one frame so the pill doesn't flash a
+  // stale label. Once loaded, always render *something* — the operator
+  // must never wonder which chain they're staring at.
+  if (!loaded) return null;
+
+  // Single-chain deployment: one inert pill (no cursor, no click). The
+  // hover title points to the CHAINS env var so operators discover how
+  // to enable switching.
+  if (chains.length < 2) {
+    const only = chains[0];
+    return (
+      <div
+        style={{display: "flex", gap: 2, background: "#070b11", border: "1px solid #1b2532", borderRadius: 6, padding: 2}}
+        role="group"
+        aria-label="chain"
+      >
+        <span
+          className="badge live"
+          style={{
+            color: "#35d07f",
+            font: "inherit",
+            fontSize: 11,
+            padding: "2px 10px",
+            letterSpacing: "0.04em",
+          }}
+          title="single-chain console — set CHAINS on the frontend to enable switching"
+        >
+          {only?.label ?? "Ethereum"}
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div

@@ -40,20 +40,53 @@ import creationHex from "@/lib/MevExecutor.creation.hex";
 import {addressUrl, explorerName, txUrl} from "@/lib/explorer";
 import {useWallet} from "@/lib/wallet";
 
-/** Constructor: `MevExecutor(address balancerVault, address weth)` — mainnet values. */
-const BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as const;
-const WETH9 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as const;
+/**
+ * Per-chain constructor arguments for `MevExecutor(balancerVault, weth)`.
+ * Balancer V2's vault is deployed at the *same* address on mainnet and Base
+ * (verified — see `bot/crates/mev-bot/src/config.rs::known::BASE_BALANCER_VAULT`);
+ * WETH is the 0xC02… wrapper on mainnet and Base's canonical `0x4200…0006`.
+ * The active chain's row below is picked from `chainSlug` before the deploy
+ * call is built (work order WS-H2).
+ */
+const CHAIN_LABEL: Record<string, string> = {
+  ethereum: "Ethereum mainnet",
+  base: "Base",
+};
+const CHAIN_DEFAULT_ID: Record<string, number> = {
+  ethereum: 1,
+  base: 8453,
+};
+const CONSTRUCTOR_ARGS: Record<
+  string,
+  {balancerVault: `0x${string}`; weth: `0x${string}`}
+> = {
+  ethereum: {
+    balancerVault: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+    weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  },
+  base: {
+    // Same-address Balancer V2 vault on Base (see config.rs::known).
+    balancerVault: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+    weth: "0x4200000000000000000000000000000000000006",
+  },
+};
 
-const STORAGE_KEY = "jerseymikes.executor";
+/** LocalStorage key: scoped per chain so an Ethereum deploy doesn't leak
+ *  into the Base panel and vice versa. Back-compat: the legacy unsuffixed
+ *  key is read once as a fallback for the ethereum slug. */
+const STORAGE_KEY_BASE = "jerseymikes.executor";
+const storageKey = (slug: string | null) =>
+  `${STORAGE_KEY_BASE}.${(slug ?? "ethereum").toLowerCase()}`;
 
 function padAddress(a: string): string {
   return a.toLowerCase().replace(/^0x/, "").padStart(64, "0");
 }
 
 /** Creation bytecode + ABI-encoded constructor args (two static address words). */
-function deployData(): `0x${string}` {
+function deployData(slug: string | null): `0x${string}` {
   const hex = creationHex.trim().replace(/^0x/, "");
-  return `0x${hex}${padAddress(BALANCER_VAULT)}${padAddress(WETH9)}` as `0x${string}`;
+  const args = CONSTRUCTOR_ARGS[(slug ?? "ethereum").toLowerCase()] ?? CONSTRUCTOR_ARGS.ethereum;
+  return `0x${hex}${padAddress(args.balancerVault)}${padAddress(args.weth)}` as `0x${string}`;
 }
 
 interface Step {
@@ -66,11 +99,16 @@ interface Step {
 export default function GoLivePanel({
   executor,
   armed,
+  /** The chain the bot behind the console is running against (from
+   *  `/api/bot/status`). Falls back to the slug map when the bot is
+   *  unreachable, so the panel still labels itself correctly (WS-H2). */
+  chainId: botChainId,
 }: {
   /** What the bot currently uses (sim fixture until EXECUTOR_ADDRESS is set). */
   executor?: string;
   /** Boot-time two-key arming state, for the final note. */
   armed?: boolean;
+  chainId?: number;
 }) {
   const {address, chainId, balanceWei, connect, disconnect, activeName, eip1193, switchChain} = useWallet();
 
@@ -94,14 +132,21 @@ export default function GoLivePanel({
 
   // Multi-chain: the panel talks to the active chain's bot config and RPC.
   const chainSlug = readActiveChain();
+  const chainKey = (chainSlug ?? "ethereum").toLowerCase();
+  const chainLabel = CHAIN_LABEL[chainKey] ?? chainKey;
+  // Expected chain id: prefer the bot's own report (the bot knows for sure
+  // which chain it's forking); fall back to the slug map for a first paint
+  // before status has landed.
+  const expectedChainId = botChainId ?? CHAIN_DEFAULT_ID[chainKey] ?? 1;
   const publicClient = useMemo(
     () => createPublicClient({chain: chainSlug === "base" ? base : mainnet, transport: http(withChain("/api/eth", chainSlug))}),
     [chainSlug]
   );
 
-  // Bot's own signer EOA — prefills the allowlist step.
+  // Bot's own signer EOA — prefills the allowlist step. Refetched on chain
+  // change so the Base panel doesn't prefill with the mainnet searcher.
   useEffect(() => {
-    fetch(withChain("/api/bot/config", readActiveChain()), {cache: "no-store"})
+    fetch(withChain("/api/bot/config", chainSlug), {cache: "no-store"})
       .then((r) => r.json())
       .then((c: {searcher?: string}) => {
         if (c.searcher && isAddress(c.searcher)) {
@@ -110,13 +155,25 @@ export default function GoLivePanel({
         }
       })
       .catch(() => {});
-  }, []);
+  }, [chainSlug]);
 
-  // Remember a deployment across reloads.
+  // Remember a deployment across reloads — per-chain so an Ethereum
+  // executor never bleeds into the Base panel (work order R6).
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved && isAddress(saved)) setDeployed(saved);
-  }, []);
+    const saved = localStorage.getItem(storageKey(chainSlug));
+    if (saved && isAddress(saved)) {
+      setDeployed(saved);
+      return;
+    }
+    // Back-compat: the legacy unsuffixed key predates multi-chain; treat it
+    // as the mainnet deployment only.
+    if (chainKey === "ethereum") {
+      const legacy = localStorage.getItem(STORAGE_KEY_BASE);
+      if (legacy && isAddress(legacy)) setDeployed(legacy);
+    } else {
+      setDeployed(null);
+    }
+  }, [chainSlug, chainKey]);
 
   const target = known && isAddress(known) ? known : deployed ?? "";
 
@@ -151,14 +208,14 @@ export default function GoLivePanel({
     return () => clearInterval(t);
   }, [refreshVerify]);
 
-  const onWalletReady = chainId === 1 && Boolean(address);
+  const onWalletReady = chainId === expectedChainId && Boolean(address);
   const walletFunded = onWalletReady && BigInt(balanceWei ?? 0) >= parseEther("0.005");
 
   const doEstimate = useCallback(async () => {
     if (!address) return;
     setStatus("estimating deployment cost…");
     try {
-      const gas = await publicClient.estimateGas({account: address as Address, data: deployData()});
+      const gas = await publicClient.estimateGas({account: address as Address, data: deployData(chainSlug)});
       const price = await publicClient.getGasPrice();
       setEstimate(`~${formatEther(BigInt(gas) * price).slice(0, 6)} ETH (${gas.toLocaleString()} gas @ ${Number(price) / 1e9} gwei)`);
       setStatus("");
@@ -166,7 +223,7 @@ export default function GoLivePanel({
       setEstimate(null);
       setStatus(`estimate failed: ${(e as Error).message.split("\n")[0]}`);
     }
-  }, [address, publicClient]);
+  }, [address, publicClient, chainSlug]);
 
   const doDeploy = useCallback(async () => {
     if (!address || !eip1193) return;
@@ -176,7 +233,7 @@ export default function GoLivePanel({
       const wallet = createWalletClient({transport: custom(eip1193)});
       const hash = (await wallet.sendTransaction({
         account: address as Address,
-        data: deployData(),
+        data: deployData(chainSlug),
         chain: null,
         // The deployer pays gas; constructor has no payable side.
       })) as `0x${string}`;
@@ -186,7 +243,7 @@ export default function GoLivePanel({
       const ca = (receipt as unknown as {contractAddress?: string}).contractAddress;
       if (ca && isAddress(ca)) {
         setDeployed(ca);
-        localStorage.setItem(STORAGE_KEY, ca);
+        localStorage.setItem(storageKey(chainSlug), ca);
         setStatus(`deployed at ${ca}`);
       } else {
         setStatus("receipt has no contract address — was the tx a deployment?");
@@ -196,7 +253,7 @@ export default function GoLivePanel({
     } finally {
       setDeploying(false);
     }
-  }, [address, eip1193, publicClient]);
+  }, [address, eip1193, publicClient, chainSlug]);
 
   const doFund = useCallback(async () => {
     if (!address || !eip1193 || !isAddress(target)) return;
@@ -254,7 +311,7 @@ export default function GoLivePanel({
   const steps: Step[] = [
     {
       key: "wallet",
-      title: "1 · Connect a wallet on Ethereum mainnet",
+      title: `1 · Connect a wallet on ${chainLabel}`,
       state: onWalletReady ? "done" : "todo",
       node: (
         <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
@@ -262,15 +319,15 @@ export default function GoLivePanel({
             <>
               <span style={{fontSize: 11}}>
                 {activeName ?? "wallet"} · <code>{address.slice(0, 10)}…</code>{" "}
-                {chainId === 1 ? (
-                  <span style={{color: "var(--green)"}}>chain 1 ✓</span>
+                {chainId === expectedChainId ? (
+                  <span style={{color: "var(--green)"}}>chain {expectedChainId} ✓</span>
                 ) : (
                   <span style={{color: "var(--amber)"}}>chain {chainId}</span>
                 )}
               </span>
-              {chainId !== 1 && (
-                <button onClick={() => void switchChain(1)} style={btn}>
-                  switch to mainnet
+              {chainId !== expectedChainId && (
+                <button onClick={() => void switchChain(expectedChainId)} style={btn}>
+                  switch wallet to {chainLabel}
                 </button>
               )}
               <button onClick={() => disconnect()} style={btn}>
@@ -320,22 +377,24 @@ export default function GoLivePanel({
               onClick={() => void doDeploy()}
               disabled={!walletFunded || deploying}
               style={{...btn, borderColor: deployedOk ? "var(--line)" : "var(--green)", color: deployedOk ? "var(--muted)" : "var(--green)"}}
+              title={`${deployedOk ? "redeploy" : "deploy"} MevExecutor on ${chainLabel}`}
             >
-              {deploying ? "deploying…" : deployedOk ? "redeploy" : "deploy"}
+              {deploying ? "deploying…" : deployedOk ? `redeploy · ${chainLabel}` : `deploy · ${chainLabel}`}
             </button>
             {estimate && <span style={{fontSize: 11, color: "var(--cyan)"}}>{estimate}</span>}
           </div>
           <p className="muted" style={{fontSize: 10, margin: 0}}>
-            constructor <code>MevExecutor(balancerVault, weth)</code> — prefilled with mainnet Balancer V2 + WETH9. The
-            creation bytecode is the CI-checked copy of the bot&apos;s artifact, so what you deploy is what the bot
-            simulates against.
+            constructor <code>MevExecutor(balancerVault, weth)</code> — prefilled with the {chainLabel} Balancer V2 vault +
+            WETH ({CONSTRUCTOR_ARGS[chainKey]?.balancerVault.slice(0, 10)}… /{" "}
+            {CONSTRUCTOR_ARGS[chainKey]?.weth.slice(0, 10)}…). The creation bytecode is the CI-checked copy of the bot&apos;s
+            artifact, so what you deploy is what the bot simulates against.
           </p>
           <div style={{display: "flex", gap: 8, alignItems: "center", fontSize: 11}}>
             <span className="muted">already deployed? paste the address:</span>
             <input value={known} onChange={(e) => setKnown(e.target.value)} placeholder="0x…" style={{...input, width: 320}} />
           </div>
           {deployHash && (
-            <a href={txUrl(1, deployHash) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
+            <a href={txUrl(expectedChainId, deployHash) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
               deployment tx ↗
             </a>
           )}
@@ -363,7 +422,7 @@ export default function GoLivePanel({
             </span>
           )}
           {fundTx && (
-            <a href={txUrl(1, fundTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
+            <a href={txUrl(expectedChainId, fundTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
               tx ↗
             </a>
           )}
@@ -377,8 +436,13 @@ export default function GoLivePanel({
       node: (
         <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
           <input value={searcherInput} onChange={(e) => setSearcherInput(e.target.value)} placeholder="searcher address" style={{...input, width: 320}} />
-          <button onClick={() => void doAllowSearcher()} disabled={!deployedOk} style={btn}>
-            setSearcher(…, true)
+          <button
+            onClick={() => void doAllowSearcher()}
+            disabled={!deployedOk}
+            style={btn}
+            title={`setSearcher(address, true) on the ${chainLabel} executor`}
+          >
+            setSearcher(…, true) · {chainLabel}
           </button>
           <span className="muted" style={{fontSize: 10}}>
             prefilled from the bot&apos;s SEARCHER_ADDRESS. The executor only accepts bundles from allowlisted addresses.
@@ -386,7 +450,7 @@ export default function GoLivePanel({
           {verify.searcherAllowed === true && <span style={{fontSize: 11, color: "var(--green)"}}>allowlisted ✓</span>}
           {verify.searcherAllowed === false && <span style={{fontSize: 11, color: "var(--amber)"}}>not allowlisted yet</span>}
           {allowTx && (
-            <a href={txUrl(1, allowTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
+            <a href={txUrl(expectedChainId, allowTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
               tx ↗
             </a>
           )}
@@ -402,7 +466,7 @@ export default function GoLivePanel({
           <div className="muted">
             code: <strong>{verify.code ?? "—"}</strong> · owner:{" "}
             {verify.owner ? (
-              <a href={addressUrl(1, verify.owner) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
+              <a href={addressUrl(expectedChainId, verify.owner) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
                 {verify.owner.slice(0, 10)}… ↗
               </a>
             ) : (
@@ -411,8 +475,8 @@ export default function GoLivePanel({
             {target && (
               <>
                 {" "}· contract:{" "}
-                <a href={addressUrl(1, target) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
-                  {target.slice(0, 10)}… on {explorerName(1)} ↗
+                <a href={addressUrl(expectedChainId, target) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
+                  {target.slice(0, 10)}… on {explorerName(expectedChainId)} ↗
                 </a>
               </>
             )}
@@ -428,12 +492,13 @@ export default function GoLivePanel({
           <button
             onClick={() => {
               void navigator.clipboard.writeText(`EXECUTOR_ADDRESS=${target}`);
-              setStatus("copied EXECUTOR_ADDRESS to clipboard");
+              setStatus(`copied EXECUTOR_ADDRESS to clipboard (${chainLabel})`);
             }}
             disabled={!isAddress(target)}
             style={{...btn, justifySelf: "start"}}
+            title={`copy the EXECUTOR_ADDRESS line for the ${chainLabel} bot's .env`}
           >
-            copy EXECUTOR_ADDRESS line
+            copy EXECUTOR_ADDRESS line · {chainLabel}
           </button>
         </div>
       ),

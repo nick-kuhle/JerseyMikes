@@ -226,11 +226,18 @@ there (no public mempool — it is back-run-only); the v1 lane is flash-loan
   7-day sample gate) that decides whether UniversalRouter decoding gets
   flipped — see [`docs/W6_MEMO.md`](docs/W6_MEMO.md) (Ethereum only — a
   sequencer chain has no public mempool to gap)
-- **Chain switcher**: with `CHAINS` set (e.g. `ethereum|…,base|…`), the
-  header gains Ethereum | Base pills; the whole panel tree re-keys on the
-  switch so no panel can show another chain's data, and an unreachable bot
-  falls back to the flagged DEMO state for that chain only. Single-chain
-  deployments (`CHAINS` unset) are unchanged.
+- **Chain indicator + switcher**: the header always shows the active chain
+  as a green pill (so which chain a screenshot came from is never
+  ambiguous). With `CHAINS` set (e.g. `ethereum|…,base|…`), the pill
+  becomes a switcher — click Ethereum ↔ Base and the whole panel tree
+  re-keys on the slug so no panel can show another chain's data. An
+  unreachable bot falls back to the flagged DEMO state for that chain
+  only. Single-chain deployments (`CHAINS` unset) get one inert pill
+  labelled with the only chain. The wallet's network and the console's
+  active chain are independent; a mismatch shows an amber banner under
+  the header, and the go-live panel's wallet gate follows the console's
+  active chain (so a Base console offers "switch wallet to Base", not
+  "switch to mainnet").
 
 The browser only ever talks to `/api/bot/*`, which the Next server proxies to
 `BOT_API_URL`; contract reads go through `/api/eth`, a server-side
