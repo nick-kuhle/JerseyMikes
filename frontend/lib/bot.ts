@@ -1,13 +1,24 @@
+import {chainBySlug, tokenForChain} from "./chains";
+
 /**
- * Server-side bridge to the Rust bot.
+ * Server-side bridge to the Rust bot(s).
  *
- * The browser never talks to the bot directly (it may be on a private network,
+ * The browser never talks to a bot directly (it may be on a private network,
  * and in a sandboxed preview `localhost` means something different in the
  * browser than on the server). Everything goes through `/api/bot/*`, which
- * proxies to `BOT_API_URL` and falls back to the demo generator when the bot is
- * not reachable.
+ * proxies to the selected chain's bot and falls back to the demo generator
+ * when that bot is not reachable.
+ *
+ * Multi-chain: every helper takes an optional `chainSlug` (the `?chain=`
+ * value). Omitted = the first configured chain, which for a single-chain
+ * deployment is the only chain — back-compatible with the old
+ * `BOT_API_URL`-only setup.
  */
-export const BOT_API_URL = process.env.BOT_API_URL ?? "http://127.0.0.1:8080";
+
+/** Default (first) chain's bot URL — kept for back-compat and the
+ * single-chain fallback in `chains()`. */
+export const BOT_API_URL =
+  process.env.BOT_API_URL ?? "http://127.0.0.1:8080";
 
 /**
  * Bearer token for the bot's *mutating* endpoints, when it runs with
@@ -15,25 +26,32 @@ export const BOT_API_URL = process.env.BOT_API_URL ?? "http://127.0.0.1:8080";
  * address).
  *
  * Server-side only — deliberately **not** `NEXT_PUBLIC_`, so the secret stays
- * on the Next.js server and never reaches the browser bundle. Every bot call
- * already goes through the `/api/bot/*` proxy, so the token only has to exist
- * here.
+ * on the Next.js server and never reaches the browser bundle.
  */
-const BOT_API_TOKEN = process.env.BOT_API_TOKEN ?? "";
-
-/** Auth header for bot requests, or `{}` when no token is configured. */
-export function botAuthHeaders(): Record<string, string> {
-  return BOT_API_TOKEN ? {authorization: `Bearer ${BOT_API_TOKEN}`} : {};
+export function botAuthHeaders(chainSlug?: string | null): Record<string, string> {
+  const chain = chainBySlug(chainSlug);
+  const token = tokenForChain(chain.slug);
+  return token ? {authorization: `Bearer ${token}`} : {};
 }
 
-export async function botFetch(path: string, timeoutMs = 2500): Promise<{ok: true; data: unknown} | {ok: false}> {
+/** Absolute upstream URL for a bot route on a chain. */
+export function botUpstreamUrl(path: string, chainSlug?: string | null): string {
+  const chain = chainBySlug(chainSlug);
+  return `${chain.botUrl}${path}`;
+}
+
+export async function botFetch(
+  path: string,
+  timeoutMs = 2500,
+  chainSlug?: string | null,
+): Promise<{ok: true; data: unknown} | {ok: false}> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${BOT_API_URL}${path}`, {
+    const res = await fetch(botUpstreamUrl(path, chainSlug), {
       signal: controller.signal,
       cache: "no-store",
-      headers: {accept: "application/json", ...botAuthHeaders()},
+      headers: {accept: "application/json", ...botAuthHeaders(chainSlug)},
     });
     if (!res.ok) return {ok: false};
     return {ok: true, data: await res.json()};
@@ -53,18 +71,19 @@ export async function botPost(
   path: string,
   body: unknown,
   timeoutMs = 3000,
+  chainSlug?: string | null,
 ): Promise<{ok: true; data: Record<string, unknown>} | {ok: false; error?: string}> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${BOT_API_URL}${path}`, {
+    const res = await fetch(botUpstreamUrl(path, chainSlug), {
       method: "POST",
       signal: controller.signal,
       cache: "no-store",
       headers: {
         "content-type": "application/json",
         accept: "application/json",
-        ...botAuthHeaders(),
+        ...botAuthHeaders(chainSlug),
       },
       body: JSON.stringify(body),
     });

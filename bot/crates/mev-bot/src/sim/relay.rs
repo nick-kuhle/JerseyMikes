@@ -91,6 +91,7 @@ impl RelaySim {
             // drifted after runtime risk edits.
             bribe_wei: eth_sent,
             net_profit_wei: net,
+            victim_predicted_out_wei: None,
             revert_reason,
             target_block: bundle.target_block,
             sim_latency_ms: started.elapsed().as_millis() as u64,

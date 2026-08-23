@@ -1,4 +1,5 @@
 "use client";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 /**
  * Direct on-chain interaction with the deployed `MevExecutor`.
@@ -23,7 +24,7 @@ import {
   parseEther,
   type Address,
 } from "viem";
-import {mainnet} from "viem/chains";
+import {base, mainnet} from "viem/chains";
 import EXECUTOR_ABI from "@/lib/MevExecutor.abi.json";
 import {shortHash} from "@/lib/format";
 import {addressUrl, explorerName, txUrl} from "@/lib/explorer";
@@ -54,7 +55,9 @@ export default function ContractPanel({
   const [quoteResult, setQuoteResult] = useState<string | null>(null);
 
   const publicClient = useMemo(
-    () => createPublicClient({chain: mainnet, transport: http("/api/eth")}),
+    // Multi-chain: reads go to the active chain's RPC through the proxy;
+    // the viem chain object matches so checksums/params are chain-correct.
+    () => createPublicClient({chain: readActiveChain() === "base" ? base : mainnet, transport: http(withChain("/api/eth", readActiveChain()))}),
     []
   );
 

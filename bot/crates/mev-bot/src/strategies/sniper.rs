@@ -104,7 +104,11 @@ impl StrategyImpl for SniperStrategy {
         // this range must be retried on the next block.
         let cursor = *self.last_log_block.read();
         let (from, to) = PoolDiscovery::window(cursor, head.number);
-        let Some(pairs) = try_scan_pair_created(&ctx.rpc, from, to).await else {
+        let factories = ctx.cfg.addresses.pair_factories();
+        if factories.is_empty() {
+            return Vec::new(); // no V2 factories on this chain
+        }
+        let Some(pairs) = try_scan_pair_created(&ctx.rpc, &factories, from, to).await else {
             tracing::debug!(
                 target: "strategy::sniper",
                 from,

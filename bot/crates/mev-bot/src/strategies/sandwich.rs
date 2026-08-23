@@ -13,7 +13,7 @@ use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 
-use crate::dex::{self, Venue};
+use crate::dex;
 use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, Call, Opportunity, PendingTx, Strategy};
 
@@ -27,7 +27,12 @@ impl StrategyImpl for SandwichStrategy {
 
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
-        let Some(intent) = decode_router(tx, weth, ctx.cfg.decode_universal_router) else {
+        let Some(intent) = decode_router(
+            tx,
+            weth,
+            ctx.cfg.decode_universal_router,
+            ctx.cfg.addresses.universal_router,
+        ) else {
             return Vec::new();
         };
         // Only single-hop paths for now: multi-hop sandwiches need the whole
@@ -49,7 +54,9 @@ impl StrategyImpl for SandwichStrategy {
         let target_block = tx.target_block(&head, ctx.cfg.sim.target_block_offset);
 
         let mut out = Vec::new();
-        for venue in [Venue::UniV2, Venue::SushiV2] {
+        // Every V2 venue the chain's registry knows about (two on mainnet,
+        // one on Base).
+        for (venue, _) in ctx.cfg.addresses.pair_factories() {
             let Some(pair) = ctx
                 .pools
                 .pair_for(intent.token_in, intent.token_out, venue)
@@ -175,6 +182,7 @@ pub fn build_leg(
 mod tests {
     use super::*;
     use crate::dex::V2Pool;
+    use crate::dex::Venue;
 
     fn pool() -> V2Pool {
         V2Pool {

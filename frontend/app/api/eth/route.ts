@@ -1,4 +1,5 @@
 import {NextRequest} from "next/server";
+import {chainBySlug} from "@/lib/chains";
 
 export const dynamic = "force-dynamic";
 
@@ -37,13 +38,23 @@ const READ_METHODS = new Set([
   "web3_clientVersion",
 ]);
 
-const UPSTREAM =
+const DEFAULT_UPSTREAM =
   process.env.ETH_PROXY_URL ||
   process.env.ETH_HTTP_URL ||
   process.env.NEXT_PUBLIC_RPC_URL ||
   // Keyless public endpoint, used only when no other RPC is configured.
   // Set ETH_PROXY_URL to use your own node/provider instead.
   "https://ethereum-rpc.publicnode.com";
+
+/**
+ * Multi-chain: the `?chain=` slug's per-chain RPC (the third `CHAINS` field)
+ * wins over the process-level default, so the Base executor panel reads Base
+ * state and the Ethereum panel reads Ethereum state from the same dashboard.
+ */
+function upstreamFor(chainSlug?: string | null): string {
+  const chain = chainBySlug(chainSlug);
+  return chain.rpcUrl ?? DEFAULT_UPSTREAM;
+}
 
 function err(message: string, status = 400) {
   return new Response(JSON.stringify({error: {message}}), {
@@ -53,6 +64,8 @@ function err(message: string, status = 400) {
 }
 
 export async function POST(req: NextRequest) {
+  const chainSlug = req.nextUrl.searchParams.get("chain");
+  const UPSTREAM = upstreamFor(chainSlug);
   let body: {method?: string; params?: unknown[]; jsonrpc?: string; id?: unknown};
   try {
     body = await req.json();

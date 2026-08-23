@@ -1,4 +1,5 @@
 "use client";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 /**
  * Execution-mode switch: simulation ⇄ live.
@@ -40,7 +41,7 @@ export default function ModeSwitch({mode, armed, demo, onChanged}: Props) {
     setBusy(true);
     setNote(null);
     try {
-      const r = await fetch("/api/bot/mode", {
+      const r = await fetch(withChain("/api/bot/mode", readActiveChain()), {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({live: want}),

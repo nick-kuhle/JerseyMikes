@@ -370,6 +370,25 @@ impl Store {
             );
             INSERT OR IGNORE INTO risk_state (id, kill_switch_tripped, cumulative_net_wei)
                 VALUES (1, 0, '0');
+
+            -- Sequencer-backend qualification evidence: for a victim-pinned
+            -- opportunity, the fork's predicted victim-leg delta vs the
+            -- victim's realised delta in the canonical (included) block.
+            -- This is the "included block" second opinion that replaces the
+            -- relay eth_callBundle comparison on chains without relays.
+            CREATE TABLE IF NOT EXISTS block_comparisons (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id TEXT NOT NULL,
+                strategy       TEXT NOT NULL,
+                victim_hash    TEXT NOT NULL,
+                block_number   INTEGER NOT NULL,
+                predicted_wei  TEXT NOT NULL,
+                realized_wei   TEXT NOT NULL,
+                error_bps      INTEGER NOT NULL,
+                created_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_block_comparisons_strategy
+                ON block_comparisons (strategy, created_at_ms);
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -378,6 +397,7 @@ impl Store {
         self.add_column("blocks", "parent_hash", "TEXT NOT NULL DEFAULT ''");
         self.add_column("blocks", "canonical", "INTEGER NOT NULL DEFAULT 1");
         self.add_column("simulations", "reorged", "INTEGER NOT NULL DEFAULT 0");
+        self.add_column("simulations", "victim_predicted_out_wei", "TEXT");
         self.add_column("bundles", "included", "INTEGER");
         self.add_column("bundles", "included_block", "INTEGER");
         self.add_column("bundles", "inclusion_checked_ms", "INTEGER");
@@ -650,8 +670,8 @@ fn write_simulation(conn: &Connection, s: &SimulationResult) -> Result<()> {
     conn.execute(
             "INSERT INTO simulations
              (opportunity_id, strategy, backend, success, gross_wei, gas_used, gas_cost_wei, bribe_wei,
-              net_wei, revert_reason, target_block, latency_ms, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              net_wei, victim_predicted_out_wei, revert_reason, target_block, latency_ms, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 s.opportunity_id,
                 s.strategy.as_str(),
@@ -662,6 +682,7 @@ fn write_simulation(conn: &Connection, s: &SimulationResult) -> Result<()> {
                 s.gas_cost_wei.to_string(),
                 s.bribe_wei.to_string(),
                 s.net_profit_wei.to_string(),
+                s.victim_predicted_out_wei,
                 s.revert_reason,
                 s.target_block as i64,
                 s.sim_latency_ms as i64,
@@ -1307,6 +1328,79 @@ impl Store {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// One included-block comparison: the fork's predicted victim-leg delta
+    /// vs the victim's realised delta in the canonical block. The
+    /// `Sequencer` qualification backend reads these as its independent
+    /// second opinion (no relay exists on a sequencer chain).
+    /// The fork's predicted victim-leg delta for an opportunity (the latest
+    /// successful fork simulation that measured one), if any.
+    pub fn victim_predicted_delta(&self, opportunity_id: &str) -> Option<i128> {
+        self.conn
+            .lock()
+            .query_row(
+                "SELECT victim_predicted_out_wei FROM simulations
+             WHERE opportunity_id = ?1 AND backend = 'anvil_fork' AND success = 1
+               AND victim_predicted_out_wei IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+                params![opportunity_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse::<i128>().ok())
+    }
+
+    /// The bundle's raw signed transactions (from the durable payload), if
+    /// the bundle is recorded. Raw-mode cancellation decodes nonces from
+    /// these and hashes them for receipt checks.
+    pub fn bundle_raw_txs(&self, bundle_id: &str) -> Option<Vec<Vec<u8>>> {
+        let payload = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT payload FROM bundles WHERE id = ?1",
+                params![bundle_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&payload).ok()?;
+        let txs = value.get("txs")?.as_array()?;
+        let mut out = Vec::new();
+        for t in txs {
+            let s = t.as_str()?;
+            out.push(hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?);
+        }
+        Some(out)
+    }
+
+    pub fn record_block_comparison(
+        &self,
+        opportunity_id: &str,
+        strategy: &str,
+        victim_hash: &str,
+        block_number: u64,
+        predicted_wei: i128,
+        realized_wei: i128,
+    ) -> Result<()> {
+        let error_bps = relative_error_bps(predicted_wei, realized_wei);
+        self.conn.lock().execute(
+            "INSERT INTO block_comparisons
+             (opportunity_id, strategy, victim_hash, block_number,
+              predicted_wei, realized_wei, error_bps, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                opportunity_id,
+                strategy,
+                victim_hash,
+                block_number as i64,
+                predicted_wei.to_string(),
+                realized_wei.to_string(),
+                error_bps as i64,
+                crate::types::now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn record_actual_mev_match(&self, matched: &ActualMevMatch) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO actual_mev_matches
@@ -1495,11 +1589,24 @@ impl Store {
 
     /// Strategy-specific fork, relay and corresponding-chain evidence. The
     /// comparison vectors contain exact relative errors in basis points.
+    /// Per-strategy qualification evidence.
+    ///
+    /// `backend` selects the source of the *independent second opinion*
+    /// (the `relay_errors_bps` field, a name kept for API stability):
+    /// - `Relay` (mainnet): fork net vs relay `eth_callBundle` net.
+    /// - `Sequencer` (Base et al., no relay market): fork prediction vs the
+    ///   *included block* — victim-pinned opportunities compare the fork's
+    ///   predicted victim-leg delta against the victim's realised delta in
+    ///   the canonical block (`block_comparisons`); victimless opportunities
+    ///   (e.g. atomic_arb) use high-confidence on-chain route matches as the
+    ///   second opinion (a relay-less chain's included block is where
+    ///   independent confirmation lives). The tolerance math is identical.
     pub fn qualification_evidence(
         &self,
         since_ms: u64,
         strategy: Strategy,
         minimum_confidence_bps: u64,
+        backend: crate::config::QualificationBackend,
     ) -> Result<QualificationEvidence> {
         let conn = self.conn.lock();
         let strategy = strategy.as_str();
@@ -1511,30 +1618,75 @@ impl Store {
             |row| row.get(0),
         )?;
 
-        let mut relay_stmt = conn.prepare(
-            "SELECT CAST(f.net_wei AS TEXT), CAST(r.net_wei AS TEXT)
-             FROM simulations f
-             JOIN simulations r ON r.opportunity_id = f.opportunity_id
-             WHERE f.backend = 'anvil_fork' AND r.backend = 'relay_call_bundle'
-               AND f.success = 1 AND r.success = 1
-               AND f.strategy = ?1 AND f.created_at_ms >= ?2
-               AND COALESCE(f.reorged, 0) = 0 AND COALESCE(r.reorged, 0) = 0
-               AND f.id = (SELECT MAX(f2.id) FROM simulations f2
-                           WHERE f2.opportunity_id = f.opportunity_id
-                             AND f2.backend = 'anvil_fork')
-               AND r.id = (SELECT MAX(r2.id) FROM simulations r2
-                           WHERE r2.opportunity_id = r.opportunity_id
-                             AND r2.backend = 'relay_call_bundle')",
-        )?;
-        let relay_rows = relay_stmt.query_map(params![strategy, since_ms as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let relay_errors_bps = relay_rows
-            .flatten()
-            .map(|(fork, relay)| {
-                relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&relay))
-            })
-            .collect();
+        let relay_errors_bps = match backend {
+            crate::config::QualificationBackend::Relay => {
+                let mut relay_stmt = conn.prepare(
+                    "SELECT CAST(f.net_wei AS TEXT), CAST(r.net_wei AS TEXT)
+                     FROM simulations f
+                     JOIN simulations r ON r.opportunity_id = f.opportunity_id
+                     WHERE f.backend = 'anvil_fork' AND r.backend = 'relay_call_bundle'
+                       AND f.success = 1 AND r.success = 1
+                       AND f.strategy = ?1 AND f.created_at_ms >= ?2
+                       AND COALESCE(f.reorged, 0) = 0 AND COALESCE(r.reorged, 0) = 0
+                       AND f.id = (SELECT MAX(f2.id) FROM simulations f2
+                                   WHERE f2.opportunity_id = f.opportunity_id
+                                     AND f2.backend = 'anvil_fork')
+                       AND r.id = (SELECT MAX(r2.id) FROM simulations r2
+                                   WHERE r2.opportunity_id = r.opportunity_id
+                                     AND r2.backend = 'relay_call_bundle')",
+                )?;
+                let relay_rows = relay_stmt
+                    .query_map(params![strategy, since_ms as i64], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                relay_rows
+                    .flatten()
+                    .map(|(fork, relay)| {
+                        relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&relay))
+                    })
+                    .collect()
+            }
+            crate::config::QualificationBackend::Sequencer => {
+                // (a) Victim-replay fidelity: the fork's predicted victim-leg
+                // delta vs the victim's realised delta in the canonical
+                // block — the included-block second opinion.
+                let mut block_stmt = conn.prepare(
+                    "SELECT error_bps FROM block_comparisons
+                     WHERE strategy = ?1 AND created_at_ms >= ?2",
+                )?;
+                let mut errs: Vec<u64> = block_stmt
+                    .query_map(params![strategy, since_ms as i64], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .flatten()
+                    .map(|e| e.max(0) as u64)
+                    .collect();
+                // (b) Victimless opportunities (atomic_arb et al.): the
+                // included block's own high-confidence route match is the
+                // independent confirmation of the fork's state prediction.
+                let mut route_stmt = conn.prepare(
+                    "SELECT CAST(f.net_wei AS TEXT), CAST(a.net_weth_wei AS TEXT)
+                     FROM actual_mev_matches a
+                     JOIN opportunities o ON o.id = a.opportunity_id
+                     JOIN simulations f ON f.opportunity_id = a.opportunity_id
+                     WHERE o.strategy = ?1 AND a.canonical = 1
+                       AND a.created_at_ms >= ?2 AND a.confidence_score_bps >= ?3
+                       AND f.backend = 'anvil_fork' AND f.success = 1
+                       AND COALESCE(f.reorged, 0) = 0
+                       AND f.id = (SELECT MAX(f2.id) FROM simulations f2
+                                   WHERE f2.opportunity_id = f.opportunity_id
+                                     AND f2.backend = 'anvil_fork')",
+                )?;
+                let route_rows = route_stmt.query_map(
+                    params![strategy, since_ms as i64, minimum_confidence_bps as i64],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                errs.extend(route_rows.flatten().map(|(fork, actual)| {
+                    relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&actual))
+                }));
+                errs
+            }
+        };
 
         let mut actual_errors_bps = Vec::new();
         let mut actual_stmt = conn.prepare(
@@ -2071,6 +2223,7 @@ mod tests {
             gas_cost_wei: U256::from(500u64),
             bribe_wei: U256::ZERO,
             net_profit_wei: net,
+            victim_predicted_out_wei: None,
             revert_reason: None,
             target_block: 100,
             sim_latency_ms: 10,

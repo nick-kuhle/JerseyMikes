@@ -10,6 +10,7 @@ import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
 import Phase1Panel from "./Phase1Panel";
 import ModeSwitch from "./ModeSwitch";
+import ChainSwitcher from "./ChainSwitcher";
 import Section from "./Section";
 import WalletButton from "./WalletButton";
 import type {
@@ -35,11 +36,16 @@ import {
 } from "@/lib/format";
 import {blockUrl, txUrl} from "@/lib/explorer";
 import {useFeed} from "@/lib/feed";
+import {onChainChange, readActiveChain, withChain} from "@/lib/chain";
 
 const FEED_MAX = 400;
 const POLL_MS = 4000;
 
 export default function Console() {
+  // Multi-chain: the active chain slug drives every API path (the server
+  // falls back to the default chain when it is null or unknown) and the
+  // keyed remount below so no panel can show another chain's data.
+  const [chainSlug, setChainSlug] = useState<string | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [pnl, setPnl] = useState<PnlResponse | null>(null);
   const [series, setSeries] = useState<SeriesPoint[]>([]);
@@ -54,12 +60,12 @@ export default function Console() {
   const [strategyFilter, setStrategyFilter] = useState("all");
   // Batched + typed SSE consumption: frames accumulate off-render and flush
   // together, so a 200-event burst costs one render instead of 200.
-  const {events, connected} = useFeed("/api/bot/stream", FEED_MAX);
+  const {events, connected} = useFeed(withChain("/api/bot/stream", chainSlug), FEED_MAX);
 
   const load = useCallback(async () => {
     const get = async <T,>(p: string, fallback: T): Promise<T> => {
       try {
-        const r = await fetch(`/api/bot/${p}`, {cache: "no-store"});
+        const r = await fetch(withChain(`/api/bot/${p}`, chainSlug), {cache: "no-store"});
         return (await r.json()) as T;
       } catch {
         return fallback;
@@ -95,6 +101,12 @@ export default function Console() {
     if (actual) setActualMev((prev) => keepIfSame(prev, actual));
     if (executionRows) setExecutions((prev) => keepIfSame(prev, executionRows));
     setReorgs((prev) => keepIfSame(prev, Array.isArray(rg) ? rg : []));
+  }, [chainSlug]);
+
+  // Active chain: initialise from localStorage, follow the switcher.
+  useEffect(() => {
+    setChainSlug(readActiveChain());
+    return onChainChange(setChainSlug);
   }, []);
 
   useEffect(() => {
@@ -133,6 +145,8 @@ export default function Console() {
           <span className="muted" style={{marginLeft: 8, fontSize: 11}}>MEV simulation console</span>
         </div>
 
+        <ChainSwitcher />
+
         <ModeSwitch mode={status?.mode} armed={status?.liveArmed} demo={demo} onChanged={load} />
 
         {demo && (
@@ -161,6 +175,7 @@ export default function Console() {
         </div>
       </header>
 
+      <div key={chainSlug ?? "default"}>
       {/* jump nav — the page is long; this keeps every section one click away */}
       <nav
         style={{
@@ -568,6 +583,7 @@ export default function Console() {
         pendingSeen={status?.stats.pendingSeen ?? 0}
         hintsSeen={status?.stats.hintsSeen ?? 0}
         startedAtMs={status?.stats.startedAtMs}
+        chainId={status?.chain.id}
       />
 
       </Section>
@@ -599,6 +615,7 @@ export default function Console() {
         Broadcasting is disabled by default and remains fail-closed unless every arming, risk, inventory, and
         strategy-specific qualification gate passes. See <code>docs/GO_LIVE.md</code> and <code>docs/RISK.md</code>.
       </footer>
+      </div>
     </main>
   );
 }

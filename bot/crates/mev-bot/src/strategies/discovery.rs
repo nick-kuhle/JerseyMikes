@@ -76,15 +76,22 @@ pub trait DiscoverySource: Send + Sync {
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>>;
 }
 
-/// The production source: plain JSON-RPC.
+/// The production source: plain JSON-RPC against the chain's registered
+/// factories (from the address registry — a chain without a V3 factory
+/// simply scans nothing on that lane).
 pub struct RpcSource<'a> {
     pub rpc: &'a RpcClient,
+    pub pair_factories: &'a [(Venue, Address)],
+    pub v3_factory: Option<Address>,
 }
 
 #[async_trait]
 impl DiscoverySource for RpcSource<'_> {
     async fn scan_pairs(&self, from: u64, to: u64) -> Option<Vec<(Venue, Address)>> {
-        try_scan_pair_created(self.rpc, from, to).await
+        if self.pair_factories.is_empty() {
+            return Some(Vec::new());
+        }
+        try_scan_pair_created(self.rpc, self.pair_factories, from, to).await
     }
 
     async fn fetch_pool(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool> {
@@ -94,7 +101,8 @@ impl DiscoverySource for RpcSource<'_> {
     }
 
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>> {
-        try_scan_pool_created(self.rpc, from, to).await
+        let factory = self.v3_factory?;
+        try_scan_pool_created(self.rpc, factory, from, to).await
     }
 }
 
@@ -159,7 +167,11 @@ impl PoolDiscovery {
     /// years-old WETH/USDC pool never enters a fresh process's V3 cache.
     pub async fn seed_core_v3(&self, ctx: &StrategyCtx) -> usize {
         let mut loaded = 0usize;
-        for token in crate::strategies::arb::CORE_TOKENS {
+        let Some(v3_factory) = ctx.cfg.addresses.univ3_factory else {
+            // No V3 factory on this chain: nothing to seed.
+            return 0;
+        };
+        for token in ctx.cfg.addresses.core_tokens() {
             for (fee, tick_spacing) in [(500u32, 10i32), (3_000, 60), (10_000, 200)] {
                 let call = IUniswapV3FactorySeed::getPoolCall {
                     tokenA: ctx.cfg.chain.weth,
@@ -172,7 +184,7 @@ impl PoolDiscovery {
                     .call_raw(
                         "eth_call",
                         serde_json::json!([{
-                            "to": format!("{:?}", crate::config::known::UNIV3_FACTORY),
+                            "to": format!("{v3_factory:?}"),
                             "data": format!("0x{}", hex::encode(call))
                         }, "latest"]),
                     )
@@ -347,7 +359,12 @@ impl PoolDiscovery {
 
     /// Production entry point: run whichever scans are enabled for this block.
     pub async fn discover(&self, ctx: &StrategyCtx, head: &BlockHead) -> usize {
-        let src = RpcSource { rpc: &ctx.rpc };
+        let pair_factories = ctx.cfg.addresses.pair_factories();
+        let src = RpcSource {
+            rpc: &ctx.rpc,
+            pair_factories: &pair_factories,
+            v3_factory: ctx.cfg.addresses.univ3_factory,
+        };
         let weth = ctx.cfg.chain.weth;
 
         let v2 = if ctx.cfg.pool_discovery {
@@ -449,7 +466,10 @@ mod tests {
     fn cache() -> PoolCache {
         // PoolCache needs an RpcClient handle, but none of these tests reach
         // the network: every read goes through the FakeSource.
-        PoolCache::new(RpcClient::new("http://127.0.0.1:1").unwrap())
+        PoolCache::new(
+            RpcClient::new("http://127.0.0.1:1").unwrap(),
+            vec![(Venue::UniV2, Address::with_last_byte(1))],
+        )
     }
 
     #[test]

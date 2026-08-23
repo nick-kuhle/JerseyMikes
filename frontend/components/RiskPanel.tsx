@@ -1,4 +1,5 @@
 "use client";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 /**
  * Risk envelope controls — instant-apply.
@@ -109,7 +110,7 @@ function RiskPanel({killSwitchTripped}: Props) {
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch("/api/bot/risk", {cache: "no-store"});
+      const res = await fetch(withChain("/api/bot/risk", readActiveChain()), {cache: "no-store"});
       const data = (await res.json()) as RiskStateResponse & {demo?: boolean};
       setDemo(Boolean(data.demo));
       if (data.effective) seed(data.effective);
@@ -136,7 +137,7 @@ function RiskPanel({killSwitchTripped}: Props) {
   const pushPatch = useCallback(
     (patch: Record<string, unknown>) => {
       setApply({kind: "applying"});
-      fetch("/api/bot/risk", {
+      fetch(withChain("/api/bot/risk", readActiveChain()), {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify(patch),
@@ -228,7 +229,7 @@ function RiskPanel({killSwitchTripped}: Props) {
   };
 
   const resetKillSwitch = () => {
-    fetch("/api/bot/risk/reset", {method: "POST", headers: {"content-type": "application/json"}, body: "{}"})
+    fetch(withChain("/api/bot/risk/reset", readActiveChain()), {method: "POST", headers: {"content-type": "application/json"}, body: "{}"})
       .then(() => {
         setKillSwitch({tripped: false, cumulativeNetWei: "0"});
         setApply({kind: "applied", at: new Date().toLocaleTimeString("en-US", {hour12: false})});

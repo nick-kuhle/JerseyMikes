@@ -103,6 +103,13 @@ impl Ingest {
             );
         }
 
+        // Sequencer chains have no relay data API: the chain's own built
+        // blocks are the delivered blocks. Defaulted on for them (see
+        // Config::chain_block_ingest).
+        if cfg.chain_block_ingest {
+            spawn_chain_blocks(http.clone(), cfg.chain.block_time_ms, tx.clone());
+        }
+
         Self { rx }
     }
 }
@@ -634,4 +641,141 @@ pub async fn fetch_raw_tx(http: &RpcClient, hash: B256) -> Option<Vec<u8>> {
     } else {
         Some(bytes)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chain-native delivered blocks (sequencer chains)
+// ---------------------------------------------------------------------------
+
+/// Poll the chain's own head and push every newly built block through the
+/// delivered-block pipeline, the same way the bloXroute relay path does on
+/// mainnet.
+///
+/// On a sequencer chain (Base v1) there is no builder/relay market and no
+/// data API to poll — the sequencer's own built blocks *are* the delivered
+/// blocks. Each block is fetched in full, persisted, scored for extractable
+/// value on the replay fork, and reconciled against the opportunities that
+/// targeted it (`reconcile_block` matches on `target_block`). This is also
+/// what feeds the `Sequencer` qualification backend's included-block
+/// evidence.
+///
+/// Polling rather than a `newHeads` subscription: sequencer-chain WS
+/// endpoints are not uniform (and often absent on free tiers), while one
+/// `eth_getBlockByNumber` per block is a negligible RPC cost. Missed blocks
+/// (a blip) are caught up by the range walk below.
+fn spawn_chain_blocks(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<IngestEvent>) {
+    tokio::spawn(async move {
+        let mut last = 0u64;
+        let interval = (block_time_ms / 2).max(250);
+        loop {
+            let result = http.call_raw("eth_blockNumber", json!([])).await;
+            if let Ok(v) = result {
+                let head = parse_u64(&v);
+                if last == 0 {
+                    // Baseline: start after the current head so a cold boot
+                    // does not replay history (the relay path only ever sees
+                    // *new* deliveries too).
+                    last = head;
+                } else if head > last {
+                    // Catch up over any missed blocks (normally exactly one).
+                    for block in last + 1..=head {
+                        let result = http
+                            .call_raw(
+                                "eth_getBlockByNumber",
+                                json!([format!("0x{block:x}"), true]),
+                            )
+                            .await;
+                        let Ok(v) = result else {
+                            // Silent `continue` is how a rate-limited provider
+                            // hides itself: log (throttled) and move on.
+                            static ERR_LOG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if ERR_LOG
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                .is_multiple_of(25)
+                            {
+                                tracing::warn!(
+                                    target: "ingest",
+                                    block,
+                                    error = %result.unwrap_err(),
+                                    "chain block fetch failed (public RPCs rate-limit                                      full-block reads — use a paid endpoint for                                      chain-native ingestion)"
+                                );
+                            }
+                            continue;
+                        };
+                        let Some(block_hash) = parse_b256(&v["hash"]) else {
+                            continue;
+                        };
+                        let block = RelayBlock {
+                            relay: "chain".into(),
+                            slot: block,
+                            block_number: block,
+                            block_hash,
+                            builder: "sequencer".into(),
+                            // No observable builder payment on a sequencer
+                            // chain in v1: the delivered-block table records
+                            // the build, not an auction result.
+                            value_wei: U256::ZERO,
+                            gas_used: parse_u64(&v["gasUsed"]),
+                            num_tx: v
+                                .get("transactions")
+                                .and_then(Value::as_array)
+                                .map(|t| t.len() as u64)
+                                .unwrap_or(0),
+                        };
+                        let txs = txs_from_block(&v);
+                        if tx
+                            .send(IngestEvent::RelayBlock { block, txs })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    last = head;
+                }
+            } else {
+                // A throttled provider must not be hammered: back off and
+                // log (throttled) instead of spinning at interval speed.
+                static HEAD_ERR: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if HEAD_ERR
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .is_multiple_of(25)
+                {
+                    tracing::warn!(
+                        target: "ingest",
+                        error = %result.unwrap_err(),
+                        "chain block ingest: head poll failed (public RPCs rate-limit                          aggressively — a paid endpoint is expected for this path)"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(interval * 2)).await;
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+        }
+    });
+}
+
+/// Parse a full-block object's transactions the way the relay path does,
+/// stamping each with the block it landed in (replay-lane semantics).
+fn txs_from_block(block: &Value) -> Vec<PendingTx> {
+    let mined = MinedAt {
+        block_number: parse_u64(block.get("number").unwrap_or(&Value::Null)),
+        base_fee_per_gas: parse_u256(block.get("baseFeePerGas").unwrap_or(&Value::Null)),
+    };
+    if mined.block_number == 0 {
+        return Vec::new();
+    }
+    block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| parse_tx_object(t, TxSource::RelayDelivered))
+        .map(|mut t| {
+            t.mined_at = Some(mined);
+            t
+        })
+        .collect()
 }

@@ -1,0 +1,53 @@
+# JerseyMikes searcher — instance template (one unit per chain).
+#
+# Multi-chain layout (docs/DEPLOYMENT.md): the instance name is the chain
+# slug, so
+#
+#   sudo systemctl start mev-bot@base
+#
+# runs the Base bot from /etc/jerseymikes/base.env, writing its own SQLite
+# database — qualification clock, smoke budget and kill switch are therefore
+# per-chain by construction. The non-templated mev-bot.service (mainnet only,
+# no instance name) remains for single-chain deployments.
+#
+# Each instance's env file carries its own CHAIN_ID, RPC URLs, strategy
+# toggles and (for sequencer chains) SUBMISSION_MODE=raw +
+# QUALIFICATION_BACKEND=sequencer — see .env.example.base for the Base shape.
+
+[Unit]
+Description=JerseyMikes MEV searcher (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jerseymikes
+Group=jerseymikes
+WorkingDirectory=/opt/jerseymikes
+EnvironmentFile=/etc/jerseymikes/%i.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/jerseymikes/mev-bot
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/jerseymikes
+
+[Install]
+WantedBy=multi-user.target

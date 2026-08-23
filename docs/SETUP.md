@@ -113,6 +113,41 @@ ETH_WS_URL=wss://eth-mainnet.g.alchemy.com/v2/<key>       # newHeads + pending t
 - Everything else is optional and has safe defaults; see the annotated
   [`.env.example`](../.env.example).
 
+### Adding a second chain: Base (chain 8453)
+
+Base runs as a **separate bot instance** with its own env file and database —
+the engine is single-chain by design. The chain registry in the bot
+(`config.rs::known`) already carries a Base profile (addresses verified
+2026-08-23), so the only per-chain work is the env file:
+
+```bash
+cp .env.example.base .env.base
+$EDITOR .env.base     # Base RPC URLs + DB_PATH=/var/lib/jerseymikes/base.sqlite
+                      # + API_BIND=127.0.0.1:8081
+mev-bot --env-file .env.base doctor    # must show: chain id "0x2105" (profile 8453)
+```
+
+What `CHAIN_ID=8453` selects automatically (no code, all env-overridable):
+
+| Setting | Base default | Why |
+| --- | --- | --- |
+| Address registry | Base WETH/USDC/DAI/cbBTC/USDbC, V3 factory/QuoterV2/SwapRouter02, V2 factory, UniversalRouter, Balancer vault (same address as mainnet) | per-chain deployments |
+| `SUBMISSION_MODE` | `raw` | no relay market: signed txs go straight to the RPC, priority fee is the ordering currency |
+| `QUALIFICATION_BACKEND` | `sequencer` | the qualification second opinion is the included block (fork vs canonical), not a relay `eth_callBundle` |
+| `REFORK_EVERY_BLOCKS` | `6` | 2 s blocks: per-block refork would be 6× the mainnet refork rate |
+| `BLOCK_TIME_MS` | `2000` | Base cadence |
+| `CHAIN_BLOCK_INGEST` | `on` | the sequencer's own built blocks are the "delivered blocks" (there is no relay data API) |
+| `RELAY_TX_INGEST` / `MEV_SHARE` / `RELAY_DATA_URLS` | `off` / empty | mainnet-only data sources must not bleed into a Base funnel |
+
+Base is a **sequencer chain**: no public mempool, so the front-run strategies
+(sandwich/sandwich_v3/jit) are off by default in `.env.example.base` and the
+v1 lane is flash-loan `atomic_arb` against the sequencer feed. Lending
+protocols exist on Base but are deliberately unregistered in v1 (phase 2).
+Arming, qualification and the go-live procedure run **per chain** —
+[`PATH_TO_LIVE.md`](PATH_TO_LIVE.md) is a per-chain checklist, and
+[`DEPLOYMENT.md`](DEPLOYMENT.md#multi-chain-layout-ethereum--base) covers the
+`mev-bot@base` unit + the console's `CHAINS` registry.
+
 ---
 
 ## Sanity check: `make doctor`

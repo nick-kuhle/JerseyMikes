@@ -32,6 +32,9 @@ services:
       BOT_API_TOKEN: "${API_AUTH_TOKEN:?set API_AUTH_TOKEN in .env - generate with openssl rand -hex 32}"
       ETH_PROXY_URL: ${ETH_HTTP_URL:-}
       ENABLE_DEMO_MUTATIONS: "false"
+      # Multi-chain: uncomment + add a second bot service (see
+      # docs/DEPLOYMENT.md "Multi-chain layout") to show Base in the console.
+      # CHAINS: "ethereum|http://bot:8080,base|http://bot-base:8080"
     restart: unless-stopped
     read_only: true
     tmpfs:

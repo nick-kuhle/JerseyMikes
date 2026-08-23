@@ -1,0 +1,35 @@
+# JerseyMikes — WAL-safe SQLite backup (instance template, one per chain).
+#
+# Pairs with mev-bot@.service: instance %i = the chain slug, so each chain's
+# database (/var/lib/jerseymikes/%i.sqlite) is backed up independently. The
+# 7-day qualification clock resets if a chain's volume is lost, so each
+# instance's snapshots must survive reboots.
+
+[Unit]
+Description=JerseyMikes qualification-database backup (%i)
+After=mev-bot@%i.service
+Wants=mev-bot@%i.service
+
+[Service]
+Type=oneshot
+User=jerseymikes
+Group=jerseymikes
+Environment=DB_PATH=/var/lib/jerseymikes/%i.sqlite
+Environment=BACKUP_DIR=/var/lib/jerseymikes/backups/%i
+ExecStart=/opt/jerseymikes/backup-db.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/jerseymikes

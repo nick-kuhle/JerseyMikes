@@ -26,7 +26,6 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 
-use crate::config::known;
 use crate::dex::Venue;
 use crate::strategies::leads::{ratio_bps, Lead, LeadAction, LiquidationLeads};
 use crate::strategies::sandwich::build_leg;
@@ -132,6 +131,9 @@ impl LiquidationStrategy {
 
     /// Harvest borrowers from recent `Borrow` events.
     async fn harvest(&self, ctx: &StrategyCtx, head: &BlockHead) {
+        let Some(pool) = ctx.cfg.addresses.aave_v3_pool else {
+            return; // Aave not present on this chain
+        };
         let from = {
             let last = *self.last_log_block.read();
             if last == 0 {
@@ -146,7 +148,7 @@ impl LiquidationStrategy {
         let params = json!([{
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{:x}", head.number),
-            "address": format!("{:?}", known::AAVE_V3_POOL),
+            "address": format!("{pool:?}"),
             "topics": [BORROW_TOPIC],
         }]);
 
@@ -191,6 +193,9 @@ impl LiquidationStrategy {
     /// liquidation band (HF < 1.05): below 1 is actionable now, 1..1.05
     /// feeds the oracle front-runner.
     async fn unhealthy(&self, ctx: &StrategyCtx) -> Vec<(Address, U256, U256)> {
+        let Some(pool) = ctx.cfg.addresses.aave_v3_pool else {
+            return Vec::new(); // Aave not present on this chain
+        };
         let users: Vec<Address> = self.watchlist.read().keys().copied().collect();
         let mut out = Vec::new();
         for chunk in users.chunks(100) {
@@ -201,7 +206,7 @@ impl LiquidationStrategy {
                         "eth_call".to_string(),
                         json!([
                             {
-                                "to": format!("{:?}", known::AAVE_V3_POOL),
+                                "to": format!("{pool:?}"),
                                 "data": format!("0x{}", hex::encode(IAaveV3Pool::getUserAccountDataCall { user: *u }.abi_encode()))
                             },
                             "latest"
@@ -273,7 +278,7 @@ impl StrategyImpl for LiquidationStrategy {
                 near_misses.push(Lead {
                     account: user,
                     collateral,
-                    debt_asset: known::USDC,
+                    debt_asset: ctx.cfg.addresses.usdc,
                     ratio_bps: bps,
                     debt_wei: total_debt_base,
                     action: LeadAction::AaveV3 { user },
@@ -335,9 +340,11 @@ pub async fn compose(
     if reserves.is_empty() {
         return None;
     }
+    let pool = ctx.cfg.addresses.aave_v3_pool?;
+    let data_provider = ctx.cfg.addresses.aave_v3_data_provider?;
     let cfg = ctx.rpc
         .call_raw("eth_call", serde_json::json!([
-            { "to": format!("{:?}", known::AAVE_V3_POOL), "data": format!("0x{}", hex::encode(IAaveV3Pool::getUserConfigurationCall { user }.abi_encode())) },
+            { "to": format!("{pool:?}"), "data": format!("0x{}", hex::encode(IAaveV3Pool::getUserConfigurationCall { user }.abi_encode())) },
             "latest"
         ]))
         .await
@@ -369,7 +376,7 @@ pub async fn compose(
             (
                 "eth_call".to_string(),
                 serde_json::json!([
-                    { "to": format!("{:?}", known::AAVE_V3_DATA_PROVIDER), "data": format!("0x{}", hex::encode(IAaveDataProvider::getUserReserveDataCall { asset: *a, user }.abi_encode())) },
+                    { "to": format!("{data_provider:?}"), "data": format!("0x{}", hex::encode(IAaveDataProvider::getUserReserveDataCall { asset: *a, user }.abi_encode())) },
                     "latest"
                 ]),
             )
@@ -468,12 +475,13 @@ async fn aave_asset_price(ctx: &StrategyCtx, cache: &AaveCache, asset: Address) 
             return Some(*price);
         }
     }
+    let oracle = ctx.cfg.addresses.aave_v3_oracle?;
     let value = ctx
         .rpc
         .call_raw(
             "eth_call",
             serde_json::json!([{
-                "to": format!("{:?}", known::AAVE_V3_ORACLE),
+                "to": format!("{oracle:?}"),
                 "data": format!("0x{}", hex::encode(IAaveOracle::getAssetPriceCall { asset }.abi_encode()))
             }, "latest"]),
         )
@@ -497,9 +505,12 @@ async fn aave_reserves(ctx: &StrategyCtx, cache: &AaveCache) -> Vec<Address> {
             return cached.clone();
         }
     }
+    let Some(pool) = ctx.cfg.addresses.aave_v3_pool else {
+        return Vec::new(); // Aave not present on this chain
+    };
     let Ok(v) = ctx.rpc
         .call_raw("eth_call", serde_json::json!([
-            { "to": format!("{:?}", known::AAVE_V3_POOL), "data": format!("0x{}", hex::encode(IAaveV3Pool::getReservesListCall {}.abi_encode())) },
+            { "to": format!("{pool:?}"), "data": format!("0x{}", hex::encode(IAaveV3Pool::getReservesListCall {}.abi_encode())) },
             "latest"
         ]))
         .await
@@ -545,9 +556,10 @@ pub async fn aave_reserve_cfg(
             return Some(*cfg);
         }
     }
+    let data_provider = ctx.cfg.addresses.aave_v3_data_provider?;
     let v = ctx.rpc
         .call_raw("eth_call", serde_json::json!([
-            { "to": format!("{:?}", known::AAVE_V3_DATA_PROVIDER), "data": format!("0x{}", hex::encode(IAaveDataProvider::getReserveConfigurationDataCall { asset }.abi_encode())) },
+            { "to": format!("{data_provider:?}"), "data": format!("0x{}", hex::encode(IAaveDataProvider::getReserveConfigurationDataCall { asset }.abi_encode())) },
             "latest"
         ]))
         .await
@@ -572,6 +584,7 @@ pub async fn aave_reserve_cfg(
 /// position. Public so the oracle front-runner rebuilds the exact same
 /// bundle as a back-run of a feed update.
 pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<Opportunity> {
+    let pool = ctx.cfg.addresses.aave_v3_pool?;
     let debt_asset = pos.debt_asset;
     let collateral = pos.collateral;
     let debt_amount = pos.debt_amount_total;
@@ -581,13 +594,13 @@ pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<
         Call::new(
             debt_asset,
             crate::dex::IERC20::approveCall {
-                spender: known::AAVE_V3_POOL,
+                spender: pool,
                 amount: U256::MAX,
             }
             .abi_encode(),
         ),
         Call::new(
-            known::AAVE_V3_POOL,
+            pool,
             IAaveV3Pool::liquidationCallCall {
                 collateralAsset: collateral,
                 debtAsset: debt_asset,
@@ -638,6 +651,7 @@ pub async fn build_opportunity(ctx: &StrategyCtx, pos: &AavePosition) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
 
     #[test]
     fn config_bitmap_decodes_borrow_and_collateral_bits() {

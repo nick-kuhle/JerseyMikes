@@ -1,5 +1,6 @@
 import {NextRequest} from "next/server";
-import {botAuthHeaders, botFetch, BOT_API_URL} from "@/lib/bot";
+import {botAuthHeaders, botFetch, botUpstreamUrl} from "@/lib/bot";
+import {chainBySlug} from "@/lib/chains";
 import {
   demoCompetition,
   demoEvent,
@@ -119,13 +120,18 @@ export async function GET(req: NextRequest, {params}: {params: Promise<{path: st
   const {path} = await params;
   const route = path.join("/");
   const search = req.nextUrl.searchParams;
-  const qs = search.toString();
+  // Multi-chain: the `?chain=` slug selects which bot instance to proxy to.
+  // It is stripped before forwarding so the bot never sees it.
+  const chainSlug = search.get("chain");
+  const rest = new URLSearchParams(search);
+  rest.delete("chain");
+  const qs = rest.toString();
 
   if (route === "stream") {
-    return streamResponse(qs);
+    return streamResponse(qs, chainSlug);
   }
 
-  const upstream = await botFetch(`/api/${route}${qs ? `?${qs}` : ""}`);
+  const upstream = await botFetch(`/api/${route}${qs ? `?${qs}` : ""}`, 2500, chainSlug);
   if (upstream.ok) return jsonResponse(upstream.data, false);
   return jsonResponse(demoFor(route, search), true);
 }
@@ -182,6 +188,10 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
   }
   const {path} = await params;
   const route = path.join("/");
+  // Multi-chain: mutations apply to the selected chain's bot instance only —
+  // the switcher always sends the active slug, and a missing slug means the
+  // first (default) chain, never a cross-chain write.
+  const chainSlug = req.nextUrl.searchParams.get("chain");
 
   // The runtime risk endpoints are forwarded verbatim (bar JSON parsing) —
   // validation is the bot's job and its 400 reason must reach the panel.
@@ -195,10 +205,10 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3000);
-      const upstream = await fetch(`${BOT_API_URL}/api/${route}`, {
+      const upstream = await fetch(botUpstreamUrl(`/api/${route}`, chainSlug), {
         method: "POST",
         signal: controller.signal,
-        headers: {"content-type": "application/json", ...botAuthHeaders()},
+        headers: {"content-type": "application/json", ...botAuthHeaders(chainSlug)},
         body: JSON.stringify(body),
       });
       clearTimeout(timer);
@@ -263,10 +273,10 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2500);
-    const upstream = await fetch(`${BOT_API_URL}/api/mode`, {
+    const upstream = await fetch(botUpstreamUrl("/api/mode", chainSlug), {
       method: "POST",
       signal: controller.signal,
-      headers: {"content-type": "application/json", ...botAuthHeaders()},
+      headers: {"content-type": "application/json", ...botAuthHeaders(chainSlug)},
       body: JSON.stringify({live: body.live}),
     });
     clearTimeout(timer);
@@ -296,7 +306,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
  * SSE: proxy the bot's live feed, or synthesise one in demo mode so the UI can
  * be developed and reviewed without a running bot.
  */
-async function streamResponse(qs: string): Promise<Response> {
+async function streamResponse(qs: string, chainSlug?: string | null): Promise<Response> {
   const headers = {
     "content-type": "text/event-stream",
     "cache-control": "no-cache, no-transform",
@@ -307,9 +317,9 @@ async function streamResponse(qs: string): Promise<Response> {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 2000);
-    const upstream = await fetch(`${BOT_API_URL}/api/stream${qs ? `?${qs}` : ""}`, {
+    const upstream = await fetch(botUpstreamUrl(`/api/stream${qs ? `?${qs}` : ""}`, chainSlug), {
       signal: controller.signal,
-      headers: {accept: "text/event-stream", ...botAuthHeaders()},
+      headers: {accept: "text/event-stream", ...botAuthHeaders(chainSlug)},
     });
     clearTimeout(timer);
     if (upstream.ok && upstream.body) {

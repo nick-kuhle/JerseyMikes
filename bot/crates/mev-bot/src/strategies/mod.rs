@@ -21,7 +21,7 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::config::{known, Config};
+use crate::config::Config;
 use crate::dex::{self, IUniswapV2Router, V2Pool, Venue};
 use crate::rpc::RpcClient;
 use crate::types::{BlockHead, Opportunity, PendingTx, Strategy};
@@ -56,7 +56,7 @@ pub struct StrategyCtx {
 impl StrategyCtx {
     pub fn new(cfg: Arc<Config>, rpc: RpcClient, executor: Address, head: BlockHead) -> Self {
         Self {
-            pools: PoolCache::new(rpc.clone()),
+            pools: PoolCache::new(rpc.clone(), cfg.addresses.pair_factories()),
             pools_v3: V3PoolCache::new(),
             cfg,
             rpc,
@@ -133,14 +133,19 @@ type PairIndex = Arc<RwLock<HashMap<PairKey, Option<Address>>>>;
 #[derive(Clone)]
 pub struct PoolCache {
     rpc: RpcClient,
+    /// `(venue, factory)` pairs for this chain, from the address registry.
+    /// A venue whose factory is absent on the chain simply never resolves a
+    /// pair — the strategy's `pair_for` miss path handles it.
+    factories: Vec<(Venue, Address)>,
     inner: Arc<RwLock<HashMap<Address, V2Pool>>>,
     pair_index: PairIndex,
 }
 
 impl PoolCache {
-    pub fn new(rpc: RpcClient) -> Self {
+    pub fn new(rpc: RpcClient, factories: Vec<(Venue, Address)>) -> Self {
         Self {
             rpc,
+            factories,
             inner: Arc::new(RwLock::new(HashMap::new())),
             pair_index: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -172,11 +177,8 @@ impl PoolCache {
         if let Some(hit) = self.pair_index.read().get(&(x, y, venue)) {
             return *hit;
         }
-        let factory = match venue {
-            Venue::UniV2 => known::UNIV2_FACTORY,
-            Venue::SushiV2 => known::SUSHI_FACTORY,
-            Venue::UniV3 => return None,
-        };
+        // A venue with no factory on this chain has no pairs to resolve.
+        let factory = self.factories.iter().find(|(v, _)| *v == venue)?.1;
         let found = dex::get_pair(&self.rpc, factory, x, y).await.ok().flatten();
         self.pair_index.write().insert((x, y, venue), found);
         found
@@ -425,11 +427,17 @@ pub fn decode_swap(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
 ///
 /// Strategies that already consume [`SwapIntent`] should call this (or
 /// [`decode_router`]) rather than growing a second decode path.
-pub fn decode_any_router(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
+/// `universal_router` is the chain's UniversalRouter deployment from the
+/// address registry — `None` disables the UR pass for this chain.
+pub fn decode_any_router(
+    tx: &PendingTx,
+    weth: Address,
+    universal_router: Option<Address>,
+) -> Option<SwapIntent> {
     decode_swap(tx, weth).or_else(|| {
-        let to = tx.to?;
-        crate::dex::calldata::decode_universal_router(to, &tx.input, tx.value, weth).map(|u| {
-            SwapIntent {
+        let (router, to) = universal_router.zip(tx.to)?;
+        crate::dex::calldata::decode_universal_router(router, to, &tx.input, tx.value, weth).map(
+            |u| SwapIntent {
                 token_in: u.token_in,
                 token_out: u.token_out,
                 amount_in: u.amount_in,
@@ -437,25 +445,30 @@ pub fn decode_any_router(tx: &PendingTx, weth: Address) -> Option<SwapIntent> {
                 path: u.path,
                 router: to,
                 native_in: u.native_in,
-            }
-        })
+            },
+        )
     })
 }
 
 /// Pick the decoder the operator asked for. When UniversalRouter is off this
 /// is exactly [`decode_swap`], so a default-off checkout is behaviour-identical
 /// to the code that collected the funnel baseline.
-pub fn decode_router(tx: &PendingTx, weth: Address, universal: bool) -> Option<SwapIntent> {
+pub fn decode_router(
+    tx: &PendingTx,
+    weth: Address,
+    universal: bool,
+    universal_router: Option<Address>,
+) -> Option<SwapIntent> {
     if universal {
-        decode_any_router(tx, weth)
+        decode_any_router(tx, weth, universal_router)
     } else {
         decode_swap(tx, weth)
     }
 }
 
-/// Run `eth_getLogs` for `PairCreated` on both V2 factories over `[from, to]`.
-/// Returns the decoded `(venue, pair_address)` tuples. A failed RPC call yields
-/// an empty vec (callers treat it as "no new pools this block").
+/// Run `eth_getLogs` for `PairCreated` on the chain's V2 factories over
+/// `[from, to]`. Returns the decoded `(venue, pair_address)` tuples. A failed
+/// RPC call yields an empty vec (callers treat it as "no new pools this block").
 ///
 /// Prefer [`try_scan_pair_created`] when the caller advances a scan cursor:
 /// this signature cannot distinguish "no pairs created" from "the RPC call
@@ -463,10 +476,11 @@ pub fn decode_router(tx: &PendingTx, weth: Address, universal: bool) -> Option<S
 /// permanently.
 pub async fn scan_pair_created(
     rpc: &crate::rpc::RpcClient,
+    factories: &[(crate::dex::Venue, Address)],
     from: u64,
     to: u64,
 ) -> Vec<(crate::dex::Venue, Address)> {
-    try_scan_pair_created(rpc, from, to)
+    try_scan_pair_created(rpc, factories, from, to)
         .await
         .unwrap_or_default()
 }
@@ -475,18 +489,17 @@ pub async fn scan_pair_created(
 /// failed, `Some(vec![])` means the range genuinely contained no pairs.
 pub async fn try_scan_pair_created(
     rpc: &crate::rpc::RpcClient,
+    factories: &[(crate::dex::Venue, Address)],
     from: u64,
     to: u64,
 ) -> Option<Vec<(crate::dex::Venue, Address)>> {
-    let logs = scan_factory_logs(
-        rpc,
-        &[known::UNIV2_FACTORY, known::SUSHI_FACTORY],
-        V2_PAIR_CREATED_TOPIC,
-        from,
-        to,
+    let addresses: Vec<Address> = factories.iter().map(|(_, a)| *a).collect();
+    let logs = scan_factory_logs(rpc, &addresses, V2_PAIR_CREATED_TOPIC, from, to).await?;
+    Some(
+        logs.iter()
+            .filter_map(|log| decode_pair_created(log, factories))
+            .collect(),
     )
-    .await?;
-    Some(logs.iter().filter_map(decode_pair_created).collect())
 }
 
 /// Fetch raw logs for one topic across a set of factory addresses.
@@ -522,12 +535,15 @@ pub async fn scan_factory_logs(
 ///
 /// For `PairCreated`, `data` is `(pair address, uint256 allPairsLength)` with
 /// the pair address right-aligned in the first 32 bytes.
-pub fn decode_pair_created(log: &serde_json::Value) -> Option<(crate::dex::Venue, Address)> {
+pub fn decode_pair_created(
+    log: &serde_json::Value,
+    factories: &[(crate::dex::Venue, Address)],
+) -> Option<(crate::dex::Venue, Address)> {
     let topic0 = log["topics"].as_array()?.first()?.as_str()?;
     if !topic0.eq_ignore_ascii_case(V2_PAIR_CREATED_TOPIC) {
         return None;
     }
-    let venue = venue_from_factory(&log["address"])?;
+    let venue = venue_from_factory(&log["address"], factories)?;
     let data = crate::types::parse_bytes(&log["data"]);
     if data.len() < 32 {
         return None;
@@ -582,35 +598,32 @@ pub fn decode_pool_created(log: &serde_json::Value) -> Option<crate::dex::V3Pool
 /// `None` means the RPC call failed.
 pub async fn try_scan_pool_created(
     rpc: &crate::rpc::RpcClient,
+    v3_factory: Address,
     from: u64,
     to: u64,
 ) -> Option<Vec<crate::dex::V3Pool>> {
-    let logs = scan_factory_logs(
-        rpc,
-        &[known::UNIV3_FACTORY],
-        V3_POOL_CREATED_TOPIC,
-        from,
-        to,
-    )
-    .await?;
+    let logs = scan_factory_logs(rpc, &[v3_factory], V3_POOL_CREATED_TOPIC, from, to).await?;
     Some(logs.iter().filter_map(decode_pool_created).collect())
 }
 
-/// Map the emitting factory address to its venue.
-fn venue_from_factory(factory: &serde_json::Value) -> Option<crate::dex::Venue> {
+/// Map the emitting factory address to its venue, using the chain's
+/// registry (`factories`) rather than a hardcoded table — a chain whose
+/// V2 factory differs from mainnet's must still decode its own logs.
+fn venue_from_factory(
+    factory: &serde_json::Value,
+    factories: &[(crate::dex::Venue, Address)],
+) -> Option<crate::dex::Venue> {
     let s = factory.as_str()?;
-    if s.eq_ignore_ascii_case(&format!("{:?}", known::UNIV2_FACTORY)) {
-        Some(crate::dex::Venue::UniV2)
-    } else if s.eq_ignore_ascii_case(&format!("{:?}", known::SUSHI_FACTORY)) {
-        Some(crate::dex::Venue::SushiV2)
-    } else {
-        None
-    }
+    factories
+        .iter()
+        .find(|(_, a)| s.eq_ignore_ascii_case(&format!("{a:?}")))
+        .map(|(v, _)| *v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
     use crate::types::{now_ms, TxSource};
     use alloy_primitives::address;
     use alloy_primitives::B256;
@@ -697,32 +710,54 @@ mod tests {
         );
         let mut tx = tx_with(data, U256::ZERO);
         tx.to = Some(known::UNIVERSAL_ROUTER);
-        assert!(decode_router(&tx, known::WETH, false).is_none());
-        let got = decode_router(&tx, known::WETH, true).expect("UR decodes when enabled");
+        assert!(decode_router(&tx, known::WETH, false, None).is_none());
+        let got = decode_router(&tx, known::WETH, true, Some(known::UNIVERSAL_ROUTER))
+            .expect("UR decodes when enabled");
         assert_eq!(got.token_in, known::WETH);
         assert_eq!(got.token_out, known::USDC);
         assert_eq!(got.amount_in, U256::from(1_000u64));
     }
 
     #[test]
-    fn venue_from_factory_maps_known_factories() {
+    fn venue_from_factory_maps_registered_factories() {
+        let factories = [
+            (Venue::UniV2, known::UNIV2_FACTORY),
+            (Venue::SushiV2, known::SUSHI_FACTORY),
+        ];
         assert_eq!(
-            venue_from_factory(&serde_json::json!(format!("{:?}", known::UNIV2_FACTORY))),
+            venue_from_factory(
+                &serde_json::json!(format!("{:?}", known::UNIV2_FACTORY)),
+                &factories
+            ),
             Some(Venue::UniV2)
         );
         assert_eq!(
-            venue_from_factory(&serde_json::json!(format!("{:?}", known::SUSHI_FACTORY))),
+            venue_from_factory(
+                &serde_json::json!(format!("{:?}", known::SUSHI_FACTORY)),
+                &factories
+            ),
             Some(Venue::SushiV2)
         );
         // Unknown factory -> None.
         assert_eq!(
-            venue_from_factory(&serde_json::json!(
-                "0x0000000000000000000000000000000000000000"
-            )),
+            venue_from_factory(
+                &serde_json::json!("0x0000000000000000000000000000000000000000"),
+                &factories
+            ),
+            None
+        );
+        // A registry without the emitting factory (e.g. Base has no Sushi)
+        // maps it to None as well.
+        let only_univ2 = [(Venue::UniV2, known::UNIV2_FACTORY)];
+        assert_eq!(
+            venue_from_factory(
+                &serde_json::json!(format!("{:?}", known::SUSHI_FACTORY)),
+                &only_univ2
+            ),
             None
         );
         // Non-string -> None.
-        assert_eq!(venue_from_factory(&serde_json::json!(42)), None);
+        assert_eq!(venue_from_factory(&serde_json::json!(42), &factories), None);
     }
 
     #[test]
@@ -776,16 +811,29 @@ mod tests {
         })
     }
 
+    fn test_factories() -> [(Venue, Address); 2] {
+        [
+            (Venue::UniV2, known::UNIV2_FACTORY),
+            (Venue::SushiV2, known::SUSHI_FACTORY),
+        ]
+    }
+
     #[test]
     fn decodes_a_pair_created_log() {
         let pair = address!("b4e16d0168e52d35cacd2c6185b44281ec28c9dc");
-        let (venue, got) = decode_pair_created(&pair_created_log(known::UNIV2_FACTORY, pair))
-            .expect("a well-formed PairCreated log decodes");
+        let (venue, got) = decode_pair_created(
+            &pair_created_log(known::UNIV2_FACTORY, pair),
+            &test_factories(),
+        )
+        .expect("a well-formed PairCreated log decodes");
         assert_eq!(venue, Venue::UniV2);
         assert_eq!(got, pair);
 
-        let (venue, _) =
-            decode_pair_created(&pair_created_log(known::SUSHI_FACTORY, pair)).unwrap();
+        let (venue, _) = decode_pair_created(
+            &pair_created_log(known::SUSHI_FACTORY, pair),
+            &test_factories(),
+        )
+        .unwrap();
         assert_eq!(venue, Venue::SushiV2);
     }
 
@@ -821,7 +869,7 @@ mod tests {
             "a PairCreated log has only 3 topics and must not decode as V3"
         );
         assert!(
-            decode_pair_created(&v3).is_none(),
+            decode_pair_created(&v3, &test_factories()).is_none(),
             "a PoolCreated log comes from the V3 factory, which maps to no V2 venue"
         );
     }
@@ -837,7 +885,7 @@ mod tests {
 
     #[test]
     fn malformed_logs_return_none_instead_of_panicking() {
-        assert!(decode_pair_created(&serde_json::json!({})).is_none());
+        assert!(decode_pair_created(&serde_json::json!({}), &test_factories()).is_none());
         assert!(decode_pool_created(&serde_json::json!({})).is_none());
         assert!(decode_pool_created(&serde_json::json!({"topics": [], "data": "0x"})).is_none());
         // Right topic count, truncated data.

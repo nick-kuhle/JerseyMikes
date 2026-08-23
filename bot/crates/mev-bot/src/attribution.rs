@@ -260,6 +260,29 @@ pub async fn reconcile_block(
         let Some(victim_receipt) = receipt(rpc, txs[victim_index].hash, &mut receipts).await else {
             continue;
         };
+        // Included-block comparison (the `Sequencer` qualification backend's
+        // second opinion): the fork predicted what the victim's own
+        // transaction would do to its WETH balance; the canonical block just
+        // showed what it actually did. Recorded on every chain — harmless on
+        // relay chains, load-bearing on sequencer chains.
+        let victim_tx = &txs[victim_index];
+        let victim_entity: HashSet<Address> = [victim_tx.from, victim_tx.to]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !victim_entity.is_empty() {
+            if let Some(predicted) = store.victim_predicted_delta(&opportunity.opportunity_id) {
+                let realized = weth_delta(&victim_receipt, weth, &victim_entity);
+                let _ = store.record_block_comparison(
+                    &opportunity.opportunity_id,
+                    &opportunity.strategy,
+                    &opportunity.victim_hash,
+                    block_number,
+                    predicted,
+                    realized,
+                );
+            }
+        }
         let victim_pools = swap_pools(&victim_receipt);
         if victim_pools.is_empty() {
             continue;

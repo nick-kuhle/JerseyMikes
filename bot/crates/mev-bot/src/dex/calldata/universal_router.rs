@@ -1,6 +1,7 @@
 //! Uniswap UniversalRouter `execute` decoder.
 //!
-//! Scope is the single mainnet router at [`known::UNIVERSAL_ROUTER`]. We walk
+//! The router address is a parameter (per-chain registry) rather than a
+//! constant: the UniversalRouter deployment differs across chains. We walk
 //! the command byte string and the parallel `inputs` array and emit a swap
 //! intent for the first `V3_SWAP_EXACT_IN` or `V2_SWAP_EXACT_IN` we find.
 //! Everything else (permits, sweeps, V4, 1inch, 0x) is ignored.
@@ -10,8 +11,6 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{sol, SolCall, SolValue};
-
-use crate::config::known;
 
 // Two overloads of `execute` must live in *separate* `sol!` blocks.
 // In one block alloy generates a single `executeCall` type and the last
@@ -64,9 +63,17 @@ pub struct UrSwap {
 }
 
 /// Decode one UniversalRouter transaction into a swap. `None` on anything
-/// we do not understand — never panics on malformed input.
-pub fn decode(to: Address, input: &[u8], value: U256, weth: Address) -> Option<UrSwap> {
-    if to != known::UNIVERSAL_ROUTER {
+/// we do not understand — never panics on malformed input. `router` is the
+/// chain's UniversalRouter deployment (from the address registry); `to`
+/// must equal it.
+pub fn decode(
+    router: Address,
+    to: Address,
+    input: &[u8],
+    value: U256,
+    weth: Address,
+) -> Option<UrSwap> {
+    if to != router {
         return None;
     }
     if input.len() < 4 {
@@ -336,7 +343,14 @@ mod tests {
                 path.clone(),
             )],
         );
-        let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
+        let s = decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH,
+        )
+        .unwrap();
         assert_eq!(s.token_in, known::WETH);
         assert_eq!(s.token_out, known::USDC);
         assert_eq!(s.amount_in, U256::from(10u128.pow(18)));
@@ -352,7 +366,14 @@ mod tests {
             vec![CMD_V3_SWAP_EXACT_IN],
             vec![v3_input(U256::from(5u128.pow(18)), U256::from(42u64), path)],
         );
-        let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
+        let s = decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH,
+        )
+        .unwrap();
         assert_eq!(s.token_in, known::WETH);
         assert_eq!(s.token_out, known::USDC);
         assert_eq!(s.amount_in, U256::from(5u128.pow(18)));
@@ -373,6 +394,7 @@ mod tests {
         );
         let s = decode(
             known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
             &data,
             U256::from(3u128.pow(18)),
             known::WETH,
@@ -391,7 +413,14 @@ mod tests {
             vec![CMD_V3_SWAP_EXACT_IN],
             vec![v3_input(U256::from(2u128.pow(18)), U256::from(9u64), path)],
         );
-        let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
+        let s = decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH,
+        )
+        .unwrap();
         assert_eq!(s.path.len(), 3);
         assert_eq!(s.token_in, known::WETH);
         assert_eq!(s.token_out, known::DAI);
@@ -405,7 +434,14 @@ mod tests {
             vec![CMD_V2_SWAP_EXACT_IN],
             vec![v2_input(U256::from(11u64), U256::from(10u64), path)],
         );
-        let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
+        let s = decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH,
+        )
+        .unwrap();
         assert_eq!(s.token_out, known::USDT);
         assert_eq!(s.amount_in, U256::from(11u64));
     }
@@ -417,13 +453,28 @@ mod tests {
             vec![CMD_V2_SWAP_EXACT_IN],
             vec![v2_input(U256::from(1u64), U256::from(1u64), path)],
         );
-        assert!(decode(known::UNIV2_ROUTER, &data, U256::ZERO, known::WETH).is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIV2_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
     }
 
     #[test]
     fn malformed_inputs_return_none_instead_of_panicking() {
-        assert!(decode(known::UNIVERSAL_ROUTER, &[], U256::ZERO, known::WETH).is_none());
         assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &[],
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
             known::UNIVERSAL_ROUTER,
             &[0xde, 0xad, 0xbe, 0xef],
             U256::ZERO,
@@ -432,19 +483,47 @@ mod tests {
         .is_none());
         // commands / inputs length mismatch
         let data = encode_execute(vec![CMD_V2_SWAP_EXACT_IN, CMD_WRAP_ETH], vec![vec![0u8; 4]]);
-        assert!(decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
         // empty command list
         let data = encode_execute(vec![], vec![]);
-        assert!(decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
         // unknown command only
         let data = encode_execute(vec![0x21], vec![vec![0u8; 32]]);
-        assert!(decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
         // truncated V3 path
         let data = encode_execute(
             vec![CMD_V3_SWAP_EXACT_IN],
             vec![v3_input(U256::from(1u64), U256::from(1u64), vec![0u8; 10])],
         );
-        assert!(decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).is_none());
+        assert!(decode(
+            known::UNIVERSAL_ROUTER,
+            known::UNIVERSAL_ROUTER,
+            &data,
+            U256::ZERO,
+            known::WETH
+        )
+        .is_none());
     }
 
     #[test]
@@ -468,7 +547,14 @@ mod tests {
         );
         let started = Instant::now();
         for _ in 0..100 {
-            assert!(decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).is_some());
+            assert!(decode(
+                known::UNIVERSAL_ROUTER,
+                known::UNIVERSAL_ROUTER,
+                &data,
+                U256::ZERO,
+                known::WETH
+            )
+            .is_some());
         }
         let elapsed = started.elapsed();
         assert!(

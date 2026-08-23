@@ -42,6 +42,20 @@ may be paused immediately. None of these controls bypasses another. See
 [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) for the exact qualification, durable nonce,
 relay retry/cancellation, finality, and rollback behavior.
 
+**Per-chain by construction.** In a multi-chain deployment
+([`DEPLOYMENT.md`](DEPLOYMENT.md#multi-chain-layout-ethereum--base)) each
+chain runs its own process with its own database, so every control above —
+arming, broadcast capability, the `LIVE_SMOKE_MAX` budget, the drawdown kill
+switch, the nonce lane and the 168 h qualification clock — is independent per
+chain. Arming Base can never affect Ethereum and vice versa; each chain earns
+its own `PASS` and follows [`PATH_TO_LIVE.md`](PATH_TO_LIVE.md) as a
+per-chain procedure. On a sequencer chain the delivery differs in one respect
+only: `SUBMISSION_MODE=raw` sends the signed transactions straight to the
+chain RPC (there is no relay market to send bundles to) and
+`QUALIFICATION_BACKEND=sequencer` takes the independent second opinion from
+the included block instead of a relay `eth_callBundle`. All nine gates still
+apply, in the same order.
+
 ## Why a failed opportunity costs nothing
 
 `MevExecutor` measures retained profit and reverts with
