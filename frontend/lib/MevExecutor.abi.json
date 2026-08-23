@@ -52,6 +52,11 @@
   },
   {
     "inputs": [],
+    "name": "BaselineNotExpired",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "BribeFailed",
     "type": "error"
   },
@@ -186,6 +191,25 @@
     "inputs": [
       {
         "indexed": true,
+        "internalType": "bytes32",
+        "name": "tag",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint64",
+        "name": "openedAtBlock",
+        "type": "uint64"
+      }
+    ],
+    "name": "ExpiredBaselineCleared",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
         "internalType": "address",
         "name": "previousOwner",
         "type": "address"
@@ -304,6 +328,19 @@
       }
     ],
     "name": "armV3Callback",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "tag",
+        "type": "bytes32"
+      }
+    ],
+    "name": "clearExpiredBaseline",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

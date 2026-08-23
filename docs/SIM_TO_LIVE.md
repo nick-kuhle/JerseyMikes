@@ -148,12 +148,20 @@ cancelled at all configured relays. If every cancellation cannot be proven,
 new broadcasts remain blocked through the old target block; nonce reuse is not
 guessed.
 
+Switching runtime mode to simulation, changing runtime risk, or tripping the
+drawdown stop cancels all active replacement UUIDs. Cancellation uses the same
+serialized nonce lane; a nonce is released only after every relay acknowledges.
+
 Accepted bundles remain `included_unfinalized` until `FINALITY_DEPTH`. The bot
 then verifies all expected receipts are successful, in one block, share the
 canonical block hash, and contain executor evidence. The API and console expose
 exact gross profit, builder payment, retained profit, signer gas, and net
 profit. `finalized_partial_inclusion`, `finalized_incoherent_inclusion`, and
-`finalized_missing_executor_evidence` are explicit incident states.
+`finalized_missing_executor_evidence` are explicit incident states. If a
+phase-1 opener lands without its close, the owner can clear expired bookkeeping
+with `clearExpiredBaseline(tag)` after the opening block, then use `ownerCall` /
+`sweep` for deliberate asset recovery. The contract never guesses a recovery
+trade.
 
 ## Rollback
 

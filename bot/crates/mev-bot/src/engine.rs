@@ -127,6 +127,12 @@ pub struct Engine {
     /// Private relay transport. Calling it is still gated by broadcast
     /// capability, qualification, runtime mode, risk and strategy eligibility.
     pub submission: Arc<crate::submission::SubmissionGateway>,
+    /// Qualification is recomputed once per head off the hot path. Candidate
+    /// checks and API reads are lock-only and never scan SQLite.
+    qualification: Arc<parking_lot::RwLock<crate::qualification::QualificationStatus>>,
+    qualification_refreshing: Arc<std::sync::atomic::AtomicBool>,
+    qualification_refreshed_at_ms: Arc<std::sync::atomic::AtomicU64>,
+    own_reconciliation_running: Arc<std::sync::atomic::AtomicBool>,
     /// Exactly one live candidate may reserve/sign/submit at a time, preventing
     /// nonce gaps when a simulation or relay request fails.
     submission_gate: Arc<tokio::sync::Semaphore>,
@@ -678,6 +684,13 @@ impl Engine {
             }
         }
 
+        let qualification = Arc::new(parking_lot::RwLock::new(crate::qualification::evaluate(
+            &cfg,
+            &store,
+            &writes,
+            now_ms(),
+        )));
+
         // Built before the struct literal below moves `cfg`.
         let mode = LiveMode::armed_at_boot(cfg.live_execution);
         // Only wire the replay queue when there is a relay feed to fill it.
@@ -714,6 +727,10 @@ impl Engine {
             latency: Arc::new(Latency::default()),
             inventory,
             submission,
+            qualification,
+            qualification_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qualification_refreshed_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
+            own_reconciliation_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submission_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             last_head: parking_lot::Mutex::new(Some(head)),
             // The boot-time refresh above already ran; the cooldowns start
@@ -724,7 +741,68 @@ impl Engine {
     }
 
     pub fn qualification_status(&self) -> crate::qualification::QualificationStatus {
-        crate::qualification::evaluate(&self.cfg, &self.store, &self.writes, now_ms())
+        self.qualification.read().clone()
+    }
+
+    fn strategy_qualified(&self, strategy: Strategy) -> bool {
+        self.qualification.read().strategy_passes(strategy)
+    }
+
+    fn refresh_qualification(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        const REFRESH_INTERVAL_MS: u64 = 30_000;
+        let now = now_ms();
+        let last = self.qualification_refreshed_at_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) < REFRESH_INTERVAL_MS
+            || self.qualification_refreshing.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.qualification_refreshed_at_ms
+            .store(now, Ordering::Release);
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = crate::qualification::evaluate(
+                &engine.cfg,
+                &engine.store,
+                &engine.writes,
+                now_ms(),
+            );
+            *engine.qualification.write() = status;
+            engine
+                .qualification_refreshing
+                .store(false, Ordering::Release);
+        });
+    }
+
+    /// Cancel every unresolved private bundle after an operator/risk policy
+    /// change. Nonces are released from highest to lowest only when every relay
+    /// acknowledges cancellation; otherwise reuse remains blocked through the
+    /// target block.
+    pub async fn cancel_active_submissions(&self, reason: &str) {
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return;
+        };
+        let mut reservations = self.store.active_nonce_reservations().unwrap_or_default();
+        reservations.sort_by_key(|reservation| std::cmp::Reverse(reservation.start_nonce));
+        for reservation in reservations {
+            if self.submission.cancel(&reservation.bundle_id).await {
+                let _ = self
+                    .store
+                    .set_nonce_reservation_status(&reservation.bundle_id, "cancelled");
+                let _ = self
+                    .inventory
+                    .release_nonces(reservation.start_nonce, reservation.nonce_count);
+                tracing::warn!(target: "submission", bundle = %reservation.bundle_id, %reason, "active bundle cancelled by policy");
+            } else {
+                self.inventory
+                    .block_broadcast_until(reservation.target_block);
+                let _ = self
+                    .store
+                    .set_nonce_reservation_status(&reservation.bundle_id, "recovery_blocked");
+                tracing::error!(target: "submission", bundle = %reservation.bundle_id, %reason, target_block = reservation.target_block, "policy cancellation not fully acknowledged; nonce reuse blocked");
+            }
+        }
     }
 
     /// Run forever.
@@ -987,15 +1065,30 @@ impl Engine {
         }
         *self.last_head.lock() = Some(head.clone());
 
-        crate::attribution::reconcile_own_submissions(
-            &self.store,
-            &self.http,
-            head.number,
-            self.cfg.finality_depth,
-            self.cfg.endpoints.searcher_address,
-            self.ctx.executor,
-        )
-        .await;
+        // Receipt polling and finality reconciliation can fan out over many
+        // submitted hashes. It must never delay pool refresh or block-cadence
+        // strategies, so it runs as an independent async task.
+        if !self
+            .own_reconciliation_running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let engine = self.clone();
+            let reconcile_head = head.number;
+            tokio::spawn(async move {
+                crate::attribution::reconcile_own_submissions(
+                    &engine.store,
+                    &engine.http,
+                    reconcile_head,
+                    engine.cfg.finality_depth,
+                    engine.cfg.endpoints.searcher_address,
+                    engine.ctx.executor,
+                )
+                .await;
+                engine
+                    .own_reconciliation_running
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
 
         // Both of these sit *in front of* the strategies on the block task, so
         // every millisecond they spend is a millisecond the strategies do not
@@ -1025,6 +1118,7 @@ impl Engine {
 
         self.ctx.set_head(head.clone());
         self.writes.record_block(&head);
+        self.refresh_qualification();
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
 
         if (self.cfg.pool_discovery || self.cfg.pool_discovery_v3)
@@ -1317,7 +1411,7 @@ impl Engine {
         let wants_broadcast = lane == FunnelLane::Live
             && self.mode.live()
             && self.cfg.broadcast_enabled
-            && self.qualification_status().strategy_passes(opp.strategy)
+            && self.strategy_qualified(opp.strategy)
             && self.inventory.broadcast_available(self.ctx.head().number);
         let submission_permit = if wants_broadcast {
             self.submission_gate.acquire().await.ok()
@@ -1327,7 +1421,7 @@ impl Engine {
         // State may have changed while waiting for the single live nonce lane.
         let can_reserve = submission_permit.is_some()
             && self.mode.live()
-            && self.qualification_status().strategy_passes(opp.strategy)
+            && self.strategy_qualified(opp.strategy)
             && self.inventory.broadcast_available(self.ctx.head().number);
         let nonce_count = Inventory::legs(&opp);
         let reserved_nonce = can_reserve.then(|| self.inventory.reserve_nonces(nonce_count));
@@ -1373,6 +1467,14 @@ impl Engine {
         // trip the live drawdown switch.
         if lane == FunnelLane::Live {
             self.risk.observe(&outcome.primary);
+            if self.risk.is_tripped() {
+                let engine = self.clone();
+                tokio::spawn(async move {
+                    engine
+                        .cancel_active_submissions("drawdown kill switch tripped")
+                        .await;
+                });
+            }
         }
         self.writes.record_simulation(&outcome.primary);
         let _ = self

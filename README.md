@@ -113,7 +113,7 @@ never needs a redeploy.
 - Guards: `minProfit`, `blockDeadline`, `maxBaseFee`, `bribeBps`, searcher
   allowlist, transient-storage reentrancy/callback protection
 
-Runtime size 10,840 bytes (deterministic across checkouts — `compile-check.js`
+Runtime size 11,340 bytes (deterministic across checkouts — `compile-check.js`
 disables solc's IPFS metadata hash, which otherwise embeds each source file's
 absolute path). Tests cover the profit invariant, every guard, a
 flash-loan arbitrage, a full sandwich round trip, and access control.

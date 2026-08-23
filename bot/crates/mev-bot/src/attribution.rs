@@ -44,17 +44,17 @@ pub async fn reconcile_own_submissions(
     let Ok(bundles) = store.submitted_bundles_through(head) else {
         return;
     };
+    let all_hashes = bundles
+        .iter()
+        .flat_map(|bundle| bundle.tx_hashes.iter().copied())
+        .collect::<Vec<_>>();
+    let receipt_map = batch_hash_receipts(rpc, &all_hashes).await;
     for bundle in bundles {
-        let mut found = Vec::new();
-        for hash in &bundle.tx_hashes {
-            let value = rpc
-                .call_raw("eth_getTransactionReceipt", json!([format!("{hash:?}")]))
-                .await
-                .unwrap_or(Value::Null);
-            if !value.is_null() {
-                found.push((*hash, value));
-            }
-        }
+        let found = bundle
+            .tx_hashes
+            .iter()
+            .filter_map(|hash| receipt_map.get(hash).cloned().map(|value| (*hash, value)))
+            .collect::<Vec<_>>();
         let found_hashes = found.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
         if found.len() != bundle.tx_hashes.len() {
             let state = if found.is_empty() {
@@ -219,7 +219,10 @@ pub async fn reconcile_block(
     let Ok(opportunities) = store.victim_opportunities_for_block(block_number) else {
         return;
     };
-    if opportunities.is_empty() {
+    let Ok(atomic_arbs) = store.atomic_arb_opportunities_for_block(block_number) else {
+        return;
+    };
+    if opportunities.is_empty() && atomic_arbs.is_empty() {
         return;
     }
     let by_hash: HashMap<String, usize> = txs
@@ -370,6 +373,170 @@ pub async fn reconcile_block(
             tracing::debug!(target: "attribution", %error, block_number, "persist match failed");
         }
     }
+
+    reconcile_atomic_arbs(
+        store,
+        rpc,
+        block_number,
+        txs,
+        weth,
+        &atomic_arbs,
+        &mut receipts,
+    )
+    .await;
+}
+
+async fn reconcile_atomic_arbs(
+    store: &Store,
+    rpc: &RpcClient,
+    block_number: u64,
+    txs: &[PendingTx],
+    weth: Address,
+    opportunities: &[crate::store::AtomicArbObservation],
+    receipt_cache: &mut HashMap<B256, Value>,
+) {
+    if opportunities.is_empty() {
+        return;
+    }
+    batch_receipts(rpc, txs, receipt_cache).await;
+    let mut candidates = Vec::new();
+    for (index, tx) in txs.iter().enumerate() {
+        let Some(value) = receipt_cache.get(&tx.hash).cloned() else {
+            continue;
+        };
+        let pools = swap_pools(&value);
+        if pools.len() >= 2 {
+            candidates.push((index, value, pools));
+        }
+    }
+
+    for opportunity in opportunities {
+        let route_pools = route_pools(&opportunity.notes);
+        if route_pools.len() < 2 {
+            continue;
+        }
+        let Some((index, value, observed_pools)) = candidates
+            .iter()
+            .find(|(_, _, pools)| route_pools.is_subset(pools))
+        else {
+            continue;
+        };
+        let tx = &txs[*index];
+        let entity = entity_addresses(tx, tx);
+        let gross = weth_delta(value, weth, &entity);
+        let gas_used = parse_u64(&value["gasUsed"]);
+        let gas_cost = parse_u256(&value["effectiveGasPrice"]).saturating_mul(U256::from(gas_used));
+        let net = gross.saturating_sub(crate::sim::anvil::to_i128(gas_cost));
+        if gross <= 0 || net <= 0 {
+            continue;
+        }
+        let matched = ActualMevMatch {
+            opportunity_id: opportunity.opportunity_id.clone(),
+            block_number,
+            victim_hash: String::new(),
+            mev_tx_hashes: vec![format!("{:?}", tx.hash)],
+            actor: tx.to.or(tx.from).map(|address| format!("{address:?}")),
+            gross_weth_wei: U256::from(gross as u128),
+            gas_cost_wei: gas_cost,
+            net_weth_wei: net,
+            confidence: "high".into(),
+            confidence_score_bps: 9_000,
+            completeness: json!({
+                "transactionGas": "exact",
+                "observableWethTransfers": "exact",
+                "routePools": "exact_log_match",
+                "bundleBoundary": "single_transaction_observed",
+                "internalEthTransfers": "not_observed_without_traces",
+                "offChainLegs": "not_observable",
+                "inventoryMarkToMarket": "not_observable"
+            }),
+            evidence: json!({
+                "kind": "same_block_atomic_arb_route_match",
+                "strategy": "atomic_arb",
+                "transactionIndex": index,
+                "requiredPools": route_pools.iter().map(|pool| format!("{pool:?}")).collect::<Vec<_>>(),
+                "observedPools": observed_pools.iter().map(|pool| format!("{pool:?}")).collect::<Vec<_>>(),
+                "entity": entity.iter().map(|address| format!("{address:?}")).collect::<Vec<_>>(),
+                "gasUsed": gas_used,
+                "limitations": [
+                    "WETH transfer delta is exact for the identified transaction entity",
+                    "off-chain legs and inventory marks are not observable",
+                    "internal ETH transfers require trace RPC and are not included"
+                ]
+            }),
+        };
+        if let Err(error) = store.record_actual_mev_match(&matched) {
+            tracing::debug!(target: "attribution", %error, block_number, "persist atomic-arb match failed");
+        }
+    }
+}
+
+fn route_pools(notes: &str) -> HashSet<Address> {
+    notes
+        .split_whitespace()
+        .filter_map(|word| word.rsplit_once(':').map(|(_, address)| address))
+        .map(|address| address.trim_matches(|character| matches!(character, '[' | ']' | ',')))
+        .filter_map(|address| address.parse::<Address>().ok())
+        .collect()
+}
+
+async fn batch_hash_receipts(rpc: &RpcClient, hashes: &[B256]) -> HashMap<B256, Value> {
+    let mut receipts = HashMap::new();
+    for chunk in hashes.chunks(100) {
+        let calls = chunk
+            .iter()
+            .map(|hash| {
+                (
+                    "eth_getTransactionReceipt".to_string(),
+                    json!([format!("{hash:?}")]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Ok(values) = rpc.batch(&calls).await else {
+            continue;
+        };
+        for (hash, result) in chunk.iter().copied().zip(values) {
+            let Ok(value) = result else {
+                continue;
+            };
+            if !value.is_null() {
+                receipts.insert(hash, value);
+            }
+        }
+    }
+    receipts
+}
+
+async fn batch_receipts(rpc: &RpcClient, txs: &[PendingTx], cache: &mut HashMap<B256, Value>) {
+    // Keep provider batch sizes conventional. Delivered-block replay is not
+    // latency-critical, but hundreds of sequential receipt round trips would
+    // unnecessarily monopolize the RPC and delay the next replay block.
+    for chunk in txs.chunks(100) {
+        let missing = chunk
+            .iter()
+            .filter(|tx| !cache.contains_key(&tx.hash))
+            .collect::<Vec<_>>();
+        let calls = missing
+            .iter()
+            .map(|tx| {
+                (
+                    "eth_getTransactionReceipt".to_string(),
+                    json!([format!("{:?}", tx.hash)]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let Ok(values) = rpc.batch(&calls).await else {
+            continue;
+        };
+        for (tx, result) in missing.into_iter().zip(values) {
+            let Ok(value) = result else {
+                continue;
+            };
+            if !value.is_null() && parse_u64(&value["status"]) == 1 {
+                cache.insert(tx.hash, value);
+            }
+        }
+    }
 }
 
 async fn receipt(rpc: &RpcClient, hash: B256, cache: &mut HashMap<B256, Value>) -> Option<Value> {
@@ -474,6 +641,14 @@ mod tests {
 
     fn topic(address: Address) -> String {
         format!("0x{:064x}", U256::from_be_slice(address.as_slice()))
+    }
+
+    #[test]
+    fn atomic_arb_notes_recover_the_exact_pool_route() {
+        let first = Address::with_last_byte(1);
+        let second = Address::with_last_byte(2);
+        let notes = format!("arb 2-leg [univ2:{first:?} -> sushiv2:{second:?}] in 10 gross 20");
+        assert_eq!(route_pools(&notes), HashSet::from([first, second]));
     }
 
     #[test]

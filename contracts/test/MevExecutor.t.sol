@@ -196,6 +196,32 @@ contract MevExecutorTest is Test {
         exec.execute(tag, back, close);
     }
 
+    function test_ownerCanClearOnlyAnExpiredPartialInclusionBaseline() public {
+        bytes32 tag = keccak256("partial-inclusion");
+        MevExecutor.Call[] memory front = new MevExecutor.Call[](0);
+        MevExecutor.Guard memory open = _guard(address(weth), 0);
+        open.phase = 1;
+
+        vm.prank(searcher);
+        exec.execute(tag, front, open);
+
+        vm.prank(searcher);
+        vm.expectRevert(MevExecutor.NotOwner.selector);
+        exec.clearExpiredBaseline(tag);
+
+        vm.expectRevert(MevExecutor.BaselineNotExpired.selector);
+        exec.clearExpiredBaseline(tag);
+
+        vm.roll(block.number + 1);
+        exec.clearExpiredBaseline(tag);
+
+        MevExecutor.Guard memory close = _guard(address(weth), 1);
+        close.phase = 2;
+        vm.prank(searcher);
+        vm.expectRevert(MevExecutor.BaselineMissing.selector);
+        exec.execute(tag, front, close);
+    }
+
     function test_twoLegBribeCanNeverConsumePrincipal() public {
         bytes32 tag = keccak256("two-leg-bribe");
         MevExecutor.Call[] memory front = new MevExecutor.Call[](1);

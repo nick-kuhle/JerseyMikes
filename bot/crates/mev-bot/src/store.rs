@@ -37,6 +37,12 @@ pub struct OpportunityVictim {
 }
 
 #[derive(Clone, Debug)]
+pub struct AtomicArbObservation {
+    pub opportunity_id: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct SubmittedBundle {
     pub bundle_id: String,
     pub opportunity_id: String,
@@ -327,6 +333,11 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_sim_strategy ON simulations(strategy);
             CREATE INDEX IF NOT EXISTS idx_sim_created ON simulations(created_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_sim_qualification
+                ON simulations(strategy, backend, created_at_ms, success, opportunity_id, id);
+            CREATE INDEX IF NOT EXISTS idx_blocks_coverage ON blocks(canonical, seen_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_qualification_incident_time
+                ON qualification_incidents(occurred_at_ms);
             CREATE INDEX IF NOT EXISTS idx_opp_created ON opportunities(created_at_ms);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_slot ON relay_bids(relay, slot);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_relay_block_slot ON relay_blocks(relay, slot);
@@ -436,8 +447,9 @@ impl WriteOp {
 /// the searcher on-time is the right trade. `dropped()` makes it visible.
 pub struct AsyncStore {
     tx: tokio::sync::mpsc::Sender<WriteOp>,
-    incident_tx: tokio::sync::mpsc::UnboundedSender<u64>,
-    incident_recorded: std::sync::atomic::AtomicBool,
+    /// First unpersisted drop timestamp. The existing writer records it after
+    /// draining a batch, avoiding a second thread solely for rare incidents.
+    incident_at_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     dropped: std::sync::atomic::AtomicU64,
     queued: std::sync::atomic::AtomicU64,
 }
@@ -452,26 +464,14 @@ impl AsyncStore {
     /// and for the synchronous writes that are not on the hot path.
     pub fn spawn(store: std::sync::Arc<Store>, capacity: usize) -> std::sync::Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteOp>(capacity.max(64));
-        let (incident_tx, mut incident_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let incident_at_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let this = std::sync::Arc::new(Self {
             tx,
-            incident_tx,
-            incident_recorded: std::sync::atomic::AtomicBool::new(false),
+            incident_at_ms: incident_at_ms.clone(),
             dropped: std::sync::atomic::AtomicU64::new(0),
             queued: std::sync::atomic::AtomicU64::new(0),
         });
-        let incident_store = store.clone();
-        tokio::task::spawn_blocking(move || {
-            while let Some(at_ms) = incident_rx.blocking_recv() {
-                if let Err(error) = incident_store.record_qualification_incident(
-                    "persistence_drop",
-                    "one or more bounded telemetry writes were dropped",
-                    at_ms,
-                ) {
-                    tracing::error!(target: "store", %error, "could not persist qualification incident");
-                }
-            }
-        });
+        let writer_incident_at_ms = incident_at_ms;
         tokio::task::spawn_blocking(move || {
             let mut batch: Vec<WriteOp> = Vec::with_capacity(BATCH_MAX);
             // `blocking_recv` parks this dedicated thread, never a runtime
@@ -502,12 +502,39 @@ impl AsyncStore {
                         tracing::warn!(target: "store", error = %e, "could not open write transaction");
                     }
                 }
+                let incident_at =
+                    writer_incident_at_ms.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if incident_at != 0 {
+                    if let Err(error) = conn.execute(
+                        "INSERT INTO qualification_incidents (kind, detail, occurred_at_ms) VALUES (?1,?2,?3)",
+                        params![
+                            "persistence_drop",
+                            "one or more bounded telemetry writes were dropped",
+                            incident_at as i64
+                        ],
+                    ) {
+                        writer_incident_at_ms.store(
+                            incident_at,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        tracing::error!(target: "store", %error, "could not persist qualification incident");
+                    }
+                }
                 drop(conn);
                 batch.clear();
             }
             tracing::info!(target: "store", "writer task stopped");
         });
         this
+    }
+
+    fn mark_drop_incident(&self) {
+        let _ = self.incident_at_ms.compare_exchange(
+            0,
+            now_ms(),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
     }
 
     /// Queue a write. Never blocks and never fails the caller: a full queue
@@ -522,12 +549,7 @@ impl AsyncStore {
                 let n = self.dropped.fetch_add(1, Relaxed) + 1;
                 // Rate-limited: one line per 1000 drops, so a sustained
                 // overload cannot itself become the bottleneck.
-                if !self
-                    .incident_recorded
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                {
-                    let _ = self.incident_tx.send(now_ms());
-                }
+                self.mark_drop_incident();
                 if n % 1000 == 1 {
                     tracing::warn!(
                         target: "store",
@@ -538,12 +560,7 @@ impl AsyncStore {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped.fetch_add(1, Relaxed);
-                if !self
-                    .incident_recorded
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                {
-                    let _ = self.incident_tx.send(now_ms());
-                }
+                self.mark_drop_incident();
             }
         }
     }
@@ -1228,6 +1245,25 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    pub fn atomic_arb_opportunities_for_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<AtomicArbObservation>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, notes FROM opportunities
+             WHERE target_block = ?1 AND strategy = 'atomic_arb'
+             ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![block_number as i64], |row| {
+            Ok(AtomicArbObservation {
+                opportunity_id: row.get(0)?,
+                notes: row.get(1)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     pub fn record_actual_mev_match(&self, matched: &ActualMevMatch) -> Result<()> {
@@ -2170,11 +2206,10 @@ mod tests {
         // persistence. With a tiny queue and no writer draining it, sends
         // must return immediately and be counted as dropped.
         let (tx, _rx) = tokio::sync::mpsc::channel::<WriteOp>(1);
-        let (incident_tx, mut incident_rx) = tokio::sync::mpsc::unbounded_channel();
+        let incident_at_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let s = AsyncStore {
             tx,
-            incident_tx,
-            incident_recorded: std::sync::atomic::AtomicBool::new(false),
+            incident_at_ms: incident_at_ms.clone(),
             dropped: std::sync::atomic::AtomicU64::new(0),
             queued: std::sync::atomic::AtomicU64::new(0),
         };
@@ -2183,13 +2218,10 @@ mod tests {
         }
         assert_eq!(s.queued(), 1, "only the buffered slot is accepted");
         assert_eq!(s.dropped(), 49, "the rest are shed, not blocked");
-        assert!(
-            incident_rx.try_recv().is_ok(),
-            "the window is durably invalidated"
-        );
-        assert!(
-            incident_rx.try_recv().is_err(),
-            "one incident per process is enough"
+        assert_ne!(
+            incident_at_ms.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the writer must durably invalidate the qualification window"
         );
     }
 }

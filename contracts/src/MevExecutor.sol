@@ -8,11 +8,10 @@ import {IERC20, IWETH, IBalancerVault, IFlashLoanRecipient} from "./interfaces/I
 ///
 /// Design goals
 /// ------------
-/// 1. **Never land unprofitable.** Every entry point measures the balance of `profitToken`
-///    (address(0) == native ETH) before and after the call batch and reverts unless the
-///    realised delta is >= `minProfit`. Because the bot only submits through private
-///    orderflow (Flashbots / MEV-Share bundles), a reverting transaction is simply not
-///    included by the builder and therefore burns **zero** gas.
+/// 1. **Retained-profit guard.** Settling entry points measure the balance of `profitToken`
+///    (address(0) == native ETH), pay any builder share, and revert unless the retained
+///    delta is >= `minProfit`. Private bundle simulation should exclude a reverting batch;
+///    partial inclusion is still treated as an operational incident by the off-chain bot.
 /// 2. **Generic.** Strategies (sandwich, JIT, atomic arb, liquidation, sniper) are encoded
 ///    off-chain as an ordered array of `Call`s. No strategy-specific on-chain logic means
 ///    no redeploy when a strategy changes.
@@ -87,6 +86,7 @@ contract MevExecutor is IFlashLoanRecipient {
     mapping(bytes32 => Baseline) private _baselines;
 
     event PhaseOpened(bytes32 indexed tag, address indexed profitToken, uint256 referenceBalance);
+    event ExpiredBaselineCleared(bytes32 indexed tag, uint64 openedAtBlock);
     event Executed(
         bytes32 indexed tag,
         address indexed profitToken,
@@ -112,6 +112,7 @@ contract MevExecutor is IFlashLoanRecipient {
     error BaselineExists();
     error BaselineMissing();
     error BaselineMismatch();
+    error BaselineNotExpired();
     /// @notice `sweep` could not deliver native ETH to `to`.
     error SweepFailed();
     /// @notice The coinbase transfer of the builder bribe reverted.
@@ -192,6 +193,17 @@ contract MevExecutor is IFlashLoanRecipient {
             _safeTransfer(token, to, amount);
         }
         emit Swept(token, to, amount);
+    }
+
+    /// @notice Delete a phase-1 baseline whose same-block settlement window expired.
+    /// @dev This repairs bookkeeping after an explicitly reported partial inclusion;
+    ///      asset recovery remains an owner decision through `ownerCall` / `sweep`.
+    function clearExpiredBaseline(bytes32 tag) external onlyOwner {
+        Baseline memory baseline = _baselines[tag];
+        if (baseline.blockNumber == 0) revert BaselineMissing();
+        if (baseline.blockNumber >= block.number) revert BaselineNotExpired();
+        delete _baselines[tag];
+        emit ExpiredBaselineCleared(tag, baseline.blockNumber);
     }
 
     /// @notice Escape hatch for arbitrary owner-driven maintenance (approvals, unwraps...).
