@@ -13,10 +13,11 @@ Companions: [`GO_LIVE.md`](GO_LIVE.md) (deploying `MevExecutor`),
 
 > **⚠ Canonical env names — read this before writing `.env`.**
 > The bot reads **wei-denominated** variables. These names do **not** exist
-> and are **silently ignored** if set: `MIN_NET_PROFIT_ETH`,
-> `MAX_BASE_FEE_GWEI`, `MAX_DRAWDOWN_ETH`, `BUILDER_SHARE_BPS`. The real knobs
-> are `MIN_NET_PROFIT_WEI`, `MAX_BASE_FEE_WEI`, `MAX_DRAWDOWN_WEI`,
-> `BRIBE_BPS`. Audit any existing env file with:
+> and are **rejected at boot** if set (`run`/`api` refuse to start; `doctor`
+> prints `✗ env names`): `MIN_NET_PROFIT_ETH`, `MAX_BASE_FEE_GWEI`,
+> `MAX_DRAWDOWN_ETH`, `BUILDER_SHARE_BPS`. The real knobs are
+> `MIN_NET_PROFIT_WEI`, `MAX_BASE_FEE_WEI`, `MAX_DRAWDOWN_WEI`, `BRIBE_BPS`.
+> Audit any existing env file with:
 >
 > ```bash
 > grep -nE '_(ETH|GWEI)=|BUILDER_SHARE' /etc/jerseymikes/env   # expect no output
@@ -33,7 +34,9 @@ make bot-build                      # or: cd bot && cargo build --release
 `eth_getRawTransactionByHash` support (required for sandwich/JIT replay),
 per-relay reachability for every `BUNDLE_RELAY_URLS` entry, key separation,
 on-chain executor posture (`eth_getCode`, `searchers(searcher)`, `owner()`),
-database writability, and the armed/broadcast/risk footer. Run it on the
+database writability, unused ETH/GWEI/`BUILDER_SHARE` env aliases (boot
+refuses these — they would silently no-op), a durable kill-switch trip
+restored from SQLite, and the armed/broadcast/risk footer. Run it on the
 production host, against the production `.env`.
 
 ## Phase 1 — on-chain deployment & key architecture

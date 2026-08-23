@@ -354,6 +354,31 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         ),
     }
 
+    // Durable kill switch. A leftover trip in this file is the same class of
+    // Day-0 surprise as an unwritable DB: the process will come up already
+    // refusing every opportunity until POST /api/risk/reset. Only probe an
+    // existing file — doctor must not create the database.
+    {
+        let db = std::path::Path::new(&cfg.api.db_path);
+        if db.exists() {
+            match mev_bot::store::Store::open(&cfg.api.db_path).and_then(|s| s.load_risk_state()) {
+                Ok(state) if state.tripped => println!(
+                    "✗ kill switch      durable trip persisted (cumulative {} wei{}) — \
+                     POST /api/risk/reset to re-arm",
+                    state.cumulative_net_wei,
+                    state
+                        .tripped_at_ms
+                        .map(|t| format!(", at {t} ms"))
+                        .unwrap_or_default()
+                ),
+                Ok(_) => println!("✓ kill switch      not tripped"),
+                Err(e) => println!("! kill switch      could not read: {e}"),
+            }
+        } else {
+            println!("· kill switch      no database yet");
+        }
+    }
+
     // The qualification clock lives in this file; if the directory is not
     // writable the clock silently never advances.
     {
@@ -376,6 +401,25 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
                 "✗ database dir      {} not writable: {e} — qualification cannot persist",
                 parent.display()
             ),
+        }
+    }
+
+    // Ghost names from older checklists. They are not read by Config::from_env,
+    // so a leftover MIN_NET_PROFIT_ETH=0.005 would leave MIN_NET_PROFIT_WEI at
+    // its 1-wei default. `validate` refuses to boot when any of these is set;
+    // doctor reports them here so the operator sees the names next to the
+    // rest of the Day-0 photograph.
+    {
+        let ignored = mev_bot::config::ignored_env_aliases();
+        if ignored.is_empty() {
+            println!("✓ env names         canonical wei/bps names only");
+        } else {
+            for alias in &ignored {
+                println!(
+                    "✗ env names         {} is set but unused — the bot reads {}",
+                    alias.name, alias.canonical
+                );
+            }
         }
     }
 

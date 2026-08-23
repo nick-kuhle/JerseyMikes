@@ -93,6 +93,14 @@ pub struct ActiveNonceReservation {
     pub target_block: u64,
 }
 
+/// Durable drawdown-kill-switch snapshot. Singleton row in `risk_state`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersistedRiskState {
+    pub tripped: bool,
+    pub tripped_at_ms: Option<u64>,
+    pub cumulative_net_wei: i128,
+}
+
 pub struct Store {
     /// Visible to the module so [`AsyncStore`]'s writer task can hold the
     /// connection across a whole batch transaction.
@@ -349,6 +357,18 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_recon_block ON reconciliations(block_number);
             CREATE INDEX IF NOT EXISTS idx_actual_mev_block ON actual_mev_matches(block_number);
             CREATE INDEX IF NOT EXISTS idx_submission_bundle ON relay_submissions(bundle_id);
+
+            -- Singleton safety state. The drawdown kill switch used to live
+            -- only in process memory; a restart silently re-armed a tripped
+            -- bot. Row id is constrained to 1 so this cannot become a log.
+            CREATE TABLE IF NOT EXISTS risk_state (
+                id                    INTEGER PRIMARY KEY CHECK (id = 1),
+                kill_switch_tripped   INTEGER NOT NULL DEFAULT 0,
+                tripped_at_ms         INTEGER,
+                cumulative_net_wei    TEXT NOT NULL DEFAULT '0'
+            );
+            INSERT OR IGNORE INTO risk_state (id, kill_switch_tripped, cumulative_net_wei)
+                VALUES (1, 0, '0');
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -1307,6 +1327,64 @@ impl Store {
         Ok(())
     }
 
+    /// Load the durable kill-switch snapshot. Missing row → not tripped.
+    pub fn load_risk_state(&self) -> Result<PersistedRiskState> {
+        let conn = self.conn.lock();
+        match conn.query_row(
+            "SELECT kill_switch_tripped, tripped_at_ms, cumulative_net_wei
+             FROM risk_state WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        ) {
+            Ok((tripped, at, cum)) => Ok(PersistedRiskState {
+                tripped: tripped != 0,
+                tripped_at_ms: at.filter(|v| *v > 0).map(|v| v as u64),
+                cumulative_net_wei: parse_i128_decimal(&cum),
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(PersistedRiskState::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the kill-switch flag and the cumulative that produced it.
+    ///
+    /// Synchronous on purpose: this is safety state, not telemetry. A full
+    /// `AsyncStore` queue must not be allowed to drop a trip. `tripped_at_ms`
+    /// is sticky for the life of a trip so a later persist of the same trip
+    /// does not rewrite the original timestamp.
+    pub fn persist_kill_switch(&self, tripped: bool, cumulative_net_wei: i128) -> Result<()> {
+        let conn = self.conn.lock();
+        let existing_at: Option<i64> = conn
+            .query_row(
+                "SELECT tripped_at_ms FROM risk_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        let tripped_at = if tripped {
+            Some(existing_at.filter(|v| *v > 0).unwrap_or(now_ms() as i64))
+        } else {
+            None
+        };
+        conn.execute(
+            "INSERT INTO risk_state (id, kill_switch_tripped, tripped_at_ms, cumulative_net_wei)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               kill_switch_tripped = excluded.kill_switch_tripped,
+               tripped_at_ms = excluded.tripped_at_ms,
+               cumulative_net_wei = excluded.cumulative_net_wei",
+            params![tripped as i32, tripped_at, cumulative_net_wei.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn record_qualification_incident(
         &self,
         kind: &str,
@@ -2213,6 +2291,35 @@ mod tests {
         let sandwich = pnl.iter().find(|p| p.strategy == "sandwich").unwrap();
         assert_eq!(sandwich.simulations, 3);
         assert_eq!(sandwich.net_profit_wei, "950");
+    }
+
+    #[test]
+    fn a_fresh_database_has_an_untripped_kill_switch() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.load_risk_state().unwrap(), PersistedRiskState::default());
+    }
+
+    #[test]
+    fn the_kill_switch_round_trips_and_keeps_its_first_timestamp() {
+        let s = Store::open_in_memory().unwrap();
+        s.persist_kill_switch(true, -250).unwrap();
+        let first = s.load_risk_state().unwrap();
+        assert!(first.tripped);
+        assert_eq!(first.cumulative_net_wei, -250);
+        assert!(first.tripped_at_ms.is_some());
+
+        // A later persist of the same trip must not rewrite the original time.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.persist_kill_switch(true, -400).unwrap();
+        let again = s.load_risk_state().unwrap();
+        assert_eq!(again.tripped_at_ms, first.tripped_at_ms);
+        assert_eq!(again.cumulative_net_wei, -400);
+
+        s.persist_kill_switch(false, 0).unwrap();
+        let cleared = s.load_risk_state().unwrap();
+        assert!(!cleared.tripped);
+        assert_eq!(cleared.cumulative_net_wei, 0);
+        assert!(cleared.tripped_at_ms.is_none());
     }
 
     #[tokio::test]
