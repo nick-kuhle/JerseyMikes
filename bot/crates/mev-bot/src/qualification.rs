@@ -203,8 +203,12 @@ fn evaluate_strategy(
         ));
     }
     if relay_comparisons < cfg.qualification_min_relay_comparisons {
+        let evidence_name = match cfg.qualification_backend {
+            crate::config::QualificationBackend::Relay => "fork-versus-relay",
+            crate::config::QualificationBackend::Sequencer => "independent canonical-state",
+        };
         reasons.push(format!(
-            "{relay_comparisons} fork-versus-relay comparisons; {} required",
+            "{relay_comparisons} {evidence_name} comparisons; {} required",
             cfg.qualification_min_relay_comparisons
         ));
     }
@@ -228,8 +232,12 @@ fn evaluate_strategy(
         PASS
     } else {
         if relay_accuracy_bps < cfg.qualification_min_accuracy_bps {
+            let label = match cfg.qualification_backend {
+                crate::config::QualificationBackend::Relay => "relay",
+                crate::config::QualificationBackend::Sequencer => "canonical-state",
+            };
             reasons.push(format!(
-                "relay accuracy is {relay_accuracy_bps}bps; {}bps required",
+                "{label} accuracy is {relay_accuracy_bps}bps; {}bps required",
                 cfg.qualification_min_accuracy_bps
             ));
         }

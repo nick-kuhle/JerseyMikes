@@ -678,6 +678,7 @@ export default function Console() {
 
 function QualificationReport({qualification}: {qualification: StatusResponse["qualification"]}) {
   const rows = qualification?.strategies ?? [];
+  const comparisonLabel = qualification?.comparisonBackend === "sequencer" ? "independent state" : "relay";
   return (
     <div className="panel" style={{padding: 10}}>
       <div className="panel-head">
@@ -705,9 +706,9 @@ function QualificationReport({qualification}: {qualification: StatusResponse["qu
             <th>strategy</th>
             <th>verdict</th>
             <th style={{textAlign: "right"}}>fork</th>
-            <th style={{textAlign: "right"}}>relay</th>
+            <th style={{textAlign: "right"}}>{comparisonLabel}</th>
             <th style={{textAlign: "right"}}>actual</th>
-            <th style={{textAlign: "right"}}>relay accuracy</th>
+            <th style={{textAlign: "right"}}>{comparisonLabel} accuracy</th>
             <th style={{textAlign: "right"}}>actual accuracy</th>
           </tr>
         </thead>

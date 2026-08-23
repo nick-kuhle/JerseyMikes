@@ -255,25 +255,33 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         cfg.qualification_min_actual_matches
     );
     {
-        let used = {
+        let (used, gas_at_risk) = {
             let db = std::path::Path::new(&cfg.api.db_path);
             if db.exists() {
                 mev_bot::store::Store::open(&cfg.api.db_path)
-                    .and_then(|s| s.smoke_used())
-                    .ok()
+                    .map(|store| {
+                        (
+                            store.smoke_used().unwrap_or(u64::MAX),
+                            store
+                                .smoke_gas_at_risk_wei()
+                                .unwrap_or(alloy_primitives::U256::MAX),
+                        )
+                    })
+                    .unwrap_or((u64::MAX, alloy_primitives::U256::MAX))
             } else {
-                Some(0)
+                (0, alloy_primitives::U256::ZERO)
             }
         };
-        let used = used.unwrap_or(0);
         let remaining = mev_bot::config::smoke_remaining(used, cfg.live_smoke_max);
         if cfg.live_smoke_max > 0 {
             println!(
-                "{} live smoke         LIVE_SMOKE_MAX={} used={} remaining={} (still needs arming, broadcast, risk, inventory, live-candidate, exact sim)",
+                "{} live smoke         LIVE_SMOKE_MAX={} used={} remaining={} gas_at_risk={} / {} wei (still needs arming, broadcast, risk, inventory, live-candidate, exact sim)",
                 if remaining > 0 { "!" } else { "·" },
                 cfg.live_smoke_max,
                 used,
-                remaining
+                remaining,
+                gas_at_risk,
+                cfg.live_smoke_max_gas_cost_wei
             );
         } else {
             println!("· live smoke         off (LIVE_SMOKE_MAX=0)");

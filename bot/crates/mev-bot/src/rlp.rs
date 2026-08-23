@@ -56,20 +56,39 @@ fn encode_length(len: usize, offset: u8) -> Vec<u8> {
     }
 }
 
-/// Decode the nonce of a signed EIP-1559 (type-2) transaction.
+/// Fee envelope carried by a signed EIP-1559 (type-2) transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eip1559Envelope {
+    pub nonce: u64,
+    pub max_priority_fee_per_gas: U256,
+    pub max_fee_per_gas: U256,
+    pub gas_limit: u64,
+}
+
+/// Decode the nonce and fee envelope of a signed EIP-1559 transaction.
 ///
 /// Layout: `0x02 || rlp([chain_id, nonce, max_priority_fee, max_fee, gas,
 /// to, value, data, access_list, y_parity, r, s])`. Returns `None` for
-/// anything that is not a well-formed type-2 payload. The fork pins to this
-/// number so a stale inventory nonce cannot produce "nonce too low".
-pub fn decode_eip1559_nonce(raw: &[u8]) -> Option<u64> {
+/// anything that is not a well-formed type-2 payload. Cancellation uses the
+/// original caps as the replacement-price floor; smoke accounting uses
+/// `gas_limit × max_fee_per_gas` as the worst-case amount at risk.
+pub fn decode_eip1559_envelope(raw: &[u8]) -> Option<Eip1559Envelope> {
     let payload = raw.strip_prefix(&[0x02])?;
     let items = decode_list(payload)?;
-    // Need at least chain_id + nonce.
-    if items.len() < 2 {
+    if items.len() < 5 {
         return None;
     }
-    decode_u64(&items[1])
+    Some(Eip1559Envelope {
+        nonce: decode_u64(&items[1])?,
+        max_priority_fee_per_gas: decode_u256(&items[2])?,
+        max_fee_per_gas: decode_u256(&items[3])?,
+        gas_limit: decode_u64(&items[4])?,
+    })
+}
+
+/// Decode only the nonce for callers that do not need fee information.
+pub fn decode_eip1559_nonce(raw: &[u8]) -> Option<u64> {
+    decode_eip1559_envelope(raw).map(|envelope| envelope.nonce)
 }
 
 /// Decode a single top-level RLP list into its items. String items are the
@@ -182,6 +201,16 @@ fn decode_u64(raw: &[u8]) -> Option<u64> {
     Some(n)
 }
 
+fn decode_u256(raw: &[u8]) -> Option<U256> {
+    if raw.is_empty() {
+        return Some(U256::ZERO);
+    }
+    if raw.len() > 32 || raw[0] == 0 {
+        return None;
+    }
+    Some(U256::from_be_slice(raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +271,15 @@ mod tests {
                 decode_eip1559_nonce(&raw),
                 Some(nonce),
                 "nonce {nonce} did not survive encode→decode"
+            );
+            assert_eq!(
+                decode_eip1559_envelope(&raw),
+                Some(Eip1559Envelope {
+                    nonce,
+                    max_priority_fee_per_gas: U256::from(1u64),
+                    max_fee_per_gas: U256::from(2u64),
+                    gas_limit: 21_000,
+                })
             );
         }
         assert_eq!(decode_eip1559_nonce(&[]), None);

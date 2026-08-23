@@ -37,6 +37,66 @@ use crate::signer::Signer;
 use crate::store::Store;
 use crate::types::BundleRecord;
 
+const CANCEL_PRIORITY_FLOOR_BUMP_WEI: u64 = 1_000_000_000;
+
+/// Worst-case gas exposure of the bot-owned transactions in a raw bundle.
+/// Malformed/non-type-2 payloads return `None` so smoke fails closed.
+pub fn raw_bundle_gas_at_risk(bundle: &BundleRecord) -> Option<U256> {
+    let mut total = U256::ZERO;
+    for tx in &bundle.txs {
+        if tx.foreign {
+            return None;
+        }
+        let envelope = crate::rlp::decode_eip1559_envelope(&tx.raw)?;
+        total = total.saturating_add(
+            envelope
+                .max_fee_per_gas
+                .saturating_mul(U256::from(envelope.gas_limit)),
+        );
+    }
+    Some(total)
+}
+
+fn bump_by_bps(value: U256, bump_bps: u64) -> U256 {
+    let bump = value
+        .saturating_mul(U256::from(bump_bps))
+        .saturating_add(U256::from(9_999u64))
+        / U256::from(10_000u64);
+    value.saturating_add(bump)
+}
+
+/// Build fee caps that satisfy both replacement pricing and current base fee.
+/// Returning `None` means the operator's hard cap cannot fund a valid cancel.
+fn classify_raw_rpc_result(result: anyhow::Result<Value>) -> (bool, Value) {
+    match result {
+        // RpcClient already unwraps JSON-RPC's outer `result` field.
+        Ok(value) => (true, json!({"result": value})),
+        Err(error) => (false, json!({"error": error.to_string()})),
+    }
+}
+
+fn replacement_fees(
+    original_priority: U256,
+    original_max_fee: U256,
+    current_base_fee: U256,
+    configured_priority: U256,
+    bump_bps: u64,
+    hard_max_fee: U256,
+) -> Option<(U256, U256)> {
+    let priority = bump_by_bps(original_priority, bump_bps)
+        .max(configured_priority.saturating_add(U256::from(CANCEL_PRIORITY_FLOOR_BUMP_WEI)));
+    let max_fee = bump_by_bps(original_max_fee, bump_bps).max(
+        current_base_fee
+            .saturating_mul(U256::from(2u8))
+            .saturating_add(priority),
+    );
+    if hard_max_fee.is_zero() || max_fee > hard_max_fee || priority > max_fee {
+        None
+    } else {
+        Some((priority, max_fee))
+    }
+}
+
 pub struct SubmissionGateway {
     mode: SubmissionMode,
     relays: Vec<(String, RpcClient)>,
@@ -50,9 +110,10 @@ pub struct SubmissionGateway {
     /// Raw mode: the priority fee a replacement (cancellation) tx bids.
     /// Bundles' own fee is set at signing time by the simulator.
     raw_priority_fee: U256,
-    /// Raw mode: how much a replacement tx bumps over the bundle's own
-    /// priority fee so the sequencer pool actually accepts it.
-    raw_cancel_bump: U256,
+    /// Percentage increase over both original fee caps for replacements.
+    raw_cancel_bump_bps: u64,
+    /// Operator hard ceiling; cancellation fails closed above this fee cap.
+    raw_cancel_max_fee: U256,
     signer: Arc<Signer>,
     store: Arc<Store>,
     retry_delay: std::time::Duration,
@@ -73,6 +134,8 @@ impl SubmissionGateway {
         searcher: Option<Address>,
         chain_id: u64,
         raw_priority_fee: U256,
+        raw_cancel_bump_bps: u64,
+        raw_cancel_max_fee: U256,
     ) -> Self {
         let relays = urls
             .iter()
@@ -95,7 +158,8 @@ impl SubmissionGateway {
             searcher,
             chain_id,
             raw_priority_fee,
-            raw_cancel_bump: U256::from(1_000_000_000u64), // +1 gwei
+            raw_cancel_bump_bps,
+            raw_cancel_max_fee,
             signer,
             store,
             retry_delay: std::time::Duration::from_millis(retry_ms),
@@ -212,12 +276,13 @@ impl SubmissionGateway {
                 rpc.call_raw("eth_sendRawTransaction", json!([raw_hex])),
             )
             .await;
-            let response = match result {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => json!({"error": e.to_string()}),
-                Err(_) => json!({"error": "submission timeout"}),
+            // `RpcClient::call_raw` already unwraps JSON-RPC's `result`
+            // field. Any `Ok(value)` is acceptance; looking for another nested
+            // `result` would mark a successfully broadcast transaction false.
+            let (ok, response) = match result {
+                Ok(result) => classify_raw_rpc_result(result),
+                Err(_) => (false, json!({"error": "submission timeout"})),
             };
-            let ok = response.get("result").is_some();
             all_accepted &= ok;
             let _ = self.store.record_relay_submission(
                 &bundle.id,
@@ -295,6 +360,37 @@ impl SubmissionGateway {
             );
             return false;
         };
+        let current_base_fee = match rpc
+            .call_raw("eth_getBlockByNumber", json!(["latest", false]))
+            .await
+        {
+            Ok(block) => {
+                let parsed = block["baseFeePerGas"]
+                    .as_str()
+                    .and_then(|value| value.strip_prefix("0x"))
+                    .and_then(|hex| U256::from_str_radix(hex, 16).ok());
+                match parsed {
+                    Some(value) => value,
+                    None => {
+                        tracing::error!(
+                            target: "submission",
+                            %replacement_uuid,
+                            "cancellation refused: latest block has no valid baseFeePerGas"
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "submission",
+                    %replacement_uuid,
+                    %error,
+                    "cancellation refused: current base fee unavailable"
+                );
+                return false;
+            }
+        };
         let mut all_cancelled = true;
         for (i, raw) in raw_txs.iter().enumerate() {
             let tx_hash = alloy_primitives::keccak256(raw);
@@ -318,16 +414,41 @@ impl SubmissionGateway {
                     continue;
                 }
             }
-            let Some(nonce) = crate::rlp::decode_eip1559_nonce(raw) else {
+            let Some(original) = crate::rlp::decode_eip1559_envelope(raw) else {
+                tracing::error!(
+                    target: "submission",
+                    %replacement_uuid,
+                    index = i,
+                    "cancellation refused: original is not a valid signed type-2 transaction"
+                );
                 all_cancelled = false;
                 continue;
             };
-            // Replacement: same nonce, self-transfer, bumped fee.
+            let Some((priority, max_fee)) = replacement_fees(
+                original.max_priority_fee_per_gas,
+                original.max_fee_per_gas,
+                current_base_fee,
+                self.raw_priority_fee,
+                self.raw_cancel_bump_bps,
+                self.raw_cancel_max_fee,
+            ) else {
+                tracing::error!(
+                    target: "submission",
+                    %replacement_uuid,
+                    index = i,
+                    hard_cap = %self.raw_cancel_max_fee,
+                    "cancellation refused: a valid replacement exceeds RAW_CANCEL_MAX_FEE_WEI"
+                );
+                all_cancelled = false;
+                continue;
+            };
+            // Replacement: same nonce, self-transfer, both fee caps bumped
+            // over the original and sufficient for the current base fee.
             let tx = Eip1559Tx {
                 chain_id: self.chain_id,
-                nonce,
-                max_priority_fee_per_gas: self.raw_priority_fee + self.raw_cancel_bump,
-                max_fee_per_gas: (self.raw_priority_fee + self.raw_cancel_bump) * U256::from(2u8),
+                nonce: original.nonce,
+                max_priority_fee_per_gas: priority,
+                max_fee_per_gas: max_fee,
                 gas_limit: 21_000,
                 to: Some(searcher),
                 value: U256::ZERO,
@@ -340,20 +461,97 @@ impl SubmissionGateway {
                     json!([format!("0x{}", hex::encode(&raw))]),
                 )
                 .await;
-            let ok = result
-                .as_ref()
-                .map(|v| v.get("result").is_some())
-                .unwrap_or(false);
+            // `call_raw` returns the unwrapped result; transport/RPC success
+            // means the replacement was accepted into the pool.
+            let ok = result.is_ok();
             all_cancelled &= ok;
             tracing::info!(
                 target: "submission",
                 %replacement_uuid,
                 index = i,
-                nonce,
+                nonce = original.nonce,
+                max_priority_fee_per_gas = %priority,
+                max_fee_per_gas = %max_fee,
                 acknowledged = ok,
                 "raw replacement (cancellation) sent"
             );
         }
         all_cancelled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signer::{Eip1559Tx, Signer};
+    use crate::types::{BundleTx, Strategy};
+
+    #[test]
+    fn unwrapped_raw_transaction_hash_is_acceptance() {
+        let (accepted, response) = classify_raw_rpc_result(Ok(json!(
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
+        )));
+        assert!(accepted);
+        assert!(response.get("result").is_some());
+    }
+
+    #[test]
+    fn replacement_bumps_original_caps_and_covers_base_fee() {
+        let gwei = U256::from(1_000_000_000u64);
+        let (priority, max_fee) = replacement_fees(
+            gwei * U256::from(2u64),
+            gwei * U256::from(20u64),
+            gwei * U256::from(15u64),
+            gwei,
+            1_250,
+            gwei * U256::from(100u64),
+        )
+        .unwrap();
+        assert_eq!(priority, U256::from(2_250_000_000u64));
+        assert_eq!(max_fee, gwei * U256::from(30u64) + priority);
+        assert!(replacement_fees(
+            gwei * U256::from(2u64),
+            gwei * U256::from(20u64),
+            gwei * U256::from(50u64),
+            gwei,
+            1_250,
+            gwei * U256::from(100u64),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn raw_smoke_risk_uses_signed_gas_limit_times_fee_cap() {
+        let signer = Signer::from_hex(Signer::SIMULATION_KEY).unwrap();
+        let tx = Eip1559Tx {
+            chain_id: 8453,
+            nonce: 7,
+            max_priority_fee_per_gas: U256::from(2u64),
+            max_fee_per_gas: U256::from(10u64),
+            gas_limit: 42_000,
+            to: Some(Address::with_last_byte(1)),
+            value: U256::ZERO,
+            data: Vec::new(),
+        };
+        let (raw, hash) = signer.sign_eip1559(&tx);
+        let bundle = BundleRecord {
+            id: "bundle".into(),
+            opportunity_id: "opportunity".into(),
+            strategy: Strategy::AtomicArb,
+            target_block: 1,
+            txs: vec![BundleTx {
+                hash: Some(hash),
+                raw,
+                can_revert: false,
+                foreign: false,
+            }],
+            submitted: false,
+            included: None,
+            created_at_ms: 0,
+        };
+        assert_eq!(
+            raw_bundle_gas_at_risk(&bundle),
+            Some(U256::from(420_000u64))
+        );
     }
 }

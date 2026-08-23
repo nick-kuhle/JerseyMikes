@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use alloy_primitives::U256;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 
@@ -365,8 +365,9 @@ impl Store {
                 id                    INTEGER PRIMARY KEY CHECK (id = 1),
                 kill_switch_tripped   INTEGER NOT NULL DEFAULT 0,
                 tripped_at_ms         INTEGER,
-                cumulative_net_wei    TEXT NOT NULL DEFAULT '0',
-                live_smoke_used       INTEGER NOT NULL DEFAULT 0
+                cumulative_net_wei       TEXT NOT NULL DEFAULT '0',
+                live_smoke_used          INTEGER NOT NULL DEFAULT 0,
+                live_smoke_gas_risk_wei  TEXT NOT NULL DEFAULT '0'
             );
             INSERT OR IGNORE INTO risk_state (id, kill_switch_tripped, cumulative_net_wei)
                 VALUES (1, 0, '0');
@@ -422,6 +423,11 @@ impl Store {
             "risk_state",
             "live_smoke_used",
             "INTEGER NOT NULL DEFAULT 0",
+        );
+        self.add_column(
+            "risk_state",
+            "live_smoke_gas_risk_wei",
+            "TEXT NOT NULL DEFAULT '0'",
         );
         Ok(())
     }
@@ -1466,19 +1472,68 @@ impl Store {
         Ok(n.max(0) as u64)
     }
 
-    /// Atomically consume one smoke slot if `used < max`. Returns whether a
-    /// slot was taken. Fail-closed: a full budget or a write error is `false`
-    /// / `Err`, never a silent extra send.
-    pub fn try_consume_smoke_slot(&self, max: u64) -> Result<bool> {
-        if max == 0 {
+    /// Worst-case raw gas exposure reserved by smoke sends. This is sticky,
+    /// like the count: a restart cannot refill the operator's risk budget.
+    pub fn smoke_gas_at_risk_wei(&self) -> Result<U256> {
+        let value: String = match self.conn.lock().query_row(
+            "SELECT COALESCE(live_smoke_gas_risk_wei, '0') FROM risk_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(value) => value,
+            Err(rusqlite::Error::QueryReturnedNoRows) => "0".into(),
+            Err(error) => return Err(error.into()),
+        };
+        value
+            .parse::<U256>()
+            .with_context(|| "invalid durable live_smoke_gas_risk_wei")
+    }
+
+    /// Atomically consume one smoke slot and, for raw mode, reserve the
+    /// transaction's worst-case gas exposure. `max_gas_cost_wei=None` is the
+    /// relay-bundle path (count only). A missing/zero raw budget fails closed.
+    pub fn try_consume_smoke_budget(
+        &self,
+        max_count: u64,
+        max_gas_cost_wei: Option<U256>,
+        gas_at_risk_wei: U256,
+    ) -> Result<bool> {
+        if max_count == 0 {
             return Ok(false);
         }
-        let changed = self.conn.lock().execute(
-            "UPDATE risk_state SET live_smoke_used = live_smoke_used + 1
-             WHERE id = 1 AND live_smoke_used < ?1",
-            params![max as i64],
+        let conn = self.conn.lock();
+        let (used, used_gas): (i64, String) = conn.query_row(
+            "SELECT COALESCE(live_smoke_used, 0),
+                    COALESCE(live_smoke_gas_risk_wei, '0')
+             FROM risk_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(changed > 0)
+        if used.max(0) as u64 >= max_count {
+            return Ok(false);
+        }
+        let current_gas = used_gas
+            .parse::<U256>()
+            .with_context(|| "invalid durable live_smoke_gas_risk_wei")?;
+        let next_gas = current_gas.saturating_add(gas_at_risk_wei);
+        if let Some(max_gas) = max_gas_cost_wei {
+            if max_gas.is_zero() || next_gas > max_gas {
+                return Ok(false);
+            }
+        }
+        let changed = conn.execute(
+            "UPDATE risk_state
+             SET live_smoke_used = live_smoke_used + 1,
+                 live_smoke_gas_risk_wei = ?1
+             WHERE id = 1 AND live_smoke_used = ?2",
+            params![next_gas.to_string(), used],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Count-only compatibility wrapper used by relay-bundle smoke and tests.
+    pub fn try_consume_smoke_slot(&self, max: u64) -> Result<bool> {
+        self.try_consume_smoke_budget(max, None, U256::ZERO)
     }
 
     /// Persist the kill-switch flag and the cumulative that produced it.
@@ -1594,13 +1649,12 @@ impl Store {
     /// `backend` selects the source of the *independent second opinion*
     /// (the `relay_errors_bps` field, a name kept for API stability):
     /// - `Relay` (mainnet): fork net vs relay `eth_callBundle` net.
-    /// - `Sequencer` (Base et al., no relay market): fork prediction vs the
-    ///   *included block* — victim-pinned opportunities compare the fork's
-    ///   predicted victim-leg delta against the victim's realised delta in
-    ///   the canonical block (`block_comparisons`); victimless opportunities
-    ///   (e.g. atomic_arb) use high-confidence on-chain route matches as the
-    ///   second opinion (a relay-less chain's included block is where
-    ///   independent confirmation lives). The tolerance math is identical.
+    /// - `Sequencer` (Base et al., no relay market): fork prediction vs an
+    ///   independently recorded canonical state transition in
+    ///   `block_comparisons`. High-confidence route matches remain in the
+    ///   separate corresponding-chain population below; they are never reused
+    ///   as the second opinion. Victimless strategies therefore remain
+    ///   unqualified until they record a genuine state-comparison row.
     pub fn qualification_evidence(
         &self,
         since_ms: u64,
@@ -1654,36 +1708,16 @@ impl Store {
                     "SELECT error_bps FROM block_comparisons
                      WHERE strategy = ?1 AND created_at_ms >= ?2",
                 )?;
-                let mut errs: Vec<u64> = block_stmt
+                let errs: Vec<u64> = block_stmt
                     .query_map(params![strategy, since_ms as i64], |row| {
                         row.get::<_, i64>(0)
                     })?
                     .flatten()
                     .map(|e| e.max(0) as u64)
                     .collect();
-                // (b) Victimless opportunities (atomic_arb et al.): the
-                // included block's own high-confidence route match is the
-                // independent confirmation of the fork's state prediction.
-                let mut route_stmt = conn.prepare(
-                    "SELECT CAST(f.net_wei AS TEXT), CAST(a.net_weth_wei AS TEXT)
-                     FROM actual_mev_matches a
-                     JOIN opportunities o ON o.id = a.opportunity_id
-                     JOIN simulations f ON f.opportunity_id = a.opportunity_id
-                     WHERE o.strategy = ?1 AND a.canonical = 1
-                       AND a.created_at_ms >= ?2 AND a.confidence_score_bps >= ?3
-                       AND f.backend = 'anvil_fork' AND f.success = 1
-                       AND COALESCE(f.reorged, 0) = 0
-                       AND f.id = (SELECT MAX(f2.id) FROM simulations f2
-                                   WHERE f2.opportunity_id = f.opportunity_id
-                                     AND f2.backend = 'anvil_fork')",
-                )?;
-                let route_rows = route_stmt.query_map(
-                    params![strategy, since_ms as i64, minimum_confidence_bps as i64],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )?;
-                errs.extend(route_rows.flatten().map(|(fork, actual)| {
-                    relative_error_bps(parse_i128_decimal(&fork), parse_i128_decimal(&actual))
-                }));
+                // Do not append `actual_mev_matches` here. Those rows feed the
+                // separate corresponding-chain population below; counting one
+                // row in both populations would manufacture independence.
                 errs
             }
         };
@@ -2240,6 +2274,51 @@ mod tests {
     }
 
     #[test]
+    fn sequencer_actual_match_is_not_reused_as_independent_evidence() {
+        let s = Store::open_in_memory().unwrap();
+        let now = now_ms();
+        let id = "atomic-one";
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "INSERT INTO opportunities
+                 (id,strategy,target_block,profit_token,expected_wei,notional_wei,victims,notes,created_at_ms)
+                 VALUES (?1,'atomic_arb',100,'0x0','100','1000','[]','test',?2)",
+                params![id, now as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO simulations
+                 (opportunity_id,strategy,backend,success,gross_wei,gas_used,gas_cost_wei,bribe_wei,net_wei,revert_reason,target_block,latency_ms,created_at_ms,reorged)
+                 VALUES (?1,'atomic_arb','anvil_fork',1,'150',21000,'50','0','100',NULL,100,1,?2,0)",
+                params![id, now as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO actual_mev_matches
+                 (opportunity_id,block_number,victim_hash,mev_tx_hashes,actor,gross_weth_wei,gas_cost_wei,net_weth_wei,confidence,confidence_score_bps,completeness,evidence,canonical,created_at_ms)
+                 VALUES (?1,100,'','[]',NULL,'150','50','100','high',9000,'{}','{}',1,?2)",
+                params![id, now as i64],
+            )
+            .unwrap();
+        }
+        let evidence = s
+            .qualification_evidence(
+                now.saturating_sub(1),
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert_eq!(evidence.fork_samples, 1);
+        assert!(
+            evidence.relay_errors_bps.is_empty(),
+            "the actual-match row is not an independent sequencer comparison"
+        );
+        assert_eq!(evidence.actual_errors_bps, vec![0]);
+    }
+
+    #[test]
     fn records_and_aggregates_pnl() {
         let s = Store::open_in_memory().unwrap();
         s.record_simulation(&sim(Strategy::Sandwich, 500)).unwrap();
@@ -2520,9 +2599,39 @@ mod tests {
         assert!(!s.try_consume_smoke_slot(2).unwrap(), "budget exhausted");
         assert_eq!(s.smoke_used().unwrap(), 2);
         assert!(!s.try_consume_smoke_slot(0).unwrap(), "max=0 is off");
-        // A kill-switch persist must not reset the smoke counter.
+        assert_eq!(s.smoke_gas_at_risk_wei().unwrap(), U256::ZERO);
+        // A kill-switch persist must not reset either smoke counter.
         s.persist_kill_switch(true, -1).unwrap();
         assert_eq!(s.smoke_used().unwrap(), 2);
+        assert_eq!(s.smoke_gas_at_risk_wei().unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn raw_smoke_reserves_count_and_worst_case_gas_atomically() {
+        let s = Store::open_in_memory().unwrap();
+        let cap = U256::from(1_000u64);
+        assert!(s
+            .try_consume_smoke_budget(2, Some(cap), U256::from(400u64))
+            .unwrap());
+        assert_eq!(s.smoke_used().unwrap(), 1);
+        assert_eq!(s.smoke_gas_at_risk_wei().unwrap(), U256::from(400u64));
+        assert!(
+            !s.try_consume_smoke_budget(2, Some(cap), U256::from(700u64))
+                .unwrap(),
+            "a send that exceeds the wei cap is refused without spending a slot"
+        );
+        assert_eq!(s.smoke_used().unwrap(), 1);
+        assert_eq!(s.smoke_gas_at_risk_wei().unwrap(), U256::from(400u64));
+        assert!(s
+            .try_consume_smoke_budget(2, Some(cap), U256::from(600u64))
+            .unwrap());
+        assert_eq!(s.smoke_used().unwrap(), 2);
+        assert_eq!(s.smoke_gas_at_risk_wei().unwrap(), cap);
+        assert!(
+            !s.try_consume_smoke_budget(3, Some(U256::ZERO), U256::from(1u64))
+                .unwrap(),
+            "zero raw gas budget is fail-closed"
+        );
     }
 
     #[tokio::test]

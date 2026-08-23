@@ -120,14 +120,23 @@ in each instance's own database / process, so arming Base can never affect
 Ethereum and vice versa. Backups land per chain under
 `/var/lib/jerseymikes/backups/<chain>/`.
 
-Sequencer chains differ from mainnet in exactly three env rows (see
+Sequencer chains use a different transport and evidence model (see
 `.env.example.base`):
 
 ```ini
-SUBMISSION_MODE=raw            # no relay market: signed txs go straight to the RPC
-QUALIFICATION_BACKEND=sequencer  # the second opinion is the included block, not a relay
-BRIBE_BPS=0                    # coinbase has no auction; priority fee is the ordering currency
+SUBMISSION_MODE=raw
+QUALIFICATION_BACKEND=sequencer
+BRIBE_BPS=0
+RAW_CANCEL_BUMP_BPS=1250
+RAW_CANCEL_MAX_FEE_WEI=500000000000
+LIVE_SMOKE_MAX_GAS_COST_WEI=0  # zero keeps unqualified raw smoke disabled
 ```
+
+A sequencer comparison must come from an independently recorded canonical
+state transition; an inferred route/outcome match cannot be counted a second
+time. Base atomic arb intentionally remains unqualified until the victimless
+state-comparison and executable multi-venue path in
+[`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md) land.
 
 The console multiplexes across the instances. Server-side env (`.env.local`
 or the console service):

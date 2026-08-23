@@ -138,14 +138,18 @@ What is actually chain-aware in the code (added with Base, all env-overridable):
 | Address registry | `config::known::for_chain(CHAIN_ID)` → `ethereum()` or `base()` profile (verified deployments); env `*_ADDRESS` overrides win field-by-field, so a chain without a built-in profile is fully env-driven |
 | Strategy availability | A strategy whose protocol is absent from the profile is not constructed (boot warning); sequencer chains warn when front-run strategies are enabled (they are back-run-only there) |
 | Discovery | Factory addresses (V2 `PairCreated`, V3 `PoolCreated`) come from the registry, not constants |
-| Delivery | `SUBMISSION_MODE`: `bundle` (relays, mainnet) or `raw` (signed txs straight to the chain RPC with a priority fee; sequencer chains have no relay market). Cancellation in raw mode is a same-nonce replacement tx |
-| Qualification | `QUALIFICATION_BACKEND`: `relay` (fork vs `eth_callBundle`) or `sequencer` (fork vs included block — the victim's realised canonical delta + route matches are the second opinion) |
+| Delivery | `SUBMISSION_MODE`: `bundle` (relays, mainnet) or `raw` (signed txs straight to the chain RPC with a priority fee; sequencer chains have no relay market). Raw cancellation replaces the nonce with both original EIP-1559 caps percentage-bumped, current base fee covered, and an operator hard cap |
+| Qualification | `QUALIFICATION_BACKEND`: `relay` (fork vs `eth_callBundle`) or `sequencer` (fork vs an independently recorded canonical state transition). Route/outcome matches stay in a separate population and cannot satisfy both thresholds |
 | Delivered blocks | Mainnet: bloXroute relay data API. Sequencer chains: `CHAIN_BLOCK_INGEST` polls the chain's own heads and scores each built block (the sequencer's block *is* the delivered block) |
 | Simulation | Fork URL is the chain's RPC; `REFORK_EVERY_BLOCKS` defaults follow the block cadence (1 on 12 s mainnet, 6 on 2 s Base); signatures carry the chain id |
 
 Base is a **sequencer chain**: no public mempool (front-run strategies are
-off in `.env.example.base`), no relay market, `BRIBE_BPS=0` — the v1 lane is
-flash-loan `atomic_arb` against the sequencer feed, and the console
-multiplexes both instances behind a chain switcher (`CHAINS` env).
-Lending-protocol deployments exist on Base but are deliberately unregistered
-in v1 (phase 2, [`STRATEGIES.md`](STRATEGIES.md)).
+off in `.env.example.base`), no relay market, and `BRIBE_BPS=0`. The current
+Base process is a measurement instrument, not a certified revenue lane:
+`atomic_arb` prices only the V2 graph, Base registers one V2 venue, V3 discovery
+does not feed that graph, and a pending dependency cannot yet be represented as
+a preconfirmed-state raw backrun. It must remain shadow-only until
+[`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md) is done.
+The console still multiplexes both instances behind `CHAINS`. Lending-protocol
+deployments exist on Base but are deliberately unregistered (phase 2,
+[`STRATEGIES.md`](STRATEGIES.md)).

@@ -34,11 +34,18 @@ Each live-candidate row requires, within the same window:
    default), with no gap larger than `QUALIFICATION_MAX_GAP_SECS`;
 2. no dropped persistence writes in the current process;
 3. `QUALIFICATION_MIN_SAMPLES` successful exact-payload fork simulations;
-4. `QUALIFICATION_MIN_RELAY_COMPARISONS` fork-versus-relay comparisons;
+4. `QUALIFICATION_MIN_RELAY_COMPARISONS` independent second-opinion comparisons
+   (relay `eth_callBundle` on relay chains; canonical state comparisons on
+   sequencer chains—the API field retains its old relay-shaped name);
 5. `QUALIFICATION_MIN_ACTUAL_MATCHES` corresponding canonical on-chain
    outcomes with confidence of at least 8000 bps;
-6. at least `QUALIFICATION_MIN_ACCURACY_BPS` of relay and actual comparisons
-   within `QUALIFICATION_MAX_ERROR_BPS` relative error.
+6. at least `QUALIFICATION_MIN_ACCURACY_BPS` of second-opinion and actual
+   comparisons within `QUALIFICATION_MAX_ERROR_BPS` relative error.
+
+The two comparison populations are non-overlapping. An `actual_mev_matches` row
+cannot also count as the sequencer second opinion. Consequently Base atomic arb
+remains `INSUFFICIENT SAMPLE` until it records independent victimless
+state-transition comparisons; this is intentional fail-closed behavior.
 
 Defaults are 30 samples/comparisons, 20% error tolerance, and 80% accuracy.
 Restart downtime is visible as an observation gap because the qualification
@@ -166,8 +173,22 @@ sim. Shadow-only strategies (`jit`, liquidations, sniper) are never
 promoted. `RiskEngine::submittable` is not loosened.
 
 The counter lives in SQLite (`risk_state.live_smoke_used`). A slot is
-consumed after every recheck, immediately before `eth_sendBundle`. A persist
-failure refuses the send. A restart cannot refill the budget.
+consumed after every recheck, immediately before submission. A persist failure
+refuses the send. A restart cannot refill the budget.
+
+Raw mode has no relay revert protection and adds a second mandatory cap:
+
+```ini
+LIVE_SMOKE_MAX=2
+LIVE_SMOKE_MAX_GAS_COST_WEI=<reviewed total worst-case wei exposure>
+```
+
+For each unqualified raw attempt, the bot decodes the exact signed type-2
+payload and durably reserves `sum(gasLimit × maxFeePerGas)` in
+`risk_state.live_smoke_gas_risk_wei`. Zero, exhaustion, or an undecodable
+payload refuses the send without consuming a count slot. The API reports
+`gasAtRiskWei` and `maxGasCostWei`. This reserves a worst case; it is not a
+promise that the transaction will consume that much gas.
 
 Prefer `atomic_arb` for the first live shot: it is Balancer-flash-loan
 funded and does not need executor WETH. Sandwich needs WETH already sitting
@@ -181,8 +202,8 @@ LIVE_SMOKE_MAX=0
 # or BROADCAST_ENABLED=false
 ```
 
-`GET /api/status` reports `liveSmoke: {max, used, remaining}`. `doctor`
-prints the same numbers.
+`GET /api/status` reports `liveSmoke: {max, used, remaining, gasAtRiskWei,
+maxGasCostWei}`. `doctor` prints the same risk state.
 
 ## Nonce recovery and finality
 
@@ -201,7 +222,12 @@ guessed.
 
 Switching runtime mode to simulation, changing runtime risk, or tripping the
 drawdown stop cancels all active replacement UUIDs. Cancellation uses the same
-serialized nonce lane; a nonce is released only after every relay acknowledges.
+serialized nonce lane. Relay mode releases only after every relay acknowledges.
+Raw mode decodes the original signed transaction, bumps both EIP-1559 caps by
+`RAW_CANCEL_BUMP_BPS`, covers the current base fee, and submits a same-nonce
+self-transfer. If the required cap exceeds `RAW_CANCEL_MAX_FEE_WEI`, the
+replacement is rejected, or the original is already mined, cancellation is not
+acknowledged and nonce reuse remains blocked.
 
 Accepted bundles remain `included_unfinalized` until `FINALITY_DEPTH`. The bot
 then verifies all expected receipts are successful, in one block, share the
