@@ -19,6 +19,7 @@ export const dynamic = "force-dynamic";
 
 /** Demo runtime mode. Flipped by POST /api/bot/mode in demo mode only. */
 let demoLive = false;
+const DEMO_MUTATIONS = process.env.ENABLE_DEMO_MUTATIONS === "true";
 
 /** Demo runtime risk envelope — the shape of GET /api/risk. */
 let demoRisk = {
@@ -98,6 +99,8 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return demoLatency();
     case "competition":
       return demoCompetition();
+    case "actual-mev":
+      return {summary: {matches: 0, highConfidence: 0}, matches: []};
     case "reorgs":
       return demoReorgs();
     default:
@@ -134,6 +137,14 @@ export async function GET(req: NextRequest, {params}: {params: Promise<{path: st
  * flagged with `demo: true` so nobody mistakes it for a real mode change.
  */
 export async function POST(req: NextRequest, {params}: {params: Promise<{path: string[]}>}) {
+  const origin = req.headers.get("origin");
+  const fetchSite = req.headers.get("sec-fetch-site");
+  if ((origin && origin !== req.nextUrl.origin) || fetchSite === "cross-site") {
+    return new Response(JSON.stringify({ok: false, error: "cross-origin control request rejected"}), {
+      status: 403,
+      headers: {"content-type": "application/json"},
+    });
+  }
   const {path} = await params;
   const route = path.join("/");
 
@@ -156,14 +167,20 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
         body: JSON.stringify(body),
       });
       clearTimeout(timer);
-      if (upstream.ok || upstream.status === 400) {
-        const data = (await upstream.json()) as Record<string, unknown>;
-        return jsonResponse({...data, ok: upstream.ok}, false);
-      }
+      const data = (await upstream.json().catch(() => ({error: `bot returned HTTP ${upstream.status}`}))) as Record<string, unknown>;
+      return new Response(JSON.stringify({...data, ok: upstream.ok, demo: false}), {
+        status: upstream.status,
+        headers: {"content-type": "application/json", "x-data-source": "bot"},
+      });
     } catch {
-      /* fall through to demo */
+      if (!DEMO_MUTATIONS) {
+        return new Response(JSON.stringify({ok: false, error: "bot control plane unreachable", demo: false}), {
+          status: 503,
+          headers: {"content-type": "application/json", "x-data-source": "bot"},
+        });
+      }
     }
-    // Demo fallback: apply to the in-memory demo envelope so the instant-
+    // Explicit development-only demo fallback: apply to the in-memory envelope so the instant-
     // apply flow is exercisable without a running bot (flagged demo:true).
     if (route === "risk/reset") {
       demoRisk = {...demoRisk, killSwitch: {...demoRisk.killSwitch, tripped: false}};
@@ -218,15 +235,21 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
       body: JSON.stringify({live: body.live}),
     });
     clearTimeout(timer);
-    if (upstream.ok || upstream.status === 409) {
-      const data = (await upstream.json()) as Record<string, unknown>;
-      return jsonResponse({...data, ok: upstream.ok}, false);
-    }
+    const data = (await upstream.json().catch(() => ({error: `bot returned HTTP ${upstream.status}`}))) as Record<string, unknown>;
+    return new Response(JSON.stringify({...data, ok: upstream.ok, demo: false}), {
+      status: upstream.status,
+      headers: {"content-type": "application/json", "x-data-source": "bot"},
+    });
   } catch {
-    /* fall through to demo */
+    if (!DEMO_MUTATIONS) {
+      return new Response(JSON.stringify({ok: false, error: "bot control plane unreachable", demo: false}), {
+        status: 503,
+        headers: {"content-type": "application/json", "x-data-source": "bot"},
+      });
+    }
   }
 
-  // Demo fallback: the bot is unreachable, so this cannot touch anything real.
+  // Development-only demo fallback. Production never reports a simulated halt as success.
   demoLive = body.live;
   return jsonResponse(
     {ok: true, mode: demoLive ? "live" : "simulation", liveArmed: true, demo: true},

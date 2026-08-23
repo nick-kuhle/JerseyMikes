@@ -29,7 +29,7 @@ pub struct ReplayRow {
     pub opportunity_id: String,
     pub strategy: String,
     pub sim_success: bool,
-    pub sim_net_wei: i64,
+    pub sim_net_wei: i128,
     pub our_bribe_wei: String,
     pub winning_bid_wei: String,
     pub victim_landed: bool,
@@ -51,7 +51,7 @@ impl ReplayRow {
             "opportunityId": self.opportunity_id,
             "strategy": self.strategy,
             "simSuccess": self.sim_success,
-            "simNetWei": self.sim_net_wei,
+            "simNetWei": self.sim_net_wei.to_string(),
             "ourBribeWei": self.our_bribe_wei,
             "winningBidWei": self.winning_bid_wei,
             "victimLanded": self.victim_landed,
@@ -139,7 +139,12 @@ impl ReplaySummary {
 /// Compare stored anvil-fork simulations in `[from_block, to_block]` (inclusive
 /// on both ends; `None` means unbounded) against relay bid traces and
 /// delivered-block transactions.
-pub fn compare(store: &Store, from_block: Option<u64>, to_block: Option<u64>, limit: i64) -> Result<Vec<ReplayRow>> {
+pub fn compare(
+    store: &Store,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    limit: i64,
+) -> Result<Vec<ReplayRow>> {
     let sims = store.replay_candidates(from_block, to_block, limit)?;
     let mut out = Vec::with_capacity(sims.len());
     for s in sims {
@@ -254,7 +259,10 @@ fn truncate_wei(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{now_ms, Opportunity, PendingTx, RelayBlock, SimBackend, SimulationResult, Strategy, TxSource};
+    use crate::types::{
+        now_ms, Opportunity, PendingTx, RelayBlock, SimBackend, SimulationResult, Strategy,
+        TxSource,
+    };
     use alloy_primitives::{Address, B256};
 
     fn seed(store: &Store) {

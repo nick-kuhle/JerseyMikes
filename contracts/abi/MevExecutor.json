@@ -27,7 +27,32 @@
   },
   {
     "inputs": [],
+    "name": "BadPhase",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "BaseFeeTooHigh",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BaselineExists",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BaselineMismatch",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BaselineMissing",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BaselineNotExpired",
     "type": "error"
   },
   {
@@ -136,7 +161,7 @@
       {
         "indexed": false,
         "internalType": "uint256",
-        "name": "profit",
+        "name": "grossProfit",
         "type": "uint256"
       },
       {
@@ -148,11 +173,36 @@
       {
         "indexed": false,
         "internalType": "uint256",
+        "name": "retainedProfit",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
         "name": "gasUsed",
         "type": "uint256"
       }
     ],
     "name": "Executed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "tag",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint64",
+        "name": "openedAtBlock",
+        "type": "uint64"
+      }
+    ],
+    "name": "ExpiredBaselineCleared",
     "type": "event"
   },
   {
@@ -172,6 +222,31 @@
       }
     ],
     "name": "OwnerChanged",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "tag",
+        "type": "bytes32"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "profitToken",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "referenceBalance",
+        "type": "uint256"
+      }
+    ],
+    "name": "PhaseOpened",
     "type": "event"
   },
   {
@@ -263,6 +338,19 @@
         "internalType": "bytes32",
         "name": "tag",
         "type": "bytes32"
+      }
+    ],
+    "name": "clearExpiredBaseline",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "tag",
+        "type": "bytes32"
       },
       {
         "components": [
@@ -312,6 +400,11 @@
             "internalType": "uint256",
             "name": "maxBaseFee",
             "type": "uint256"
+          },
+          {
+            "internalType": "uint8",
+            "name": "phase",
+            "type": "uint8"
           }
         ],
         "internalType": "struct MevExecutor.Guard",
@@ -395,6 +488,11 @@
             "internalType": "uint256",
             "name": "maxBaseFee",
             "type": "uint256"
+          },
+          {
+            "internalType": "uint8",
+            "name": "phase",
+            "type": "uint8"
           }
         ],
         "internalType": "struct MevExecutor.Guard",

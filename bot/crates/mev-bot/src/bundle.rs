@@ -22,6 +22,7 @@ sol! {
             uint16 bribeBps;
             uint64 blockDeadline;
             uint256 maxBaseFee;
+            uint8 phase;
         }
 
         function execute(bytes32 tag, Call[] calldata calls, Guard calldata g) external payable returns (uint256);
@@ -54,10 +55,11 @@ fn to_sol_calls(calls: &[Call]) -> Vec<IMevExecutor::Call> {
         .collect()
 }
 
-fn tag_of(opp: &Opportunity, front: bool) -> B256 {
-    let mut seed = opp.id.clone().into_bytes();
-    seed.push(if front { 0 } else { 1 });
-    keccak256(seed)
+/// Stable tag shared by every leg of one opportunity. Two-leg settlement uses
+/// it to connect the opening balance persisted by the front leg to the closing
+/// profit check in the back leg.
+fn tag_of(opp: &Opportunity) -> B256 {
+    keccak256(opp.id.as_bytes())
 }
 
 /// Encode a call to `MevExecutor.execute` (or `flashExecute` when the leg needs
@@ -68,7 +70,12 @@ fn tag_of(opp: &Opportunity, front: bool) -> B256 {
 /// front leg's `minProfit` is zero while the back leg carries the real
 /// requirement. For single-shot strategies (arb, liquidation) there is only a
 /// front leg and it carries the requirement.
-pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &RiskConfig) -> Vec<u8> {
+pub fn encode_execute(
+    opp: &Opportunity,
+    calls: &[Call],
+    front: bool,
+    risk: &RiskConfig,
+) -> Vec<u8> {
     let single_leg = opp.back_calls.is_empty();
     let enforce = !front || single_leg;
     let min_profit = if enforce {
@@ -77,6 +84,13 @@ pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &Ris
         U256::ZERO
     };
 
+    let phase = if single_leg {
+        0
+    } else if front {
+        1
+    } else {
+        2
+    };
     let guard = IMevExecutor::Guard {
         profitToken: opp.profit_token,
         minProfit: min_profit,
@@ -84,11 +98,15 @@ pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &Ris
         bribeBps: if enforce { risk.bribe_bps } else { 0 },
         blockDeadline: opp.target_block,
         maxBaseFee: risk.max_base_fee_wei,
+        phase,
     };
 
-    if front && !opp.flash_tokens.is_empty() {
+    // Flash funding belongs to the settling transaction. That is the front
+    // leg for a normal single-shot opportunity and the back leg for a
+    // victim-hash back-run whose front call list is intentionally empty.
+    if enforce && !opp.flash_tokens.is_empty() {
         IMevExecutor::flashExecuteCall {
-            tag: tag_of(opp, front),
+            tag: tag_of(opp),
             tokens: opp.flash_tokens.clone(),
             amounts: opp.flash_amounts.clone(),
             calls: to_sol_calls(calls),
@@ -97,7 +115,7 @@ pub fn encode_execute(opp: &Opportunity, calls: &[Call], front: bool, risk: &Ris
         .abi_encode()
     } else {
         IMevExecutor::executeCall {
-            tag: tag_of(opp, front),
+            tag: tag_of(opp),
             calls: to_sol_calls(calls),
             g: guard,
         }
@@ -189,9 +207,11 @@ pub fn build_bundle(
     }
     for raw in victims_raw {
         txs.push(BundleTx {
-            hash: None,
+            hash: Some(keccak256(raw)),
             raw: raw.clone(),
-            can_revert: true,
+            // A victim revert invalidates sandwich/JIT/back-run economics. It
+            // must never appear in `revertingTxHashes`.
+            can_revert: false,
             foreign: true,
         });
     }
@@ -235,6 +255,7 @@ pub fn send_bundle_params(bundle: &BundleRecord) -> Value {
             .map(|t| format!("0x{}", hex::encode(&t.raw)))
             .collect::<Vec<_>>(),
         "blockNumber": format!("0x{:x}", bundle.target_block),
+        "replacementUuid": bundle.id,
         "revertingTxHashes": bundle
             .txs
             .iter()

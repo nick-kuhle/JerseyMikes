@@ -188,7 +188,7 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
         // the oldest hash is evicted, which is the correct one to lose — a
         // pending transaction we have not hydrated in a full buffer's worth of
         // time is almost certainly mined or replaced already.
-        let mut pending: std::collections::VecDeque<String> =
+        let mut pending: std::collections::VecDeque<(String, u64)> =
             std::collections::VecDeque::with_capacity(PENDING_RING_CAPACITY);
         let mut dropped: u64 = 0;
         let mut ticker = tokio::time::interval(Duration::from_millis(25));
@@ -214,7 +214,10 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
                                         );
                                     }
                                 }
-                                pending.push_back(h.to_string());
+                                // Preserve the websocket observation time.
+                                // Starting latency after hydration hid the RPC
+                                // round trip from the 150 ms budget.
+                                pending.push_back((h.to_string(), now_ms()));
                             }
                         }
                         None => return,
@@ -227,9 +230,10 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
                 continue;
             }
             let take = pending.len().min(HYDRATION_BATCH);
-            let calls: Vec<(String, Value)> = pending
-                .drain(..take)
-                .map(|h| ("eth_getTransactionByHash".to_string(), json!([h])))
+            let batch: Vec<(String, u64)> = pending.drain(..take).collect();
+            let calls: Vec<(String, Value)> = batch
+                .iter()
+                .map(|(hash, _)| ("eth_getTransactionByHash".to_string(), json!([hash])))
                 .collect();
             let results = match http.batch(&calls).await {
                 Ok(r) => r,
@@ -238,8 +242,10 @@ fn spawn_pending(ws_url: String, http: RpcClient, tx: mpsc::Sender<IngestEvent>)
                     continue;
                 }
             };
-            for r in results.into_iter().flatten() {
-                if let Some(ptx) = parse_tx_object(&r, TxSource::PublicMempool) {
+            for (result, (_, observed_at_ms)) in results.into_iter().zip(batch) {
+                let Ok(r) = result else { continue };
+                if let Some(mut ptx) = parse_tx_object(&r, TxSource::PublicMempool) {
+                    ptx.seen_at_ms = observed_at_ms;
                     if tx.send(IngestEvent::Pending(ptx)).await.is_err() {
                         return;
                     }

@@ -188,7 +188,7 @@ function kindColor(e: FeedEvent): string {
     case "opportunity":
       return STRATEGY_COLOR[e.strategy] ?? "#f5b544";
     case "simulation":
-      return e.net_profit_wei > 0 ? "#35d07f" : "#ff5c5c";
+      return BigInt(e.net_profit_wei) > 0n ? "#35d07f" : "#ff5c5c";
     case "bundle":
       return "#f5b544";
     case "relay":
@@ -259,9 +259,9 @@ function detail(e: FeedEvent, chainId?: number) {
       return (
         <span>
           <b style={{color: STRATEGY_COLOR[e.strategy]}}>{e.strategy}</b> · {e.backend} ·{" "}
-          <span className={e.net_profit_wei > 0 ? "pos" : "neg"}>
-            {e.net_profit_wei > 0 ? "+" : ""}
-            {(e.net_profit_wei / 1e18).toFixed(6)} ETH
+          <span className={BigInt(e.net_profit_wei) > 0n ? "pos" : "neg"}>
+            {BigInt(e.net_profit_wei) > 0n ? "+" : ""}
+            {weiToEth(e.net_profit_wei, 6)} ETH
           </span>{" "}
           · gas {e.gas_used.toLocaleString()} {e.revert_reason ? `· ${e.revert_reason}` : ""}
         </span>

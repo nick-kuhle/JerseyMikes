@@ -389,7 +389,7 @@ pub fn search_with(
         }
     }
 
-    out.sort_by(|a, b| b.gross_profit.cmp(&a.gross_profit));
+    out.sort_by_key(|candidate| std::cmp::Reverse(candidate.gross_profit));
     out.truncate(MAX_CANDIDATES);
     (selected, edges, out)
 }

@@ -108,8 +108,17 @@ impl Simulator {
                     // Exact pin: the parent of the victim's own block. Anything
                     // else and the victim's nonce, the pool reserves and the
                     // oracle prices all belong to a different chain state.
-                    fork.simulate_at(parent, opp, victims_raw, victim_sender_nonce, base_fee)
-                        .await?
+                    tokio::time::timeout(
+                        self.cfg.sim.timeout,
+                        fork.simulate_at(parent, opp, &bundle, victim_sender_nonce),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "replay simulation timed out after {:?}",
+                            self.cfg.sim.timeout
+                        )
+                    })??
                 }
                 // Refusing to score is the honest outcome. Simulating a mined
                 // transaction on the live fork answers a question nobody asked
@@ -122,11 +131,14 @@ impl Simulator {
             }
         } else {
             match &self.fork {
-                Some(fork) => {
-                    fork.ensure_fork_at(parent).await.ok();
-                    fork.simulate(opp, victims_raw, victim_sender_nonce, base_fee)
-                        .await?
-                }
+                Some(fork) => tokio::time::timeout(
+                    self.cfg.sim.timeout,
+                    fork.simulate_at_head(parent, opp, &bundle, victim_sender_nonce),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("live simulation timed out after {:?}", self.cfg.sim.timeout)
+                })??,
                 None => crate::sim::empty_result(opp, "no simulation backend configured"),
             }
         };
@@ -139,10 +151,19 @@ impl Simulator {
             "latest".to_string()
         };
         let relay_result = match (&self.relay, self.cfg.sim.use_call_bundle) {
-            (Some(r), true) => match r.call_bundle(&bundle, opp.strategy, &block_tag).await {
-                Ok(res) => Some(res),
-                Err(e) => {
+            (Some(r), true) => match tokio::time::timeout(
+                self.cfg.sim.timeout,
+                r.call_bundle(&bundle, opp.strategy, &block_tag),
+            )
+            .await
+            {
+                Ok(Ok(res)) => Some(res),
+                Ok(Err(e)) => {
                     tracing::debug!(target: "sim", error = %e, "relay call_bundle failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(target: "sim", timeout = ?self.cfg.sim.timeout, "relay call_bundle timed out");
                     None
                 }
             },

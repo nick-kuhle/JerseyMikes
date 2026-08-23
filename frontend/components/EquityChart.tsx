@@ -9,10 +9,10 @@ function EquityChart({series}: {series: SeriesPoint[]}) {
   // Up to 250 points reduced on every render otherwise — and recharts then
   // re-renders the whole SVG because `data` is a new array identity.
   const data = useMemo(() => {
-    let cum = 0;
+    let cum = 0n;
     return series.map((p) => {
-      cum += p.netWei;
-      return {block: p.block, eth: cum / 1e18, blockNet: p.netWei / 1e18, count: p.count};
+      cum += BigInt(p.netWei);
+      return {block: p.block, eth: Number(cum) / 1e18, blockNet: Number(BigInt(p.netWei)) / 1e18, count: p.count};
     });
   }, [series]);
 
@@ -51,10 +51,13 @@ function EquityChart({series}: {series: SeriesPoint[]}) {
               fontFamily: "ui-monospace, monospace",
             }}
             labelStyle={{color: "#6b7c93"}}
-            formatter={(value: number, name: string) => [
-              `${value >= 0 ? "+" : ""}${value.toFixed(6)} ETH`,
-              name === "eth" ? "cumulative" : "block net",
-            ]}
+            formatter={(value, name) => {
+              const numeric = Number(value ?? 0);
+              return [
+                `${numeric >= 0 ? "+" : ""}${numeric.toFixed(6)} ETH`,
+                name === "eth" ? "cumulative" : "block net",
+              ];
+            }}
           />
           <ReferenceLine y={0} stroke="#2a3646" strokeDasharray="3 3" />
           <Line type="monotone" dataKey="eth" stroke={color} strokeWidth={1.6} dot={false} isAnimationActive={false} />

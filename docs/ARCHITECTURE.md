@@ -75,8 +75,11 @@ the victim replay was not faithful.
 | `bot/crates/mev-bot/src/replay.rs` | Offline harness: stored sims × relay traces → true-positive rate |
 | `bot/crates/mev-bot/src/competition.rs` | Inclusion probability from our bribe vs realised builder payment |
 | `bot/crates/mev-bot/src/latency.rs` | Per-stage histograms; 150 ms mempool→bundle budget |
-| `bot/crates/mev-bot/src/inventory.rs` | Searcher nonce + ETH/WETH balances |
-| `bot/crates/mev-bot/src/api.rs` | REST + SSE for the dashboard; `GET/POST /api/mode` is the runtime simulation ⇄ live switch (see `docs/RISK.md`) |
+| `bot/crates/mev-bot/src/inventory.rs` | Pending-chain nonce, serialized private reservations, recovery block, and exact ETH/WETH inventory gates |
+| `bot/crates/mev-bot/src/qualification.rs` | Per-strategy continuity/sample/accuracy verdicts (`PASS`, `FAIL`, `INSUFFICIENT SAMPLE`) |
+| `bot/crates/mev-bot/src/submission.rs` | Signed multi-relay `eth_sendBundle`, bounded same-UUID retries, and cancellation |
+| `bot/crates/mev-bot/src/attribution.rs` | Exact finalized own-outcome reconciliation and confidence-scored competitor evidence |
+| `bot/crates/mev-bot/src/api.rs` | REST + SSE, including runtime mode, qualification, actual MEV, and execution outcomes |
 | `frontend/` | Next.js console (`/api/bot/*` proxies the bot; `/api/eth` is a server-side read-only RPC proxy for contract reads) |
 
 ## The execution path, end to end
@@ -95,10 +98,16 @@ the victim replay was not faithful.
    all three land in one block exactly as a bundle would.
 5. The realised balance delta of the executor, minus gas and the builder bribe,
    is the recorded net P/L. In parallel the relay simulates the same bundle.
-6. The result and the (unsent) bundle are written to SQLite and pushed to the
-   dashboard over SSE.
-
-Step 6 is where a live bot would call `eth_sendBundle`. This build stops there.
+6. Shadow results are written to SQLite and pushed over SSE. For live-lane
+   candidates only, the engine independently checks boot arming, broadcast
+   capability, runtime mode, strategy qualification, inventory, and nonce
+   recovery. A qualified candidate enters the single nonce lane and the exact
+   reserved-nonce payload is simulated.
+7. The reservation is synchronously persisted before concurrent signed
+   `eth_sendBundle` calls. Transport failures receive bounded same-UUID retries.
+8. Submitted hashes are reconciled after canonical finality. Executor events
+   and receipts produce exact own gross, builder payment, retained profit, gas,
+   and net profit; partial/incoherent outcomes stay explicit.
 
 ## The bloXroute Max Profit relay path
 

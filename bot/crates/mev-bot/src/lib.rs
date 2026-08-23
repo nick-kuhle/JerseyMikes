@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 //! JerseyMikes MEV bot — simulation-first MEV search on live mainnet data.
 //!
 //! See `docs/ARCHITECTURE.md` for the wiring diagram. The short version:
@@ -11,12 +13,13 @@
 //!                         sniper)
 //! ```
 //!
-//! Nothing in this crate broadcasts a transaction. The only functions that could
-//! (`bundle::send_bundle_params`) are behind `Config::live_execution`, which
-//! requires two independent environment acknowledgements to enable.
+//! Relay submission is fail-closed behind independent boot arming, broadcast
+//! capability, runtime mode, risk, inventory, durable nonce, exact simulation,
+//! and strategy-specific qualification gates. All defaults remain shadow-only.
 
 pub mod alerts;
 pub mod api;
+pub mod attribution;
 pub mod bundle;
 pub mod competition;
 pub mod config;
@@ -26,6 +29,7 @@ pub mod ingest;
 pub mod inventory;
 pub mod latency;
 pub mod metrics;
+pub mod qualification;
 pub mod replay;
 pub mod risk;
 pub mod rlp;
@@ -34,4 +38,5 @@ pub mod signer;
 pub mod sim;
 pub mod store;
 pub mod strategies;
+pub mod submission;
 pub mod types;

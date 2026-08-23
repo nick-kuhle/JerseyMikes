@@ -1,5 +1,9 @@
 # Local build & sandbox notes
 
+> Historical verification log. Current supported versions, deployment, and
+> execution behavior are defined by `SETUP.md`, `DEPLOYMENT.md`, and
+> `SIM_TO_LIVE.md`; older session notes are retained only as provenance.
+
 ## Session 2026-08-22 (Aave per-reserve liquidation config)
 
 Retired the last documented assumption in the Aave strategy: positions are

@@ -66,7 +66,17 @@ const input = {
     // checked out into. `useLiteralContent` keeps the creation-bytecode
     // metadata deterministic too.
     metadata: {bytecodeHash: "none", useLiteralContent: true},
-    outputSelection: {"*": {"*": ["abi", "evm.bytecode.object", "evm.deployedBytecode.object"]}},
+    outputSelection: {
+      "*": {
+        "": ["ast"],
+        "*": [
+          "abi",
+          "evm.bytecode.object",
+          "evm.deployedBytecode.object",
+          "evm.deployedBytecode.immutableReferences",
+        ],
+      },
+    },
   },
 };
 
@@ -88,6 +98,22 @@ if (errors.length) {
   process.exit(1);
 }
 
+// Resolve Solidity's AST ids in `immutableReferences` back to source names so
+// the Rust simulator can patch a runtime-only fixture without hard-coding byte
+// offsets that change on every contract edit.
+const immutableNames = new Map();
+function indexImmutableNames(node) {
+  if (!node || typeof node !== "object") return;
+  if (node.nodeType === "VariableDeclaration" && node.mutability === "immutable") {
+    immutableNames.set(String(node.id), node.name);
+  }
+  for (const value of Object.values(node)) {
+    if (Array.isArray(value)) value.forEach(indexImmutableNames);
+    else if (value && typeof value === "object") indexImmutableNames(value);
+  }
+}
+for (const source of Object.values(out.sources || {})) indexImmutableNames(source.ast);
+
 // Emit ABIs consumed by the frontend so the dashboard can talk to the contracts.
 const abiDir = path.join(ROOT, "abi");
 fs.mkdirSync(abiDir, {recursive: true});
@@ -105,6 +131,16 @@ for (const [file, contracts] of Object.entries(out.contracts || {})) {
       fs.writeFileSync(path.join(artifactDir, "MevExecutor.runtime.hex"), "0x" + c.evm.deployedBytecode.object);
       fs.writeFileSync(path.join(artifactDir, "MevExecutor.creation.hex"), "0x" + c.evm.bytecode.object);
       fs.writeFileSync(path.join(artifactDir, "MevExecutor.abi.json"), JSON.stringify(c.abi, null, 2) + "\n");
+      const refs = {};
+      for (const [id, positions] of Object.entries(c.evm.deployedBytecode.immutableReferences || {})) {
+        const name = immutableNames.get(String(id));
+        if (!name) throw new Error(`unknown immutable AST id ${id}`);
+        refs[name] = positions;
+      }
+      fs.writeFileSync(
+        path.join(artifactDir, "MevExecutor.immutables.json"),
+        JSON.stringify(refs, null, 2) + "\n",
+      );
     }
     console.log(`ok  ${name.padEnd(24)} runtime ${String(size).padStart(6)} bytes`);
     count++;

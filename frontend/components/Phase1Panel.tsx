@@ -1,6 +1,6 @@
 "use client";
 
-import type {CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
+import type {ActualMevResponse, CompetitionResponse, ExecutionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
 
 /**
  * Phase 1 instrumentation: latency histograms, competition ranking, re-orgs.
@@ -8,10 +8,14 @@ import type {CompetitionResponse, LatencySnapshot, ReorgRow} from "@/lib/types";
 export default function Phase1Panel({
   latency,
   competition,
+  actualMev,
+  executions,
   reorgs,
 }: {
   latency: LatencySnapshot | null | undefined;
   competition: CompetitionResponse | null | undefined;
+  actualMev: ActualMevResponse | null | undefined;
+  executions: ExecutionResponse | null | undefined;
   reorgs: ReorgRow[] | null | undefined;
 }) {
   const total = latency?.stages?.total;
@@ -71,14 +75,14 @@ export default function Phase1Panel({
 
       <div className="panel" style={{padding: 12}}>
         <div className="panel-head">
-          <span>competition vs builder payment</span>
-          <span className="muted">inclusion model</span>
+          <span>target & on-chain MEV evidence</span>
+          <span className="muted">block bid is context, not a forecast</span>
         </div>
         <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10}}>
-          <Stat label="true-positive rate" value={summary ? `${(100 * tpr).toFixed(0)}%` : "—"} />
-          <Stat label="mean inclusion p" value={summary ? Number(summary.meanInclusionP ?? 0).toFixed(2) : "—"} />
-          <Stat label="would outbid" value={String(summary?.wouldOutbid ?? 0)} />
-          <Stat label="victims landed" value={String(summary?.victimsLanded ?? 0)} />
+          <Stat label="target-observed rate" value={summary ? `${(100 * tpr).toFixed(0)}%` : "—"} />
+          <Stat label="MEV matches" value={String(actualMev?.summary.matches ?? 0)} />
+          <Stat label="high confidence" value={String(actualMev?.summary.highConfidence ?? 0)} />
+          <Stat label="block-bid rank only" value={String(summary?.wouldOutbid ?? 0)} />
         </div>
         <div style={{maxHeight: 180, overflowY: "auto"}}>
           <table className="grid">
@@ -97,53 +101,66 @@ export default function Phase1Panel({
                   <td>{r.strategy}</td>
                   <td style={{textAlign: "right"}}>{r.inclusionP.toFixed(2)}</td>
                   <td className={r.truePositive ? "pos" : r.falsePositive ? "neg" : "muted"}>
-                    {r.truePositive ? "TP" : r.falsePositive ? "FP" : r.wouldOutbid ? "WIN" : "—"}
+                    {r.truePositive ? "TARGET" : r.falsePositive ? "MISSING" : r.wouldOutbid ? "BID>" : "—"}
                   </td>
                 </tr>
               ))}
               {!(competition?.recent ?? []).length && (
                 <tr>
                   <td colSpan={4} className="muted" style={{textAlign: "center", padding: 12}}>
-                    no reconciliations yet — run `mev-bot replay` or wait for a delivered block
+                    no target observations yet — wait for a delivered block
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        {(actualMev?.matches ?? []).slice(0, 3).map((match) => (
+          <div key={match.opportunityId} style={{fontSize: 10, marginTop: 5}}>
+            <span className={match.confidence === "high" ? "pos" : "muted"}>{match.confidence}</span>{" "}
+            #{match.blockNumber} · {match.mevTxHashes.length} MEV tx · net {match.netWethWei.slice(0, 10)} wei
+          </div>
+        ))}
       </div>
 
       <div className="panel" style={{padding: 12}}>
         <div className="panel-head">
-          <span>re-orgs</span>
-          <span className="muted">{reorgs?.length ?? 0} logged</span>
+          <span>own execution outcomes</span>
+          <span className="muted">{executions?.finalityDepth ?? "—"} block finality · {reorgs?.length ?? 0} re-orgs</span>
         </div>
-        <table className="grid">
-          <thead>
-            <tr>
-              <th>range</th>
-              <th>depth</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(reorgs ?? []).map((r, i) => (
-              <tr key={`${r.fromBlock}-${i}`}>
-                <td>
-                  #{r.fromBlock}
-                  {r.toBlock !== r.fromBlock ? `–${r.toBlock}` : ""}
-                </td>
-                <td>{r.depth}</td>
-              </tr>
-            ))}
-            {!(reorgs ?? []).length && (
+        <div style={{maxHeight: 250, overflowY: "auto"}}>
+          <table className="grid">
+            <thead>
               <tr>
-                <td colSpan={2} className="muted" style={{textAlign: "center", padding: 12}}>
-                  none this run
-                </td>
+                <th>target</th>
+                <th>strategy</th>
+                <th>state</th>
+                <th style={{textAlign: "right"}}>exact net</th>
               </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {(executions?.executions ?? []).map((execution) => (
+                <tr key={execution.bundleId} title={execution.bundleId}>
+                  <td>#{execution.targetBlock}</td>
+                  <td>{execution.strategy}</td>
+                  <td className={execution.state === "finalized_included" ? "pos" : execution.state.includes("partial") || execution.state.includes("incoherent") ? "neg" : "muted"}>
+                    {execution.state.replaceAll("_", " ")}
+                  </td>
+                  <td style={{textAlign: "right"}}>
+                    {execution.netProfitWei == null ? "—" : `${execution.netProfitWei.slice(0, 12)} wei`}
+                  </td>
+                </tr>
+              ))}
+              {!(executions?.executions ?? []).length && (
+                <tr>
+                  <td colSpan={4} className="muted" style={{textAlign: "center", padding: 12}}>
+                    no submitted bundles — broadcasting remains gated
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   );

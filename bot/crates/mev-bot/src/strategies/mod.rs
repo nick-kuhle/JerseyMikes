@@ -127,11 +127,14 @@ pub trait StrategyImpl: Send + Sync {
 ///
 /// Reserves are the only thing that changes, and they can be read for dozens of
 /// pools in a single batched JSON-RPC round trip.
+type PairKey = (Address, Address, Venue);
+type PairIndex = Arc<RwLock<HashMap<PairKey, Option<Address>>>>;
+
 #[derive(Clone)]
 pub struct PoolCache {
     rpc: RpcClient,
     inner: Arc<RwLock<HashMap<Address, V2Pool>>>,
-    pair_index: Arc<RwLock<HashMap<(Address, Address, Venue), Option<Address>>>>,
+    pair_index: PairIndex,
 }
 
 impl PoolCache {
@@ -726,7 +729,7 @@ mod tests {
     fn scan_decodes_pair_address_from_log_data() {
         // Build a 32-byte data payload with a known address right-aligned.
         let expected_pair = address!("1234567890abcdef1234567890abcdef12345678");
-        let mut data = vec![0u8; 32];
+        let mut data = [0u8; 32];
         data[12..32].copy_from_slice(expected_pair.as_slice());
 
         // Simulate the inner decode loop of `scan_pair_created` without an RPC.
@@ -734,7 +737,7 @@ mod tests {
         assert_eq!(pair, expected_pair);
 
         // A short data payload (< 32 bytes) must be skipped.
-        let short = vec![0u8; 16];
+        let short = [0u8; 16];
         assert!(short.len() < 32);
     }
 

@@ -24,15 +24,12 @@ contract MevExecutorTest is Test {
         exec = new MevExecutor(address(vault), address(weth));
         exec.setSearcher(searcher, true);
         vm.deal(address(exec), 10 ether);
+        vm.deal(address(this), 100 ether);
     }
 
     function _guard(address token, uint256 minProfit) internal pure returns (MevExecutor.Guard memory) {
         return MevExecutor.Guard({
-            profitToken: token,
-            minProfit: minProfit,
-            bribeBps: 0,
-            blockDeadline: 0,
-            maxBaseFee: 0
+            profitToken: token, minProfit: minProfit, bribeBps: 0, blockDeadline: 0, maxBaseFee: 0, phase: 0
         });
     }
 
@@ -67,7 +64,8 @@ contract MevExecutorTest is Test {
     function test_revertsWhenUnprofitable() public {
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
         // Burn 1 wei of ETH: guaranteed negative delta.
-        calls[0] = MevExecutor.Call({target: address(weth), value: 1, data: abi.encodeWithSignature("deposit()")});
+        calls[0] =
+            MevExecutor.Call({target: address(weth), value: 1, data: abi.encodeWithSignature("deposit()")});
 
         vm.prank(searcher);
         vm.expectRevert(abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 0, 1));
@@ -155,10 +153,13 @@ contract MevExecutorTest is Test {
 
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
         // Donate 1 ETH into the executor to create a positive ETH delta.
-        calls[0] = MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
+        calls[0] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
 
-        MevExecutor.Guard memory g = _guard(address(0), 0.5 ether);
-        g.bribeBps = 9000; // pay 90% of profit to the builder
+        // `minProfit` is retained profit after the builder payment. One ETH
+        // gross at 90% leaves exactly 0.1 ETH in the executor.
+        MevExecutor.Guard memory g = _guard(address(0), 0.1 ether);
+        g.bribeBps = 9000;
 
         vm.prank(searcher);
         uint256 profit = exec.execute(bytes32("arb"), calls, g);
@@ -169,6 +170,100 @@ contract MevExecutorTest is Test {
     function donate() external {
         (bool ok,) = msg.sender.call{value: 1 ether}("");
         require(ok, "donate failed");
+    }
+
+    function test_nonWethMaxBalanceCannotOverflowIrrelevantBribeMath() public {
+        MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
+        calls[0] = MevExecutor.Call({
+            target: address(usdc),
+            value: 0,
+            data: abi.encodeCall(MockERC20.mint, (address(exec), type(uint256).max))
+        });
+        MevExecutor.Guard memory g = _guard(address(usdc), type(uint256).max);
+        g.bribeBps = 10_000;
+
+        vm.prank(searcher);
+        uint256 profit = exec.execute(keccak256("max-token-profit"), calls, g);
+        assertEq(profit, type(uint256).max);
+        assertEq(usdc.balanceOf(address(exec)), type(uint256).max);
+    }
+
+    function test_twoLegSettlementDoesNotCallReturnedPrincipalProfit() public {
+        bytes32 tag = keccak256("two-leg-loss");
+        MevExecutor.Call[] memory front = new MevExecutor.Call[](1);
+        front[0] = MevExecutor.Call({
+            target: address(weth), value: 1 ether, data: abi.encodeWithSignature("deposit()")
+        });
+        MevExecutor.Guard memory open = _guard(address(0), 0);
+        open.phase = 1;
+        vm.prank(searcher);
+        exec.execute(tag, front, open);
+        assertEq(address(exec).balance, 9 ether, "front spent one ETH");
+
+        // Returning exactly the one ETH of principal used by the front leg is
+        // zero total profit. The historical per-leg guard called it +1 ETH.
+        MevExecutor.Call[] memory back = new MevExecutor.Call[](1);
+        back[0] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
+        MevExecutor.Guard memory close = _guard(address(0), 1);
+        close.phase = 2;
+        vm.prank(searcher);
+        vm.expectRevert(abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 0, 1));
+        exec.execute(tag, back, close);
+    }
+
+    function test_ownerCanClearOnlyAnExpiredPartialInclusionBaseline() public {
+        bytes32 tag = keccak256("partial-inclusion");
+        MevExecutor.Call[] memory front = new MevExecutor.Call[](0);
+        MevExecutor.Guard memory open = _guard(address(weth), 0);
+        open.phase = 1;
+
+        vm.prank(searcher);
+        exec.execute(tag, front, open);
+
+        vm.prank(searcher);
+        vm.expectRevert(MevExecutor.NotOwner.selector);
+        exec.clearExpiredBaseline(tag);
+
+        vm.expectRevert(MevExecutor.BaselineNotExpired.selector);
+        exec.clearExpiredBaseline(tag);
+
+        vm.roll(block.number + 1);
+        exec.clearExpiredBaseline(tag);
+
+        MevExecutor.Guard memory close = _guard(address(weth), 1);
+        close.phase = 2;
+        vm.prank(searcher);
+        vm.expectRevert(MevExecutor.BaselineMissing.selector);
+        exec.execute(tag, front, close);
+    }
+
+    function test_twoLegBribeCanNeverConsumePrincipal() public {
+        bytes32 tag = keccak256("two-leg-bribe");
+        MevExecutor.Call[] memory front = new MevExecutor.Call[](1);
+        front[0] = MevExecutor.Call({
+            target: address(weth), value: 1 ether, data: abi.encodeWithSignature("deposit()")
+        });
+        MevExecutor.Guard memory open = _guard(address(0), 0);
+        open.phase = 1;
+        vm.prank(searcher);
+        exec.execute(tag, front, open);
+
+        // Return principal + 1 ETH gross profit. A 90% bribe leaves 0.1 ETH,
+        // so a 0.2 ETH retained-profit floor must reject the close. The bribe
+        // is calculated on the 1 ETH total profit, never the 2 ETH back-leg
+        // proceeds.
+        MevExecutor.Call[] memory back = new MevExecutor.Call[](2);
+        back[0] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
+        back[1] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
+        MevExecutor.Guard memory close = _guard(address(0), 0.2 ether);
+        close.phase = 2;
+        close.bribeBps = 9000;
+        vm.prank(searcher);
+        vm.expectRevert(abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 0.1 ether, 0.2 ether));
+        exec.execute(tag, back, close);
     }
 
     // -----------------------------------------------------------------

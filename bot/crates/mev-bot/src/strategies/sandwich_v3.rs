@@ -12,7 +12,7 @@
 //! | Budget | Value |
 //! | --- | --- |
 //! | `eth_call` per V3 candidate | ≤ [`MAX_QUOTES_PER_CANDIDATE`] (12) |
-//! | V3 candidates per pending tx | ≤ [`MAX_CANDIDATES_PER_TX`] (4) |
+//! | V3 candidates per pending tx | 1 (the calldata-selected pool) |
 //! | Added latency on the pending path | ≤ 25 ms p95 (operator-measured) |
 //!
 //! A naive ternary search over `quote_v3` is ~120 `eth_call`s and will get
@@ -50,9 +50,6 @@ use crate::types::{now_ms, Call, Opportunity, PendingTx, Strategy};
 
 /// Hard ceiling on QuoterV2 `eth_call`s for one candidate.
 pub const MAX_QUOTES_PER_CANDIDATE: u32 = 12;
-/// Largest-notional-first cap on V3 candidates evaluated per pending tx.
-pub const MAX_CANDIDATES_PER_TX: usize = 4;
-
 /// Coarse grid, as fractions of `max_in` in bps. Four points keep the
 /// subsequent refine inside the 12-call budget (4 × 2 + 2 × 2 = 12).
 const COARSE_BPS: [u32; 4] = [400, 1_200, 2_800, 5_600];
@@ -140,7 +137,6 @@ impl StrategyImpl for SandwichV3Strategy {
         // One pool per victim (the fee is in the calldata). The candidate
         // cap is here so a future multi-fee expansion cannot blow the
         // pending-path budget by accident.
-        debug_assert!(1 <= MAX_CANDIDATES_PER_TX);
         let Some(sizing) = size_v3_sandwich(
             &quoter,
             &intent,
@@ -609,7 +605,11 @@ mod tests {
         let err_in = r_in.abs_diff(p.reserve0) * U256::from(100u64) / p.reserve0;
         let err_out = r_out.abs_diff(p.reserve1) * U256::from(100u64) / p.reserve1;
         assert!(err_in <= U256::from(1u64), "r_in {r_in} vs {}", p.reserve0);
-        assert!(err_out <= U256::from(1u64), "r_out {r_out} vs {}", p.reserve1);
+        assert!(
+            err_out <= U256::from(1u64),
+            "r_out {r_out} vs {}",
+            p.reserve1
+        );
     }
 
     #[tokio::test]
@@ -620,9 +620,14 @@ mod tests {
         };
         let victim = U256::from(50_000u128) * U256::from(10u128.pow(18));
         let max_in = U256::from(100_000u128) * U256::from(10u128.pow(18));
-        let s = size_v3_sandwich(&q, &intent(victim, U256::ZERO), max_in, MAX_QUOTES_PER_CANDIDATE)
-            .await
-            .expect("should find a sandwich");
+        let s = size_v3_sandwich(
+            &q,
+            &intent(victim, U256::ZERO),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await
+        .expect("should find a sandwich");
         assert!(s.gross_profit > U256::ZERO);
         assert!(s.amount_in > U256::ZERO);
         assert!(s.quotes_used <= MAX_QUOTES_PER_CANDIDATE);
@@ -641,9 +646,13 @@ mod tests {
             calls: AtomicU32::new(0),
         };
         let max_in = U256::from(100_000u128) * U256::from(10u128.pow(18));
-        let res =
-            size_v3_sandwich(&q, &intent(victim, strict_min), max_in, MAX_QUOTES_PER_CANDIDATE)
-                .await;
+        let res = size_v3_sandwich(
+            &q,
+            &intent(victim, strict_min),
+            max_in,
+            MAX_QUOTES_PER_CANDIDATE,
+        )
+        .await;
         assert!(res.is_none(), "must not sandwich a zero-slippage victim");
         assert!(q.calls.load(Ordering::Relaxed) <= MAX_QUOTES_PER_CANDIDATE);
     }
@@ -723,17 +732,17 @@ mod tests {
         assert!(accept_victim(&i, weth(), &cache).is_some());
 
         // Wrong fee tier → miss.
-        let mut other = i.clone();
+        let mut other = i;
         other.fee = 500;
         assert!(accept_victim(&other, weth(), &cache).is_none());
 
         // Zero amount → miss.
-        let mut z = i.clone();
+        let mut z = i;
         z.amount_in = U256::ZERO;
         assert!(accept_victim(&z, weth(), &cache).is_none());
 
         // Not WETH-in → miss (we don't inventory the other side).
-        let mut sold = i.clone();
+        let mut sold = i;
         sold.token_in = usdc();
         sold.token_out = weth();
         assert!(accept_victim(&sold, weth(), &cache).is_none());

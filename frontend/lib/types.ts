@@ -28,6 +28,20 @@ export interface RiskValues {
   maxInflightPerStrategy: number;
 }
 
+export interface StrategyQualification {
+  strategy: Strategy;
+  liveCandidate: boolean;
+  verdict: "PASS" | "FAIL" | "INSUFFICIENT SAMPLE";
+  forkSamples: number;
+  relayComparisons: number;
+  actualComparisons: number;
+  relayWithinTolerance: number;
+  actualWithinTolerance: number;
+  relayAccuracyBps: number;
+  actualAccuracyBps: number;
+  reasons: string[];
+}
+
 export interface StatusResponse {
   chain: {id: number; name: string};
   head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number};
@@ -39,6 +53,27 @@ export interface StatusResponse {
    * instead of a toggle it cannot honour.
    */
   liveArmed?: boolean;
+  broadcastEnabled?: boolean;
+  qualification?: {
+    pass: boolean;
+    startedAtMs: number;
+    elapsedHours: number;
+    requiredHours: number;
+    liveCandidateSimulations: number;
+    relayCrossChecks: number;
+    highConfidenceActualMatches: number;
+    observationCount: number;
+    maximumObservationGapSecs: number;
+    allowedObservationGapSecs: number;
+    minimumSamples: number;
+    minimumRelayComparisons: number;
+    minimumActualMatches: number;
+    maximumErrorBps: number;
+    minimumAccuracyBps: number;
+    persistenceDropped: number;
+    reasons: string[];
+    strategies: StrategyQualification[];
+  };
   strategies: Strategy[];
   /** Boot-time set (env toggles); `strategies` is the runtime-effective set. */
   bootStrategies?: Strategy[];
@@ -120,7 +155,7 @@ export interface ReconciliationRow {
   blockNumber: number;
   opportunityId: string;
   strategy: string;
-  simNetWei: number;
+  simNetWei: string;
   ourBribeWei: string;
   winningBidWei: string;
   victimLanded: boolean;
@@ -145,6 +180,50 @@ export interface CompetitionResponse {
   summary: CompetitionSummary;
   recent: ReconciliationRow[];
   demo?: boolean;
+}
+
+export interface ActualMevResponse {
+  summary: {matches: number; highConfidence: number};
+  matches: {
+    opportunityId: string;
+    blockNumber: number;
+    victimHash: string;
+    mevTxHashes: string[];
+    actor: string | null;
+    grossWethWei: string;
+    gasCostWei: string;
+    netWethWei: string;
+    confidence: "high" | "medium" | string;
+    confidenceScoreBps: number;
+    completeness: Record<string, string>;
+    evidence: Record<string, unknown>;
+    createdAtMs: number;
+  }[];
+  demo?: boolean;
+}
+
+export interface ExecutionResponse {
+  finalityDepth: number;
+  executions: {
+    bundleId: string;
+    opportunityId: string;
+    strategy: Strategy;
+    targetBlock: number;
+    state: string;
+    included: boolean | null;
+    includedBlock: number | null;
+    observedTxHashes: string[];
+    submittedAtMs: number;
+    txHashes: string[];
+    grossProfitWei: string | null;
+    builderPaymentWei: string | null;
+    retainedProfitWei: string | null;
+    gasCostWei: string | null;
+    netProfitWei: string | null;
+    canonical: boolean | null;
+    finalizedBlock: number | null;
+    reconciledAtMs: number | null;
+  }[];
 }
 
 export interface ReorgRow {
@@ -178,15 +257,15 @@ export interface PnlRow {
   losses: number;
   gross_profit_wei: string;
   gas_spent_wei: string;
-  net_profit_wei: number;
-  best_net_wei: number;
-  worst_net_wei: number;
+  net_profit_wei: string;
+  best_net_wei: string;
+  worst_net_wei: string;
   avg_latency_ms: number;
 }
 
 export interface PnlResponse {
   byStrategy: PnlRow[];
-  totalNetWei: number;
+  totalNetWei: string;
   demo?: boolean;
 }
 
@@ -199,7 +278,7 @@ export interface SimulationRow {
   gasUsed: number;
   gasCostWei: string;
   bribeWei: string;
-  netWei: number;
+  netWei: string;
   revertReason: string | null;
   targetBlock: number;
   latencyMs: number;
@@ -237,7 +316,7 @@ export interface OpportunityRow {
 
 export interface SeriesPoint {
   block: number;
-  netWei: number;
+  netWei: string;
   count: number;
 }
 
@@ -318,7 +397,7 @@ export type FeedEvent =
       strategy: Strategy;
       backend: string;
       success: boolean;
-      net_profit_wei: number;
+      net_profit_wei: string;
       gas_used: number;
       gross_profit_wei: string;
       revert_reason: string | null;

@@ -26,7 +26,9 @@ contract AuditTest is Test {
     }
 
     function _g(address t, uint256 m) internal pure returns (MevExecutor.Guard memory) {
-        return MevExecutor.Guard({profitToken: t, minProfit: m, bribeBps: 0, blockDeadline: 0, maxBaseFee: 0});
+        return MevExecutor.Guard({
+            profitToken: t, minProfit: m, bribeBps: 0, blockDeadline: 0, maxBaseFee: 0, phase: 0
+        });
     }
 
     /// Can a non-owner, non-searcher arm the V3 callback? (should be no)

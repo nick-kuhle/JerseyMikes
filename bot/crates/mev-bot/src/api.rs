@@ -76,6 +76,9 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/funnel", get(funnel))
         .route("/api/latency", get(latency))
         .route("/api/competition", get(competition))
+        .route("/api/actual-mev", get(actual_mev))
+        .route("/api/executions", get(executions))
+        .route("/api/qualification", get(qualification))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
         .route("/api/mode", get(mode))
@@ -131,7 +134,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         for byte in a.iter().chain(b.iter()) {
             sink |= *byte;
         }
-        return std::hint::black_box(sink) == 0 && false;
+        std::hint::black_box(sink);
+        return false;
     }
     let mut diff = 0u8;
     for (x, y) in a.iter().zip(b.iter()) {
@@ -163,6 +167,8 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         // Boot-time arming (`LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`).
         // The runtime switch can only narrow this, never widen it.
         "liveArmed": e.mode.armed(),
+        "broadcastEnabled": e.cfg.broadcast_enabled,
+        "qualification": e.qualification_status(),
         // Runtime-effective enablement (already intersected with what was
         // constructed at boot); the boot set is in `bootStrategies` and
         // /api/config.
@@ -210,6 +216,13 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         "searcher": format!("{:?}", e.cfg.endpoints.searcher_address),
         "liveExecution": e.mode.live(),
         "liveArmed": e.mode.armed(),
+        "broadcastEnabled": e.cfg.broadcast_enabled,
+        "qualification": e.qualification_status(),
+        "strategyEligibility": Strategy::all().iter().map(|strategy| json!({
+            "name": strategy.as_str(),
+            "liveCandidate": strategy.live_candidate(),
+            "shadowOnlyReason": strategy.shadow_only_reason(),
+        })).collect::<Vec<_>>(),
         "endpoints": {
             "ws": e.cfg.endpoints.ws_url.is_some(),
             "mevShare": !e.cfg.endpoints.mev_share_sse.is_empty(),
@@ -227,8 +240,10 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
 async fn pnl(State(s): State<ApiState>) -> impl IntoResponse {
     match s.engine.store.pnl() {
         Ok(rows) => {
-            let total: i64 = rows.iter().map(|r| r.net_profit_wei).sum();
-            Json(json!({"byStrategy": rows, "totalNetWei": total}))
+            let total = rows.iter().fold(0i128, |sum, row| {
+                sum.saturating_add(row.net_profit_wei.parse::<i128>().unwrap_or(0))
+            });
+            Json(json!({"byStrategy": rows, "totalNetWei": total.to_string()}))
         }
         Err(e) => Json(json!({"error": e.to_string()})),
     }
@@ -325,6 +340,38 @@ async fn competition(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> 
     Json(json!({"summary": summary, "recent": rows}))
 }
 
+async fn qualification(State(s): State<ApiState>) -> impl IntoResponse {
+    Json(json!({
+        "status": s.engine.qualification_status(),
+        "broadcastEnabled": s.engine.cfg.broadcast_enabled,
+        "runtimeLive": s.engine.mode.live(),
+        "armed": s.engine.mode.armed(),
+    }))
+}
+
+async fn actual_mev(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
+    let matches = s
+        .engine
+        .store
+        .recent_actual_mev_matches(limit)
+        .unwrap_or_default();
+    let summary = s
+        .engine
+        .store
+        .actual_mev_summary()
+        .unwrap_or_else(|_| json!({"matches": 0, "highConfidence": 0}));
+    Json(json!({"summary": summary, "matches": matches}))
+}
+
+async fn executions(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1_000);
+    match s.engine.store.recent_execution_outcomes(limit) {
+        Ok(rows) => Json(json!({"executions": rows, "finalityDepth": s.engine.cfg.finality_depth})),
+        Err(error) => Json(json!({"error": error.to_string()})),
+    }
+}
+
 async fn reorgs(State(s): State<ApiState>, Query(q): Query<LimitQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(20).clamp(1, 200);
     match s.engine.store.recent_reorgs(limit) {
@@ -373,7 +420,7 @@ struct ModeRequest {
 /// that decision is read exactly once at boot. An unarmed process gets a
 /// 409 with the restart instructions rather than a silent mode change.
 async fn set_mode(State(s): State<ApiState>, Json(body): Json<ModeRequest>) -> Response {
-    match s.engine.mode.set_live(body.live) {
+    match s.engine.set_runtime_mode(body.live).await {
         Ok(live) => Json(json!({
             "ok": true,
             "mode": if live { "live" } else { "simulation" },
@@ -460,9 +507,9 @@ async fn risk_state(State(s): State<ApiState>) -> impl IntoResponse {
 /// human-readable reason and change nothing.
 async fn set_risk(State(s): State<ApiState>, Json(patch): Json<RiskPatch>) -> Response {
     let e = &s.engine;
-    match e.runtime.apply(patch) {
+    match e.apply_runtime_risk(patch).await {
         Ok(()) => {
-            tracing::info!(target: "api", "risk envelope updated at runtime");
+            tracing::info!(target: "api", "risk envelope updated atomically; active private bundles cancelled");
             let effective = e.runtime.risk();
             (
                 StatusCode::OK,

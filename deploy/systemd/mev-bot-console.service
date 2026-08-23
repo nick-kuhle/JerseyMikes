@@ -1,4 +1,4 @@
-# JerseyMikes console (Next.js) — talks to mev-bot over BOT_API_URL.
+# JerseyMikes Next.js console — loopback-only hardened systemd unit.
 
 [Unit]
 Description=JerseyMikes MEV console
@@ -7,13 +7,30 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/jerseymikes/console
+User=jerseymikes
+Group=jerseymikes
+WorkingDirectory=/opt/jerseymikes/frontend
 EnvironmentFile=/etc/jerseymikes/env
 Environment=PORT=3000
 Environment=NODE_ENV=production
-ExecStart=/usr/bin/npm run start
-Restart=always
-RestartSec=3
+Environment=HOSTNAME=127.0.0.1
+ExecStart=/usr/bin/npm run start:loopback
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

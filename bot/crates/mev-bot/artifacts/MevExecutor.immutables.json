@@ -1,0 +1,38 @@
+{
+  "BALANCER_VAULT": [
+    {
+      "length": 32,
+      "start": 641
+    },
+    {
+      "length": 32,
+      "start": 4183
+    },
+    {
+      "length": 32,
+      "start": 4367
+    },
+    {
+      "length": 32,
+      "start": 5597
+    }
+  ],
+  "WETH": [
+    {
+      "length": 32,
+      "start": 590
+    },
+    {
+      "length": 32,
+      "start": 5996
+    },
+    {
+      "length": 32,
+      "start": 6199
+    },
+    {
+      "length": 32,
+      "start": 6286
+    }
+  ]
+}

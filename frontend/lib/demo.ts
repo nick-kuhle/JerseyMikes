@@ -370,7 +370,7 @@ export function demoSimulations(limit = 60): SimulationRow[] {
       gasUsed,
       gasCostWei: String(Math.floor(gasCost)),
       bribeWei: String(Math.floor(win ? gross * 0.9 : 0)),
-      netWei: net,
+      netWei: String(Math.floor(net)),
       revertReason: win ? null : pick(["Unprofitable(0, 1)", "victim replay failed: nonce too low", "tx reverted"]),
       targetBlock: START_BLOCK + 420 - Math.floor(i / 3),
       latencyMs: 40 + Math.floor(rand() * 260),
@@ -411,23 +411,23 @@ export function demoPnl(): PnlResponse {
   const sims = demoSimulations(240);
   const byStrategy = STRATEGIES.map((strategy) => {
     const rows = sims.filter((s) => s.strategy === strategy && s.backend === "anvil_fork");
-    const net = rows.reduce((a, r) => a + r.netWei, 0);
+    const net = rows.reduce((a, r) => a + Number(r.netWei), 0);
     return {
       strategy,
       simulations: rows.length,
-      wins: rows.filter((r) => r.netWei > 0).length,
-      losses: rows.filter((r) => r.netWei <= 0).length,
+      wins: rows.filter((r) => BigInt(r.netWei) > 0n).length,
+      losses: rows.filter((r) => BigInt(r.netWei) <= 0n).length,
       gross_profit_wei: String(rows.reduce((a, r) => a + Number(r.grossWei), 0)),
       gas_spent_wei: String(rows.reduce((a, r) => a + Number(r.gasCostWei), 0)),
-      net_profit_wei: net,
-      best_net_wei: rows.reduce((a, r) => Math.max(a, r.netWei), 0),
-      worst_net_wei: rows.reduce((a, r) => Math.min(a, r.netWei), 0),
+      net_profit_wei: String(Math.floor(net)),
+      best_net_wei: String(rows.reduce((a, r) => Math.max(a, Number(r.netWei)), 0)),
+      worst_net_wei: String(rows.reduce((a, r) => Math.min(a, Number(r.netWei)), 0)),
       avg_latency_ms: rows.length ? rows.reduce((a, r) => a + r.latencyMs, 0) / rows.length : 0,
     };
   });
   return {
     byStrategy,
-    totalNetWei: byStrategy.reduce((a, r) => a + r.net_profit_wei, 0),
+    totalNetWei: String(byStrategy.reduce((a, r) => a + Number(r.net_profit_wei), 0)),
     demo: true,
   };
 }
@@ -437,7 +437,7 @@ export function demoSeries(limit = 120): SeriesPoint[] {
   for (let i = 0; i < limit; i++) {
     out.push({
       block: START_BLOCK + 300 + i,
-      netWei: Math.floor((rand() - 0.42) * 3.2e16),
+      netWei: String(Math.floor((rand() - 0.42) * 3.2e16)),
       count: 1 + Math.floor(rand() * 5),
     });
   }
@@ -559,7 +559,7 @@ export function demoEvent(i: number): FeedEvent {
       strategy,
       backend: "anvil_fork",
       success: win,
-      net_profit_wei: win ? Math.floor(gross * 0.08) : -Math.floor(rand() * 4e15),
+      net_profit_wei: String(win ? Math.floor(gross * 0.08) : -Math.floor(rand() * 4e15)),
       gas_used: 210_000 + Math.floor(rand() * 300_000),
       gross_profit_wei: String(gross),
       revert_reason: win ? null : "Unprofitable(0, 1)",

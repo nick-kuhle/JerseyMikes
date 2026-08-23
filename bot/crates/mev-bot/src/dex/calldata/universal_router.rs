@@ -206,7 +206,7 @@ pub fn decode_v3_path(path: &[u8]) -> Option<Vec<Address>> {
         return None;
     }
     // 20 + n*(3+20) == len, n >= 1
-    if (path.len() - 20) % 23 != 0 {
+    if !(path.len() - 20).is_multiple_of(23) {
         return None;
     }
     let mut tokens = Vec::new();
@@ -330,7 +330,11 @@ mod tests {
         let path = vec![known::WETH, known::USDC];
         let data = encode_execute(
             vec![CMD_V2_SWAP_EXACT_IN],
-            vec![v2_input(U256::from(10u128.pow(18)), U256::from(1_000u64), path.clone())],
+            vec![v2_input(
+                U256::from(10u128.pow(18)),
+                U256::from(1_000u64),
+                path.clone(),
+            )],
         );
         let s = decode(known::UNIVERSAL_ROUTER, &data, U256::ZERO, known::WETH).unwrap();
         assert_eq!(s.token_in, known::WETH);

@@ -124,6 +124,18 @@ pub struct Engine {
     strategy_gate: Arc<tokio::sync::Semaphore>,
     pub latency: Arc<Latency>,
     pub inventory: Arc<Inventory>,
+    /// Private relay transport. Calling it is still gated by broadcast
+    /// capability, qualification, runtime mode, risk and strategy eligibility.
+    pub submission: Arc<crate::submission::SubmissionGateway>,
+    /// Qualification is recomputed once per head off the hot path. Candidate
+    /// checks and API reads are lock-only and never scan SQLite.
+    qualification: Arc<parking_lot::RwLock<crate::qualification::QualificationStatus>>,
+    qualification_refreshing: Arc<std::sync::atomic::AtomicBool>,
+    qualification_refreshed_at_ms: Arc<std::sync::atomic::AtomicU64>,
+    own_reconciliation_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Exactly one live candidate may reserve/sign/submit at a time, preventing
+    /// nonce gaps when a simulation or relay request fails.
+    submission_gate: Arc<tokio::sync::Semaphore>,
     last_head: parking_lot::Mutex<Option<BlockHead>>,
     /// Block number of the last pool-discovery pass (`u64::MAX` = never run).
     last_discovery_block: std::sync::atomic::AtomicU64,
@@ -451,16 +463,34 @@ impl Engine {
         let runtime = crate::risk::RuntimeRisk::new(cfg.risk.clone(), cfg.strategies.clone());
         let risk = Arc::new(RiskEngine::new(cfg.clone(), runtime.clone()));
 
-        let signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
+        let relay_signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
             Some(k) => Signer::from_hex(k)?,
             None => {
                 tracing::warn!(
                     target: "engine",
-                    "no FLASHBOTS_SIGNER_KEY set — using an ephemeral key (relay cross-checks may be rate limited)"
+                    "no FLASHBOTS_SIGNER_KEY set — using an ephemeral relay-auth key (cross-checks may be rate limited)"
                 );
                 Signer::ephemeral()
             }
         });
+        let submission = Arc::new(crate::submission::SubmissionGateway::new(
+            &cfg.endpoints.bundle_relay_urls,
+            relay_signer.clone(),
+            store.clone(),
+            cfg.submission_retry_ms,
+            cfg.submission_max_attempts,
+        ));
+        let transaction_signer = Arc::new(match &cfg.endpoints.searcher_private_key {
+            Some(k) => Signer::from_hex(k)?,
+            None => Signer::simulation(),
+        });
+        if transaction_signer.address() != cfg.endpoints.searcher_address {
+            anyhow::bail!(
+                "transaction signer {:?} does not match configured searcher {:?}",
+                transaction_signer.address(),
+                cfg.endpoints.searcher_address
+            );
+        }
 
         // Current head, needed before anything else can be sized.
         let head = fetch_head(&http).await?;
@@ -468,13 +498,7 @@ impl Engine {
 
         // Local fork simulator. Absence is not fatal: the bot still observes and
         // records, it just cannot score opportunities.
-        let fork = match crate::sim::anvil::AnvilSim::spawn(
-            cfg.clone(),
-            head.number,
-            runtime.clone(),
-        )
-        .await
-        {
+        let fork = match crate::sim::anvil::AnvilSim::spawn(cfg.clone(), head.number).await {
             Ok(f) => Some(Arc::new(f)),
             Err(e) => {
                 tracing::error!(target: "engine", error = %e, "anvil fork unavailable — simulations disabled");
@@ -490,7 +514,6 @@ impl Engine {
                 cfg.clone(),
                 head.number,
                 cfg.sim.anvil_replay_port,
-                runtime.clone(),
             )
             .await
             {
@@ -516,7 +539,7 @@ impl Engine {
         };
 
         let relay = if cfg.sim.use_call_bundle {
-            crate::sim::relay::RelaySim::new(&cfg, signer.clone()).ok()
+            crate::sim::relay::RelaySim::new(&cfg, relay_signer.clone()).ok()
         } else {
             None
         };
@@ -532,7 +555,7 @@ impl Engine {
             fork,
             replay_fork,
             relay,
-            signer,
+            transaction_signer,
             runtime.clone(),
         ));
         let ctx = Arc::new(StrategyCtx::new(
@@ -541,6 +564,11 @@ impl Engine {
             executor,
             head.clone(),
         ));
+        let pool_discovery = PoolDiscovery::new();
+        if cfg.pool_discovery_v3 {
+            let loaded = pool_discovery.seed_core_v3(&ctx).await;
+            tracing::info!(target: "discovery", loaded, "seeded established core V3 pools");
+        }
 
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
@@ -566,7 +594,10 @@ impl Engine {
         // reads it when a price update appears in the mempool.
         let leads = LiquidationLeads::new();
         if cfg.strategies.liquidation {
-            strategies.push(Arc::new(LiquidationStrategy::new(leads.clone())));
+            strategies.push(Arc::new(LiquidationStrategy::new(
+                leads.clone(),
+                cfg.liquidation.watch_cap,
+            )));
         }
         if cfg.strategies.liquidation_compound {
             strategies.push(Arc::new(CompoundLiquidationStrategy::new(
@@ -613,17 +644,52 @@ impl Engine {
             .started_at_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
 
-        let pool_discovery = PoolDiscovery::new();
         let inventory = Arc::new(Inventory::new(cfg.inventory_gate));
         // Best-effort: a dummy searcher will read as nonce 0 / zero balances,
         // which is the honest picture of mainnet and does not gate unless
         // `INVENTORY_GATE` is on.
         if let Err(e) = inventory
-            .refresh(&http, cfg.endpoints.searcher_address, cfg.chain.weth)
+            .refresh(
+                &http,
+                cfg.endpoints.searcher_address,
+                cfg.chain.weth,
+                cfg.endpoints.executor,
+            )
             .await
         {
             tracing::debug!(target: "engine", error = %e, "inventory refresh failed at boot");
         }
+
+        // Private bundles do not appear in the public pending nonce. Recover
+        // every durable reservation before allowing a nonce to be reused.
+        for reservation in store.active_nonce_reservations().unwrap_or_default() {
+            if reservation.target_block < head.number {
+                let _ = store.set_nonce_reservation_status(&reservation.bundle_id, "expired");
+                continue;
+            }
+            if submission.cancel(&reservation.bundle_id).await {
+                let _ = store.set_nonce_reservation_status(&reservation.bundle_id, "cancelled");
+            } else {
+                inventory.block_broadcast_until(reservation.target_block);
+                let _ =
+                    store.set_nonce_reservation_status(&reservation.bundle_id, "recovery_blocked");
+                tracing::error!(
+                    target: "submission",
+                    bundle = %reservation.bundle_id,
+                    start_nonce = reservation.start_nonce,
+                    nonce_count = reservation.nonce_count,
+                    target_block = reservation.target_block,
+                    "could not prove private-bundle cancellation; nonce reuse blocked until target expiry"
+                );
+            }
+        }
+
+        let qualification = Arc::new(parking_lot::RwLock::new(crate::qualification::evaluate(
+            &cfg,
+            &store,
+            &writes,
+            now_ms(),
+        )));
 
         // Built before the struct literal below moves `cfg`.
         let mode = LiveMode::armed_at_boot(cfg.live_execution);
@@ -660,12 +726,118 @@ impl Engine {
             strategy_gate: Arc::new(tokio::sync::Semaphore::new(strategy_concurrency)),
             latency: Arc::new(Latency::default()),
             inventory,
+            submission,
+            qualification,
+            qualification_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qualification_refreshed_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
+            own_reconciliation_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            submission_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             last_head: parking_lot::Mutex::new(Some(head)),
             // The boot-time refresh above already ran; the cooldowns start
             // unset so the first observed block always does a full pass.
             last_discovery_block: std::sync::atomic::AtomicU64::new(NEVER),
             last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
         })
+    }
+
+    pub fn qualification_status(&self) -> crate::qualification::QualificationStatus {
+        self.qualification.read().clone()
+    }
+
+    fn strategy_qualified(&self, strategy: Strategy) -> bool {
+        self.qualification.read().strategy_passes(strategy)
+    }
+
+    fn refresh_qualification(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        // One minute is comfortably below the default 120-second continuity
+        // limit while avoiding repeated seven-day evidence scans.
+        const REFRESH_INTERVAL_MS: u64 = 60_000;
+        let now = now_ms();
+        let last = self.qualification_refreshed_at_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last) < REFRESH_INTERVAL_MS
+            || self.qualification_refreshing.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.qualification_refreshed_at_ms
+            .store(now, Ordering::Release);
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = crate::qualification::evaluate(
+                &engine.cfg,
+                &engine.store,
+                &engine.writes,
+                now_ms(),
+            );
+            *engine.qualification.write() = status;
+            engine
+                .qualification_refreshing
+                .store(false, Ordering::Release);
+        });
+    }
+
+    /// Atomically narrow/widen runtime mode with respect to the serialized
+    /// submission lane. A transition to simulation cancels active payloads
+    /// before another candidate can reserve a nonce.
+    pub async fn set_runtime_mode(&self, live: bool) -> Result<bool, &'static str> {
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return Ok(false);
+        };
+        let effective = self.mode.set_live(live)?;
+        if !effective {
+            self.cancel_active_submissions_locked("runtime mode changed to simulation")
+                .await;
+        }
+        Ok(effective)
+    }
+
+    /// Apply a risk patch while holding the nonce lane, then cancel every
+    /// payload signed under the previous policy before releasing it.
+    pub async fn apply_runtime_risk(&self, patch: crate::risk::RiskPatch) -> Result<(), String> {
+        let _nonce_lane = self
+            .submission_gate
+            .acquire()
+            .await
+            .map_err(|_| "submission lane is closed".to_string())?;
+        self.runtime.apply(patch)?;
+        self.cancel_active_submissions_locked("runtime risk policy changed")
+            .await;
+        Ok(())
+    }
+
+    /// Cancel every unresolved private bundle after an operator/risk policy
+    /// change. Nonces are released from highest to lowest only when every relay
+    /// acknowledges cancellation; otherwise reuse remains blocked through the
+    /// target block.
+    pub async fn cancel_active_submissions(&self, reason: &str) {
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return;
+        };
+        self.cancel_active_submissions_locked(reason).await;
+    }
+
+    async fn cancel_active_submissions_locked(&self, reason: &str) {
+        let mut reservations = self.store.active_nonce_reservations().unwrap_or_default();
+        reservations.sort_by_key(|reservation| std::cmp::Reverse(reservation.start_nonce));
+        for reservation in reservations {
+            if self.submission.cancel(&reservation.bundle_id).await {
+                let _ = self
+                    .store
+                    .set_nonce_reservation_status(&reservation.bundle_id, "cancelled");
+                let _ = self
+                    .inventory
+                    .release_nonces(reservation.start_nonce, reservation.nonce_count);
+                tracing::warn!(target: "submission", bundle = %reservation.bundle_id, %reason, "active bundle cancelled by policy");
+            } else {
+                self.inventory
+                    .block_broadcast_until(reservation.target_block);
+                let _ = self
+                    .store
+                    .set_nonce_reservation_status(&reservation.bundle_id, "recovery_blocked");
+                tracing::error!(target: "submission", bundle = %reservation.bundle_id, %reason, target_block = reservation.target_block, "policy cancellation not fully acknowledged; nonce reuse blocked");
+            }
+        }
     }
 
     /// Run forever.
@@ -774,6 +946,18 @@ impl Engine {
             tx_count: txs.len(),
             txs: summaries,
         });
+
+        // Match decision-time opportunities before replay scoring creates its
+        // own post-mortem rows for this block. Matches carry explicit evidence
+        // and confidence; competitor total economics are never called exact.
+        crate::attribution::reconcile_block(
+            &self.store,
+            &self.http,
+            block_number,
+            &txs,
+            self.cfg.chain.weth,
+        )
+        .await;
 
         // Score each transaction: strategies propose opportunities (sandwich,
         // back-run, liquidation, sniper) and the simulator decides whether value
@@ -916,6 +1100,31 @@ impl Engine {
         }
         *self.last_head.lock() = Some(head.clone());
 
+        // Receipt polling and finality reconciliation can fan out over many
+        // submitted hashes. It must never delay pool refresh or block-cadence
+        // strategies, so it runs as an independent async task.
+        if !self
+            .own_reconciliation_running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let engine = self.clone();
+            let reconcile_head = head.number;
+            tokio::spawn(async move {
+                crate::attribution::reconcile_own_submissions(
+                    &engine.store,
+                    &engine.http,
+                    reconcile_head,
+                    engine.cfg.finality_depth,
+                    engine.cfg.endpoints.searcher_address,
+                    engine.ctx.executor,
+                )
+                .await;
+                engine
+                    .own_reconciliation_running
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
+
         // Both of these sit *in front of* the strategies on the block task, so
         // every millisecond they spend is a millisecond the strategies do not
         // get. Neither needs to run on every block: the searcher's nonce and
@@ -935,6 +1144,7 @@ impl Engine {
                     &self.http,
                     self.cfg.endpoints.searcher_address,
                     self.cfg.chain.weth,
+                    self.cfg.endpoints.executor,
                 )
                 .await;
             self.latency
@@ -943,6 +1153,7 @@ impl Engine {
 
         self.ctx.set_head(head.clone());
         self.writes.record_block(&head);
+        self.refresh_qualification();
         let _ = self.feed.send(FeedEvent::Block(head.clone()));
 
         if (self.cfg.pool_discovery || self.cfg.pool_discovery_v3)
@@ -1229,6 +1440,10 @@ impl Engine {
         self.writes.record_opportunity(&opp);
         let _ = self.feed.send(FeedEvent::Opportunity(opp.clone()));
 
+        // Shadow simulation stays fully concurrent. Only a profitable,
+        // qualified candidate enters the serialized nonce lane below.
+        let simulation_nonce = self.inventory.nonce_for(&opp);
+
         self.risk.begin(opp.strategy);
         let outcome = self
             .sim
@@ -1237,7 +1452,7 @@ impl Engine {
                 &victims_raw,
                 victim_sender_nonce,
                 base_fee,
-                self.inventory.nonce_for(&opp),
+                simulation_nonce,
                 lane == FunnelLane::Replay,
             )
             .await;
@@ -1262,7 +1477,19 @@ impl Engine {
             self.latency
                 .observe(Stage::Total, now_ms().saturating_sub(seen_at_ms));
         }
-        self.risk.observe(&outcome.primary);
+        // Post-mortem replay is evidence, not capital at risk; it must never
+        // trip the live drawdown switch.
+        if lane == FunnelLane::Live {
+            self.risk.observe(&outcome.primary);
+            if self.risk.is_tripped() {
+                let engine = self.clone();
+                tokio::spawn(async move {
+                    engine
+                        .cancel_active_submissions("drawdown kill switch tripped")
+                        .await;
+                });
+            }
+        }
         self.writes.record_simulation(&outcome.primary);
         let _ = self
             .feed
@@ -1293,14 +1520,150 @@ impl Engine {
                 live = self.mode.live(),
                 "PROFITABLE bundle"
             );
-            // Whether the bundle is marked submitted follows the effective
-            // mode (boot-time arming && runtime switch). Flipping either of
-            // the env keys requires a restart by design — the runtime switch
-            // can only narrow what the environment allowed, never widen it.
-            bundle.submitted = self.mode.live();
+            if lane == FunnelLane::Live && self.mode.live() && self.cfg.broadcast_enabled {
+                bundle = self
+                    .submit_live_candidate(
+                        &opp,
+                        &victims_raw,
+                        victim_sender_nonce,
+                        base_fee,
+                        simulation_nonce,
+                        bundle,
+                    )
+                    .await;
+            }
         }
-        self.writes.record_bundle(&bundle);
+        if bundle.submitted {
+            // Settlement records are safety state, not droppable telemetry.
+            if let Err(error) = self.store.record_bundle(&bundle) {
+                tracing::error!(target: "submission", %error, bundle = %bundle.id, "persisting submitted bundle failed");
+                self.inventory.block_broadcast_until(bundle.target_block);
+            }
+        } else {
+            self.writes.record_bundle(&bundle);
+        }
         let _ = self.feed.send(FeedEvent::Bundle(bundle));
+    }
+
+    /// Serialize only profitable live candidates. Shadow simulations remain
+    /// fully concurrent; when an earlier accepted bundle advanced the nonce,
+    /// this reruns the candidate with the newly reserved nonce before sending.
+    async fn submit_live_candidate(
+        self: &Arc<Self>,
+        opp: &Opportunity,
+        victims_raw: &[Vec<u8>],
+        victim_sender_nonce: Option<(alloy_primitives::Address, u64)>,
+        base_fee: U256,
+        initially_simulated_nonce: u64,
+        initial_bundle: crate::types::BundleRecord,
+    ) -> crate::types::BundleRecord {
+        let qualification = self.qualification_status();
+        if !qualification.strategy_passes(opp.strategy) {
+            let reasons = qualification
+                .strategies
+                .iter()
+                .find(|row| row.strategy == opp.strategy.as_str())
+                .map(|row| row.reasons.clone())
+                .unwrap_or_else(|| qualification.reasons.clone());
+            tracing::warn!(target: "submission", strategy = opp.strategy.as_str(), ?reasons, "strategy has not independently passed qualification");
+            return initial_bundle;
+        }
+
+        let Ok(_nonce_lane) = self.submission_gate.acquire().await else {
+            return initial_bundle;
+        };
+        let head = self.ctx.head().number;
+        if !self.mode.live()
+            || !self.cfg.broadcast_enabled
+            || !self.strategy_qualified(opp.strategy)
+            || !self.inventory.broadcast_available(head)
+            || initial_bundle.target_block <= head
+        {
+            return initial_bundle;
+        }
+
+        let nonce_count = Inventory::legs(opp);
+        if nonce_count == 0 {
+            return initial_bundle;
+        }
+        let start_nonce = self.inventory.reserve_nonces(nonce_count);
+        let mut bundle = initial_bundle;
+
+        if start_nonce != initially_simulated_nonce {
+            self.risk.begin(opp.strategy);
+            let exact = self
+                .sim
+                .run(
+                    opp,
+                    victims_raw,
+                    victim_sender_nonce,
+                    base_fee,
+                    start_nonce,
+                    false,
+                )
+                .await;
+            self.risk.end(opp.strategy);
+            let Ok(exact) = exact else {
+                let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                return bundle;
+            };
+            Stats::bump(&self.stats.simulations);
+            self.writes.record_simulation(&exact.primary);
+            let _ = self.feed.send(FeedEvent::Simulation(exact.primary.clone()));
+            if let Some(relay) = &exact.relay {
+                self.writes.record_simulation(relay);
+                let _ = self.feed.send(FeedEvent::Simulation(relay.clone()));
+            }
+            if !self.risk.submittable(&exact.primary) {
+                let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+                return bundle;
+            }
+            bundle = exact.bundle;
+        }
+
+        // Recheck mutable controls after any serialized exact-payload rerun.
+        if !self.mode.live()
+            || !self.strategy_qualified(opp.strategy)
+            || self.risk.check(opp, base_fee).is_err()
+            || !self.inventory.can_fund(opp)
+        {
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+            return bundle;
+        }
+
+        if self
+            .store
+            .reserve_bundle_nonces(
+                &bundle.id,
+                &bundle.opportunity_id,
+                start_nonce,
+                nonce_count,
+                bundle.target_block,
+            )
+            .is_err()
+        {
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+            tracing::error!(target: "submission", bundle = %bundle.id, "durable nonce reservation failed; refusing broadcast");
+            return bundle;
+        }
+
+        bundle.submitted = self.submission.submit(&bundle).await;
+        if bundle.submitted {
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "accepted");
+        } else if self.submission.cancel(&bundle.id).await {
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "cancelled");
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
+        } else {
+            self.inventory.block_broadcast_until(bundle.target_block);
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "recovery_blocked");
+        }
+        bundle
     }
 
     /// Compare stored simulations for `block` against relay bid traces and

@@ -9,10 +9,10 @@ is irreversible, so read the whole page once before spending anything.
 ```text
 your machine                       ethereum mainnet
 ────────────                       ───────────────
-mev-bot (Rust)  ── simulates ──▶   MevExecutor  ◀── holds a little ETH for gas
+mev-bot (Rust)  ── simulates ──▶   MevExecutor  ◀── may hold ETH used as call value
    │  ▲                             owner = your wallet
    │  └── reads/writes via RPC      searchers = the bot's signer EOA
-   └── until Phase 3: never broadcasts anything
+   └── broadcasts only after every independent go-live gate passes
 ```
 
 > Already deployed, and just switching the bot over from simulation?
@@ -27,15 +27,22 @@ profit guard — if the batch does not come out ahead by at least
 private orderflow is simply dropped by the builder, which is why liberal
 searching is safe to practise with.
 
+This revision is **not ABI-compatible with older executor deployments**. The
+current ABI uses `execute(bytes32,Call[],Guard)` and
+`flashExecute(bytes32,address[],uint256[],Call[],Guard)`, with phase `0` for a
+single-shot batch, `1` for an opening baseline, and `2` for same-block
+settlement. `minProfit` is retained profit after builder payment. Redeploy from
+this revision and update `EXECUTOR_ADDRESS`; do not reuse an older deployment.
+
 Two facts that answer most confusion:
 
 - **You do not need to deploy anything to simulate.** The simulator injects
   the compiled bytecode into its own local fork. A deployment only matters
   for the live path.
-- **Deploying does not make the bot trade.** The bot broadcasts nothing until
-  it is restarted with both live-execution keys set (and even then, this
-  build records bundles rather than sending them — actual submission is
-  Phase 3 of [`ROADMAP.md`](ROADMAP.md)).
+- **Deploying does not make the bot trade.** Relay submission additionally
+  requires the funded transaction key, boot arming, `BROADCAST_ENABLED`,
+  runtime live mode, risk and inventory approval, and a strategy-specific
+  qualification `PASS`. All default values remain fail-closed.
 
 ## Prerequisites
 
@@ -66,10 +73,7 @@ prefills the bot's `SEARCHER_ADDRESS` for the allowlist step.)
    remembers it. The constructor is `MevExecutor(balancerVault, weth)` — the
    prefilled values are mainnet's Balancer V2 vault and WETH9; leave them.
    Your deployer wallet is now `owner` **and** an allowed searcher.
-4. **Fund the executor.** Send 0.02–0.05 ETH to the new address. This is the
-   gas the executor will spend when it eventually executes bundles. It is not
-   trading capital — swap capital comes from zero-fee Balancer flash loans.
-   The owner can always sweep it back.
+4. **Optionally fund the executor.** The searcher EOA—not the contract—pays transaction gas. Send ETH to the executor only when a strategy needs native call value; flash-funded WETH strategies do not require a standing ETH balance. The owner can sweep any balance back.
 5. **Allowlist the bot's searcher.** The field is prefilled from the bot's
    `SEARCHER_ADDRESS` (or enter it manually) and calls
    `setSearcher(addr, true)`. The executor only accepts bundles from
@@ -80,7 +84,7 @@ prefills the bot's `SEARCHER_ADDRESS` for the allowlist step.)
    on-chain control** panel now reads your deployed contract, and simulations
    use it instead of the injected placeholder.
 
-Costs you should expect on path A: one deployment (~2–3M gas), one funding
+Costs you should expect on path A: one deployment (~2–3M gas), an optional funding
 transfer (21k gas + the amount sent), one `setSearcher` (~50k gas). At 1–2
 gwei base fee that is a few thousandths of an ETH total.
 
@@ -118,23 +122,28 @@ deploy, then clear it.
 
 ## What "arming" actually means (and why it comes last)
 
-The bot's execution mode has two layers — see [`RISK.md`](RISK.md):
+The bot's execution mode has three operator-controlled layers — see
+[`RISK.md`](RISK.md):
 
-1. **Arming at boot** — `LIVE_EXECUTION=true` and
-   `I_UNDERSTAND_LIVE_RISK=yes` in the bot's `.env`, then a restart. This is
-   the deliberate two-key switch; the console's mode toggle can never set it.
-2. **The runtime switch** — once a bot is armed, the console's
-   `SIMULATION ⇄ LIVE` badge pauses/resumes live mode without a restart.
+1. **Broadcast capability** — `BROADCAST_ENABLED=true` permits relay transport.
+2. **Arming at boot** — `LIVE_EXECUTION=true` and
+   `I_UNDERSTAND_LIVE_RISK=yes`, then a restart. The console can never set it.
+3. **The runtime switch** — on an armed process, the authenticated
+   `SIMULATION ⇄ LIVE` control pauses/resumes live mode without a restart.
 
-The order that keeps you safe: deploy → fund → allowlist searcher →
-`EXECUTOR_ADDRESS` → restart → **watch it in simulation for days** — and treat
-arming as its own decision, made only when the funnel says the bot is finding
-real, profitable bundles. An unarmed bot cannot be flipped live by anyone
-through the UI.
+These do not override the per-strategy qualification, risk, inventory, nonce,
+or exact-payload simulation gates.
 
-**Honest reminder:** in the current build, even an armed bot only *marks*
-profitable bundles as submitted — the `eth_sendBundle` transport is Phase 3
-and does not exist yet. Arming today is preparation, not a money switch.
+The order that keeps you safe: deploy → fund → allowlist the address derived
+from `SEARCHER_PRIVATE_KEY` → set `EXECUTOR_ADDRESS` → restart → collect at
+least seven continuously observed days → require an explicit per-strategy
+`PASS` → tighten risk → enable broadcast capability → arm. An unarmed process
+cannot be flipped live through the UI.
+
+**Live submission exists in this build.** `eth_sendBundle` is invoked across
+configured relays when every gate passes. Treat arming as a money switch, and
+follow the full evidence, nonce-recovery, finality, and rollback procedure in
+[`SIM_TO_LIVE.md`](SIM_TO_LIVE.md).
 
 > Before you arm, secure the bot's API. A network-reachable
 > `API_BIND` with no `API_AUTH_TOKEN` lets anyone who can reach the port

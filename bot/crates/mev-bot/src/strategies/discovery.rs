@@ -22,12 +22,21 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, U256};
+use alloy_sol_types::{sol, SolCall};
 use async_trait::async_trait;
+
+sol! {
+    interface IUniswapV3FactorySeed {
+        function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+    }
+}
 use parking_lot::RwLock;
 
 use crate::dex::{self, V2Pool, V3Pool, Venue};
 use crate::rpc::RpcClient;
-use crate::strategies::{try_scan_pair_created, try_scan_pool_created, PoolCache, StrategyCtx, V3PoolCache};
+use crate::strategies::{
+    try_scan_pair_created, try_scan_pool_created, PoolCache, StrategyCtx, V3PoolCache,
+};
 use crate::types::BlockHead;
 
 /// Minimum WETH liquidity (wei) before a discovered pool enters the cache —
@@ -79,7 +88,9 @@ impl DiscoverySource for RpcSource<'_> {
     }
 
     async fn fetch_pool(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool> {
-        dex::fetch_v2_pool(self.rpc, pair, venue, 30, block).await.ok()
+        dex::fetch_v2_pool(self.rpc, pair, venue, 30, block)
+            .await
+            .ok()
     }
 
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>> {
@@ -141,6 +152,62 @@ impl PoolDiscovery {
 
     pub fn seen_v3_count(&self) -> usize {
         self.seen_v3.read().len()
+    }
+
+    /// Seed established core V3 pools directly from the factory. Creation-log
+    /// scanning intentionally starts near the head, so without this pass the
+    /// years-old WETH/USDC pool never enters a fresh process's V3 cache.
+    pub async fn seed_core_v3(&self, ctx: &StrategyCtx) -> usize {
+        let mut loaded = 0usize;
+        for token in crate::strategies::arb::CORE_TOKENS {
+            for (fee, tick_spacing) in [(500u32, 10i32), (3_000, 60), (10_000, 200)] {
+                let call = IUniswapV3FactorySeed::getPoolCall {
+                    tokenA: ctx.cfg.chain.weth,
+                    tokenB: token,
+                    fee: alloy_primitives::aliases::U24::from(fee),
+                }
+                .abi_encode();
+                let Ok(value) = ctx
+                    .rpc
+                    .call_raw(
+                        "eth_call",
+                        serde_json::json!([{
+                            "to": format!("{:?}", crate::config::known::UNIV3_FACTORY),
+                            "data": format!("0x{}", hex::encode(call))
+                        }, "latest"]),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                let raw = crate::types::parse_bytes(&value);
+                if raw.len() < 32 {
+                    continue;
+                }
+                let pool = Address::from_slice(&raw[12..32]);
+                if pool == Address::ZERO || ctx.pools_v3.contains(pool) {
+                    continue;
+                }
+                let (token0, token1) = if ctx.cfg.chain.weth < token {
+                    (ctx.cfg.chain.weth, token)
+                } else {
+                    (token, ctx.cfg.chain.weth)
+                };
+                ctx.pools_v3.insert(V3Pool {
+                    address: pool,
+                    token0,
+                    token1,
+                    fee,
+                    tick_spacing,
+                    // Factory seeding proves the pool exists but does not
+                    // retrieve its historical PoolCreated height.
+                    block: 0,
+                });
+                self.seen_v3.write().insert(pool);
+                loaded += 1;
+            }
+        }
+        loaded
     }
 
     /// The `[from, to]` range to scan for a head of `head`, given `cursor`
@@ -489,7 +556,10 @@ mod tests {
         let d = PoolDiscovery::new();
         let pools = cache();
 
-        assert_eq!(d.discover_v2_with(&src, &pools, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v2_with(&src, &pools, WETH(), 100).await.loaded,
+            0
+        );
         assert_eq!(pools.len(), 0);
         assert_eq!(d.seen_count(), 0);
 
@@ -524,7 +594,12 @@ mod tests {
         }
         let d = PoolDiscovery::new();
         let pools = cache();
-        assert_eq!(d.discover_v2_with(&NonWeth, &pools, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v2_with(&NonWeth, &pools, WETH(), 100)
+                .await
+                .loaded,
+            0
+        );
         assert!(d.non_weth.read().contains(&addr(1)));
         assert_eq!(pools.len(), 0);
     }
@@ -578,7 +653,12 @@ mod tests {
         };
         let d = PoolDiscovery::new();
         let pools_v3 = V3PoolCache::new();
-        assert_eq!(d.discover_v3_with(&src, &pools_v3, WETH(), 100).await.loaded, 0);
+        assert_eq!(
+            d.discover_v3_with(&src, &pools_v3, WETH(), 100)
+                .await
+                .loaded,
+            0
+        );
         assert_eq!(pools_v3.len(), 0);
     }
 }
