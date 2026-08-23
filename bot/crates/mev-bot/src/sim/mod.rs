@@ -88,7 +88,11 @@ impl Simulator {
             executor,
             nonce,
             base_fee,
-            priority_fee: U256::from(1_000_000_000u64),
+            // On relay chains the leg fee is a simulation artefact (builders
+            // price by the bribe); on sequencer chains it is the ordering
+            // currency, so it is config-driven (PRIORITY_FEE_WEI) and the
+            // signed bundle's actual fee.
+            priority_fee: self.cfg.priority_fee_wei,
             // Clamped below any block gas limit: relays reject an over-limit
             // tx before simulating it, exactly like the fork does. The cap
             // follows the runtime risk envelope: a dashboard change applies
@@ -190,6 +194,7 @@ pub fn empty_result(opp: &Opportunity, reason: &str) -> SimulationResult {
         gas_cost_wei: U256::ZERO,
         bribe_wei: U256::ZERO,
         net_profit_wei: 0,
+        victim_predicted_out_wei: None,
         revert_reason: Some(reason.to_string()),
         target_block: opp.target_block,
         sim_latency_ms: 0,

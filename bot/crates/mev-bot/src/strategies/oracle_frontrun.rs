@@ -181,35 +181,40 @@ impl OracleFrontrunStrategy {
         }
 
         // Maker: every ilk's OSM pip, plus the OsmMom and Spot ter, which
-        // poke pips in one transaction.
-        for spec in maker::maker::table() {
+        // poke pips in one transaction. The built-in ilk table is a
+        // mainnet artifact — only watched on chains whose registry says the
+        // Maker protocol is present (the env-driven Chainlink/OSM feeds
+        // above are chain-agnostic and always apply).
+        if ctx.cfg.addresses.maker {
+            for spec in maker::maker::table() {
+                resolved.insert(
+                    spec.pip,
+                    Feed {
+                        target: spec.pip,
+                        collateral: spec.gem,
+                        kind: FeedKind::MakerOsm,
+                    },
+                );
+            }
+            if let Some(mom) = maker_osm_mom() {
+                resolved.insert(
+                    mom,
+                    Feed {
+                        target: mom,
+                        collateral: Address::ZERO,
+                        kind: FeedKind::MakerSpot,
+                    },
+                );
+            }
             resolved.insert(
-                spec.pip,
+                maker::maker::SPOT,
                 Feed {
-                    target: spec.pip,
-                    collateral: spec.gem,
-                    kind: FeedKind::MakerOsm,
-                },
-            );
-        }
-        if let Some(mom) = maker_osm_mom() {
-            resolved.insert(
-                mom,
-                Feed {
-                    target: mom,
+                    target: maker::maker::SPOT,
                     collateral: Address::ZERO,
                     kind: FeedKind::MakerSpot,
                 },
             );
         }
-        resolved.insert(
-            maker::maker::SPOT,
-            Feed {
-                target: maker::maker::SPOT,
-                collateral: Address::ZERO,
-                kind: FeedKind::MakerSpot,
-            },
-        );
 
         *self.watched.write() = resolved;
         *self.resolved_at_block.write() = head.number;

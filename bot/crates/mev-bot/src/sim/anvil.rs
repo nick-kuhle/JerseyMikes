@@ -391,10 +391,15 @@ impl AnvilSim {
                 .context("decode executor immutable references")?;
         let mut runtime = hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
             .context("decode embedded executor runtime bytecode")?;
-        for (name, value) in [
-            ("BALANCER_VAULT", crate::config::known::BALANCER_VAULT),
-            ("WETH", self.cfg.chain.weth),
-        ] {
+        // Immutables from the chain's registry. A chain without a Balancer
+        // vault (the flash-loan funding source) gets a fixture whose
+        // flashExecute path is dead — the non-flash strategies still work.
+        let mut immutable_values: Vec<(&str, Address)> = Vec::new();
+        if let Some(vault) = self.cfg.addresses.balancer_vault {
+            immutable_values.push(("BALANCER_VAULT", vault));
+        }
+        immutable_values.push(("WETH", self.cfg.chain.weth));
+        for (name, value) in immutable_values {
             let positions = refs
                 .get(name)
                 .ok_or_else(|| anyhow!("compiler artifact has no {name} immutable references"))?;
@@ -582,6 +587,15 @@ impl AnvilSim {
     ) -> Result<SimulationResult> {
         let _ = self.rpc.call_raw("evm_setAutomine", json!([false])).await;
         let before = self.balance_of(opp.profit_token).await?;
+        // The victim's own balance, measured when the bundle actually
+        // replays a foreign transaction: this is the fork's prediction of
+        // what the victim's trade does to their `profit_token` balance.
+        let victim = match victim_sender_nonce {
+            Some((sender, _)) if bundle.txs.iter().any(|t| t.foreign) => {
+                Some(self.balance_of_account(opp.profit_token, sender).await?)
+            }
+            _ => None,
+        };
         let mut ok = true;
         let mut revert_reason: Option<String> = None;
         let mut sent: Vec<(String, bool)> = Vec::with_capacity(bundle.txs.len());
@@ -712,6 +726,26 @@ impl AnvilSim {
         }
 
         let after = self.balance_of(opp.profit_token).await?;
+        let victim_after = match victim {
+            Some(before) => {
+                let (sender, _) = victim_sender_nonce.unwrap();
+                Some((
+                    before,
+                    self.balance_of_account(opp.profit_token, sender).await?,
+                ))
+            }
+            None => None,
+        };
+        let victim_predicted = match victim_after {
+            Some((before, after)) => {
+                // Signed fork-predicted victim delta (negative when the
+                // victim spent the profit token). Wrapping is safe: both
+                // sides are bounded by total supply, far inside i128.
+                let delta = to_i128(after).wrapping_sub(to_i128(before));
+                Some(delta.to_string())
+            }
+            None => None,
+        };
         let retained = after.saturating_sub(before);
         let gross = if event_gross.is_zero() {
             retained.saturating_add(event_bribe)
@@ -752,6 +786,7 @@ impl AnvilSim {
             gas_cost_wei: gas_cost,
             bribe_wei: event_bribe,
             net_profit_wei: net,
+            victim_predicted_out_wei: victim_predicted,
             revert_reason,
             target_block: opp.target_block,
             sim_latency_ms: started.elapsed().as_millis() as u64,
@@ -760,19 +795,23 @@ impl AnvilSim {
     }
 
     async fn balance_of(&self, token: Address) -> Result<U256> {
+        self.balance_of_account(token, self.executor()).await
+    }
+
+    /// `profit_token` balance of an arbitrary account in the fork. The
+    /// executor's balance is the accounting source; the victim sender's
+    /// balance change is the fork's prediction of the victim's own trade
+    /// (the sequencer qualification backend compares it against the
+    /// victim's realised delta in the canonical block).
+    async fn balance_of_account(&self, token: Address, account: Address) -> Result<U256> {
         if token == Address::ZERO {
             let v = self
                 .rpc
-                .call_raw(
-                    "eth_getBalance",
-                    json!([format!("{:?}", self.executor()), "latest"]),
-                )
+                .call_raw("eth_getBalance", json!([format!("{account:?}"), "latest"]))
                 .await?;
             return Ok(crate::types::parse_u256(&v));
         }
-        let data = crate::dex::IERC20::balanceOfCall {
-            account: self.executor(),
-        };
+        let data = crate::dex::IERC20::balanceOfCall { account };
         use alloy_sol_types::SolCall;
         let v = self
             .rpc

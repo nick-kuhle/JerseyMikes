@@ -41,7 +41,6 @@ use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 
-use crate::config::known;
 use crate::dex::{self, v2_amount_out, v3_fee_to_bps, V3Pool};
 use crate::rpc::RpcClient;
 use crate::strategies::jit::{decode_v3_swap, V3SwapIntent};
@@ -127,9 +126,19 @@ impl StrategyImpl for SandwichV3Strategy {
         let base_fee = tx.base_fee(&head);
         let target_block = tx.target_block(&head, ctx.cfg.sim.target_block_offset);
 
+        // Both the quoter and the router come from the chain's registry:
+        // they are different deployments on different chains, and quoting
+        // through the wrong one is a silent misprice.
+        let (Some(quoter_addr), Some(router_addr)) = (
+            ctx.cfg.addresses.univ3_quoter_v2,
+            ctx.cfg.addresses.univ3_swap_router_02,
+        ) else {
+            return Vec::new();
+        };
+
         let quoter = RpcQuoter {
             rpc: &ctx.rpc,
-            quoter: known::UNIV3_QUOTER_V2,
+            quoter: quoter_addr,
             block: ctx.block_tag(state_block),
             calls: AtomicU32::new(0),
         };
@@ -154,6 +163,7 @@ impl StrategyImpl for SandwichV3Strategy {
         }
 
         let front = build_router_leg(
+            router_addr,
             intent.token_in,
             intent.token_out,
             pool.fee,
@@ -165,6 +175,7 @@ impl StrategyImpl for SandwichV3Strategy {
         // see the post-front-run + victim state, so we refuse to invent a
         // min-out and let the on-chain profit guard drop a misprice.
         let back = build_router_leg(
+            router_addr,
             intent.token_out,
             intent.token_in,
             pool.fee,
@@ -487,7 +498,9 @@ pub fn implied_reserves(
 }
 
 /// Approve the router, then `exactInputSingle` with `sqrtPriceLimitX96 = 0`.
+/// `router` is the chain's SwapRouter02 from the address registry.
 pub fn build_router_leg(
+    router: Address,
     token_in: Address,
     token_out: Address,
     fee: u32,
@@ -495,7 +508,6 @@ pub fn build_router_leg(
     amount_out_min: U256,
     recipient: Address,
 ) -> Vec<Call> {
-    let router = known::UNIV3_SWAP_ROUTER_02;
     vec![
         Call::new(
             token_in,
@@ -526,6 +538,7 @@ pub fn build_router_leg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
     use crate::dex::{v2_amount_out, V2Pool, Venue};
 
     fn weth() -> Address {
@@ -751,6 +764,7 @@ mod tests {
     #[test]
     fn router_leg_is_approve_then_exact_input_single() {
         let calls = build_router_leg(
+            known::UNIV3_SWAP_ROUTER_02,
             weth(),
             usdc(),
             3_000,

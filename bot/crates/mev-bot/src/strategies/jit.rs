@@ -22,7 +22,6 @@ use alloy_sol_types::{sol, SolCall};
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::config::known;
 use crate::strategies::{StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, parse_u256, Call, Opportunity, PendingTx, Strategy};
 
@@ -275,12 +274,16 @@ async fn pool_state(
         ])
     };
 
+    let Some(v3_factory) = ctx.cfg.addresses.univ3_factory else {
+        // No V3 factory on this chain: nothing to look up.
+        return Ok(None);
+    };
     let pool_raw = ctx
         .rpc
         .call_raw(
             "eth_call",
             call(
-                known::UNIV3_FACTORY,
+                v3_factory,
                 IUniswapV3Factory::getPoolCall {
                     tokenA: a,
                     tokenB: b,
@@ -453,6 +456,7 @@ pub fn size_position(state: &V3State, capital: U256, zero_for_one: bool) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
 
     fn state() -> V3State {
         V3State {

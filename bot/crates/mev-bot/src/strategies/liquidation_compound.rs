@@ -48,7 +48,6 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 
-use crate::config::known;
 use crate::dex::{self, IERC20};
 use crate::strategies::leads::liquidation_opportunity;
 use crate::strategies::sandwich::build_leg;
@@ -150,6 +149,9 @@ impl CompoundLiquidationStrategy {
 
     /// Enumerate the market's collateral assets (once; retried when empty).
     async fn asset_list(&self, ctx: &StrategyCtx) -> Vec<Address> {
+        let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+            return Vec::new(); // Comet not present on this chain
+        };
         {
             let a = self.assets.read();
             if !a.is_empty() {
@@ -161,7 +163,7 @@ impl CompoundLiquidationStrategy {
             .call_raw(
                 "eth_call",
                 json!([
-                    { "to": format!("{:?}", known::COMPOUND_V3_USDC), "data": format!("0x{}", hex::encode(IComet::numAssetsCall {}.abi_encode())) },
+                    { "to": format!("{:?}", comet), "data": format!("0x{}", hex::encode(IComet::numAssetsCall {}.abi_encode())) },
                     "latest"
                 ]),
             )
@@ -179,7 +181,7 @@ impl CompoundLiquidationStrategy {
             calls.push((
                 "eth_call".to_string(),
                 json!([
-                    { "to": format!("{:?}", known::COMPOUND_V3_USDC), "data": format!("0x{}", hex::encode(IComet::getAssetInfoCall { index: i as u8 }.abi_encode())) },
+                    { "to": format!("{:?}", comet), "data": format!("0x{}", hex::encode(IComet::getAssetInfoCall { index: i as u8 }.abi_encode())) },
                     "latest"
                 ]),
             ));
@@ -204,6 +206,9 @@ impl CompoundLiquidationStrategy {
 
     /// Harvest account candidates from recent Supply/Withdraw activity.
     async fn harvest(&self, ctx: &StrategyCtx, head: &BlockHead) {
+        let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+            return; // Comet not present on this chain
+        };
         let from = {
             let last = *self.last_log_block.read();
             if last == 0 {
@@ -217,7 +222,7 @@ impl CompoundLiquidationStrategy {
         let params = json!([{
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{:x}", head.number),
-            "address": format!("{:?}", known::COMPOUND_V3_USDC),
+            "address": format!("{:?}", comet),
             "topics": [[SUPPLY_TOPIC, WITHDRAW_TOPIC]],
         }]);
         match ctx.rpc.call_raw("eth_getLogs", params).await {
@@ -248,6 +253,9 @@ impl CompoundLiquidationStrategy {
 
     /// Batched `isLiquidatable`; returns the liquidatable subset.
     async fn liquidatable(&self, ctx: &StrategyCtx) -> Vec<Address> {
+        let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+            return Vec::new(); // Comet not present on this chain
+        };
         let accounts: Vec<Address> = self.watchlist.read().iter().map(|w| w.account).collect();
         let mut out = Vec::new();
         for chunk in accounts.chunks(100) {
@@ -257,7 +265,7 @@ impl CompoundLiquidationStrategy {
                     (
                         "eth_call".to_string(),
                         json!([
-                            { "to": format!("{:?}", known::COMPOUND_V3_USDC), "data": format!("0x{}", hex::encode(IComet::isLiquidatableCall { account: *a }.abi_encode())) },
+                            { "to": format!("{:?}", comet), "data": format!("0x{}", hex::encode(IComet::isLiquidatableCall { account: *a }.abi_encode())) },
                             "latest"
                         ]),
                     )
@@ -285,13 +293,16 @@ impl CompoundLiquidationStrategy {
         account: Address,
         assets: &[Address],
     ) -> Vec<(Address, U256)> {
+        let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+            return Vec::new(); // Comet not present on this chain
+        };
         let calls: Vec<(String, serde_json::Value)> = assets
             .iter()
             .map(|a| {
                 (
                     "eth_call".to_string(),
                     json!([
-                        { "to": format!("{:?}", known::COMPOUND_V3_USDC), "data": format!("0x{}", hex::encode(IComet::userCollateralCall { account, asset: *a }.abi_encode())) },
+                        { "to": format!("{:?}", comet), "data": format!("0x{}", hex::encode(IComet::userCollateralCall { account, asset: *a }.abi_encode())) },
                         "latest"
                     ]),
                 )
@@ -317,12 +328,15 @@ impl CompoundLiquidationStrategy {
     /// Collateral units per 1e9 base units (the quote is linear in base), so
     /// `base_needed = seized * 1e9 / rate`.
     async fn quote_rate(&self, ctx: &StrategyCtx, asset: Address) -> Option<U256> {
+        let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+            return None; // Comet not present on this chain
+        };
         let Ok(v) = ctx
             .rpc
             .call_raw(
                 "eth_call",
                 json!([
-                    { "to": format!("{:?}", known::COMPOUND_V3_USDC), "data": format!("0x{}", hex::encode(IComet::quoteCollateralCall { asset, baseAmount: U256::from(1_000_000_000u64) }.abi_encode())) },
+                    { "to": format!("{:?}", comet), "data": format!("0x{}", hex::encode(IComet::quoteCollateralCall { asset, baseAmount: U256::from(1_000_000_000u64) }.abi_encode())) },
                     "latest"
                 ]),
             )
@@ -361,20 +375,24 @@ pub async fn build_opportunity(
     rates: &HashMap<Address, U256>,
     target_block: u64,
 ) -> Option<Opportunity> {
+    let Some(comet) = ctx.cfg.addresses.compound_v3_usdc else {
+        return None; // Comet not present on this chain
+    };
+    let usdc = ctx.cfg.addresses.usdc;
     if balances.is_empty() {
         return None;
     }
     let executor = ctx.executor;
     let mut calls = vec![Call::new(
-        known::USDC,
+        usdc,
         IERC20::approveCall {
-            spender: known::COMPOUND_V3_USDC,
+            spender: comet,
             amount: U256::MAX,
         }
         .abi_encode(),
     )];
     calls.push(Call::new(
-        known::COMPOUND_V3_USDC,
+        comet,
         IComet::absorbCall {
             absorber: executor,
             accounts: vec![account],
@@ -397,7 +415,7 @@ pub async fn build_opportunity(
             continue;
         }
         calls.push(Call::new(
-            known::COMPOUND_V3_USDC,
+            comet,
             IComet::buyCollateralCall {
                 asset: *asset,
                 // Slippage bound: at most 3% worse than the storefront quote.
@@ -420,17 +438,13 @@ pub async fn build_opportunity(
         swap_assets.iter().map(|(a, _)| a).collect::<Vec<_>>()
     );
     for (asset, seized) in swap_assets {
-        if let Some(pair) = ctx
-            .pools
-            .pair_for(asset, known::USDC, dex::Venue::UniV2)
-            .await
-        {
+        if let Some(pair) = ctx.pools.pair_for(asset, usdc, dex::Venue::UniV2).await {
             if let Some(pool) = ctx
                 .pools
                 .load(pair, dex::Venue::UniV2, ctx.head().number)
                 .await
             {
-                calls.extend(build_leg(&pool, asset, known::USDC, seized, executor));
+                calls.extend(build_leg(&pool, asset, usdc, seized, executor));
             } else {
                 notes.push_str("; swap pool missing (unsimulatable leg recorded)");
             }
@@ -440,9 +454,9 @@ pub async fn build_opportunity(
     Some(liquidation_opportunity(
         Strategy::LiquidationCompound,
         calls,
-        vec![known::USDC],
+        vec![usdc],
         vec![flash],
-        known::USDC,
+        usdc,
         expected,
         flash,
         target_block,
@@ -499,6 +513,7 @@ impl StrategyImpl for CompoundLiquidationStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
 
     #[test]
     fn absorb_encodes_the_comet_selector() {

@@ -493,17 +493,28 @@ impl Engine {
                 Signer::ephemeral()
             }
         });
+        let transaction_signer = Arc::new(match &cfg.endpoints.searcher_private_key {
+            Some(k) => Signer::from_hex(k)?,
+            None => Signer::simulation(),
+        });
+        // The raw transport (sequencer chains) needs the tx signer, the
+        // searcher address and the chain RPC — it signs same-nonce
+        // replacement transactions for cancellation. Bundle mode ignores
+        // them (relays carry the delivery).
+        let raw_mode = cfg.submission_mode == crate::config::SubmissionMode::Raw;
         let submission = Arc::new(crate::submission::SubmissionGateway::new(
             &cfg.endpoints.bundle_relay_urls,
             relay_signer.clone(),
             store.clone(),
             cfg.submission_retry_ms,
             cfg.submission_max_attempts,
+            cfg.submission_mode,
+            raw_mode.then(|| cfg.endpoints.http_url.clone()),
+            raw_mode.then(|| transaction_signer.clone()),
+            raw_mode.then_some(cfg.endpoints.searcher_address),
+            cfg.chain.chain_id,
+            cfg.priority_fee_wei,
         ));
-        let transaction_signer = Arc::new(match &cfg.endpoints.searcher_private_key {
-            Some(k) => Signer::from_hex(k)?,
-            None => Signer::simulation(),
-        });
         if transaction_signer.address() != cfg.endpoints.searcher_address {
             anyhow::bail!(
                 "transaction signer {:?} does not match configured searcher {:?}",
@@ -590,6 +601,11 @@ impl Engine {
             tracing::info!(target: "discovery", loaded, "seeded established core V3 pools");
         }
 
+        // Boot coherence: every profile/strategy/env mismatch, named.
+        for warning in cfg.coherence_warnings() {
+            tracing::warn!(target: "engine", "{warning}");
+        }
+
         let mut strategies: Vec<Arc<dyn StrategyImpl>> = Vec::new();
         if cfg.strategies.sandwich {
             strategies.push(Arc::new(SandwichStrategy));
@@ -599,6 +615,15 @@ impl Engine {
                 tracing::warn!(
                     target: "engine",
                     "STRATEGY_SANDWICH_V3 is on but POOL_DISCOVERY_V3 is off — the V3 cache will stay empty and the strategy will emit nothing"
+                );
+            }
+            if cfg.addresses.univ3_quoter_v2.is_none()
+                || cfg.addresses.univ3_swap_router_02.is_none()
+            {
+                tracing::warn!(
+                    target: "engine",
+                    "STRATEGY_SANDWICH_V3 is on but the chain registry has no \
+                     QuoterV2 or SwapRouter02 — the strategy will emit nothing"
                 );
             }
             strategies.push(Arc::new(SandwichV3Strategy));
@@ -613,25 +638,30 @@ impl Engine {
         // strategies publish into it every block, the oracle front-runner
         // reads it when a price update appears in the mempool.
         let leads = LiquidationLeads::new();
-        if cfg.strategies.liquidation {
+        // Protocol availability comes from the chain registry (the coherence
+        // warnings above already named any enabled-but-missing protocol).
+        let aave_present = cfg.addresses.aave_v3_pool.is_some()
+            && cfg.addresses.aave_v3_oracle.is_some()
+            && cfg.addresses.aave_v3_data_provider.is_some();
+        if cfg.strategies.liquidation && aave_present {
             strategies.push(Arc::new(LiquidationStrategy::new(
                 leads.clone(),
                 cfg.liquidation.watch_cap,
             )));
         }
-        if cfg.strategies.liquidation_compound {
+        if cfg.strategies.liquidation_compound && cfg.addresses.compound_v3_usdc.is_some() {
             strategies.push(Arc::new(CompoundLiquidationStrategy::new(
                 cfg.liquidation.watch_cap,
             )));
         }
-        if cfg.strategies.liquidation_morpho {
+        if cfg.strategies.liquidation_morpho && cfg.addresses.morpho_blue.is_some() {
             strategies.push(Arc::new(MorphoLiquidationStrategy::new(
                 cfg.liquidation.morpho_market_cap,
                 cfg.liquidation.morpho_borrower_cap,
                 leads.clone(),
             )));
         }
-        if cfg.strategies.liquidation_maker {
+        if cfg.strategies.liquidation_maker && cfg.addresses.maker {
             let ilks: Vec<&'static crate::strategies::liquidation_maker::maker::IlkSpec> = cfg
                 .liquidation
                 .maker_ilks
@@ -722,8 +752,10 @@ impl Engine {
 
         // Built before the struct literal below moves `cfg`.
         let mode = LiveMode::armed_at_boot(cfg.live_execution);
-        // Only wire the replay queue when there is a relay feed to fill it.
-        let (replay_tx, replay_rx) = if cfg.relay_tx_ingest {
+        // Only wire the replay queue when there is a delivered-block feed to
+        // fill it — the bloXroute relay (mainnet) or the chain's own blocks
+        // (sequencer chains; CHAIN_BLOCK_INGEST).
+        let (replay_tx, replay_rx) = if cfg.relay_tx_ingest || cfg.chain_block_ingest {
             let (t, r) = tokio::sync::mpsc::channel(cfg.replay_queue_depth);
             (Some(t), Some(r))
         } else {
@@ -1607,6 +1639,25 @@ impl Engine {
                 .map(|row| row.reasons.clone())
                 .unwrap_or_else(|| qualification.reasons.clone());
             tracing::warn!(target: "submission", strategy = opp.strategy.as_str(), ?reasons, "strategy has not independently passed qualification");
+            return initial_bundle;
+        }
+
+        // Raw transport (sequencer chains) can only send *our* signed
+        // transactions: a victim's signed bytes cannot be re-sent, so a
+        // victim-pinned bundle (sandwich/JIT back-runs) is not deliverable
+        // at the transport level. Block-cadence opportunities (atomic_arb:
+        // no victim) are fine. The gateway repeats this check as a
+        // backstop; refusing here means the nonce lane is never touched.
+        if self.cfg.submission_mode == crate::config::SubmissionMode::Raw
+            && !opp.victim_hashes.is_empty()
+        {
+            tracing::warn!(
+                target: "submission",
+                strategy = opp.strategy.as_str(),
+                "raw submission mode cannot include the victim's signed \
+                 transaction — refusing (private-orderflow delivery is a \
+                 later integration on sequencer chains)"
+            );
             return initial_bundle;
         }
 

@@ -154,8 +154,54 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
     }
 
     match http.call_raw("eth_chainId", json!([])).await {
-        Ok(v) => println!("✓ chain id          {v}"),
+        Ok(v) => {
+            // Cross-check the RPC's chain against the configured profile: a
+            // Base env pointed at a mainnet RPC (or vice versa) is the
+            // classic cross-chain data-bleed setup — name it here, at
+            // pre-flight, not in a poisoned soak.
+            let reported = v.to_string();
+            let reported = reported.trim_matches('"');
+            let hex_id = reported
+                .strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok());
+            let profile = mev_bot::config::known::for_chain(cfg.chain.chain_id);
+            let profile_name = match profile {
+                Some(p) => p.chain_id.to_string(),
+                None => "custom (env)".to_string(),
+            };
+            let weth = format!("{:?}", cfg.addresses.weth);
+            match hex_id {
+                Some(id) if id == cfg.chain.chain_id => {
+                    println!("✓ chain id          {v} (profile {profile_name}, WETH {weth})");
+                }
+                Some(id) => println!(
+                    "✗ chain id          {v} — RPC is chain {id} but CHAIN_ID is {} \
+                     (WETH {weth}); the profile and the RPC disagree",
+                    cfg.chain.chain_id
+                ),
+                None => println!("✓ chain id          {v} (profile {profile_name}, WETH {weth})"),
+            }
+        }
         Err(e) => println!("✗ chain id          {e}"),
+    }
+    // Transport + qualification shape for this chain, so the operator sees
+    // how a live send and the PASS gate actually work before arming.
+    println!(
+        "· transport         {} ({}), qualification backend: {}",
+        if cfg.submission_mode == mev_bot::config::SubmissionMode::Raw {
+            "raw tx to chain RPC"
+        } else {
+            "relay eth_sendBundle"
+        },
+        if cfg.addresses.sequencer_only {
+            "sequencer chain, no relay market"
+        } else {
+            "relay market"
+        },
+        cfg.qualification_backend.as_str()
+    );
+    for warning in cfg.coherence_warnings() {
+        println!("! coherence         {warning}");
     }
 
     // Raw transaction access is what makes faithful victim replay possible.

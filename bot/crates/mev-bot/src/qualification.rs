@@ -53,6 +53,11 @@ pub struct QualificationStatus {
     pub maximum_error_bps: u64,
     pub minimum_accuracy_bps: u64,
     pub persistence_dropped: u64,
+    /// Which independent second opinion the comparison evidence comes from:
+    /// `relay` (fork vs `eth_callBundle`) on mainnet, `sequencer` (fork vs
+    /// included block) on sequencer chains. The console labels its panel
+    /// with this so a Base verdict is never misread as a relay verdict.
+    pub comparison_backend: String,
     pub reasons: Vec<String>,
     pub strategies: Vec<StrategyQualification>,
 }
@@ -109,7 +114,12 @@ pub fn evaluate(
     let mut strategies = Vec::new();
     for strategy in Strategy::all() {
         let evidence = store
-            .qualification_evidence(since_ms, strategy, MINIMUM_ATTRIBUTION_CONFIDENCE_BPS)
+            .qualification_evidence(
+                since_ms,
+                strategy,
+                MINIMUM_ATTRIBUTION_CONFIDENCE_BPS,
+                cfg.qualification_backend,
+            )
             .unwrap_or_default();
         strategies.push(evaluate_strategy(cfg, strategy, evidence, &global_reasons));
     }
@@ -150,6 +160,7 @@ pub fn evaluate(
         maximum_error_bps: cfg.qualification_max_error_bps,
         minimum_accuracy_bps: cfg.qualification_min_accuracy_bps,
         persistence_dropped: dropped,
+        comparison_backend: cfg.qualification_backend.as_str().to_string(),
         reasons: global_reasons,
         strategies,
     }

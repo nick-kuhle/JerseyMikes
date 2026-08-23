@@ -172,6 +172,41 @@ contract MevExecutorTest is Test {
         require(ok, "donate failed");
     }
 
+    /// WS-E: sequencer chains (Base) run `BRIBE_BPS=0` — there is no builder
+    /// auction, so the coinbase transfer must not fire and the full realised
+    /// profit must be retained. This is the contract-level proof that the
+    /// `bribeBps == 0` path behaves on a chain without a relay market.
+    function test_zeroBribePaysNothingAndRetainsFullProfit() public {
+        address builder = address(0xBEEF);
+        vm.coinbase(builder);
+        uint256 builderBefore = builder.balance;
+
+        MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
+        calls[0] = MevExecutor.Call({
+            target: address(this),
+            value: 0,
+            data: abi.encodeWithSignature("donate()")
+        });
+
+        // bribeBps stays 0 (the Base configuration). The whole 1 ETH gross is
+        // retained, so even a 1 ETH retained-profit floor passes.
+        MevExecutor.Guard memory g = _guard(address(0), 1 ether);
+        assertEq(g.bribeBps, 0);
+
+        vm.prank(searcher);
+        uint256 profit = exec.execute(bytes32("base-arb"), calls, g);
+        assertEq(profit, 1 ether, "full gross returned");
+        assertEq(builder.balance, builderBefore, "no bribe paid to coinbase");
+        // And the retained floor actually bound the result: a 1.1 ETH floor
+        // would have reverted on this 1 ETH gross.
+        vm.prank(searcher);
+        MevExecutor.Guard memory g2 = _guard(address(0), 1.1 ether);
+        vm.expectRevert(
+            abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 1 ether, 1.1 ether)
+        );
+        exec.execute(bytes32("base-arb-2"), calls, g2);
+    }
+
     function test_nonWethMaxBalanceCannotOverflowIrrelevantBribeMath() public {
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
         calls[0] = MevExecutor.Call({

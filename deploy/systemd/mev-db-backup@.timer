@@ -1,0 +1,17 @@
+# JerseyMikes — run the per-chain database backup every 15 minutes (instance
+# template). Instance %i = the chain slug, matching mev-bot@%i.service.
+# The 7-day qualification clock resets if a chain's database volume is lost,
+# so snapshots must survive reboots (Persistent=true) and missed runs are
+# caught up rather than skipped.
+
+[Unit]
+Description=Run the JerseyMikes (%i) database backup every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+Unit=mev-db-backup@%i.service
+
+[Install]
+WantedBy=timers.target

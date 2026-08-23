@@ -110,9 +110,6 @@ const BORROW_V1_TOPIC: &str = "0x8e6fd4ede24c40b1817b419873d34541a59b1f39bb3ba1a
 /// `Borrow(bytes32,address,address,address,uint256,uint256)` — v1.1 signature.
 const BORROW_V11_TOPIC: &str = "0x570954540bed6b1304a87dfe815a5eda4a648f7097a16240dcd85c9b5fd42a43";
 
-pub const MORPHO_BLUE: Address =
-    alloy_primitives::address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
-
 /// `ORACLE_PRICE_SCALE` in Morpho Blue (prices are 1e36-scaled).
 const PRICE_SCALE: U256 = U256::from_limbs([0xB34B9F1000000000, 0xC097CE7BC90715, 0x0, 0x0]); // 1e36
 const WAD: U256 = U256::from_limbs([0xDE0B6B3A7640000, 0x0, 0x0, 0x0]); // 1e18
@@ -254,6 +251,9 @@ impl MorphoLiquidationStrategy {
 
     /// Resolve market params for ids that do not have them yet.
     async fn resolve_params(&self, ctx: &StrategyCtx) {
+        let Some(blue) = ctx.cfg.addresses.morpho_blue else {
+            return; // Morpho not present on this chain
+        };
         let unresolved: Vec<B256> = {
             let ms = self.markets.read();
             ms.values()
@@ -270,7 +270,7 @@ impl MorphoLiquidationStrategy {
                 (
                     "eth_call".to_string(),
                     json!([
-                        { "to": format!("{MORPHO_BLUE:?}"), "data": format!("0x{}", hex::encode(IMorpho::idToMarketParamsCall { id: *id }.abi_encode())) },
+                        { "to": format!("{blue:?}"), "data": format!("0x{}", hex::encode(IMorpho::idToMarketParamsCall { id: *id }.abi_encode())) },
                         "latest"
                     ]),
                 )
@@ -302,6 +302,9 @@ impl MorphoLiquidationStrategy {
 
     /// Harvest active markets and their borrowers from activity events.
     async fn harvest(&self, ctx: &StrategyCtx, head: &BlockHead) {
+        let Some(blue) = ctx.cfg.addresses.morpho_blue else {
+            return; // Morpho not present on this chain
+        };
         let from = {
             let last = *self.last_log_block.read();
             if last == 0 {
@@ -315,7 +318,7 @@ impl MorphoLiquidationStrategy {
         let params = json!([{
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{:x}", head.number),
-            "address": format!("{MORPHO_BLUE:?}"),
+            "address": format!("{blue:?}"),
             // Position-altering events; both Borrow generations.
             "topics": [[SUPPLY_TOPIC, SUPPLY_COLLATERAL_TOPIC, BORROW_V1_TOPIC, BORROW_V11_TOPIC]],
         }]);
@@ -367,6 +370,9 @@ impl MorphoLiquidationStrategy {
         &self,
         ctx: &StrategyCtx,
     ) -> Vec<(B256, IMorpho::MarketParams, Address, U256, U256, U256, U256)> {
+        let Some(blue) = ctx.cfg.addresses.morpho_blue else {
+            return Vec::new(); // Morpho not present on this chain
+        };
         let snapshot: Vec<(B256, IMorpho::MarketParams, Vec<Address>)> = {
             let ms = self.markets.read();
             ms.values()
@@ -397,7 +403,7 @@ impl MorphoLiquidationStrategy {
                 .call_raw(
                     "eth_call",
                     json!([
-                        { "to": format!("{MORPHO_BLUE:?}"), "data": format!("0x{}", hex::encode(IMorpho::marketCall { id }.abi_encode())) },
+                        { "to": format!("{blue:?}"), "data": format!("0x{}", hex::encode(IMorpho::marketCall { id }.abi_encode())) },
                         "latest"
                     ]),
                 )
@@ -443,7 +449,7 @@ impl MorphoLiquidationStrategy {
                     (
                         "eth_call".to_string(),
                         json!([
-                            { "to": format!("{MORPHO_BLUE:?}"), "data": format!("0x{}", hex::encode(IMorpho::positionCall { id, user: *u }.abi_encode())) },
+                            { "to": format!("{blue:?}"), "data": format!("0x{}", hex::encode(IMorpho::positionCall { id, user: *u }.abi_encode())) },
                             "latest"
                         ]),
                     )
@@ -543,6 +549,9 @@ pub async fn build_opportunity(
     oracle_price: U256,
     target_block: u64,
 ) -> Option<Opportunity> {
+    let Some(blue) = ctx.cfg.addresses.morpho_blue else {
+        return None; // Morpho not present on this chain
+    };
     if borrow_shares.is_zero() {
         return None;
     }
@@ -555,13 +564,13 @@ pub async fn build_opportunity(
         Call::new(
             params.loanToken,
             IERC20::approveCall {
-                spender: MORPHO_BLUE,
+                spender: blue,
                 amount: U256::MAX,
             }
             .abi_encode(),
         ),
         Call::new(
-            MORPHO_BLUE,
+            blue,
             IMorpho::liquidateCall {
                 marketParams: params.clone(),
                 borrower,

@@ -33,6 +33,8 @@ interface Props {
   hintsSeen?: number;
   /** Engine start time — the W6 gate wants a full week of funnel data. */
   startedAtMs?: number;
+  /** The active chain id (1 = Ethereum, 8453 = Base). */
+  chainId?: number;
 }
 
 const ALL_STRATEGIES: Strategy[] = [
@@ -72,7 +74,10 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, startedAtMs}: Props) {
+function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, startedAtMs, chainId}: Props) {
+  // The W6 go/no-go card is a public-mempool question — meaningful on
+  // Ethereum only. Sequencer chains (Base) have no public mempool to gap.
+  const showW6 = chainId === 1;
   // Which lane is on screen. Live is the default: it is the one that answers
   // "should I change something?". Replay answers "what did we miss?".
   const [lane, setLane] = useState<"live" | "replay">("live");
@@ -146,7 +151,7 @@ function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, star
             </button>
           ) : null}
         </div>
-        <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />
+        {showW6 && <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />}
       </div>
     );
   }
@@ -324,7 +329,7 @@ function FunnelPanel({funnel, funnelReplay, pendingSeen = 0, hintsSeen = 0, star
         risk-gating too tightly or simulator failures.
       </p>
 
-      <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />
+      {showW6 && <W6GapCard funnel={funnel} pendingSeen={pendingSeen} hintsSeen={hintsSeen} startedAtMs={startedAtMs} />}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 "use client";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 import {useCallback, useEffect, useState} from "react";
 import type {RelayBlockRow, RelayBlockTxRow} from "@/lib/types";
@@ -22,7 +23,7 @@ export default function RelayBlocksPanel({chainId}: {chainId?: number}) {
 
   const loadBlocks = useCallback(async () => {
     try {
-      const r = await fetch("/api/bot/relay-blocks?limit=25", {cache: "no-store"});
+      const r = await fetch(withChain("/api/bot/relay-blocks?limit=25", readActiveChain()), {cache: "no-store"});
       const rows = (await r.json()) as RelayBlockRow[];
       setBlocks(Array.isArray(rows) ? rows : []);
     } catch {
@@ -45,7 +46,7 @@ export default function RelayBlocksPanel({chainId}: {chainId?: number}) {
     setLoadingTxs(true);
     (async () => {
       try {
-        const r = await fetch(`/api/bot/relay-txs?blockNumber=${expanded}&limit=300`, {cache: "no-store"});
+        const r = await fetch(withChain(`/api/bot/relay-txs?blockNumber=${expanded}&limit=300`, readActiveChain()), {cache: "no-store"});
         const rows = (await r.json()) as RelayBlockTxRow[];
         if (!cancelled) setTxs(Array.isArray(rows) ? rows : []);
       } catch {

@@ -340,6 +340,14 @@ pub struct SimulationResult {
     /// decimal string so JavaScript and SQLite never round it.
     #[serde(with = "crate::types::i128_decimal")]
     pub net_profit_wei: i128,
+    /// For victim-pinned bundles: the victim sender's `profit_token` balance
+    /// change across the forked block, in signed wei (decimal string).
+    /// This is the fork's prediction of what the victim's own transaction
+    /// does — the sequencer backend's qualification compares it against the
+    /// victim's realised delta in the canonical block (the "included block"
+    /// second opinion; there is no relay on a sequencer chain).
+    #[serde(default)]
+    pub victim_predicted_out_wei: Option<String>,
     pub revert_reason: Option<String>,
     pub target_block: u64,
     pub sim_latency_ms: u64,

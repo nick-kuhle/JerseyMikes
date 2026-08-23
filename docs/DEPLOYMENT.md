@@ -91,6 +91,60 @@ private temporary/devices namespaces, no new privileges, and only
 startup nonce recovery; unresolved private bundles are cancelled or keep nonce
 reuse blocked through target expiry.
 
+## Multi-chain layout (Ethereum + Base)
+
+One `mev-bot` process per chain — the engine is single-chain by design (one
+config, one fork, one store, one nonce lane), and process isolation means a
+Base crash can never touch the mainnet soak. The instance-name is the chain
+slug:
+
+| Chain | Unit | Env file | Database | Port |
+| --- | --- | --- | --- | --- |
+| Ethereum | `mev-bot@ethereum` (or the legacy non-templated `mev-bot`) | `/etc/jerseymikes/ethereum.env` | `/var/lib/jerseymikes/ethereum.sqlite` | `:8080` |
+| Base | `mev-bot@base` | `/etc/jerseymikes/base.env` | `/var/lib/jerseymikes/base.sqlite` | `:8081` |
+
+```bash
+# per-chain env files — base.env starts from .env.example.base
+sudo install -o root -g jerseymikes -m 0640 .env /etc/jerseymikes/ethereum.env
+sudo install -o root -g jerseymikes -m 0640 .env.base /etc/jerseymikes/base.env
+
+# templated units: one unit + one backup timer per chain
+sudo systemctl daemon-reload
+sudo systemctl enable --now mev-bot@ethereum mev-bot@base
+sudo systemctl enable --now mev-db-backup@ethereum.timer mev-db-backup@base.timer
+```
+
+Per-chain isolation is **by construction**: the qualification clock, the
+`LIVE_SMOKE_MAX` budget, the drawdown kill switch and the nonce lane all live
+in each instance's own database / process, so arming Base can never affect
+Ethereum and vice versa. Backups land per chain under
+`/var/lib/jerseymikes/backups/<chain>/`.
+
+Sequencer chains differ from mainnet in exactly three env rows (see
+`.env.example.base`):
+
+```ini
+SUBMISSION_MODE=raw            # no relay market: signed txs go straight to the RPC
+QUALIFICATION_BACKEND=sequencer  # the second opinion is the included block, not a relay
+BRIBE_BPS=0                    # coinbase has no auction; priority fee is the ordering currency
+```
+
+The console multiplexes across the instances. Server-side env (`.env.local`
+or the console service):
+
+```ini
+CHAINS="ethereum|http://127.0.0.1:8080,base|http://127.0.0.1:8081"
+# optional third field = per-chain RPC for the /api/eth contract panel:
+# CHAINS="ethereum|http://127.0.0.1:8080|https://eth-rpc,base|http://127.0.0.1:8081|https://base-rpc"
+BOT_API_TOKEN_ETHERIUM=...   # per-chain tokens; fall back to the shared BOT_API_TOKEN
+```
+
+With `CHAINS` unset the console is single-chain on `BOT_API_URL`
+(back-compat). The header switcher selects the active chain (persisted in the
+browser); every panel re-keys on the switch, so a panel can never show
+another chain's data, and an unreachable bot falls back to the flagged
+DEMO state for that chain only.
+
 ## Database backups
 
 The qualification clock (168 h of canonical block observations) lives in the

@@ -1,10 +1,11 @@
 # JerseyMikes
 
-A simulation-first MEV searcher for Ethereum mainnet: **sandwich, JIT liquidity,
-atomic arbitrage, liquidations (Aave V3, Compound V3, Morpho Blue, Maker),
-oracle-update front-running and new-token sniping**, wired to live mempool
-and private-orderflow data, scored against a forked EVM, and rendered in a
-real-time console.
+A simulation-first MEV searcher for **Ethereum mainnet and Base** (one process
+per chain): **sandwich, JIT liquidity, atomic arbitrage, liquidations
+(Aave V3, Compound V3, Morpho Blue, Maker), oracle-update front-running and
+new-token sniping**, wired to live mempool and private-orderflow data (or, on
+sequencer chains, the sequencer feed), scored against a forked EVM, and
+rendered in a real-time console.
 
 **Broadcasting is disabled by default and fail-closed.** The live transport
 exists, but requires separate boot arming, broadcast capability, authenticated
@@ -65,7 +66,7 @@ Requirements (install walkthrough + troubleshooting in
 | Relay **data API** (`proposer_payload_delivered`) | what the winning builder actually paid — the market price of each block's MEV, and our benchmark |
 | **bloXroute Max Profit relay** delivered blocks | the winning block's transactions are fetched, stored and scored for extractable value |
 | Third-party mempool streams (bloXroute / Blocknative) | optional, comma-separated in `EXTRA_MEMPOOL_WS` |
-| L2 sequencer / preconfirmation feed | wired and idle until chain #2 |
+| L2 sequencer / preconfirmation feed | wired; on **Base** the chain's own built blocks are ingested as the delivered blocks (`CHAIN_BLOCK_INGEST`, on by default there) |
 
 ### How an opportunity is scored
 
@@ -164,6 +165,23 @@ cargo run --bin mev-bot -- doctor    # endpoint pre-flight
 cargo run --release --bin mev-bot    # run
 ```
 
+## Multi-chain (Ethereum + Base)
+
+One `mev-bot` process per chain — the engine is single-chain by design, and
+process isolation means a Base run can never touch the mainnet instance (or
+its 7-day qualification clock). `CHAIN_ID` selects a built-in, live-verified
+address profile (`1` = Ethereum, `8453` = Base); any other id runs with an
+empty profile that the `*_ADDRESS` env vars fill in field-by-field, so a new
+chain needs no code.
+
+Sequencer chains (Base) differ in three env rows: `SUBMISSION_MODE=raw`
+(signed txs go straight to the chain RPC — no relay market — with
+`PRIORITY_FEE_WEI` as the ordering currency), `QUALIFICATION_BACKEND=sequencer`
+(the qualification second opinion is the included block, not a relay
+`eth_callBundle`), and `BRIBE_BPS=0`. Front-run strategies are off by default
+there (no public mempool — it is back-run-only); the v1 lane is flash-loan
+`atomic_arb`. See `.env.example.base` and [`docs/SETUP.md`](docs/SETUP.md).
+
 ## The console
 
 `frontend/` — Next.js 16, live at `:3000`.
@@ -206,7 +224,13 @@ cargo run --release --bin mev-bot    # run
 - **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
   (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
   7-day sample gate) that decides whether UniversalRouter decoding gets
-  flipped — see [`docs/W6_MEMO.md`](docs/W6_MEMO.md)
+  flipped — see [`docs/W6_MEMO.md`](docs/W6_MEMO.md) (Ethereum only — a
+  sequencer chain has no public mempool to gap)
+- **Chain switcher**: with `CHAINS` set (e.g. `ethereum|…,base|…`), the
+  header gains Ethereum | Base pills; the whole panel tree re-keys on the
+  switch so no panel can show another chain's data, and an unreachable bot
+  falls back to the flagged DEMO state for that chain only. Single-chain
+  deployments (`CHAINS` unset) are unchanged.
 
 The browser only ever talks to `/api/bot/*`, which the Next server proxies to
 `BOT_API_URL`; contract reads go through `/api/eth`, a server-side
@@ -248,6 +272,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
 | [`docs/W6_MEMO.md`](docs/W6_MEMO.md) | The public-mempool gap memo that gates UniversalRouter decoding — template + decision record |
 | [`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md) | Switching a simulating bot over to live: securing the API first, the `.env` upgrade trap, tightening risk, arming last |
+| [`docs/PATH_TO_LIVE.md`](docs/PATH_TO_LIVE.md) | The one-page in-the-room runbook for the live-smoke burst + 7-day soak (a per-chain procedure) |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
 

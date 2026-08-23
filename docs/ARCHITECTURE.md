@@ -122,11 +122,30 @@ strategies propose opportunities against exactly the transactions that actually
 landed, and the simulator records whether value was extractable. See
 [`BLOXROUTE_RELAY.md`](BLOXROUTE_RELAY.md).
 
-## Adding the second chain
+## Multi-chain (Ethereum + Base, one process per chain)
 
-`ChainConfig` already carries chain id, WETH, stable, and block time; the
-strategies read addresses from `config::known` or from config. To add, say,
-Base: point `ETH_HTTP_URL`/`ETH_WS_URL` at it, set `CHAIN_ID`, override the
-factory/router/vault addresses, set `SEQUENCER_FEED_URL`, and disable
-`STRATEGY_SANDWICH` (no public mempool to sandwich). The simulation and
-accounting layers are chain-agnostic.
+The engine is single-chain by design — one `Config`, one fork, one store, one
+nonce lane — so a second chain is a **second process**, not a mode. Each
+instance gets its own env file, port, database and systemd unit
+(`mev-bot@<chain>`, [`DEPLOYMENT.md`](DEPLOYMENT.md#multi-chain-layout-ethereum--base)),
+which makes qualification, the smoke budget, the kill switch and nonce
+recovery per-chain **by construction**.
+
+What is actually chain-aware in the code (added with Base, all env-overridable):
+
+| Layer | How it varies per chain |
+| --- | --- |
+| Address registry | `config::known::for_chain(CHAIN_ID)` → `ethereum()` or `base()` profile (verified deployments); env `*_ADDRESS` overrides win field-by-field, so a chain without a built-in profile is fully env-driven |
+| Strategy availability | A strategy whose protocol is absent from the profile is not constructed (boot warning); sequencer chains warn when front-run strategies are enabled (they are back-run-only there) |
+| Discovery | Factory addresses (V2 `PairCreated`, V3 `PoolCreated`) come from the registry, not constants |
+| Delivery | `SUBMISSION_MODE`: `bundle` (relays, mainnet) or `raw` (signed txs straight to the chain RPC with a priority fee; sequencer chains have no relay market). Cancellation in raw mode is a same-nonce replacement tx |
+| Qualification | `QUALIFICATION_BACKEND`: `relay` (fork vs `eth_callBundle`) or `sequencer` (fork vs included block — the victim's realised canonical delta + route matches are the second opinion) |
+| Delivered blocks | Mainnet: bloXroute relay data API. Sequencer chains: `CHAIN_BLOCK_INGEST` polls the chain's own heads and scores each built block (the sequencer's block *is* the delivered block) |
+| Simulation | Fork URL is the chain's RPC; `REFORK_EVERY_BLOCKS` defaults follow the block cadence (1 on 12 s mainnet, 6 on 2 s Base); signatures carry the chain id |
+
+Base is a **sequencer chain**: no public mempool (front-run strategies are
+off in `.env.example.base`), no relay market, `BRIBE_BPS=0` — the v1 lane is
+flash-loan `atomic_arb` against the sequencer feed, and the console
+multiplexes both instances behind a chain switcher (`CHAINS` env).
+Lending-protocol deployments exist on Base but are deliberately unregistered
+in v1 (phase 2, [`STRATEGIES.md`](STRATEGIES.md)).

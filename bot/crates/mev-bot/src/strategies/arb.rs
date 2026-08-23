@@ -14,16 +14,11 @@ use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 
-use crate::config::known;
 use crate::dex::graph::{self, CycleCandidate, DirectedEdge};
 use crate::dex::{self, V2Pool, Venue};
 use crate::strategies::sandwich::build_leg;
 use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
-
-/// Tokens we always keep pools loaded for. Everything else is discovered from
-/// mempool flow.
-pub const CORE_TOKENS: [Address; 4] = [known::USDC, known::USDT, known::DAI, known::WBTC];
 
 pub struct AtomicArbStrategy;
 
@@ -36,9 +31,10 @@ impl StrategyImpl for AtomicArbStrategy {
     async fn on_block(&self, ctx: &StrategyCtx, head: &BlockHead) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
 
-        // Make sure the core pairs are loaded on both venues.
-        for token in CORE_TOKENS {
-            for venue in [Venue::UniV2, Venue::SushiV2] {
+        // Make sure the chain's core pairs are loaded on every registered
+        // V2 venue (Base has one, mainnet has two).
+        for token in ctx.cfg.addresses.core_tokens() {
+            for (venue, _) in ctx.cfg.addresses.pair_factories() {
                 if let Some(pair) = ctx.pools.pair_for(weth, token, venue).await {
                     ctx.pools.load(pair, venue, head.number).await;
                 }
@@ -75,7 +71,12 @@ impl StrategyImpl for AtomicArbStrategy {
     /// victim will leave behind.
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
-        let Some(intent) = decode_router(tx, weth, ctx.cfg.decode_universal_router) else {
+        let Some(intent) = decode_router(
+            tx,
+            weth,
+            ctx.cfg.decode_universal_router,
+            ctx.cfg.addresses.universal_router,
+        ) else {
             return Vec::new();
         };
         if intent.path.len() != 2 {
@@ -86,14 +87,27 @@ impl StrategyImpl for AtomicArbStrategy {
         // block started from, not the state a hundred blocks later.
         let state_block = tx.state_block(&head);
 
+        // The back-run needs the same couple on *two* venues: buy on one,
+        // sell on the other. Walk the registered V2 factories in order.
+        let venues: Vec<Venue> = ctx
+            .cfg
+            .addresses
+            .pair_factories()
+            .iter()
+            .map(|(v, _)| *v)
+            .collect();
+        if venues.len() < 2 {
+            // Single-venue chains have no cross-venue arb to back-run.
+            return Vec::new();
+        }
         let Some(victim_pair) = ctx
             .pools
-            .pair_for(intent.token_in, intent.token_out, Venue::UniV2)
+            .pair_for(intent.token_in, intent.token_out, venues[0])
             .await
         else {
             return Vec::new();
         };
-        let Some(victim_pool) = ctx.pool_at(victim_pair, Venue::UniV2, state_block).await else {
+        let Some(victim_pool) = ctx.pool_at(victim_pair, venues[0], state_block).await else {
             return Vec::new();
         };
         let Some((after, _)) = victim_pool.with_swap(intent.token_in, intent.amount_in) else {
@@ -102,12 +116,12 @@ impl StrategyImpl for AtomicArbStrategy {
 
         let Some(other_pair) = ctx
             .pools
-            .pair_for(intent.token_in, intent.token_out, Venue::SushiV2)
+            .pair_for(intent.token_in, intent.token_out, venues[1])
             .await
         else {
             return Vec::new();
         };
-        let Some(other) = ctx.pool_at(other_pair, Venue::SushiV2, state_block).await else {
+        let Some(other) = ctx.pool_at(other_pair, venues[1], state_block).await else {
             return Vec::new();
         };
 
@@ -260,6 +274,7 @@ pub fn approve_call(token: Address, spender: Address) -> Call {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::known;
 
     fn pool(venue: Venue, r0: u128, r1: u128) -> V2Pool {
         V2Pool {

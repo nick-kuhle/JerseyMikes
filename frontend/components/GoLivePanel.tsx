@@ -1,4 +1,5 @@
 "use client";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 /**
  * Go-live readiness: the six-step MevExecutor deployment checklist.
@@ -33,7 +34,7 @@ import {
   parseEther,
   type Address,
 } from "viem";
-import {mainnet} from "viem/chains";
+import {base, mainnet} from "viem/chains";
 import EXECUTOR_ABI from "@/lib/MevExecutor.abi.json";
 import creationHex from "@/lib/MevExecutor.creation.hex";
 import {addressUrl, explorerName, txUrl} from "@/lib/explorer";
@@ -91,11 +92,16 @@ export default function GoLivePanel({
   const [status, setStatus] = useState("");
   const [known, setKnown] = useState("");
 
-  const publicClient = useMemo(() => createPublicClient({chain: mainnet, transport: http("/api/eth")}), []);
+  // Multi-chain: the panel talks to the active chain's bot config and RPC.
+  const chainSlug = readActiveChain();
+  const publicClient = useMemo(
+    () => createPublicClient({chain: chainSlug === "base" ? base : mainnet, transport: http(withChain("/api/eth", chainSlug))}),
+    [chainSlug]
+  );
 
   // Bot's own signer EOA — prefills the allowlist step.
   useEffect(() => {
-    fetch("/api/bot/config", {cache: "no-store"})
+    fetch(withChain("/api/bot/config", readActiveChain()), {cache: "no-store"})
       .then((r) => r.json())
       .then((c: {searcher?: string}) => {
         if (c.searcher && isAddress(c.searcher)) {

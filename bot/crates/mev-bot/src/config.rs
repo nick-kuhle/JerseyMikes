@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 pub mod known {
     use alloy_primitives::{address, Address};
 
+    use super::{QualificationBackend, SubmissionMode};
+    use crate::dex::Venue;
+
+    // ── Ethereum mainnet values (kept as constants: tests, the ethereum()
+    //    profile, and the pre-registry call sites all reference them). ──
+
     pub const WETH: Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     pub const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     pub const USDT: Address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
@@ -41,6 +47,7 @@ pub mod known {
     pub const AAVE_V3_ORACLE: Address = address!("54586bE62E3c3580375aE3723C145253060Ca0C2");
     pub const AAVE_V3_DATA_PROVIDER: Address = address!("7B4EB56E7CD4b454BA8ff71E4518426369a138a3");
     pub const COMPOUND_V3_USDC: Address = address!("c3d688B66703497DAA19211EEdff47f25384cdc3");
+    pub const MORPHO_BLUE: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
 
     /// Chainlink ETH/USD and BTC/USD proxy aggregators — the feeds Aave,
     /// Compound V3 and Morpho markets most commonly price collateral with.
@@ -51,9 +58,359 @@ pub mod known {
     pub const CHAINLINK_BTC_USD_PROXY: Address =
         address!("F4030086522a5bEEa4988F8cA5B36dbC97BeE88c");
 
+    // ── Base (chain 8453) values ──────────────────────────────────────────
+    // Verified live against Base mainnet 2026-08-23 (code presence +
+    // cross-checked immutable getters; the ⚠ marks the ones whose
+    // verification was doc- or code-presence-based only — re-verify on
+    // deploy, they are env-overridable regardless).
+
+    pub const BASE_WETH: Address = address!("4200000000000000000000000000000000000006");
+    /// Native (non-bridged) USDC on Base.
+    pub const BASE_USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    pub const BASE_DAI: Address = address!("50c5725949A6F0c72E6C4a641F24049A917DB0Cb");
+    /// Coinbase wrapped BTC ("cbBTC").
+    pub const BASE_WBTC: Address = address!("cbB7C0000aB88B473b1f5aFd9ef808440eed33Bf");
+    /// Circle's USDbC (the USDC bridged through Circle CCTP).
+    pub const BASE_USDBC: Address = address!("d9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA");
+    pub const BASE_UNIV2_FACTORY: Address = address!("8909Dc15e40173Ff4699343b6eB8132c65e18eC6");
+    /// ⚠ code-presence verified; `WETH()` getter check pending a paid RPC.
+    pub const BASE_UNIV2_ROUTER: Address = address!("4752ba5DBc23f44D87826276BF6Fd6b1C372aD24");
+    pub const BASE_UNIV3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
+    /// ⚠ `factory()` + `WETH9()` getters verified live 2026-08-23.
+    pub const BASE_UNIV3_QUOTER_V2: Address = address!("3d4e44Eb1374240CE5F1B871ab261CD16335B76a");
+    pub const BASE_UNIV3_NPM: Address = address!("03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1");
+    /// ⚠ per Uniswap's official Base deployment doc; code present on chain.
+    pub const BASE_UNIVERSAL_ROUTER: Address = address!("6fF5693b99212Da76ad316178A184AB56D299b43");
+    /// SwapRouter02. `factory()` + `WETH9()` getters verified live 2026-08-23.
+    pub const BASE_UNIV3_SWAP_ROUTER_02: Address =
+        address!("2626664c2603336E57B271c5C0b26F421741e481");
+    /// Balancer V2 vault — deployed at the *same* address as mainnet
+    /// (verified: code present, identical size/prologue to the mainnet vault).
+    pub const BASE_BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+    /// Aerodrome router — registered for the phase-2 integration; unused by
+    /// any v1 strategy (its Solidly-style math is out of scope, see the
+    /// Base work order §7).
+    pub const BASE_AERODROME_ROUTER: Address = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
+
     /// Collateral tokens whose feeds the oracle front-runner maps leads to.
     pub fn collateral_universe() -> [Address; 3] {
         [WETH, WBTC, WSTETH]
+    }
+
+    // ── Chain address registry ────────────────────────────────────────────
+
+    /// The per-chain address table the strategies, discovery and simulator
+    /// read at runtime. Selected by `CHAIN_ID` at boot, then overridden
+    /// field-by-field by env (see `Config::from_env`) — a new chain with
+    /// env overrides needs no code change.
+    ///
+    /// `None` fields are *capabilities, not errors*: a strategy whose
+    /// protocol is absent on a chain is skipped at construction with a
+    /// warning (fail-loud, not fail-wrong — a mainnet Aave address on Base
+    /// would simply simulate garbage).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ChainAddresses {
+        pub chain_id: u64,
+        // Core tokens
+        pub weth: Address,
+        pub usdc: Address,
+        pub usdt: Option<Address>,
+        pub dai: Option<Address>,
+        pub wbtc: Option<Address>,
+        pub wsteth: Option<Address>,
+        // AMMs
+        pub univ2_factory: Option<Address>,
+        pub univ2_router: Option<Address>,
+        pub univ3_factory: Option<Address>,
+        pub univ3_quoter_v2: Option<Address>,
+        pub univ3_npm: Option<Address>,
+        pub univ3_swap_router: Option<Address>,
+        pub univ3_swap_router_02: Option<Address>,
+        pub universal_router: Option<Address>,
+        pub sushi_factory: Option<Address>,
+        pub balancer_vault: Option<Address>,
+        /// Registry-only (no v1 strategy reads it); recorded so a future
+        /// Aerodrome integration finds the router without re-verifying.
+        pub aerodrome_router: Option<Address>,
+        // Lending protocols (None ⇒ that liquidation strategy is
+        // unavailable on this chain and is skipped at construction)
+        pub aave_v3_pool: Option<Address>,
+        pub aave_v3_oracle: Option<Address>,
+        pub aave_v3_data_provider: Option<Address>,
+        pub compound_v3_usdc: Option<Address>,
+        pub morpho_blue: Option<Address>,
+        /// Whether the built-in Maker ilk table (`strategies::liquidation_maker::maker`)
+        /// applies to this chain.
+        pub maker: bool,
+        // Arb core pairs: non-WETH tokens the block-cadence arb keeps
+        // loaded on every venue. Entries past `core_tokens_len` are padding.
+        pub core_tokens: [Address; 4],
+        pub core_tokens_len: u8,
+        // Chain behaviour
+        /// No public mempool: all flow arrives via the sequencer feed and is
+        /// back-run-only. Sandwich/JIT are constructible but warn at boot;
+        /// the relay-shaped env is inert.
+        pub sequencer_only: bool,
+        /// Default `REFORK_EVERY_BLOCKS`. Mainnet blocks are 12 s, Base 2 s —
+        /// a per-block refork on Base is 6× the mainnet refork rate for the
+        /// same wall-clock cost.
+        pub refork_default: u64,
+        /// Default submission transport for this chain.
+        pub submission_default: SubmissionMode,
+        /// Default qualification comparison backend for this chain.
+        pub qualification_default: QualificationBackend,
+    }
+
+    impl ChainAddresses {
+        /// The arb core-pair list (non-WETH), ready to iterate.
+        pub fn core_tokens(&self) -> Vec<Address> {
+            self.core_tokens[..self.core_tokens_len as usize].to_vec()
+        }
+
+        /// V2 factories to scan for `PairCreated`, in venue order.
+        pub fn pair_factories(&self) -> Vec<(Venue, Address)> {
+            let mut out = Vec::new();
+            if let Some(f) = self.univ2_factory {
+                out.push((Venue::UniV2, f));
+            }
+            if let Some(f) = self.sushi_factory {
+                out.push((Venue::SushiV2, f));
+            }
+            out
+        }
+    }
+
+    /// Ethereum mainnet (chain 1) registry.
+    pub fn ethereum() -> &'static ChainAddresses {
+        static PROFILE: std::sync::OnceLock<ChainAddresses> = std::sync::OnceLock::new();
+        PROFILE.get_or_init(|| ChainAddresses {
+            chain_id: 1,
+            weth: WETH,
+            usdc: USDC,
+            usdt: Some(USDT),
+            dai: Some(DAI),
+            wbtc: Some(WBTC),
+            wsteth: Some(WSTETH),
+            univ2_factory: Some(UNIV2_FACTORY),
+            univ2_router: Some(UNIV2_ROUTER),
+            univ3_factory: Some(UNIV3_FACTORY),
+            univ3_quoter_v2: Some(UNIV3_QUOTER_V2),
+            univ3_npm: Some(UNIV3_NPM),
+            univ3_swap_router: Some(UNIV3_SWAP_ROUTER),
+            univ3_swap_router_02: Some(UNIV3_SWAP_ROUTER_02),
+            universal_router: Some(UNIVERSAL_ROUTER),
+            sushi_factory: Some(SUSHI_FACTORY),
+            balancer_vault: Some(BALANCER_VAULT),
+            aerodrome_router: None,
+            aave_v3_pool: Some(AAVE_V3_POOL),
+            aave_v3_oracle: Some(AAVE_V3_ORACLE),
+            aave_v3_data_provider: Some(AAVE_V3_DATA_PROVIDER),
+            compound_v3_usdc: Some(COMPOUND_V3_USDC),
+            morpho_blue: Some(MORPHO_BLUE),
+            maker: true,
+            core_tokens: [USDC, USDT, DAI, WBTC],
+            core_tokens_len: 4,
+            sequencer_only: false,
+            refork_default: 1,
+            submission_default: SubmissionMode::Bundle,
+            qualification_default: QualificationBackend::Relay,
+        })
+    }
+
+    /// Base mainnet (chain 8453) registry. See the ⚠ notes on the
+    /// individual constants above for the verification state of each row.
+    ///
+    /// v1 scope: flash-loan arb on UniV2/UniV3 via the sequencer feed.
+    /// Lending-protocol rows are deliberately `None` (Aave/Morpho exist on
+    /// Base; wiring them is the documented phase 2, and until then the
+    /// strategies skip at construction with a warning).
+    pub fn base() -> &'static ChainAddresses {
+        static PROFILE: std::sync::OnceLock<ChainAddresses> = std::sync::OnceLock::new();
+        PROFILE.get_or_init(|| ChainAddresses {
+            chain_id: 8453,
+            weth: BASE_WETH,
+            usdc: BASE_USDC,
+            usdt: None,
+            dai: Some(BASE_DAI),
+            wbtc: Some(BASE_WBTC),
+            wsteth: None,
+            univ2_factory: Some(BASE_UNIV2_FACTORY),
+            univ2_router: Some(BASE_UNIV2_ROUTER),
+            univ3_factory: Some(BASE_UNIV3_FACTORY),
+            univ3_quoter_v2: Some(BASE_UNIV3_QUOTER_V2),
+            univ3_npm: Some(BASE_UNIV3_NPM),
+            univ3_swap_router: None,
+            univ3_swap_router_02: Some(BASE_UNIV3_SWAP_ROUTER_02),
+            universal_router: Some(BASE_UNIVERSAL_ROUTER),
+            sushi_factory: None,
+            balancer_vault: Some(BASE_BALANCER_VAULT),
+            aerodrome_router: Some(BASE_AERODROME_ROUTER),
+            aave_v3_pool: None,
+            aave_v3_oracle: None,
+            aave_v3_data_provider: None,
+            compound_v3_usdc: None,
+            morpho_blue: None,
+            maker: false,
+            // USDbC is a second USDC-class stable; the arb graph can route
+            // through it once pool discovery finds the WETH pairs.
+            core_tokens: [BASE_USDC, BASE_DAI, BASE_WBTC, BASE_USDBC],
+            core_tokens_len: 4,
+            sequencer_only: true,
+            refork_default: 6,
+            submission_default: SubmissionMode::Raw,
+            qualification_default: QualificationBackend::Sequencer,
+        })
+    }
+
+    /// The built-in registry for a chain id. `None` for chains without a
+    /// profile — the operator supplies addresses via env overrides.
+    pub fn for_chain(chain_id: u64) -> Option<&'static ChainAddresses> {
+        match chain_id {
+            1 => Some(ethereum()),
+            8453 => Some(base()),
+            _ => None,
+        }
+    }
+
+    /// Apply env overrides to a profile, field-by-field: env wins.
+    ///
+    /// Pure (lookup injected) so the precedence is unit-testable without
+    /// touching the process environment — the same pattern as
+    /// `collect_ignored_env_aliases`.
+    pub fn apply_address_overrides(
+        mut a: ChainAddresses,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> ChainAddresses {
+        let override_addr = |env: &str| lookup(env).and_then(|v| v.parse::<Address>().ok());
+        a.weth = override_addr("WETH_ADDRESS").unwrap_or(a.weth);
+        a.usdc = override_addr("USD_STABLE_ADDRESS").unwrap_or(a.usdc);
+        if let Some(v) = override_addr("USDT_ADDRESS") {
+            a.usdt = Some(v);
+        }
+        if let Some(v) = override_addr("DAI_ADDRESS") {
+            a.dai = Some(v);
+        }
+        if let Some(v) = override_addr("WBTC_ADDRESS") {
+            a.wbtc = Some(v);
+        }
+        if let Some(v) = override_addr("WSTETH_ADDRESS") {
+            a.wsteth = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV2_FACTORY_ADDRESS") {
+            a.univ2_factory = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV2_ROUTER_ADDRESS") {
+            a.univ2_router = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV3_FACTORY_ADDRESS") {
+            a.univ3_factory = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV3_QUOTER_V2_ADDRESS") {
+            a.univ3_quoter_v2 = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV3_NPM_ADDRESS") {
+            a.univ3_npm = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV3_SWAP_ROUTER_ADDRESS") {
+            a.univ3_swap_router = Some(v);
+        }
+        if let Some(v) = override_addr("UNIV3_SWAP_ROUTER_02_ADDRESS") {
+            a.univ3_swap_router_02 = Some(v);
+        }
+        if let Some(v) = override_addr("UNIVERSAL_ROUTER_ADDRESS") {
+            a.universal_router = Some(v);
+        }
+        if let Some(v) = override_addr("SUSHI_FACTORY_ADDRESS") {
+            a.sushi_factory = Some(v);
+        }
+        if let Some(v) = override_addr("BALANCER_VAULT_ADDRESS") {
+            a.balancer_vault = Some(v);
+        }
+        if let Some(v) = override_addr("AERODROME_ROUTER_ADDRESS") {
+            a.aerodrome_router = Some(v);
+        }
+        if let Some(v) = override_addr("AAVE_V3_POOL_ADDRESS") {
+            a.aave_v3_pool = Some(v);
+        }
+        if let Some(v) = override_addr("AAVE_V3_ORACLE_ADDRESS") {
+            a.aave_v3_oracle = Some(v);
+        }
+        if let Some(v) = override_addr("AAVE_V3_DATA_PROVIDER_ADDRESS") {
+            a.aave_v3_data_provider = Some(v);
+        }
+        if let Some(v) = override_addr("COMPOUND_V3_USDC_ADDRESS") {
+            a.compound_v3_usdc = Some(v);
+        }
+        if let Some(v) = override_addr("MORPHO_BLUE_ADDRESS") {
+            a.morpho_blue = Some(v);
+        }
+        a
+    }
+}
+
+/// How signed payloads reach the chain.
+///
+/// `Bundle` is the Ethereum-mainnet path: `eth_sendBundle` to private
+/// relays, same-UUID retries, `eth_cancelBundle` cancellation.
+///
+/// `Raw` is the sequencer-chain path (Base v1): there is no relay/builder
+/// market — the signed transaction goes straight to the chain's RPC with a
+/// priority fee, and cancellation is a replacement transaction (same nonce,
+/// bumped fee) rather than `eth_cancelBundle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmissionMode {
+    Bundle,
+    Raw,
+}
+
+impl SubmissionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubmissionMode::Bundle => "bundle",
+            SubmissionMode::Raw => "raw",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bundle" => Some(SubmissionMode::Bundle),
+            "raw" => Some(SubmissionMode::Raw),
+            _ => None,
+        }
+    }
+}
+
+/// Where qualification's independent second opinion comes from.
+///
+/// `Relay` (mainnet): fork-vs-`eth_callBundle` — the builder's own
+/// simulation of our payload.
+///
+/// `Sequencer` (Base): fork-vs-included-block — the victim's own
+/// execution as the sequencer actually built it (canonical receipt) vs the
+/// fork's replay of the same victim. No relay calls; the tolerance and
+/// accuracy math is the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QualificationBackend {
+    Relay,
+    Sequencer,
+}
+
+impl QualificationBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QualificationBackend::Relay => "relay",
+            QualificationBackend::Sequencer => "sequencer",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "relay" => Some(QualificationBackend::Relay),
+            "sequencer" => Some(QualificationBackend::Sequencer),
+            _ => None,
+        }
     }
 }
 
@@ -120,9 +477,29 @@ pub struct OracleConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub chain: ChainConfig,
+    /// Per-chain address registry: the built-in profile for
+    /// `chain.chain_id` with env overrides applied. Strategies, discovery
+    /// and the simulator read this — never the `known::` constants.
+    pub addresses: known::ChainAddresses,
     pub endpoints: Endpoints,
     pub risk: RiskConfig,
     pub strategies: StrategyToggles,
+    /// Priority fee (wei) the bot bids on its own transactions.
+    ///
+    /// Mainnet (`SubmissionMode::Bundle`) it is the simulated leg's fee —
+    /// builders price bundles by payment, not by the leg's fee, so the
+    /// default (1 gwei) is a simulation artefact. On sequencer chains
+    /// (`SubmissionMode::Raw`, e.g. Base) the priority fee *is* the
+    /// ordering currency: this is the number that buys inclusion, and it is
+    /// re-derived per chain (gas is ~10⁻⁴× mainnet).
+    pub priority_fee_wei: U256,
+    /// How signed payloads reach the chain (relay bundles vs raw txs).
+    /// Default follows the chain profile; `SUBMISSION_MODE` overrides.
+    pub submission_mode: SubmissionMode,
+    /// Qualification's independent comparison backend (relay
+    /// `eth_callBundle` vs the sequencer's included block).
+    /// Default follows the chain profile; `QUALIFICATION_BACKEND` overrides.
+    pub qualification_backend: QualificationBackend,
     pub sim: SimConfig,
     /// Compound V3 / Morpho Blue / Maker liquidation tuning.
     pub liquidation: LiquidationConfig,
@@ -151,9 +528,19 @@ pub struct Config {
     /// the same feed moves at 3. Every additional leg costs ~120k gas.
     pub arb_max_cycle_len: usize,
     /// Whether the bloXroute Max Profit relay's delivered blocks are fetched and
-    /// their transactions ingested + scored. On by default; this is read-only
-    /// (polling a public data API + the execution node), never a submission.
+    /// their transactions ingested + scored. On by default on mainnet; this is
+    /// read-only (polling a public data API + the execution node), never a
+    /// submission. Defaulted off on sequencer chains — bloXroute's data API is
+    /// mainnet-only and would bleed mainnet blocks into a Base funnel (R6).
     pub relay_tx_ingest: bool,
+    /// Whether delivered blocks are ingested directly from the chain
+    /// (`newHeads` + `eth_getBlockByHash`) instead of a relay data API. This is
+    /// the sequencer-chain equivalent of the bloXroute path: the sequencer's
+    /// own built blocks, scored for extractable value and used as the
+    /// "included block" second opinion for `QUALIFICATION_BACKEND=sequencer`.
+    /// Defaulted on for sequencer chains, off for mainnet (which uses the
+    /// relay path).
+    pub chain_block_ingest: bool,
     /// How many delivered-block transactions are scored concurrently.
     ///
     /// A mainnet block carries ~150–200 transactions and each one fans out to
@@ -476,12 +863,6 @@ fn env_u256(key: &str, default: u128) -> U256 {
     }
 }
 
-fn env_addr(key: &str, default: Address) -> Address {
-    env_opt(key)
-        .and_then(|v| v.parse::<Address>().ok())
-        .unwrap_or(default)
-}
-
 /// Parse `proxy:collateral,proxy:collateral` into address pairs. Malformed
 /// entries are dropped with a warning rather than failing the boot — one bad
 /// address should not blind the whole oracle watch.
@@ -590,9 +971,80 @@ impl Config {
     /// Load configuration from the process environment (after `.env` is applied).
     pub fn from_env() -> Result<Self> {
         let http_url = env_opt("ETH_HTTP_URL")
-            .context("ETH_HTTP_URL is required (an archive-capable mainnet RPC endpoint)")?;
+            .context("ETH_HTTP_URL is required (an archive-capable RPC endpoint)")?;
 
         let chain_id = env_u64("CHAIN_ID", 1);
+
+        // ── Chain address registry: built-in profile + env overrides ──
+        // Env wins field-by-field, so a chain without a built-in profile is
+        // fully configurable from the environment (no code change).
+        let base_profile = known::for_chain(chain_id)
+            .copied()
+            .unwrap_or(known::ChainAddresses {
+                chain_id,
+                weth: Address::ZERO,
+                usdc: Address::ZERO,
+                usdt: None,
+                dai: None,
+                wbtc: None,
+                wsteth: None,
+                univ2_factory: None,
+                univ2_router: None,
+                univ3_factory: None,
+                univ3_quoter_v2: None,
+                univ3_npm: None,
+                univ3_swap_router: None,
+                univ3_swap_router_02: None,
+                universal_router: None,
+                sushi_factory: None,
+                balancer_vault: None,
+                aerodrome_router: None,
+                aave_v3_pool: None,
+                aave_v3_oracle: None,
+                aave_v3_data_provider: None,
+                compound_v3_usdc: None,
+                morpho_blue: None,
+                maker: false,
+                core_tokens: [Address::ZERO; 4],
+                core_tokens_len: 0,
+                sequencer_only: false,
+                refork_default: 1,
+                submission_default: SubmissionMode::Bundle,
+                qualification_default: QualificationBackend::Relay,
+            });
+        let addresses = known::apply_address_overrides(base_profile, env_opt);
+
+        // WETH is the anchor of the whole engine (profit token default, gas
+        // accounting, discovery). A chain without a profile and without an
+        // explicit WETH_ADDRESS cannot run — fail closed, not at 0x0.
+        if addresses.weth == Address::ZERO {
+            anyhow::bail!(
+                "WETH_ADDRESS is required for chain {chain_id} (no built-in address \
+                 profile for this chain id)"
+            );
+        }
+
+        let submission_mode = match env_opt("SUBMISSION_MODE") {
+            Some(v) => SubmissionMode::parse(&v).ok_or_else(|| {
+                anyhow::anyhow!("SUBMISSION_MODE must be 'bundle' or 'raw' (got {v:?})")
+            })?,
+            None => addresses.submission_default,
+        };
+        let qualification_backend = match env_opt("QUALIFICATION_BACKEND") {
+            Some(v) => QualificationBackend::parse(&v).ok_or_else(|| {
+                anyhow::anyhow!("QUALIFICATION_BACKEND must be 'relay' or 'sequencer' (got {v:?})")
+            })?,
+            None => addresses.qualification_default,
+        };
+        // A sequencer-only chain has no relays to send bundles to: the raw
+        // transport is the only path that can work. Refuse the mismatch at
+        // boot rather than arming a send path that cannot deliver.
+        if addresses.sequencer_only && submission_mode == SubmissionMode::Bundle {
+            anyhow::bail!(
+                "SUBMISSION_MODE=bundle cannot work on chain {chain_id}: there is no \
+                 public mempool or relay market — set SUBMISSION_MODE=raw"
+            );
+        }
 
         // Relay authentication and transaction signing are different trust
         // domains. Derive the searcher address from the funded transaction key
@@ -629,28 +1081,53 @@ impl Config {
             }
         };
 
+        // Read before `addresses` moves into the struct literal below.
+        let refork_default = addresses.refork_default;
+        let sequencer_only = addresses.sequencer_only;
+
         let cfg = Self {
             chain: ChainConfig {
                 chain_id,
                 name: env_or("CHAIN_NAME", "ethereum"),
-                weth: env_addr("WETH_ADDRESS", known::WETH),
-                usd_stable: env_addr("USD_STABLE_ADDRESS", known::USDC),
+                // From the registry (profile + env override), not a
+                // hardcoded default — a Base boot must not silently
+                // anchor on the mainnet WETH.
+                weth: addresses.weth,
+                usd_stable: addresses.usdc,
                 block_time_ms: env_u64("BLOCK_TIME_MS", 12_000),
             },
+            addresses,
             endpoints: Endpoints {
                 http_url,
                 ws_url: env_opt("ETH_WS_URL"),
-                mev_share_sse: env_or("MEV_SHARE_SSE_URL", "https://mev-share.flashbots.net"),
+                // Mainnet-shaped feeds default ON for mainnet and OFF for
+                // sequencer chains: a Base instance must not silently
+                // ingest mainnet MEV-Share hints or relay data — cross-chain
+                // data bleed poisons the per-chain funnel and qualification
+                // evidence (work order R6: the one unacceptable bug class).
+                mev_share_sse: env_opt("MEV_SHARE_SSE_URL").unwrap_or_else(|| {
+                    if sequencer_only {
+                        String::new()
+                    } else {
+                        "https://mev-share.flashbots.net".into()
+                    }
+                }),
                 relay_url,
                 bundle_relay_urls,
                 relay_data_urls: {
                     let v = env_list("RELAY_DATA_URLS");
                     if v.is_empty() {
-                        vec![
-                            "https://boost-relay.flashbots.net".into(),
-                            "https://bloxroute.max-profit.blxrbdn.com".into(),
-                            "https://agnostic-relay.net".into(),
-                        ]
+                        // Mainnet's relay data APIs; sequencer chains have
+                        // no equivalent and get nothing (no bleed).
+                        if sequencer_only {
+                            Vec::new()
+                        } else {
+                            vec![
+                                "https://boost-relay.flashbots.net".into(),
+                                "https://bloxroute.max-profit.blxrbdn.com".into(),
+                                "https://agnostic-relay.net".into(),
+                            ]
+                        }
                     } else {
                         v
                     }
@@ -693,6 +1170,9 @@ impl Config {
                 max_inflight_per_strategy: env_u64("MAX_INFLIGHT_PER_STRATEGY", 32) as usize,
                 max_revert_rate: env_f64("MAX_REVERT_RATE", 1.0),
             },
+            priority_fee_wei: env_u256("PRIORITY_FEE_WEI", 1_000_000_000), // 1 gwei
+            submission_mode,
+            qualification_backend,
             strategies: StrategyToggles {
                 sandwich: env_bool("STRATEGY_SANDWICH", true),
                 sandwich_v3: env_bool("STRATEGY_SANDWICH_V3", true),
@@ -721,7 +1201,10 @@ impl Config {
                     }
                 },
                 replay_fork: env_bool("REPLAY_FORK", true),
-                refork_every_blocks: env_u64("REFORK_EVERY_BLOCKS", 1),
+                // Per-chain default: mainnet reforks every block (12 s
+                // cadence); Base defaults to every 6 blocks (2 s cadence)
+                // for the same wall-clock refork rate.
+                refork_every_blocks: env_u64("REFORK_EVERY_BLOCKS", refork_default),
                 use_call_bundle: env_bool("USE_CALL_BUNDLE", true),
                 target_block_offset: env_u64("TARGET_BLOCK_OFFSET", 1),
                 timeout: Duration::from_millis(env_u64("SIM_TIMEOUT_MS", 2_500)),
@@ -776,7 +1259,11 @@ impl Config {
                 .clamp(2, crate::dex::graph::MAX_CYCLE_LEN),
             // Infrastructure toggle: pull delivered blocks + transactions from the
             // bloXroute Max Profit relay and score them for extractable value.
-            relay_tx_ingest: env_bool("RELAY_TX_INGEST", true),
+            // Chain-appropriate defaults: mainnet polls bloXroute; a
+            // sequencer chain polls its own blocks (no relay exists there,
+            // and the mainnet data API would bleed cross-chain).
+            relay_tx_ingest: env_bool("RELAY_TX_INGEST", !sequencer_only),
+            chain_block_ingest: env_bool("CHAIN_BLOCK_INGEST", sequencer_only),
             relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
             // Sized for the live path: enough in-flight transactions to keep
             // the runtime busy, low enough that a mempool burst sheds instead
@@ -888,7 +1375,116 @@ pub fn validate_api(api: &ApiConfig) -> Result<()> {
     Ok(())
 }
 
+/// The pure core of [`Config::coherence_warnings`]: chain profile + strategy
+/// toggles + relay-shaped env flags → named warnings. Free function so the
+/// rules are unit-testable without constructing a full `Config`.
+pub fn coherence_warnings_for(
+    a: &known::ChainAddresses,
+    s: &StrategyToggles,
+    relay_tx_ingest: bool,
+    sequencer_feed_set: bool,
+    no_oracle_feeds: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if a.sequencer_only {
+        for (name, on) in [
+            ("STRATEGY_SANDWICH", s.sandwich),
+            ("STRATEGY_SANDWICH_V3", s.sandwich_v3),
+            ("STRATEGY_JIT", s.jit),
+        ] {
+            if on {
+                out.push(format!(
+                    "{name} is on but chain {} has no public mempool \
+                     (sequencer feed only): front-run strategies can only \
+                     act on sequencer-feed transactions, which are \
+                     back-run-only (no signed victim bytes). They will \
+                     self-reject every candidate.",
+                    a.chain_id
+                ));
+            }
+        }
+        if relay_tx_ingest {
+            out.push(
+                "RELAY_TX_INGEST is on but the bloXroute Max Profit relay \
+                 covers Ethereum mainnet only — it is inert on this chain \
+                 (delivered-block scoring here comes from the chain's own \
+                 blocks)."
+                    .to_string(),
+            );
+        }
+    }
+    if !a.sequencer_only && sequencer_feed_set {
+        out.push(
+            "SEQUENCER_FEED_URL is set but this chain has a public \
+             mempool — the sequencer feed will run as an extra stream \
+             (TxSource::Sequencer), not as the primary source."
+                .to_string(),
+        );
+    }
+    for (name, on, present) in [
+        (
+            "STRATEGY_LIQUIDATION",
+            s.liquidation,
+            a.aave_v3_pool.is_some()
+                && a.aave_v3_oracle.is_some()
+                && a.aave_v3_data_provider.is_some(),
+        ),
+        (
+            "STRATEGY_LIQUIDATION_COMPOUND",
+            s.liquidation_compound,
+            a.compound_v3_usdc.is_some(),
+        ),
+        (
+            "STRATEGY_LIQUIDATION_MORPHO",
+            s.liquidation_morpho,
+            a.morpho_blue.is_some(),
+        ),
+        ("STRATEGY_LIQUIDATION_MAKER", s.liquidation_maker, a.maker),
+    ] {
+        if on && !present {
+            out.push(format!(
+                "{name} is on but its protocol is not present on chain \
+                 {} — the strategy will not be constructed.",
+                a.chain_id
+            ));
+        }
+    }
+    if s.oracle_frontrun && !a.maker && no_oracle_feeds {
+        out.push(
+            "STRATEGY_ORACLE_FRONTRUN is on but neither the Maker table \
+             (mainnet-only) nor ORACLE_WATCH_FEEDS entries are available \
+             for this chain — it will have nothing to watch."
+                .to_string(),
+        );
+    }
+    if a.balancer_vault.is_none() && s.atomic_arb {
+        out.push(format!(
+            "STRATEGY_ATOMIC_ARB is on but chain {} has no Balancer vault \
+             registered — flashExecute bundles cannot be funded and every \
+             arb candidate will revert in the fork. Set \
+             BALANCER_VAULT_ADDRESS if a flash-loan source exists.",
+            a.chain_id
+        ));
+    }
+    out
+}
+
 impl Config {
+    /// Boot-time coherence warnings: the chain profile vs the enabled
+    /// strategies vs the relay-shaped env. Fail-loud, not fail-wrong —
+    /// construction continues (the operator's explicit toggles win) but
+    /// every mismatch is named, at boot and in `doctor`, so an inert
+    /// strategy is never a silent one.
+    pub fn coherence_warnings(&self) -> Vec<String> {
+        coherence_warnings_for(
+            &self.addresses,
+            &self.strategies,
+            self.relay_tx_ingest,
+            self.endpoints.sequencer_feed.is_some(),
+            self.oracle.watch_feeds.is_empty(),
+        )
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} ur={} arb_legs={} bloxroute_txs={} live={} smoke={}",
@@ -1132,5 +1728,232 @@ mod tests {
         assert_eq!(clamp_bundle_gas(20_000_000), 16_777_216);
         assert_eq!(clamp_bundle_gas(30_000_000), 16_777_216);
         assert_eq!(clamp_bundle_gas(u64::MAX), 16_777_216);
+    }
+
+    // ── WS-A: chain profiles & address registry ─────────────────────────
+
+    #[test]
+    fn for_chain_selects_the_built_in_profiles() {
+        assert_eq!(known::for_chain(1).unwrap().chain_id, 1);
+        assert_eq!(known::for_chain(8453).unwrap().chain_id, 8453);
+        assert!(
+            known::for_chain(42161).is_none(),
+            "no Arbitrum profile in v1"
+        );
+        assert!(known::for_chain(0).is_none());
+    }
+
+    #[test]
+    fn base_profile_carries_the_verified_addresses() {
+        // Pinned against live Base mainnet 2026-08-23 (code presence +
+        // cross-checked immutable getters; see the ⚠ notes on the constants).
+        let b = known::base();
+        assert_eq!(b.weth, known::BASE_WETH);
+        assert_eq!(b.usdc, known::BASE_USDC);
+        assert_eq!(b.dai, Some(known::BASE_DAI));
+        assert_eq!(b.wbtc, Some(known::BASE_WBTC));
+        assert_eq!(b.univ2_factory, Some(known::BASE_UNIV2_FACTORY));
+        assert_eq!(b.univ3_factory, Some(known::BASE_UNIV3_FACTORY));
+        assert_eq!(b.univ3_quoter_v2, Some(known::BASE_UNIV3_QUOTER_V2));
+        assert_eq!(
+            b.univ3_swap_router_02,
+            Some(known::BASE_UNIV3_SWAP_ROUTER_02)
+        );
+        assert_eq!(b.universal_router, Some(known::BASE_UNIVERSAL_ROUTER));
+        // Balancer vault is deployed at the same address as mainnet.
+        assert_eq!(b.balancer_vault, Some(known::BASE_BALANCER_VAULT));
+        assert_eq!(b.balancer_vault, Some(known::BALANCER_VAULT));
+        // v1 scope: no lending protocols, no Maker, no Sushi, no USDT.
+        assert!(b.aave_v3_pool.is_none());
+        assert!(b.compound_v3_usdc.is_none());
+        assert!(b.morpho_blue.is_none());
+        assert!(!b.maker);
+        assert!(b.sushi_factory.is_none());
+        assert!(b.usdt.is_none());
+        // Chain behaviour: sequencer feed only, slower refork, raw transport,
+        // sequencer-shaped qualification.
+        assert!(b.sequencer_only);
+        assert_eq!(b.refork_default, 6);
+        assert_eq!(b.submission_default, SubmissionMode::Raw);
+        assert_eq!(b.qualification_default, QualificationBackend::Sequencer);
+        assert_eq!(b.pair_factories().len(), 1, "Base has one V2 venue");
+    }
+
+    #[test]
+    fn ethereum_profile_unchanged_by_the_registry() {
+        // The pre-registry constants are the ethereum() profile values —
+        // a mainnet boot must see byte-identical addresses.
+        let e = known::ethereum();
+        assert_eq!(e.weth, known::WETH);
+        assert_eq!(e.usdc, known::USDC);
+        assert_eq!(e.univ3_factory, Some(known::UNIV3_FACTORY));
+        assert_eq!(e.univ3_quoter_v2, Some(known::UNIV3_QUOTER_V2));
+        assert_eq!(e.univ3_swap_router_02, Some(known::UNIV3_SWAP_ROUTER_02));
+        assert_eq!(e.universal_router, Some(known::UNIVERSAL_ROUTER));
+        assert_eq!(e.balancer_vault, Some(known::BALANCER_VAULT));
+        assert!(e.maker);
+        assert!(!e.sequencer_only);
+        assert_eq!(e.refork_default, 1);
+        assert_eq!(e.submission_default, SubmissionMode::Bundle);
+        assert_eq!(e.qualification_default, QualificationBackend::Relay);
+        assert_eq!(e.pair_factories().len(), 2);
+    }
+
+    #[test]
+    fn env_overrides_win_over_the_profile() {
+        let base = *known::base();
+        let override_weth = alloy_primitives::address!("000000000000000000000000000000000000C0DE");
+        let a = known::apply_address_overrides(base, |name| match name {
+            "WETH_ADDRESS" => Some("0x000000000000000000000000000000000000C0DE".into()),
+            "UNIV3_FACTORY_ADDRESS" => Some("0x000000000000000000000000000000000000FACE".into()),
+            _ => None,
+        });
+        assert_eq!(a.weth, override_weth);
+        assert_eq!(
+            a.univ3_factory,
+            Some(alloy_primitives::address!(
+                "000000000000000000000000000000000000FACE"
+            ))
+        );
+        // Non-overridden fields keep the profile values.
+        assert_eq!(a.usdc, known::BASE_USDC);
+        assert_eq!(a.univ3_quoter_v2, Some(known::BASE_UNIV3_QUOTER_V2));
+    }
+
+    #[test]
+    fn a_chain_without_a_profile_is_fully_env_driven() {
+        // Unknown chain id → empty skeleton; env overrides fill it in. No
+        // code change needed to add a chain.
+        let skeleton = known::ChainAddresses {
+            chain_id: 42161,
+            weth: Address::ZERO,
+            usdc: Address::ZERO,
+            usdt: None,
+            dai: None,
+            wbtc: None,
+            wsteth: None,
+            univ2_factory: None,
+            univ2_router: None,
+            univ3_factory: None,
+            univ3_quoter_v2: None,
+            univ3_npm: None,
+            univ3_swap_router: None,
+            univ3_swap_router_02: None,
+            universal_router: None,
+            sushi_factory: None,
+            balancer_vault: None,
+            aerodrome_router: None,
+            aave_v3_pool: None,
+            aave_v3_oracle: None,
+            aave_v3_data_provider: None,
+            compound_v3_usdc: None,
+            morpho_blue: None,
+            maker: false,
+            core_tokens: [Address::ZERO; 4],
+            core_tokens_len: 0,
+            sequencer_only: false,
+            refork_default: 1,
+            submission_default: SubmissionMode::Bundle,
+            qualification_default: QualificationBackend::Relay,
+        };
+        assert!(skeleton.weth == Address::ZERO);
+        let a = known::apply_address_overrides(skeleton, |name| match name {
+            "WETH_ADDRESS" => Some("0x4200000000000000000000000000000000000006".into()),
+            _ => None,
+        });
+        assert_eq!(a.weth, known::BASE_WETH, "env fills the empty skeleton");
+    }
+
+    #[test]
+    fn submission_mode_and_backend_parse_case_insensitively() {
+        assert_eq!(
+            SubmissionMode::parse("bundle"),
+            Some(SubmissionMode::Bundle)
+        );
+        assert_eq!(SubmissionMode::parse("RAW"), Some(SubmissionMode::Raw));
+        assert_eq!(SubmissionMode::parse("bundles"), None);
+        assert_eq!(SubmissionMode::parse(""), None);
+        assert_eq!(
+            QualificationBackend::parse("relay"),
+            Some(QualificationBackend::Relay)
+        );
+        assert_eq!(
+            QualificationBackend::parse("Sequencer"),
+            Some(QualificationBackend::Sequencer)
+        );
+        assert_eq!(QualificationBackend::parse("mempool"), None);
+    }
+
+    #[test]
+    fn sequencer_only_chain_names_the_inert_strategies() {
+        let base = *known::base();
+        let mut s = StrategyToggles {
+            sandwich: true,
+            sandwich_v3: true,
+            jit: true,
+            atomic_arb: true,
+            liquidation: true,
+            liquidation_compound: true,
+            liquidation_morpho: true,
+            liquidation_maker: true,
+            oracle_frontrun: true,
+            sniper: true,
+        };
+        let warnings = coherence_warnings_for(&base, &s, true, false, true);
+        let text = warnings.join("\n");
+        for needle in [
+            "STRATEGY_SANDWICH is on but chain 8453 has no public mempool",
+            "STRATEGY_SANDWICH_V3 is on but chain 8453 has no public mempool",
+            "STRATEGY_JIT is on but chain 8453 has no public mempool",
+            "RELAY_TX_INGEST is on but the bloXroute Max Profit relay",
+            "STRATEGY_LIQUIDATION is on but its protocol is not present",
+            "STRATEGY_LIQUIDATION_COMPOUND is on but its protocol is not present",
+            "STRATEGY_LIQUIDATION_MORPHO is on but its protocol is not present",
+            "STRATEGY_LIQUIDATION_MAKER is on but its protocol is not present",
+            "STRATEGY_ORACLE_FRONTRUN is on but neither the Maker table",
+        ] {
+            assert!(
+                text.contains(needle),
+                "missing warning: {needle}\n---\n{text}"
+            );
+        }
+        // atomic_arb is fine on Base (Balancer vault present).
+        assert!(!text.contains("STRATEGY_ATOMIC_ARB is on"));
+
+        // The documented .env.example.base shape: front-run + liquidations
+        // off, arb on, relay ingest off → no warnings at all.
+        s.sandwich = false;
+        s.sandwich_v3 = false;
+        s.jit = false;
+        s.liquidation = false;
+        s.liquidation_compound = false;
+        s.liquidation_morpho = false;
+        s.liquidation_maker = false;
+        s.oracle_frontrun = false;
+        assert!(
+            coherence_warnings_for(&base, &s, false, true, true).is_empty(),
+            "the Base v1 toggle set must boot clean"
+        );
+    }
+
+    #[test]
+    fn ethereum_boot_with_default_toggles_is_quiet() {
+        let e = *known::ethereum();
+        let s = StrategyToggles {
+            sandwich: true,
+            sandwich_v3: true,
+            jit: true,
+            atomic_arb: true,
+            liquidation: true,
+            liquidation_compound: true,
+            liquidation_morpho: true,
+            liquidation_maker: true,
+            oracle_frontrun: true,
+            sniper: true,
+        };
+        assert!(
+            coherence_warnings_for(&e, &s, true, false, false).is_empty(),
+            "a default mainnet boot must not warn"
+        );
     }
 }
