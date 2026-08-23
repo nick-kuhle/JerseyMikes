@@ -137,7 +137,8 @@ What stays boot-only, deliberately:
 | Everything else in `Config` (endpoints, chain, sim settings) | Not runtime state; change requires a restart. |
 
 Validation: patches are all-or-nothing; `bribeBps ≤ 10000`, gas cap in
-`[21000, 30M]` (the simulator ceiling), wei amounts must parse. A rejected
+`[21000, 16777216]` (the EIP-7825 per-tx protocol cap, live since Fusaka),
+wei amounts must parse. A rejected
 patch changes nothing and returns its reason with a 400. The `.env` snippet
 in the panel is demoted to what it always really was: persisting the current
 values as **boot defaults**.

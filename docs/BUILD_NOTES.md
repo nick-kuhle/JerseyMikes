@@ -200,8 +200,10 @@ Operator-reported symptoms after running the merged liquidation coverage:
   are clamped to 95% of it (5% headroom for the victim txs sharing the
   mined block). A boot-time warning names `MAX_GAS_PER_BUNDLE` when
   clamping engages instead of discovering it one rejected back-run at a
-  time. The signed-bundle path (`eth_callBundle`) clamps to a 30M ceiling —
-  relays reject over-limit txs the same way the fork does.
+  time. The signed-bundle path (`eth_callBundle`) clamps to the EIP-7825
+  per-transaction protocol cap (16,777,216 gas, live since Fusaka
+  2025-12-03) — every txpool, builder and relay rejects over-limit txs the
+  same way the fork does.
 - Status-0 receipts are re-executed via `eth_call` while the simulation
   snapshot is still live, and the revert bytes are decoded: Solidity
   `Error(string)`/`Panic`, the executor's own guards
