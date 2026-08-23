@@ -452,7 +452,15 @@ mod tests {
             live_execution: false,
             broadcast_enabled: false,
             qualification_hours: 168,
+            qualification_min_samples: 30,
+            qualification_min_relay_comparisons: 30,
             qualification_min_actual_matches: 30,
+            qualification_max_error_bps: 2_000,
+            qualification_min_accuracy_bps: 8_000,
+            qualification_max_gap_secs: 120,
+            finality_depth: 12,
+            submission_retry_ms: 250,
+            submission_max_attempts: 2,
         })
     }
 
