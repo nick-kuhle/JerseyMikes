@@ -23,6 +23,13 @@ const V3_SWAP: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e1
 const EXECUTED: &str = "0x920d3a9c5eb5759e8895809a65dae03c9336ebf6f554de8cdc90e3bcb4404121";
 const WINDOW: usize = 5;
 
+struct SelectedCandidate {
+    indices: Vec<usize>,
+    receipts: Vec<Value>,
+    entity: HashSet<Address>,
+    confidence: &'static str,
+}
+
 /// Exact reconciliation for our own submitted payloads. Unlike competitor
 /// attribution, bundle boundaries and signer identity are known, so executor
 /// events plus receipts produce exact on-chain retained WETH/ETH less gas.
@@ -238,34 +245,39 @@ pub async fn reconcile_block(
         let after_end = (victim_index + WINDOW + 1).min(txs.len());
         let mut before = Vec::new();
         let mut after = Vec::new();
-        for index in before_start..victim_index {
-            if let Some(candidate_receipt) = receipt(rpc, txs[index].hash, &mut receipts).await {
+        for (index, candidate) in txs.iter().enumerate().take(victim_index).skip(before_start) {
+            if let Some(candidate_receipt) = receipt(rpc, candidate.hash, &mut receipts).await {
                 if !swap_pools(&candidate_receipt).is_disjoint(&victim_pools) {
                     before.push((index, candidate_receipt));
                 }
             }
         }
-        for index in victim_index + 1..after_end {
-            if let Some(candidate_receipt) = receipt(rpc, txs[index].hash, &mut receipts).await {
+        for (index, candidate) in txs
+            .iter()
+            .enumerate()
+            .take(after_end)
+            .skip(victim_index + 1)
+        {
+            if let Some(candidate_receipt) = receipt(rpc, candidate.hash, &mut receipts).await {
                 if !swap_pools(&candidate_receipt).is_disjoint(&victim_pools) {
                     after.push((index, candidate_receipt));
                 }
             }
         }
 
-        let mut selected: Option<(Vec<usize>, Vec<Value>, HashSet<Address>, &'static str)> = None;
+        let mut selected: Option<SelectedCandidate> = None;
         'pairs: for (front_index, front_receipt) in before.iter().rev() {
             for (back_index, back_receipt) in &after {
                 let front = &txs[*front_index];
                 let back = &txs[*back_index];
                 if same_actor(front, back) {
                     let entity = entity_addresses(front, back);
-                    selected = Some((
-                        vec![*front_index, *back_index],
-                        vec![front_receipt.clone(), back_receipt.clone()],
+                    selected = Some(SelectedCandidate {
+                        indices: vec![*front_index, *back_index],
+                        receipts: vec![front_receipt.clone(), back_receipt.clone()],
                         entity,
-                        "high",
-                    ));
+                        confidence: "high",
+                    });
                     break 'pairs;
                 }
             }
@@ -276,17 +288,21 @@ pub async fn reconcile_block(
         if selected.is_none() {
             if let Some((index, candidate_receipt)) = after.first() {
                 let tx = &txs[*index];
-                selected = Some((
-                    vec![*index],
-                    vec![candidate_receipt.clone()],
-                    entity_addresses(tx, tx),
-                    "medium",
-                ));
+                selected = Some(SelectedCandidate {
+                    indices: vec![*index],
+                    receipts: vec![candidate_receipt.clone()],
+                    entity: entity_addresses(tx, tx),
+                    confidence: "medium",
+                });
             }
         }
-        let Some((indices, candidate_receipts, entity, confidence)) = selected else {
+        let Some(selected) = selected else {
             continue;
         };
+        let indices = selected.indices;
+        let candidate_receipts = selected.receipts;
+        let entity = selected.entity;
+        let confidence = selected.confidence;
 
         let weth_delta = candidate_receipts.iter().fold(0i128, |sum, value| {
             sum.saturating_add(weth_delta(value, weth, &entity))

@@ -255,6 +255,13 @@ impl Store {
                 UNIQUE(bundle_id, relay)
             );
 
+            CREATE TABLE IF NOT EXISTS qualification_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                occurred_at_ms INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS nonce_reservations (
                 bundle_id TEXT PRIMARY KEY,
                 opportunity_id TEXT NOT NULL,
@@ -429,6 +436,8 @@ impl WriteOp {
 /// the searcher on-time is the right trade. `dropped()` makes it visible.
 pub struct AsyncStore {
     tx: tokio::sync::mpsc::Sender<WriteOp>,
+    incident_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+    incident_recorded: std::sync::atomic::AtomicBool,
     dropped: std::sync::atomic::AtomicU64,
     queued: std::sync::atomic::AtomicU64,
 }
@@ -443,10 +452,25 @@ impl AsyncStore {
     /// and for the synchronous writes that are not on the hot path.
     pub fn spawn(store: std::sync::Arc<Store>, capacity: usize) -> std::sync::Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<WriteOp>(capacity.max(64));
+        let (incident_tx, mut incident_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
         let this = std::sync::Arc::new(Self {
             tx,
+            incident_tx,
+            incident_recorded: std::sync::atomic::AtomicBool::new(false),
             dropped: std::sync::atomic::AtomicU64::new(0),
             queued: std::sync::atomic::AtomicU64::new(0),
+        });
+        let incident_store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            while let Some(at_ms) = incident_rx.blocking_recv() {
+                if let Err(error) = incident_store.record_qualification_incident(
+                    "persistence_drop",
+                    "one or more bounded telemetry writes were dropped",
+                    at_ms,
+                ) {
+                    tracing::error!(target: "store", %error, "could not persist qualification incident");
+                }
+            }
         });
         tokio::task::spawn_blocking(move || {
             let mut batch: Vec<WriteOp> = Vec::with_capacity(BATCH_MAX);
@@ -498,6 +522,12 @@ impl AsyncStore {
                 let n = self.dropped.fetch_add(1, Relaxed) + 1;
                 // Rate-limited: one line per 1000 drops, so a sustained
                 // overload cannot itself become the bottleneck.
+                if !self
+                    .incident_recorded
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = self.incident_tx.send(now_ms());
+                }
                 if n % 1000 == 1 {
                     tracing::warn!(
                         target: "store",
@@ -508,6 +538,12 @@ impl AsyncStore {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 self.dropped.fetch_add(1, Relaxed);
+                if !self
+                    .incident_recorded
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    let _ = self.incident_tx.send(now_ms());
+                }
             }
         }
     }
@@ -1220,6 +1256,29 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_qualification_incident(
+        &self,
+        kind: &str,
+        detail: &str,
+        occurred_at_ms: u64,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO qualification_incidents (kind, detail, occurred_at_ms)
+             VALUES (?1,?2,?3)",
+            params![kind, detail, occurred_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn qualification_incident_count(&self, since_ms: u64) -> Result<u64> {
+        let count: i64 = self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM qualification_incidents WHERE occurred_at_ms >= ?1",
+            params![since_ms as i64],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Canonical observation continuity over the requested qualification window.
     /// A prior observation at or before `since_ms` anchors the left edge; the
     /// right edge includes the gap from the newest observation to `now_ms`.
@@ -1805,13 +1864,14 @@ impl Store {
 }
 
 fn relative_error_bps(predicted: i128, observed: i128) -> u64 {
-    let difference = predicted.abs_diff(observed);
-    let denominator = observed.unsigned_abs().max(1);
-    difference
-        .saturating_mul(10_000)
-        .checked_div(denominator)
-        .unwrap_or(u128::MAX)
-        .min(u64::MAX as u128) as u64
+    let difference = U256::from(predicted.abs_diff(observed));
+    let denominator = U256::from(observed.unsigned_abs().max(1));
+    let ratio = difference * U256::from(10_000u64) / denominator;
+    if ratio > U256::from(u64::MAX) {
+        u64::MAX
+    } else {
+        ratio.to::<u64>()
+    }
 }
 
 fn parse_i128_decimal(value: &str) -> i128 {
@@ -1851,6 +1911,14 @@ mod tests {
             sim_latency_ms: 10,
             created_at_ms: now_ms(),
         }
+    }
+
+    #[test]
+    fn relative_error_is_exact_and_overflow_safe() {
+        assert_eq!(relative_error_bps(100, 100), 0);
+        assert_eq!(relative_error_bps(80, 100), 2_000);
+        assert_eq!(relative_error_bps(120, 100), 2_000);
+        assert_eq!(relative_error_bps(i128::MIN, i128::MAX), 20_000);
     }
 
     #[test]
@@ -2102,8 +2170,11 @@ mod tests {
         // persistence. With a tiny queue and no writer draining it, sends
         // must return immediately and be counted as dropped.
         let (tx, _rx) = tokio::sync::mpsc::channel::<WriteOp>(1);
+        let (incident_tx, mut incident_rx) = tokio::sync::mpsc::unbounded_channel();
         let s = AsyncStore {
             tx,
+            incident_tx,
+            incident_recorded: std::sync::atomic::AtomicBool::new(false),
             dropped: std::sync::atomic::AtomicU64::new(0),
             queued: std::sync::atomic::AtomicU64::new(0),
         };
@@ -2112,5 +2183,13 @@ mod tests {
         }
         assert_eq!(s.queued(), 1, "only the buffered slot is accepted");
         assert_eq!(s.dropped(), 49, "the rest are shed, not blocked");
+        assert!(
+            incident_rx.try_recv().is_ok(),
+            "the window is durably invalidated"
+        );
+        assert!(
+            incident_rx.try_recv().is_err(),
+            "one incident per process is enough"
+        );
     }
 }

@@ -421,7 +421,7 @@ pub fn size_position(state: &V3State, capital: U256, zero_for_one: bool) -> Opti
     let sqrt_p = |tick: i32| -> f64 { (1.0001f64).powf(tick as f64 / 2.0) };
     let sa = sqrt_p(lower);
     let sb = sqrt_p(upper);
-    if !(sb > sa) {
+    if sb.partial_cmp(&sa) != Some(std::cmp::Ordering::Greater) {
         return None;
     }
 

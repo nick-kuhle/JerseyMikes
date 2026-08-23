@@ -1,5 +1,9 @@
 # Phase 2 — Engineering Work Order
 
+> **Historical decision record.** Phase 2 intentionally excluded submission;
+> that is not the current build. Use [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) and
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) for current execution behavior.
+
 **Audience:** the dev teams picking up Phase 2 of JerseyMikes.
 **What this is:** the consolidation of the former `PHASE_2_DESIGN.md` (the
 engineering spec) and `PHASE_2_REVIEW.md` (the maintainer review of that spec)

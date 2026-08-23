@@ -122,29 +122,31 @@ required on PRs to `main`. Phase 2 is **not** closed: W6 is still open,
 W4 is not raised past 3, and the handoff stays until those reports exist.
 Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
 
-## Phase 3 — going live (opt-in, separate PR)
+## Phase 3 — production execution readiness
 
-- [x] Console control surface: runtime simulation ⇄ live switch
-      (`GET/POST /api/mode`, `engine.rs::LiveMode`) layered strictly on top of
-      the boot-time two-key arming — an unarmed process refuses the switch
-      with the restart instructions; an armed one can pause/resume without a
-      restart. See `docs/RISK.md`.
-- [x] Console control surface (round 2): runtime risk envelope
-      (`GET/POST /api/risk` + kill-switch reset) — instant-apply panel,
-      share down to the simulator's bundle guards; strategy toggles narrow
-      only. Plus the six-step go-live deployment panel (deploy / fund /
-      allowlist / verify with CI-checked bytecode). Deploying and tuning
-      remain separate from the two-key arming.
-- [ ] Multi-relay submission with per-relay inclusion stats
-- [ ] Bundle merging and cancellation
-- [ ] Hot-wallet inventory management, WETH top-ups, profit sweeping
-- [x] Alerting: kill-switch trips, endpoint failures (head/pending stalls),
-      inclusion-rate collapse — rule engine over live state, lifecycle
-      (fire/resolve), `GET /api/alerts`, SSE feed events, optional
-      `ALERT_WEBHOOK_URL` delivery. See `docs/DEPLOYMENT.md`.
-- [x] Deployment: systemd units + Docker Compose (anvil included), Prometheus
-      `GET /api/metrics`, health endpoint; log shipping is delegated to
-      journald/the Docker logging driver. See `docs/DEPLOYMENT.md`.
+- [x] Three independent operator controls: boot arming, broadcast capability,
+      and authenticated runtime mode.
+- [x] Per-strategy `PASS` / `FAIL` / `INSUFFICIENT SAMPLE` qualification from
+      continuous canonical coverage, fork/relay samples, corresponding actual
+      on-chain outcomes, and explicit accuracy tolerances.
+- [x] Separate funded transaction signer and relay reputation signer.
+- [x] Concurrent multi-relay `eth_sendBundle`, bounded same-UUID retry, relay
+      response persistence, and cancellation.
+- [x] Serialized durable nonce reservations, startup cancellation recovery, and
+      fail-closed reuse blocking through target expiry.
+- [x] Finality-aware exact own execution reconciliation, explicit partial and
+      incoherent inclusion states, reorg invalidation, API and console views.
+- [x] Confidence/completeness-scored competitor attribution without claiming
+      unknowable off-chain or inventory economics.
+- [x] Hardened Docker Compose and systemd deployment targets, metrics, health,
+      alerts, and a reconciled runbook.
+- [ ] Automated inventory top-up/profit sweeping policy (manual operator action
+      remains safer for the first production period).
+- [ ] Bundle merging across independent opportunities.
+
+See `SIM_TO_LIVE.md` for the implemented broadcast predicate and operating
+procedure. Completion of code does not make a strategy qualified; only its own
+live evidence can produce `PASS`.
 
 ## Phase 4 — more chains
 

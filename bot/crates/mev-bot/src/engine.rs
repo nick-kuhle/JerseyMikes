@@ -492,13 +492,7 @@ impl Engine {
 
         // Local fork simulator. Absence is not fatal: the bot still observes and
         // records, it just cannot score opportunities.
-        let fork = match crate::sim::anvil::AnvilSim::spawn(
-            cfg.clone(),
-            head.number,
-            runtime.clone(),
-        )
-        .await
-        {
+        let fork = match crate::sim::anvil::AnvilSim::spawn(cfg.clone(), head.number).await {
             Ok(f) => Some(Arc::new(f)),
             Err(e) => {
                 tracing::error!(target: "engine", error = %e, "anvil fork unavailable — simulations disabled");
@@ -514,7 +508,6 @@ impl Engine {
                 cfg.clone(),
                 head.number,
                 cfg.sim.anvil_replay_port,
-                runtime.clone(),
             )
             .await
             {

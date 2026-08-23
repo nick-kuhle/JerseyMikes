@@ -39,14 +39,12 @@ Three corollaries follow:
   `eth_getRawTransactionByHash`". Lowering the gate just produces
   more simulations that revert.
 
-- **Never broadcast before Phase 1 work is done.** The README and
-  `RISK.md` are explicit about this. The simulation-only guard is
-  two independent environment variables, both required, by design. A
-  bundle that the on-chain guard would revert is *not* a safe bundle
-  to send — the builder drops reverted bundles, but the bundle still
-  hits the mempool, costs gas, and is observable. Read
-  [`ROADMAP.md`](ROADMAP.md) Phase 1 before doing anything that
-  touches the `LIVE_EXECUTION` path.
+- **Never bypass qualification to chase opportunities.** Broadcasting
+  now requires boot arming, a separate capability flag, runtime live mode,
+  risk/inventory/nonce gates, and that strategy's own evidence verdict.
+  Private bundles do not enter the public mempool, but relay/builder defects
+  and partial inclusion remain real risks. Read [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md)
+  before touching `LIVE_EXECUTION` or `BROADCAST_ENABLED`.
 
 - **The strategies you have are the strategies you should be
   improving.** New chains, new AMMs, new aggregators — these are
@@ -398,15 +396,13 @@ dependent and moving. Sandwich attacks in particular are under
 active scrutiny. This guide does not give legal advice, but two
 operational notes:
 
-- **The bot's simulation-only mode is a feature, not just a
-  development convenience.** A simulation-only bot can be
-  operated in jurisdictions that would not allow a live bot. Read
-  the README's warning carefully and treat it as binding.
-- **The relay's `eth_callBundle` cross-check** is a real
-  audit-trail: every bundle the bot would have submitted is
-  visible in the relay's data, timestamped, with a simulated
-  outcome. Treat it as a log you'd be willing to share, not one
-  you'd be willing to lose.
+- **Simulation-only mode is a feature, not just a development
+  convenience.** Keep every broadcast/arming default off where live extraction
+  is not intended or permitted.
+- **The local evidence store is the audit trail.** Relay `eth_callBundle`
+  requests are private RPC calls and should not be assumed retrievable from a
+  relay. Preserve SQLite fork/relay comparisons, actual-MEV attribution,
+  submitted payloads, nonce reservations and finalized outcomes.
 
 ## 7. The roadmap, in priority order
 

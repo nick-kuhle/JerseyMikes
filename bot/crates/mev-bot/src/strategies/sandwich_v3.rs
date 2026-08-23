@@ -12,7 +12,7 @@
 //! | Budget | Value |
 //! | --- | --- |
 //! | `eth_call` per V3 candidate | ≤ [`MAX_QUOTES_PER_CANDIDATE`] (12) |
-//! | V3 candidates per pending tx | ≤ [`MAX_CANDIDATES_PER_TX`] (4) |
+//! | V3 candidates per pending tx | 1 (the calldata-selected pool) |
 //! | Added latency on the pending path | ≤ 25 ms p95 (operator-measured) |
 //!
 //! A naive ternary search over `quote_v3` is ~120 `eth_call`s and will get
@@ -51,7 +51,6 @@ use crate::types::{now_ms, Call, Opportunity, PendingTx, Strategy};
 /// Hard ceiling on QuoterV2 `eth_call`s for one candidate.
 pub const MAX_QUOTES_PER_CANDIDATE: u32 = 12;
 /// Largest-notional-first cap on V3 candidates evaluated per pending tx.
-pub const MAX_CANDIDATES_PER_TX: usize = 4;
 
 /// Coarse grid, as fractions of `max_in` in bps. Four points keep the
 /// subsequent refine inside the 12-call budget (4 × 2 + 2 × 2 = 12).
@@ -140,7 +139,6 @@ impl StrategyImpl for SandwichV3Strategy {
         // One pool per victim (the fee is in the calldata). The candidate
         // cap is here so a future multi-fee expansion cannot blow the
         // pending-path budget by accident.
-        debug_assert!(1 <= MAX_CANDIDATES_PER_TX);
         let Some(sizing) = size_v3_sandwich(
             &quoter,
             &intent,

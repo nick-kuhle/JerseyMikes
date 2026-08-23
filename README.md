@@ -6,10 +6,11 @@ oracle-update front-running and new-token sniping**, wired to live mempool
 and private-orderflow data, scored against a forked EVM, and rendered in a
 real-time console.
 
-**Nothing is broadcast.** The bot reads real mainnet data, builds real bundles,
-and simulates them against real state — then records the result instead of
-sending it. Turning that off takes two independent environment variables that
-are not set by default.
+**Broadcasting is disabled by default and fail-closed.** The live transport
+exists, but requires separate boot arming, broadcast capability, authenticated
+runtime mode, risk and inventory approval, durable nonce recovery, exact-payload
+simulation, and an independent strategy-specific qualification `PASS` after at
+least seven continuously observed days.
 
 ```
 bot (Rust)                contracts (Foundry)          frontend (Next.js)
@@ -45,9 +46,9 @@ Requirements (install walkthrough + troubleshooting in
 
 | Tool | Version | Why |
 | --- | --- | --- |
-| **Rust** | 1.79+ | searcher, simulator and API (`bot/`) |
+| **Rust** | 1.85+ | searcher, simulator and API (`bot/`) |
 | **[Foundry](https://getfoundry.sh)** | latest | contracts build/tests; `anvil` is the simulation engine |
-| **Node.js** | 20+ | the console (`frontend/`) |
+| **Node.js** | 22+ | the console (`frontend/`) |
 | Ethereum RPC | archive-capable, mainnet | live + historical state |
 
 ---
@@ -77,17 +78,23 @@ Requirements (install walkthrough + troubleshooting in
    the recorded P/L — not an estimate.
 5. In parallel, the relay's `eth_callBundle` scores the same bundle. Divergence
    between the two is itself a signal.
-6. Everything is written to SQLite and streamed to the dashboard.
-
-Step 7 — `eth_sendBundle` — is the only thing this build does not do.
+6. Everything is written to SQLite and streamed to the dashboard. Canonical
+   delivered blocks are matched to decision-time opportunities and competitor
+   economics are confidence/completeness scored.
+7. Only a qualified live strategy enters the serialized durable nonce lane;
+   that exact payload is rechecked and sent to configured private relays.
+8. Own submitted hashes are reconciled after finality into exact gross,
+   builder payment, retained profit, gas, and net profit. Partial/incoherent
+   inclusion remains an explicit incident state.
 
 ### Why a losing bundle costs nothing
 
-`MevExecutor` measures the profit token's balance before and after the batch and
-reverts with `Unprofitable(realised, required)` unless the delta clears
-`minProfit`. Bundles go through private orderflow, so a reverting bundle is
-**dropped by the builder and never included**: no block space, no gas. That is
-what makes liberal risk parameters safe to start with.
+`MevExecutor` enforces retained profit after builder payment and reverts with
+`Unprofitable(realised, required)` below `minProfit`. A correctly simulated
+atomic private bundle that reverts should be dropped without gas cost. Relay or
+builder defects and partial inclusion are still operational risks, so the bot
+uses non-reverting payload policy, finality-aware receipt reconciliation,
+explicit incident states, and a drawdown stop.
 
 ---
 
@@ -106,7 +113,7 @@ never needs a redeploy.
 - Guards: `minProfit`, `blockDeadline`, `maxBaseFee`, `bribeBps`, searcher
   allowlist, transient-storage reentrancy/callback protection
 
-Runtime size 9,577 bytes (deterministic across checkouts — `compile-check.js`
+Runtime size 10,840 bytes (deterministic across checkouts — `compile-check.js`
 disables solc's IPFS metadata hash, which otherwise embeds each source file's
 absolute path). Tests cover the profit invariant, every guard, a
 flash-loan arbitrage, a full sandwich round trip, and access control.
@@ -133,8 +140,11 @@ src/
   risk.rs        gates, caps, drawdown kill switch
   sim/           anvil fork backend + relay eth_callBundle backend
   bundle.rs      Opportunity → calldata → signed bundle → relay payloads
-  signer.rs      secp256k1, EIP-1559, X-Flashbots-Signature
-  store.rs       SQLite schema + P/L aggregates
+  signer.rs      separate EIP-1559 transaction and relay-reputation signing
+  qualification.rs  per-strategy continuity, evidence, and accuracy verdicts
+  submission.rs  multi-relay retries/cancellation
+  attribution.rs exact own outcomes + confidence-scored competitor evidence
+  store.rs       SQLite P/L, qualification, nonce, relay, and finality state
   api.rs         REST + SSE
   engine.rs      the loop that ties it together
 ```
@@ -156,7 +166,7 @@ cargo run --release --bin mev-bot    # run
 
 ## The console
 
-`frontend/` — Next.js 15, live at `:3000`.
+`frontend/` — Next.js 16, live at `:3000`.
 
 - Cumulative simulated P/L (equity curve) and per-strategy breakdown
 - Simulated transaction history with gas, gross, net and revert reasons
@@ -191,8 +201,8 @@ cargo run --release --bin mev-bot    # run
 - **Go-live checklist**: the six-step MevExecutor deployment panel
   (`docs/GO_LIVE.md` Path A) — connect wallet, gas check, deploy (CI-checked
   bytecode, free cost estimate), fund, `setSearcher`, verify + copy the
-  `EXECUTOR_ADDRESS` line. Deploying still changes nothing about bot
-  behaviour: two-key arming stays the gate.
+  `EXECUTOR_ADDRESS` line. Deployment alone changes no execution mode; all
+  broadcast and strategy-specific qualification gates still apply.
 - **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
   (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
   7-day sample gate) that decides whether UniversalRouter decoding gets
@@ -216,10 +226,9 @@ requires a shared secret: set `API_AUTH_TOKEN` whenever `API_BIND` is not
 loopback, or the bot refuses to start — in simulation mode too. See
 [Securing the API](docs/DEPLOYMENT.md#securing-the-api).
 
-Upgrading a bot that already has a `.env`? That file is gitignored, so it keeps
-your old `API_BIND=0.0.0.0:8080` and the bot will refuse to start until you
-change it. One-line fix in
-[`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md#if-you-are-upgrading-an-existing-env).
+Upgrading an existing `.env` requires adding the signer, broadcast,
+qualification, finality, and API-security variables deliberately. Follow the
+ordered migration in [`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md).
 
 Risk defaults are intentionally permissive — `MIN_NET_PROFIT_WEI=1`,
 `MAX_POSITION_WEI=100 ETH`, every strategy on — because the first run's job is
@@ -233,7 +242,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/SETUP.md`](docs/SETUP.md) | Install walkthrough for all three toolchains, `.env`, `make doctor`, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Wiring, data flow, repo layout, how to add a chain |
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
-| [`docs/RISK.md`](docs/RISK.md) | Why nothing can be broadcast, every guard, known limitations |
+| [`docs/RISK.md`](docs/RISK.md) | Fail-closed broadcast predicate, executor guards, nonce/finality and known limitations |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased plan through going live and chains 2–5 |
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
 | [`docs/PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md) | Phase 2 work order: W0–W6 tickets with budgets and acceptance criteria (temporary; deleted when Phase 2 ships) |
@@ -244,19 +253,19 @@ to measure what is reachable, not to be profitable. See
 
 ## Status
 
-Phase 2 implementation is complete — including liquidation coverage
-(Aave/Compound V3/Morpho Blue/Maker), oracle-update front-running, and
-decoded revert reasons — and what remains of the phase is two data-gated
-decisions (W6 UniversalRouter decoding, W4 arb leg count) tracked in
-[`PHASE_2_HANDOFF.md`](docs/PHASE_2_HANDOFF.md); note that the WETH-funding
-fix reset the sandwich/sniper/JIT funnel baseline, so read those rows from
-that merge forward. The console now tunes the risk envelope at runtime
-(`/api/risk`), walks the go-live deployment checklist, and the ops surface
-ships alerting + Prometheus metrics + systemd/Docker units
-([`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)). The pipeline is still
-simulation-only: the mode switch is layered strictly on top of the
-boot-time two-key arming and can never arm an unarmed bot. Going live is
-Phase 3 and is a separate decision.
+The repository now contains the production relay path, but all execution
+defaults remain off. Current engineering live candidates are V2 sandwich, V3
+sandwich, and atomic arbitrage; each must independently earn a `PASS` from
+continuous canonical fork/relay/on-chain accuracy evidence. Other strategy rows
+remain visible and explicitly ineligible until their documented settlement or
+valuation limitation is removed.
+
+Production operations include separate transaction/reputation signers,
+multi-relay same-UUID retries and cancellation, durable serialized nonce
+reservations and restart recovery, finality-aware exact own-outcome accounting,
+confidence/completeness-scored competitor attribution, hardened Docker/systemd
+targets, and qualification/execution reporting in the API and console. Follow
+[`docs/SIM_TO_LIVE.md`](docs/SIM_TO_LIVE.md); arming is now a real money switch.
 
 ⚠️ Sandwich attacks extract value from other users. This repository is a
 research tool; deploying it against live users is your decision and your

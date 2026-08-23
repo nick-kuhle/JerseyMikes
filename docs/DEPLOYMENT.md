@@ -10,6 +10,8 @@ the same operational surface:
 | Health | `GET /api/health` (used by the Docker healthcheck) |
 | Metrics | `GET /api/metrics` — Prometheus text: funnel per strategy/lane, latency percentiles, stats, risk envelope, kill switch, inventory |
 | Alerts | `GET /api/alerts` — active set + transition history; also on the SSE feed (`alert` events) and, if `ALERT_WEBHOOK_URL` is set, POSTed there |
+| Qualification | `GET /api/qualification` — continuity, tolerances, and per-strategy verdicts |
+| Own settlement | `GET /api/executions` — pending/final/partial state and exact finalized economics |
 
 ## Securing the API
 
@@ -60,19 +62,32 @@ ssh -N -L 8080:127.0.0.1:8080 user@host   # then use http://127.0.0.1:8080
 ## systemd
 
 ```bash
-sudo mkdir -p /opt/jerseymikes /etc/jerseymikes
-# build + install the bot binary and the console (see Makefile: bot-build, front-build)
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin jerseymikes
+sudo install -d -o jerseymikes -g jerseymikes -m 0750 \
+  /opt/jerseymikes /opt/jerseymikes/frontend /var/lib/jerseymikes
+sudo install -d -o root -g jerseymikes -m 0750 /etc/jerseymikes
+
+# Build first: make bot-build front-build. Then install the bot binary and the
+# complete production frontend (package files, node_modules and .next).
+sudo install -o root -g root -m 0755 bot/target/release/mev-bot /opt/jerseymikes/mev-bot
+sudo cp -a frontend/. /opt/jerseymikes/frontend/
+sudo chown -R root:root /opt/jerseymikes/frontend
+sudo install -o root -g jerseymikes -m 0640 .env /etc/jerseymikes/env
+# In /etc/jerseymikes/env use DB_PATH=/var/lib/jerseymikes/mev.sqlite.
+sudo install -o root -g root -m 0755 "$(command -v anvil)" /usr/local/bin/anvil
 sudo cp deploy/systemd/*.service /etc/systemd/system/
-sudo cp .env /etc/jerseymikes/env            # the bot's own .env, minus secrets you keep local-only
+sudo systemd-analyze verify /etc/systemd/system/mev-bot*.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now mev-bot mev-bot-console
-journalctl -u mev-bot -f                      # logs
+journalctl -u mev-bot -f
 ```
 
-The bot unit expects `/opt/jerseymikes/mev-bot` and **anvil on PATH**
-(`Environment=PATH` is a stub — extend it if Foundry lives elsewhere, e.g.
-`/root/.foundry/bin`). `Restart=always` covers crashes; alerting covers
-everything that crashes *quietly*.
+The units run as the unprivileged `jerseymikes` user with a read-only system,
+private temporary/devices namespaces, no new privileges, and only
+`/var/lib/jerseymikes` writable by the bot. Keep the environment file mode
+`0640` because it holds both signing keys. `Restart=on-failure` does not bypass
+startup nonce recovery; unresolved private bundles are cancelled or keep nonce
+reuse blocked through target expiry.
 
 ## Docker Compose
 
@@ -80,8 +95,12 @@ everything that crashes *quietly*.
 cd deploy && docker compose --env-file ../.env up -d --build
 ```
 
-The bot image carries `anvil` (copied from the official Foundry image);
-SQLite persists on the `bot-data` volume.
+The bot image carries pinned Rust/Foundry toolchains and `anvil`; the console
+uses pinned Node 22. Both run unprivileged with read-only root filesystems,
+dropped capabilities, health checks, and loopback-only host publishing. SQLite
+persists on the `bot-data` volume. Back it up before upgrades: it contains
+qualification evidence, nonce reservations, submitted payloads and finalized
+execution outcomes—not just dashboard history.
 
 Compose sets `API_BIND=0.0.0.0:8080` inside the bot container — the console
 container has to reach it over the compose network — and therefore **requires

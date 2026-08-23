@@ -4,56 +4,50 @@
 > [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) — secure the API first, tighten these
 > knobs second, arm last.
 
-## Why nothing can be broadcast
+## Why broadcasting is fail-closed
 
-1. **No submission call site.** The engine records `BundleRecord`s and stops.
-   `bundle::send_bundle_params` exists so the payload shape is exercised and
-   testable, but no code path passes it to a transport.
-2. **Two-key switch.** `Config::live_execution` is only true when
-   `LIVE_EXECUTION=true` **and** `I_UNDERSTAND_LIVE_RISK=yes`. Neither is set by
-   `.env.example`.
-3. **Read-only relay calls.** The only relay method used is `eth_callBundle`,
-   which simulates and returns; it never enqueues.
-4. **Simulation happens on a local fork.** `anvil --fork-url` is a separate
-   process bound to `127.0.0.1`; every simulation RPC goes there, not to
-   mainnet.
+The transport exists, but no single switch can invoke it. A bundle reaches a
+relay only after all of these independent checks:
 
-## The two layers of the execution mode (boot arming vs runtime switch)
+1. live (not replay) strategy lane;
+2. engineering live-candidate strategy;
+3. risk, drawdown, gas, and exact-account inventory approval;
+4. boot arming (`LIVE_EXECUTION=true` and `I_UNDERSTAND_LIVE_RISK=yes`);
+5. independent capability (`BROADCAST_ENABLED=true`);
+6. authenticated runtime mode is live;
+7. the candidate strategy's own qualification verdict is `PASS`;
+8. no unresolved startup nonce-recovery block;
+9. exact reserved-nonce fork simulation succeeds.
 
-The mode the dashboard's simulation ⇄ live switch moves has **two** inputs,
-deliberately split so the runtime switch can only ever *narrow* what the
-operator's environment allowed:
+The defaults disable both arming and broadcast capability. `eth_callBundle`
+remains a read-only accuracy cross-check; `eth_sendBundle` uses the separately
+configured relay reputation signer while bundle transactions use the funded
+`SEARCHER_PRIVATE_KEY`.
 
-| Layer | Where it is decided | Who can change it | When |
-| --- | --- | --- | --- |
-| **Arming** — `LiveMode::armed()` | `LIVE_EXECUTION=true` **and** `I_UNDERSTAND_LIVE_RISK=yes`, read once by `Config::from_env` | the operator, by editing the bot's env and **restarting** | process start |
-| **Runtime switch** — `LiveMode::live() == armed && runtime` | `POST /api/mode {"live": bool}` (the dashboard switch) or `GET /api/mode` to read | anyone with API access, **but only within what arming allows** | any time |
+## Execution controls
 
-Consequences, all enforced in code (`engine.rs::LiveMode`, unit-tested):
+| Layer | Where decided | Change cadence |
+| --- | --- | --- |
+| Broadcast capability | `BROADCAST_ENABLED` | restart |
+| Boot arming | `LIVE_EXECUTION` + literal `I_UNDERSTAND_LIVE_RISK=yes` | restart |
+| Runtime mode | authenticated `POST /api/mode` | immediate, can only narrow boot arming |
+| Strategy qualification | canonical evidence in SQLite | continuously recomputed |
+| Risk/strategy narrowing | authenticated `POST /api/risk` | immediate |
 
-- A process started unarmed **cannot** be switched live through the API —
-  `set_live(true)` returns an error with the restart instructions, and the API
-  surfaces it as `409 Conflict`. There is no runtime path that grants arming.
-- A process started armed boots **live** (the environment already expressed
-  intent); the runtime switch exists to pause back to simulation and resume
-  without a restart.
-- When arming is false (the default, and the only state Phase 2 allows), the
-  runtime switch is a no-op on the engine: nothing is ever marked submitted,
-  exactly as before this endpoint existed.
-
-Note that even an armed + live process in this build only *marks* profitable
-bundles as submitted — the actual `eth_sendBundle` transport is Phase 3 of the
-roadmap (`ROADMAP.md`) and does not exist in this tree. The switch is the
-control surface Phase 3 will drive; it changes what the engine records today.
+An unarmed process cannot be switched live (`409 Conflict`). An armed process
+may be paused immediately. None of these controls bypasses another. See
+[`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) for the exact qualification, durable nonce,
+relay retry/cancellation, finality, and rollback behavior.
 
 ## Why a failed opportunity costs nothing
 
-`MevExecutor` measures the balance of the profit token before and after the
-batch and reverts with `Unprofitable(realised, required)` if the delta is below
-`minProfit`. Bundles are submitted through private orderflow, so a bundle whose
-transactions revert is **dropped by the builder and never included** — no block
-space, no gas. The gas-burn risk that exists for public-mempool bots does not
-exist here.
+`MevExecutor` measures retained profit and reverts with
+`Unprofitable(realised, required)` below `minProfit`. A correctly simulated
+atomic private bundle that reverts should be dropped by the builder and consume
+no gas. This is not a guarantee against relay/builder defects or partial
+inclusion; the bot therefore uses non-reverting bundle policy, exact receipt
+reconciliation, explicit partial-inclusion incident states, and a drawdown
+stop. The searcher must still hold gas ETH.
 
 Additional on-chain guards, all optional per bundle:
 
@@ -117,10 +111,13 @@ tightening order once there is data:
 
 ## Operational notes
 
-- The database is append-only; delete `data/mev.sqlite` to reset P/L.
-- `mev-bot doctor` verifies every endpoint before a run.
-- The kill switch is per-process; restarting clears it unless the drawdown is
-  recomputed from the database.
+- SQLite is production safety state: it contains qualification evidence,
+  submitted payloads, nonce reservations, relay responses, and finalized
+  outcomes. Back it up; never delete it during nonce recovery or go-live.
+- `mev-bot doctor` verifies endpoints before a run; qualification and execution
+  endpoints verify evidence after it starts.
+- The drawdown kill switch is currently process-local; a restart requires an
+  explicit operator review of persisted realized/simulated P/L before resuming.
 
 ## Runtime risk surface (`GET/POST /api/risk`)
 

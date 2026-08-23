@@ -127,11 +127,14 @@ pub trait StrategyImpl: Send + Sync {
 ///
 /// Reserves are the only thing that changes, and they can be read for dozens of
 /// pools in a single batched JSON-RPC round trip.
+type PairKey = (Address, Address, Venue);
+type PairIndex = Arc<RwLock<HashMap<PairKey, Option<Address>>>>;
+
 #[derive(Clone)]
 pub struct PoolCache {
     rpc: RpcClient,
     inner: Arc<RwLock<HashMap<Address, V2Pool>>>,
-    pair_index: Arc<RwLock<HashMap<(Address, Address, Venue), Option<Address>>>>,
+    pair_index: PairIndex,
 }
 
 impl PoolCache {

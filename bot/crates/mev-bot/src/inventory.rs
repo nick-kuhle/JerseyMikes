@@ -271,6 +271,31 @@ mod tests {
     }
 
     #[test]
+    fn nonce_reservations_release_only_from_the_tip() {
+        let inv = Inventory::new(false);
+        inv.set_nonce(10);
+        let first = inv.reserve_nonces(2);
+        assert_eq!(first, 10);
+        assert_eq!(inv.nonce(), 12);
+        assert!(inv.release_nonces(first, 2));
+        assert_eq!(inv.nonce(), 10);
+
+        let a = inv.reserve_nonces(1);
+        let _b = inv.reserve_nonces(1);
+        assert!(!inv.release_nonces(a, 1), "must not create a nonce gap");
+        assert_eq!(inv.nonce(), 12);
+    }
+
+    #[test]
+    fn unresolved_recovery_blocks_through_the_target() {
+        let inv = Inventory::new(false);
+        inv.block_broadcast_until(100);
+        assert!(!inv.broadcast_available(99));
+        assert!(!inv.broadcast_available(100));
+        assert!(inv.broadcast_available(101));
+    }
+
+    #[test]
     fn snapshot_exports_the_dashboard_fields() {
         let inv = Inventory::new(true);
         inv.set_nonce(3);

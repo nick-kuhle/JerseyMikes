@@ -1,26 +1,40 @@
-# JerseyMikes searcher — systemd unit.
-# Install: sudo cp deploy/systemd/*.service /etc/systemd/system/
-#          sudo systemctl daemon-reload && sudo systemctl enable --now mev-bot
-# Configure: EnvironmentFile points at the same .env the bot already uses
-# (copy it somewhere stable, e.g. /etc/jerseymikes/env).
-# Logs: journalctl -u mev-bot -f  (journald is the log shipper — forward it
-# with rsyslog/Vector/etc. rather than adding one to the app).
+# JerseyMikes searcher — hardened systemd unit.
+# Install paths and user creation are documented in docs/DEPLOYMENT.md.
 
 [Unit]
-Description=JerseyMikes MEV searcher (simulation-first)
+Description=JerseyMikes MEV searcher
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-# User=jerseymikes
+User=jerseymikes
+Group=jerseymikes
 WorkingDirectory=/opt/jerseymikes
 EnvironmentFile=/etc/jerseymikes/env
-ExecStart=/opt/jerseymikes/mev-bot
-Restart=always
-RestartSec=3
-# The bot needs anvil (Foundry) on PATH for the fork simulator.
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/jerseymikes/mev-bot
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/jerseymikes
 
 [Install]
 WantedBy=multi-user.target

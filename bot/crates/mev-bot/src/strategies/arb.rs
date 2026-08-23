@@ -200,9 +200,6 @@ fn try_cycle(
     token_in: Address,
     head: &BlockHead,
 ) -> Option<Opportunity> {
-    if a.other_token(token_in).is_none() {
-        return None;
-    }
     let mid = a.other_token(token_in)?;
     if b.other_token(mid)? != token_in {
         return None;

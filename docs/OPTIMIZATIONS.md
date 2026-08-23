@@ -1,6 +1,7 @@
 # Optimizations — Rust backend + Next.js dashboard
 
-Part 1 covers the Rust bot, part 2 the Next.js 15 console. Both were verified
+Part 1 covers the Rust bot, part 2 the console (Next.js 15 when this historical
+optimization record was written; the current manifest is authoritative). Both were verified
 with the full CI suite plus live runs; see the verification sections.
 
 ---

@@ -41,19 +41,6 @@ const EXECUTED_TOPIC: &str = "0x920d3a9c5eb5759e8895809a65dae03c9336ebf6f554de8c
 /// `MAX_GAS_PER_BUNDLE` can never get a bundle rejected before it runs.
 pub const MAX_TX_GAS_CEILING: u64 = 30_000_000;
 
-/// Clamp a configured bundle gas limit to 95% of the block gas limit (5%
-/// headroom for the victim transactions sharing the mined block). A limit of
-/// 0 means "unknown" and leaves the configured value untouched.
-fn clamp_gas(configured: u64, block_gas_limit: u64) -> u64 {
-    if block_gas_limit == 0 {
-        return configured;
-    }
-    let capped = block_gas_limit
-        .saturating_sub(block_gas_limit / 20)
-        .max(21_000);
-    configured.min(capped)
-}
-
 pub struct AnvilSim {
     cfg: Arc<Config>,
     rpc: RpcClient,
@@ -62,9 +49,6 @@ pub struct AnvilSim {
     forked_at: Mutex<u64>,
     executor: parking_lot::RwLock<Address>,
     searcher: Address,
-    /// The runtime risk envelope — `minProfit`/`bribeBps` guards and the gas
-    /// cap follow dashboard changes immediately, not at the next restart.
-    risk: crate::risk::RuntimeRisk,
     /// Serialises access: one simulation at a time per fork.
     lock: Mutex<()>,
 }
@@ -303,13 +287,9 @@ fn decode_callfailed_inner(data: &[u8]) -> Option<Vec<u8>> {
 
 impl AnvilSim {
     /// Start a local anvil forked at `block` on the configured primary port.
-    pub async fn spawn(
-        cfg: Arc<Config>,
-        block: u64,
-        risk: crate::risk::RuntimeRisk,
-    ) -> Result<Self> {
+    pub async fn spawn(cfg: Arc<Config>, block: u64) -> Result<Self> {
         let port = cfg.sim.anvil_port;
-        Self::spawn_on(cfg, block, port, risk).await
+        Self::spawn_on(cfg, block, port).await
     }
 
     /// Start a local anvil forked at `block` on an explicit port.
@@ -317,12 +297,7 @@ impl AnvilSim {
     /// A second instance on a second port is what keeps replay work off the
     /// live fork: the two pin to different heights and would otherwise reset
     /// each other on every alternating simulation.
-    pub async fn spawn_on(
-        cfg: Arc<Config>,
-        block: u64,
-        port: u16,
-        risk: crate::risk::RuntimeRisk,
-    ) -> Result<Self> {
+    pub async fn spawn_on(cfg: Arc<Config>, block: u64, port: u16) -> Result<Self> {
         let mut cmd = tokio::process::Command::new(&cfg.sim.anvil_bin);
         cmd.arg("--fork-url")
             .arg(&cfg.endpoints.http_url)
@@ -368,7 +343,6 @@ impl AnvilSim {
             child: Mutex::new(Some(child)),
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
-            risk,
             lock: Mutex::new(()),
         };
         sim.prepare_state().await?;
@@ -376,11 +350,7 @@ impl AnvilSim {
     }
 
     /// Attach to an already-running anvil (useful in CI / docker-compose).
-    pub async fn attach(
-        cfg: Arc<Config>,
-        url: &str,
-        risk: crate::risk::RuntimeRisk,
-    ) -> Result<Self> {
+    pub async fn attach(cfg: Arc<Config>, url: &str) -> Result<Self> {
         let rpc = RpcClient::new(url.to_string())?;
         let block = parse_u64(&rpc.call_raw("eth_blockNumber", json!([])).await?);
         let executor = cfg.endpoints.executor.unwrap_or(SIM_EXECUTOR);
@@ -391,7 +361,6 @@ impl AnvilSim {
             child: Mutex::new(None),
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
-            risk,
             lock: Mutex::new(()),
         };
         sim.prepare_state().await?;
@@ -405,96 +374,95 @@ impl AnvilSim {
     /// Install the executor bytecode, make the searcher the owner and give both
     /// accounts a spending balance inside the fork.
     async fn prepare_state(&self) -> Result<()> {
-        if self.cfg.endpoints.executor.is_none() {
-            #[derive(serde::Deserialize)]
-            struct ImmutableRef {
-                start: usize,
-                length: usize,
-            }
-            let refs: std::collections::HashMap<String, Vec<ImmutableRef>> =
-                serde_json::from_str(EXECUTOR_IMMUTABLE_REFS)
-                    .context("decode executor immutable references")?;
-            let mut runtime =
-                hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
-                    .context("decode embedded executor runtime bytecode")?;
-            for (name, value) in [
-                ("BALANCER_VAULT", crate::config::known::BALANCER_VAULT),
-                ("WETH", self.cfg.chain.weth),
-            ] {
-                let positions = refs.get(name).ok_or_else(|| {
-                    anyhow!("compiler artifact has no {name} immutable references")
-                })?;
-                let mut word = [0u8; 32];
-                word[12..].copy_from_slice(value.as_slice());
-                for position in positions {
-                    if position.length > 32 || position.start + position.length > runtime.len() {
-                        bail!("invalid immutable range for {name}");
-                    }
-                    runtime[position.start..position.start + position.length]
-                        .copy_from_slice(&word[32 - position.length..]);
-                }
-            }
-
-            self.rpc
-                .call_raw(
-                    "anvil_setCode",
-                    json!([
-                        format!("{SIM_EXECUTOR:?}"),
-                        format!("0x{}", hex::encode(runtime))
-                    ]),
-                )
-                .await
-                .context("install constructor-equivalent executor fixture")?;
-            *self.executor.write() = SIM_EXECUTOR;
-
-            // Storage slot 0 is owner. The owner is also accepted by
-            // `onlySearcher`, so no mapping slot needs to be fabricated.
-            self.rpc
-                .call_raw(
-                    "anvil_setStorageAt",
-                    json!([
-                        format!("{SIM_EXECUTOR:?}"),
-                        "0x0",
-                        format!("0x{:064x}", U256::from_be_slice(self.searcher.as_slice()))
-                    ]),
-                )
-                .await
-                .context("set fixture owner/searcher")?;
-
-            let rich = U256::from(30_000u64) * U256::from(1_000_000_000_000_000_000u128);
-            for who in [self.searcher, SIM_EXECUTOR] {
-                self.rpc
-                    .call_raw(
-                        "anvil_setBalance",
-                        json!([format!("{who:?}"), format!("0x{rich:x}")]),
-                    )
-                    .await
-                    .with_context(|| format!("fund fixture account {who:?}"))?;
-            }
-
-            // Mainnet WETH9's `balanceOf` mapping is storage slot 3. Setting
-            // the fixture executor's entry directly avoids mining a setup
-            // deposit and therefore keeps the fork pinned to the exact parent
-            // block the opportunity targets.
-            let mut key = [0u8; 64];
-            key[12..32].copy_from_slice(SIM_EXECUTOR.as_slice());
-            key[63] = 3;
-            let slot = alloy_primitives::keccak256(key);
-            let weth_inventory = U256::from(10_000u64) * U256::from(1_000_000_000_000_000_000u128);
-            self.rpc
-                .call_raw(
-                    "anvil_setStorageAt",
-                    json!([
-                        format!("{:?}", self.cfg.chain.weth),
-                        format!("{slot:?}"),
-                        format!("0x{weth_inventory:064x}")
-                    ]),
-                )
-                .await
-                .context("fund fixture executor with WETH")?;
-        } else {
-            *self.executor.write() = self.cfg.endpoints.executor.expect("checked above");
+        if let Some(executor) = self.cfg.endpoints.executor {
+            *self.executor.write() = executor;
+            return Ok(());
         }
+        #[derive(serde::Deserialize)]
+        struct ImmutableRef {
+            start: usize,
+            length: usize,
+        }
+        let refs: std::collections::HashMap<String, Vec<ImmutableRef>> =
+            serde_json::from_str(EXECUTOR_IMMUTABLE_REFS)
+                .context("decode executor immutable references")?;
+        let mut runtime = hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
+            .context("decode embedded executor runtime bytecode")?;
+        for (name, value) in [
+            ("BALANCER_VAULT", crate::config::known::BALANCER_VAULT),
+            ("WETH", self.cfg.chain.weth),
+        ] {
+            let positions = refs
+                .get(name)
+                .ok_or_else(|| anyhow!("compiler artifact has no {name} immutable references"))?;
+            let mut word = [0u8; 32];
+            word[12..].copy_from_slice(value.as_slice());
+            for position in positions {
+                if position.length > 32 || position.start + position.length > runtime.len() {
+                    bail!("invalid immutable range for {name}");
+                }
+                runtime[position.start..position.start + position.length]
+                    .copy_from_slice(&word[32 - position.length..]);
+            }
+        }
+
+        self.rpc
+            .call_raw(
+                "anvil_setCode",
+                json!([
+                    format!("{SIM_EXECUTOR:?}"),
+                    format!("0x{}", hex::encode(runtime))
+                ]),
+            )
+            .await
+            .context("install constructor-equivalent executor fixture")?;
+        *self.executor.write() = SIM_EXECUTOR;
+
+        // Storage slot 0 is owner. The owner is also accepted by
+        // `onlySearcher`, so no mapping slot needs to be fabricated.
+        self.rpc
+            .call_raw(
+                "anvil_setStorageAt",
+                json!([
+                    format!("{SIM_EXECUTOR:?}"),
+                    "0x0",
+                    format!("0x{:064x}", U256::from_be_slice(self.searcher.as_slice()))
+                ]),
+            )
+            .await
+            .context("set fixture owner/searcher")?;
+
+        let rich = U256::from(30_000u64) * U256::from(1_000_000_000_000_000_000u128);
+        for who in [self.searcher, SIM_EXECUTOR] {
+            self.rpc
+                .call_raw(
+                    "anvil_setBalance",
+                    json!([format!("{who:?}"), format!("0x{rich:x}")]),
+                )
+                .await
+                .with_context(|| format!("fund fixture account {who:?}"))?;
+        }
+
+        // Mainnet WETH9's `balanceOf` mapping is storage slot 3. Setting
+        // the fixture executor's entry directly avoids mining a setup
+        // deposit and therefore keeps the fork pinned to the exact parent
+        // block the opportunity targets.
+        let mut key = [0u8; 64];
+        key[12..32].copy_from_slice(SIM_EXECUTOR.as_slice());
+        key[63] = 3;
+        let slot = alloy_primitives::keccak256(key);
+        let weth_inventory = U256::from(10_000u64) * U256::from(1_000_000_000_000_000_000u128);
+        self.rpc
+            .call_raw(
+                "anvil_setStorageAt",
+                json!([
+                    format!("{:?}", self.cfg.chain.weth),
+                    format!("{slot:?}"),
+                    format!("0x{weth_inventory:064x}")
+                ]),
+            )
+            .await
+            .context("fund fixture executor with WETH")?;
         Ok(())
     }
 
@@ -815,32 +783,6 @@ pub fn to_i128(v: U256) -> i128 {
 mod tests {
     use super::*;
     use alloy_sol_types::{sol, SolError};
-
-    #[test]
-    fn clamp_leaves_sane_configurations_alone() {
-        // Default config on today's 60M mainnet limit: untouched.
-        assert_eq!(clamp_gas(3_000_000, 60_000_000), 3_000_000);
-        // Unknown limit (0): untouched — the live fork reads it right after
-        // spawning, so 0 only ever means "not yet measured".
-        assert_eq!(clamp_gas(3_000_000, 0), 3_000_000);
-    }
-
-    #[test]
-    fn clamp_caps_above_limit_configurations() {
-        // The reproduced failure: configured > fork limit. 95% of the limit,
-        // leaving headroom for the victim txs in the same mined block.
-        assert_eq!(clamp_gas(70_000_000, 60_000_000), 57_000_000);
-        // An attached anvil started with a small --gas-limit.
-        assert_eq!(clamp_gas(3_000_000, 2_000_000), 1_900_000);
-        // Absurd configuration on an old 30M-limit fork.
-        assert_eq!(clamp_gas(300_000_000, 30_000_000), 28_500_000);
-    }
-
-    #[test]
-    fn clamp_never_goes_below_intrinsic_floor() {
-        assert!(clamp_gas(u64::MAX, 30_000_000) < 30_000_000);
-        assert!(clamp_gas(u64::MAX, 100_000) >= 21_000);
-    }
 
     #[test]
     fn decodes_solidity_error_string() {

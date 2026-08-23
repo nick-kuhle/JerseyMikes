@@ -10,9 +10,8 @@
  *                                          args encoded in the browser; the
  *                                          hex is a CI-checked copy of the
  *                                          bot artifact)
- *   4. fund the executor                  (0.02–0.05 ETH for its gas — not
- *                                          trading capital; swaps are
- *                                          Balancer flash-loan funded)
+ *   4. optionally fund the executor       (native call value only; the searcher
+ *                                          EOA pays transaction gas)
  *   5. allowlist the bot's searcher EOA   (setSearcher(searcher, true))
  *   6. verify + point the bot at it       (owner / searcher checks, then
  *                                          EXECUTOR_ADDRESS in .env)
@@ -339,8 +338,8 @@ export default function GoLivePanel({
     },
     {
       key: "fund",
-      title: "4 · Fund the executor (its gas money)",
-      state: fundedOk ? "done" : deployedOk ? "todo" : "locked",
+      title: "4 · Optional executor native-call funding",
+      state: deployedOk ? "done" : "locked",
       node: (
         <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
           <input value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} style={{...input, width: 80}} />
@@ -350,7 +349,7 @@ export default function GoLivePanel({
             send
           </button>
           <span className="muted" style={{fontSize: 10}}>
-            0.02–0.05 ETH. Not trading capital — swap capital is flash-loan funded; the owner can always sweep it back.
+            Optional. The searcher EOA pays transaction gas; fund the contract only when calls need native value. The owner can sweep it back.
           </span>
           {verify.executorBalance && (
             <span style={{fontSize: 11, color: fundedOk ? "var(--green)" : "var(--amber)"}}>

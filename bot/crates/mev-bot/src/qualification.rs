@@ -81,7 +81,8 @@ pub fn evaluate(
         .observation_coverage(since_ms, now_ms)
         .unwrap_or_default();
     let allowed_gap_ms = cfg.qualification_max_gap_secs.saturating_mul(1_000);
-    let dropped = writes.dropped();
+    let durable_incidents = store.qualification_incident_count(since_ms).unwrap_or(0);
+    let dropped = writes.dropped().max(durable_incidents);
     let elapsed_hours = coverage
         .first_seen_ms
         .map(|started| now_ms.saturating_sub(started) / 3_600_000)
@@ -246,11 +247,10 @@ fn evaluate_strategy(
 }
 
 fn accuracy_bps(within: u64, total: u64) -> u64 {
-    if total == 0 {
-        0
-    } else {
-        within.saturating_mul(10_000) / total
-    }
+    within
+        .saturating_mul(10_000)
+        .checked_div(total)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
