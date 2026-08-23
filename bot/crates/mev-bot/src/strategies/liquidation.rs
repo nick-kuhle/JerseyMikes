@@ -18,7 +18,7 @@
 //! The oracle front-runner reuses the same composition reader at trigger
 //! time, so a feed update back-runs the position as it stands then.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -172,7 +172,11 @@ impl LiquidationStrategy {
                         .collect();
                     by_age.sort_unstable_by_key(|(_, seen)| std::cmp::Reverse(*seen));
                     by_age.truncate(self.watch_cap);
-                    set.retain(|address, _| by_age.iter().any(|(keep, _)| keep == address));
+                    let keep = by_age
+                        .into_iter()
+                        .map(|(address, _)| address)
+                        .collect::<HashSet<_>>();
+                    set.retain(|address, _| keep.contains(address));
                 }
                 drop(set);
                 *self.last_log_block.write() = head.number;
@@ -389,7 +393,7 @@ pub async fn compose(
         if !reserve_cfg.active {
             continue;
         }
-        let Some(price) = aave_asset_price(ctx, *asset).await else {
+        let Some(price) = aave_asset_price(ctx, cache, *asset).await else {
             continue;
         };
         let scale = decimal_scale(reserve_cfg.decimals);
@@ -457,7 +461,13 @@ fn decimal_scale(decimals: u8) -> U256 {
     scale
 }
 
-async fn aave_asset_price(ctx: &StrategyCtx, asset: Address) -> Option<U256> {
+async fn aave_asset_price(ctx: &StrategyCtx, cache: &AaveCache, asset: Address) -> Option<U256> {
+    let head = ctx.head().number;
+    if let Some((block, price)) = cache.price.read().get(&asset) {
+        if *block == head {
+            return Some(*price);
+        }
+    }
     let value = ctx
         .rpc
         .call_raw(
@@ -470,7 +480,12 @@ async fn aave_asset_price(ctx: &StrategyCtx, asset: Address) -> Option<U256> {
         .await
         .ok()?;
     let raw = crate::types::parse_bytes(&value);
-    (raw.len() >= 32).then(|| U256::from_be_slice(&raw[0..32]))
+    if raw.len() < 32 {
+        return None;
+    }
+    let price = U256::from_be_slice(&raw[0..32]);
+    cache.price.write().insert(asset, (head, price));
+    Some(price)
 }
 
 /// The pool's reserve list, cached per strategy instance (refreshed if a
@@ -516,6 +531,7 @@ async fn aave_reserves(ctx: &StrategyCtx, cache: &AaveCache) -> Vec<Address> {
 pub struct AaveCache {
     reserves: RwLock<Vec<Address>>,
     cfg: RwLock<std::collections::HashMap<Address, (u64, ReserveCfg)>>,
+    price: RwLock<std::collections::HashMap<Address, (u64, U256)>>,
 }
 
 pub async fn aave_reserve_cfg(

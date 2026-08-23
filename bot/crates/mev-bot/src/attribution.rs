@@ -44,6 +44,16 @@ pub async fn reconcile_own_submissions(
     let Ok(bundles) = store.submitted_bundles_through(head) else {
         return;
     };
+    let bundles = bundles
+        .into_iter()
+        .filter(|bundle| {
+            !(bundle.inclusion_state == "included_unfinalized"
+                && bundle
+                    .observed_block
+                    .map(|block| head < block.saturating_add(finality_depth))
+                    .unwrap_or(false))
+        })
+        .collect::<Vec<_>>();
     let all_hashes = bundles
         .iter()
         .flat_map(|bundle| bundle.tx_hashes.iter().copied())
@@ -62,7 +72,16 @@ pub async fn reconcile_own_submissions(
             } else {
                 "partial_unfinalized"
             };
-            let _ = store.mark_bundle_observation(&bundle.bundle_id, state, &found_hashes);
+            let observed_block = found
+                .first()
+                .map(|(_, receipt)| parse_u64(&receipt["blockNumber"]))
+                .filter(|value| *value != 0);
+            let _ = store.mark_bundle_observation(
+                &bundle.bundle_id,
+                state,
+                observed_block,
+                &found_hashes,
+            );
             if head >= bundle.target_block.saturating_add(finality_depth) {
                 if found.is_empty() {
                     let _ = store.mark_bundle_not_included(&bundle.bundle_id);
@@ -109,6 +128,7 @@ pub async fn reconcile_own_submissions(
                 let _ = store.mark_bundle_observation(
                     &bundle.bundle_id,
                     "incoherent_unfinalized",
+                    Some(included_block).filter(|value| *value != 0),
                     &found_hashes,
                 );
             }
@@ -119,6 +139,7 @@ pub async fn reconcile_own_submissions(
             let _ = store.mark_bundle_observation(
                 &bundle.bundle_id,
                 "included_unfinalized",
+                Some(included_block),
                 &found_hashes,
             );
             continue;

@@ -48,6 +48,8 @@ pub struct SubmittedBundle {
     pub opportunity_id: String,
     pub target_block: u64,
     pub tx_hashes: Vec<alloy_primitives::B256>,
+    pub inclusion_state: String,
+    pub observed_block: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +337,8 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_sim_created ON simulations(created_at_ms);
             CREATE INDEX IF NOT EXISTS idx_sim_qualification
                 ON simulations(strategy, backend, created_at_ms, success, opportunity_id, id);
+            CREATE INDEX IF NOT EXISTS idx_sim_opportunity_backend
+                ON simulations(opportunity_id, backend, id);
             CREATE INDEX IF NOT EXISTS idx_blocks_coverage ON blocks(canonical, seen_at_ms);
             CREATE INDEX IF NOT EXISTS idx_qualification_incident_time
                 ON qualification_incidents(occurred_at_ms);
@@ -957,7 +961,8 @@ impl Store {
     pub fn submitted_bundles_through(&self, block_number: u64) -> Result<Vec<SubmittedBundle>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, opportunity_id, target_block, payload FROM bundles
+            "SELECT id, opportunity_id, target_block, payload,
+                    inclusion_state, included_block FROM bundles
              WHERE submitted = 1 AND included IS NULL AND target_block <= ?1
              ORDER BY target_block ASC LIMIT 500",
         )?;
@@ -967,10 +972,15 @@ impl Store {
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)? as u64,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?
+                    .map(|value| value.max(0) as u64),
             ))
         })?;
         let mut out = Vec::new();
-        for (bundle_id, opportunity_id, target_block, payload) in rows.flatten() {
+        for (bundle_id, opportunity_id, target_block, payload, inclusion_state, observed_block) in
+            rows.flatten()
+        {
             let value: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
             let tx_hashes = value
                 .get(0)
@@ -988,6 +998,8 @@ impl Store {
                     opportunity_id,
                     target_block,
                     tx_hashes,
+                    inclusion_state,
+                    observed_block,
                 });
             }
         }
@@ -1081,14 +1093,17 @@ impl Store {
         &self,
         bundle_id: &str,
         state: &str,
+        observed_block: Option<u64>,
         observed_hashes: &[alloy_primitives::B256],
     ) -> Result<()> {
         self.conn.lock().execute(
-            "UPDATE bundles SET inclusion_state = ?2, observed_tx_hashes = ?3,
-                    inclusion_checked_ms = ?4 WHERE id = ?1",
+            "UPDATE bundles SET inclusion_state = ?2,
+                    included_block = COALESCE(?3, included_block),
+                    observed_tx_hashes = ?4, inclusion_checked_ms = ?5 WHERE id = ?1",
             params![
                 bundle_id,
                 state,
+                observed_block.map(|value| value as i64),
                 serde_json::to_string(
                     &observed_hashes
                         .iter()
