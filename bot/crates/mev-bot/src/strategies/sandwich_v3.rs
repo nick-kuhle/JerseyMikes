@@ -50,8 +50,6 @@ use crate::types::{now_ms, Call, Opportunity, PendingTx, Strategy};
 
 /// Hard ceiling on QuoterV2 `eth_call`s for one candidate.
 pub const MAX_QUOTES_PER_CANDIDATE: u32 = 12;
-/// Largest-notional-first cap on V3 candidates evaluated per pending tx.
-
 /// Coarse grid, as fractions of `max_in` in bps. Four points keep the
 /// subsequent refine inside the 12-call budget (4 × 2 + 2 × 2 = 12).
 const COARSE_BPS: [u32; 4] = [400, 1_200, 2_800, 5_600];
@@ -734,17 +732,17 @@ mod tests {
         assert!(accept_victim(&i, weth(), &cache).is_some());
 
         // Wrong fee tier → miss.
-        let mut other = i.clone();
+        let mut other = i;
         other.fee = 500;
         assert!(accept_victim(&other, weth(), &cache).is_none());
 
         // Zero amount → miss.
-        let mut z = i.clone();
+        let mut z = i;
         z.amount_in = U256::ZERO;
         assert!(accept_victim(&z, weth(), &cache).is_none());
 
         // Not WETH-in → miss (we don't inventory the other side).
-        let mut sold = i.clone();
+        let mut sold = i;
         sold.token_in = usdc();
         sold.token_out = weth();
         assert!(accept_victim(&sold, weth(), &cache).is_none());
