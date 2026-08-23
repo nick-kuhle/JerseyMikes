@@ -485,6 +485,16 @@ fn env_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Clamp `MAX_GAS_PER_BUNDLE` into `[21_000, MAX_TX_GAS_CEILING]`.
+///
+/// Pure so the boundaries are unit-testable without mutating the process
+/// environment. The upper bound is the EIP-7825 per-transaction protocol
+/// cap (16,777,216 gas, live since Fusaka 2025-12-03) — see
+/// [`crate::sim::anvil::MAX_TX_GAS_CEILING`].
+fn clamp_bundle_gas(raw: u64) -> u64 {
+    raw.clamp(21_000, crate::sim::anvil::MAX_TX_GAS_CEILING)
+}
+
 impl Config {
     /// Load configuration from the process environment (after `.env` is applied).
     pub fn from_env() -> Result<Self> {
@@ -575,10 +585,10 @@ impl Config {
                 // Clamped into the same range the runtime patch validator
                 // enforces — an out-of-range env value would otherwise be
                 // echoed back by GET /api/risk and poison every dashboard
-                // patch that re-sends it ("outside [21000, 30000000]").
+                // patch that re-sends it ("outside [21000, 16777216]").
                 max_gas_per_bundle: {
                     let raw = env_u64("MAX_GAS_PER_BUNDLE", 3_000_000);
-                    let clamped = raw.clamp(21_000, crate::sim::anvil::MAX_TX_GAS_CEILING);
+                    let clamped = clamp_bundle_gas(raw);
                     if clamped != raw {
                         eprintln!(
                             "MAX_GAS_PER_BUNDLE={raw} outside [21000, {}] — clamped to {clamped} \
@@ -948,5 +958,21 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("supersecret"), "signer key leaked: {json}");
         assert!(!json.contains("flashbots_signer_key"), "{json}");
+    }
+
+    #[test]
+    fn bundle_gas_clamps_to_the_eip7825_per_tx_cap() {
+        // Lower bound: one intrinsic-cost transfer.
+        assert_eq!(clamp_bundle_gas(0), 21_000);
+        assert_eq!(clamp_bundle_gas(21_000), 21_000);
+        // The 3M default passes through untouched.
+        assert_eq!(clamp_bundle_gas(3_000_000), 3_000_000);
+        // The EIP-7825 cap itself is still a legal tx gas limit.
+        assert_eq!(clamp_bundle_gas(16_777_216), 16_777_216);
+        // Anything above it would be protocol-invalid since Fusaka
+        // (2025-12-03) regardless of the 60M block gas limit.
+        assert_eq!(clamp_bundle_gas(20_000_000), 16_777_216);
+        assert_eq!(clamp_bundle_gas(30_000_000), 16_777_216);
+        assert_eq!(clamp_bundle_gas(u64::MAX), 16_777_216);
     }
 }

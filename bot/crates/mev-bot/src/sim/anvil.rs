@@ -36,10 +36,13 @@ pub const SIM_EXECUTOR: Address =
 const EXECUTED_TOPIC: &str = "0x920d3a9c5eb5759e8895809a65dae03c9336ebf6f554de8cdc90e3bcb4404121";
 
 /// Ceiling for the *signed* bundle transactions (the relay `eth_callBundle`
-/// path, which has no fork to read a live limit from): comfortably below any
-/// L1 block gas limit, past or present, so a misconfigured
-/// `MAX_GAS_PER_BUNDLE` can never get a bundle rejected before it runs.
-pub const MAX_TX_GAS_CEILING: u64 = 30_000_000;
+/// path, which has no fork to read a live limit from). Since Fusaka
+/// (2025-12-03), EIP-7825 enforces a protocol-level cap of 16,777,216 (2^24)
+/// gas on *any single transaction*: a tx signed above it is invalid no
+/// matter what the block gas limit is (60M since EIP-7935, also Fusaka).
+/// Clamping here keeps a misconfigured `MAX_GAS_PER_BUNDLE` from ever
+/// signing a bundle that every builder must reject before it runs.
+pub const MAX_TX_GAS_CEILING: u64 = 16_777_216;
 
 pub struct AnvilSim {
     cfg: Arc<Config>,
@@ -783,6 +786,16 @@ pub fn to_i128(v: U256) -> i128 {
 mod tests {
     use super::*;
     use alloy_sol_types::{sol, SolError};
+
+    #[test]
+    fn tx_gas_ceiling_is_the_eip7825_protocol_cap() {
+        // EIP-7825 (live since Fusaka, 2025-12-03): no single transaction may
+        // specify more than 2^24 gas, independent of the block gas limit
+        // (60M since EIP-7935). Raising this const above that cap would let
+        // a misconfigured MAX_GAS_PER_BUNDLE sign bundles that are
+        // protocol-invalid — rejected by every txpool, builder and relay.
+        assert_eq!(MAX_TX_GAS_CEILING, 16_777_216);
+    }
 
     #[test]
     fn decodes_solidity_error_string() {

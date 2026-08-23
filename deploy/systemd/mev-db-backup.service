@@ -1,0 +1,33 @@
+# JerseyMikes — WAL-safe SQLite backup (see deploy/backup-db.sh).
+# Scheduled by mev-db-backup.timer; pairs with mev-bot.service, which keeps
+# the live database under /var/lib/jerseymikes.
+
+[Unit]
+Description=JerseyMikes qualification-database backup
+After=mev-bot.service
+Wants=mev-bot.service
+
+[Service]
+Type=oneshot
+User=jerseymikes
+Group=jerseymikes
+# Override paths here if DB_PATH/BACKUP_DIR are not the defaults below.
+Environment=DB_PATH=/var/lib/jerseymikes/mev.sqlite
+Environment=BACKUP_DIR=/var/lib/jerseymikes/backups
+ExecStart=/opt/jerseymikes/backup-db.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/jerseymikes

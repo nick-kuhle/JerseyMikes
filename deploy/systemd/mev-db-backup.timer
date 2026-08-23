@@ -1,0 +1,16 @@
+# JerseyMikes — run the database backup every 15 minutes.
+# The 7-day qualification clock resets if the database volume is lost, so
+# snapshots must survive reboots (Persistent=true) and missed runs are
+# caught up rather than skipped.
+
+[Unit]
+Description=Run the JerseyMikes database backup every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+Unit=mev-db-backup.service
+
+[Install]
+WantedBy=timers.target

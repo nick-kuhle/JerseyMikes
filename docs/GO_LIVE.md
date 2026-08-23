@@ -1,5 +1,10 @@
 # Going live, step by step (deploying MevExecutor to Ethereum mainnet)
 
+> Coming from a fresh server? Start with
+> [`DAY0_RUNBOOK.md`](DAY0_RUNBOOK.md) — the full Phase 0→4 path from bare
+> host to the Day-7 money switch. This page covers just the contract
+> deployment leg in depth.
+
 Written for a first-time operator. It answers the two questions people ask
 first — *do I deploy before arming the bot?* (yes — deploy is step 1, arming
 is the very last thing and a separate decision) and *what do I need?*
