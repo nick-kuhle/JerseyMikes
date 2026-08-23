@@ -495,6 +495,75 @@ fn clamp_bundle_gas(raw: u64) -> u64 {
     raw.clamp(21_000, crate::sim::anvil::MAX_TX_GAS_CEILING)
 }
 
+/// Env names that operators historically set from older checklists.
+///
+/// They are **not** read by [`Config::from_env`]. If they are present the
+/// canonical wei/bps knobs stay at their liberal defaults — a live-money
+/// footgun (`MIN_NET_PROFIT_ETH=0.005` silently leaves `MIN_NET_PROFIT_WEI=1`).
+/// `validate` refuses to boot when any of these is set; `doctor` prints them
+/// as `✗`. See `docs/DAY0_RUNBOOK.md`.
+pub const IGNORED_ENV_ALIASES: &[(&str, &str)] = &[
+    ("MIN_NET_PROFIT_ETH", "MIN_NET_PROFIT_WEI"),
+    ("MAX_BASE_FEE_GWEI", "MAX_BASE_FEE_WEI"),
+    ("MAX_DRAWDOWN_ETH", "MAX_DRAWDOWN_WEI"),
+    ("BUILDER_SHARE_BPS", "BRIBE_BPS"),
+];
+
+/// One unused alias found in the process environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IgnoredEnvAlias {
+    pub name: &'static str,
+    pub canonical: &'static str,
+}
+
+/// Collect unused checklist aliases using an injected lookup so the mapping
+/// is unit-testable without mutating the process environment.
+pub fn collect_ignored_env_aliases(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<IgnoredEnvAlias> {
+    IGNORED_ENV_ALIASES
+        .iter()
+        .filter(|(name, _)| lookup(name).is_some())
+        .map(|(name, canonical)| IgnoredEnvAlias { name, canonical })
+        .collect()
+}
+
+/// Unused checklist aliases currently set in the process environment.
+pub fn ignored_env_aliases() -> Vec<IgnoredEnvAlias> {
+    collect_ignored_env_aliases(env_opt)
+}
+
+/// Human-readable reason `validate` / `doctor` print when aliases are set.
+pub fn format_ignored_env_error(found: &[IgnoredEnvAlias]) -> String {
+    let mut lines = vec![
+        "the following environment variables are set but are not read by the bot.".to_string(),
+        "They come from an older checklist and would silently leave the canonical \
+         wei/bps knobs at their liberal defaults."
+            .to_string(),
+        String::new(),
+    ];
+    for alias in found {
+        lines.push(format!(
+            "  {} is set — use {} instead (this bot is wei/bps denominated)",
+            alias.name, alias.canonical
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Remove the unused names from the env file (or rename them) and restart.".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Fail closed when unused aliases are present. Split out so the rule is
+/// testable without constructing a whole `Config`.
+pub fn validate_ignored_aliases(found: &[IgnoredEnvAlias]) -> Result<()> {
+    if found.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("{}", format_ignored_env_error(found))
+}
+
 impl Config {
     /// Load configuration from the process environment (after `.env` is applied).
     pub fn from_env() -> Result<Self> {
@@ -958,6 +1027,55 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("supersecret"), "signer key leaked: {json}");
         assert!(!json.contains("flashbots_signer_key"), "{json}");
+    }
+
+    #[test]
+    fn unused_checklist_aliases_are_detected_without_touching_the_process_env() {
+        // A lookup, not `std::env`: this test must stay hermetic so it cannot
+        // race other tests or depend on the operator's shell.
+        let lookup = |name: &str| match name {
+            "MIN_NET_PROFIT_ETH" => Some("0.005".into()),
+            "BUILDER_SHARE_BPS" => Some("9000".into()),
+            _ => None,
+        };
+        let found = collect_ignored_env_aliases(lookup);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "MIN_NET_PROFIT_ETH");
+        assert_eq!(found[0].canonical, "MIN_NET_PROFIT_WEI");
+        assert_eq!(found[1].name, "BUILDER_SHARE_BPS");
+        assert_eq!(found[1].canonical, "BRIBE_BPS");
+        assert!(validate_ignored_aliases(&found).is_err());
+        assert!(validate_ignored_aliases(&[]).is_ok());
+    }
+
+    #[test]
+    fn unused_alias_error_names_the_canonical_knob() {
+        let found =
+            collect_ignored_env_aliases(|name| (name == "MAX_BASE_FEE_GWEI").then(|| "100".into()));
+        let err = format_ignored_env_error(&found);
+        assert!(err.contains("MAX_BASE_FEE_GWEI"), "{err}");
+        assert!(err.contains("MAX_BASE_FEE_WEI"), "{err}");
+        assert!(!err.contains("100"), "do not echo the unused value: {err}");
+        assert!(err.contains("wei/bps"), "{err}");
+    }
+
+    #[test]
+    fn every_documented_ghost_name_is_in_the_alias_table() {
+        // PATH_TO_PRODUCTION §3.2 / DAY0_RUNBOOK: these four names do not
+        // exist in the bot and must not silently no-op.
+        let names: Vec<&str> = IGNORED_ENV_ALIASES.iter().map(|(n, _)| *n).collect();
+        for required in [
+            "MIN_NET_PROFIT_ETH",
+            "MAX_BASE_FEE_GWEI",
+            "MAX_DRAWDOWN_ETH",
+            "BUILDER_SHARE_BPS",
+        ] {
+            assert!(
+                names.contains(&required),
+                "{required} dropped from IGNORED_ENV_ALIASES"
+            );
+        }
+        assert_eq!(IGNORED_ENV_ALIASES.len(), 4);
     }
 
     #[test]

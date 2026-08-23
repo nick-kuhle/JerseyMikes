@@ -461,7 +461,27 @@ impl Engine {
         // Runtime risk envelope: boot values from the environment, mutable
         // via POST /api/risk (see RuntimeRisk for the narrowing invariants).
         let runtime = crate::risk::RuntimeRisk::new(cfg.risk.clone(), cfg.strategies.clone());
-        let risk = Arc::new(RiskEngine::new(cfg.clone(), runtime.clone()));
+        let risk = {
+            let engine = RiskEngine::new(cfg.clone(), runtime.clone()).with_store(store.clone());
+            match store.load_risk_state() {
+                Ok(state) => engine.restore(&state),
+                Err(error) => {
+                    // Cannot prove the previous process was untripped: fail
+                    // closed. POST /api/risk/reset is the explicit re-arm.
+                    tracing::error!(
+                        target: "engine",
+                        %error,
+                        "could not load durable kill-switch state — starting tripped"
+                    );
+                    engine.restore(&crate::store::PersistedRiskState {
+                        tripped: true,
+                        tripped_at_ms: None,
+                        cumulative_net_wei: 0,
+                    });
+                }
+            }
+            Arc::new(engine)
+        };
 
         let relay_signer = Arc::new(match &cfg.endpoints.flashbots_signer_key {
             Some(k) => Signer::from_hex(k)?,

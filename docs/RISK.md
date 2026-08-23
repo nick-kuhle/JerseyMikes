@@ -74,6 +74,12 @@ Set in the environment; see `.env.example`.
 | `MAX_DRAWDOWN_WEI` | `0` (off) | Cumulative simulated loss that trips the kill switch |
 | `MAX_INFLIGHT_PER_STRATEGY` | `32` | Concurrent simulations per strategy |
 
+The names are wei- or bps-denominated on purpose. `MIN_NET_PROFIT_ETH`,
+`MAX_BASE_FEE_GWEI`, `MAX_DRAWDOWN_ETH`, and `BUILDER_SHARE_BPS` are **not**
+read: if any of them is set, `run`/`api` refuse to start and `doctor` prints
+`✗ env names`. That is fail-closed against an older checklist whose values
+would otherwise silently no-op and leave the liberal defaults above in force.
+
 These start **deliberately liberal**. The first run's job is to measure how much
 MEV is reachable and where the losses come from, not to be profitable. Suggested
 tightening order once there is data:
@@ -112,12 +118,16 @@ tightening order once there is data:
 ## Operational notes
 
 - SQLite is production safety state: it contains qualification evidence,
-  submitted payloads, nonce reservations, relay responses, and finalized
-  outcomes. Back it up; never delete it during nonce recovery or go-live.
+  submitted payloads, nonce reservations, relay responses, finalized
+  outcomes, **and the drawdown kill switch**. Back it up; never delete it
+  during nonce recovery or go-live.
 - `mev-bot doctor` verifies endpoints before a run; qualification and execution
-  endpoints verify evidence after it starts.
-- The drawdown kill switch is currently process-local; a restart requires an
-  explicit operator review of persisted realized/simulated P/L before resuming.
+  endpoints verify evidence after it starts. A persisted kill-switch trip
+  prints as `✗ kill switch`.
+- The drawdown kill switch is durable. A trip is written synchronously to
+  SQLite and restored at boot — `systemctl restart` cannot silently re-arm
+  a bot that stopped itself. `POST /api/risk/reset` (authenticated) is the
+  only re-arm; it clears both the in-memory flag and the durable row.
 
 ## Runtime risk surface (`GET/POST /api/risk`)
 
@@ -126,7 +136,8 @@ applies changes instantly: the risk engine gates the next opportunity, the
 fork simulator prices the next bundle's `minProfit`/`bribeBps` guards, and
 the signed-bundle gas cap — all from the same shared runtime state. A
 `POST /api/risk/reset` re-arms a tripped drawdown kill switch (explicitly,
-from the dashboard).
+from the dashboard) and clears the durable SQLite row so the next restart
+does not come up already tripped.
 
 What stays boot-only, deliberately:
 

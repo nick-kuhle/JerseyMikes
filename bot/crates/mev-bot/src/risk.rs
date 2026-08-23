@@ -249,6 +249,9 @@ pub struct RiskEngine {
     /// Running simulated PnL in wei; drives the drawdown kill switch.
     cumulative_net: RwLock<i128>,
     tripped: RwLock<bool>,
+    /// Optional SQLite handle. Tests leave this `None` so they stay hermetic;
+    /// production wires it so a trip survives `systemctl restart`.
+    store: Option<Arc<crate::store::Store>>,
 }
 
 impl RiskEngine {
@@ -259,6 +262,38 @@ impl RiskEngine {
             inflight: RwLock::new(HashMap::new()),
             cumulative_net: RwLock::new(0),
             tripped: RwLock::new(false),
+            store: None,
+        }
+    }
+
+    /// Attach the durable store. Must be called before [`Self::restore`] so a
+    /// subsequent trip or reset writes through.
+    pub fn with_store(mut self, store: Arc<crate::store::Store>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Re-apply a snapshot loaded from SQLite at boot. A previously tripped
+    /// process comes back tripped; `POST /api/risk/reset` is the only re-arm.
+    pub fn restore(&self, state: &crate::store::PersistedRiskState) {
+        *self.tripped.write() = state.tripped;
+        *self.cumulative_net.write() = state.cumulative_net_wei;
+        if state.tripped {
+            tracing::error!(
+                target: "risk",
+                cumulative_net_wei = state.cumulative_net_wei,
+                tripped_at_ms = ?state.tripped_at_ms,
+                "restored durable drawdown kill switch from SQLite — POST /api/risk/reset to re-arm"
+            );
+        }
+    }
+
+    fn persist(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(error) = store.persist_kill_switch(self.is_tripped(), self.cumulative_net()) {
+            tracing::error!(target: "risk", %error, "could not persist kill-switch state");
         }
     }
 
@@ -312,19 +347,29 @@ impl RiskEngine {
     /// Fold a simulation into the running PnL and trip the kill switch if the
     /// drawdown limit is breached.
     pub fn observe(&self, sim: &SimulationResult) {
-        let mut cum = self.cumulative_net.write();
-        *cum += sim.net_profit_wei;
-        let limit = self.runtime.risk().max_drawdown_wei;
-        if !limit.is_zero() {
-            let limit_i = crate::sim::anvil::to_i128(limit);
-            if *cum < -limit_i {
-                *self.tripped.write() = true;
-                tracing::error!(
-                    target: "risk",
-                    cumulative_net_wei = *cum,
-                    "drawdown kill switch tripped — no new opportunities will be taken"
-                );
+        let mut newly_tripped = false;
+        {
+            let mut cum = self.cumulative_net.write();
+            *cum += sim.net_profit_wei;
+            let limit = self.runtime.risk().max_drawdown_wei;
+            if !limit.is_zero() {
+                let limit_i = crate::sim::anvil::to_i128(limit);
+                if *cum < -limit_i {
+                    let mut tripped = self.tripped.write();
+                    if !*tripped {
+                        *tripped = true;
+                        newly_tripped = true;
+                        tracing::error!(
+                            target: "risk",
+                            cumulative_net_wei = *cum,
+                            "drawdown kill switch tripped — no new opportunities will be taken"
+                        );
+                    }
+                }
             }
+        }
+        if newly_tripped {
+            self.persist();
         }
     }
 
@@ -339,6 +384,7 @@ impl RiskEngine {
     pub fn reset(&self) {
         *self.tripped.write() = false;
         *self.cumulative_net.write() = 0;
+        self.persist();
     }
 
     /// Would we have sent this bundle? Simulation-only builds never actually do.
@@ -563,6 +609,39 @@ mod tests {
         );
         r.reset();
         assert!(r.check(&opp(Strategy::Sandwich, 10), U256::ZERO).is_ok());
+    }
+
+    #[test]
+    fn a_tripped_kill_switch_survives_a_new_engine() {
+        // The defect: trip lived only in process memory, so `systemctl restart`
+        // after a drawdown silently re-armed the bot. Persist + restore must
+        // bring the next process up already tripped; reset is the only re-arm.
+        let store = std::sync::Arc::new(crate::store::Store::open_in_memory().unwrap());
+        let c = cfg();
+        let rt = crate::risk::RuntimeRisk::new(c.risk.clone(), c.strategies.clone());
+        let first = RiskEngine::new(c.clone(), rt.clone()).with_store(store.clone());
+        first.observe(&sim(-600, 1));
+        first.observe(&sim(-600, 1));
+        assert!(first.is_tripped());
+
+        let restored = RiskEngine::new(c.clone(), rt.clone()).with_store(store.clone());
+        restored.restore(&store.load_risk_state().unwrap());
+        assert!(restored.is_tripped());
+        assert_eq!(restored.cumulative_net(), first.cumulative_net());
+        assert_eq!(
+            restored.check(&opp(Strategy::Sandwich, 10), U256::ZERO),
+            Err(Reject::KillSwitch)
+        );
+
+        restored.reset();
+        assert!(!restored.is_tripped());
+        let after_reset = RiskEngine::new(c, rt).with_store(store.clone());
+        after_reset.restore(&store.load_risk_state().unwrap());
+        assert!(!after_reset.is_tripped());
+        assert_eq!(after_reset.cumulative_net(), 0);
+        assert!(after_reset
+            .check(&opp(Strategy::Sandwich, 10), U256::ZERO)
+            .is_ok());
     }
 
     #[test]
