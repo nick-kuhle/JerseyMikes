@@ -217,6 +217,28 @@ pub struct Config {
     pub submission_retry_ms: u64,
     /// Maximum relay submission attempts per bundle.
     pub submission_max_attempts: u64,
+    /// How many live submissions may proceed *without* a strategy `PASS`.
+    ///
+    /// 0 (default) = off. Capped at [`LIVE_SMOKE_MAX_CAP`]. Still requires
+    /// boot arming, `BROADCAST_ENABLED`, runtime live mode, risk, inventory,
+    /// live-candidate engineering, and an exact-payload sim. Counts durable
+    /// `eth_sendBundle` *attempts* in SQLite so a restart cannot refill the
+    /// budget. A persist failure refuses the send.
+    pub live_smoke_max: u64,
+}
+
+/// Hard ceiling on `LIVE_SMOKE_MAX`. The point is one or two proving shots,
+/// not a back door around the seven-day gate.
+pub const LIVE_SMOKE_MAX_CAP: u64 = 5;
+
+/// True while `used` is still strictly below `max`. `max == 0` is off.
+pub fn smoke_allows(used: u64, max: u64) -> bool {
+    max > 0 && used < max
+}
+
+/// Slots remaining. Saturates at 0.
+pub fn smoke_remaining(used: u64, max: u64) -> u64 {
+    max.saturating_sub(used)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -797,6 +819,7 @@ impl Config {
             finality_depth: env_u64("FINALITY_DEPTH", 12).max(1),
             submission_retry_ms: env_u64("SUBMISSION_RETRY_MS", 250).max(50),
             submission_max_attempts: env_u64("SUBMISSION_MAX_ATTEMPTS", 2).clamp(1, 5),
+            live_smoke_max: env_u64("LIVE_SMOKE_MAX", 0).min(LIVE_SMOKE_MAX_CAP),
         };
         // NOTE: `validate()` is deliberately NOT called here. `doctor` and
         // `replay` load the config without ever binding a port, and they must
@@ -825,6 +848,7 @@ impl Config {
     /// `API_AUTH_TOKEN`. Loopback-only setups are unaffected.
     pub fn validate(&self) -> Result<()> {
         validate_api(&self.api)?;
+        validate_ignored_aliases(&ignored_env_aliases())?;
         if self.broadcast_enabled && !self.live_execution {
             anyhow::bail!(
                 "BROADCAST_ENABLED=true requires both LIVE_EXECUTION=true and I_UNDERSTAND_LIVE_RISK=yes"
@@ -867,7 +891,7 @@ pub fn validate_api(api: &ApiConfig) -> Result<()> {
 impl Config {
     pub fn summary(&self) -> String {
         format!(
-            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} ur={} arb_legs={} bloxroute_txs={} live={}",
+            "chain={} ({}) ws={} mev_share={} call_bundle={} strategies=[{}] discovery={}/v3:{} ur={} arb_legs={} bloxroute_txs={} live={} smoke={}",
             self.chain.name,
             self.chain.chain_id,
             self.endpoints.ws_url.is_some(),
@@ -879,7 +903,8 @@ impl Config {
             self.decode_universal_router,
             self.arb_max_cycle_len,
             self.relay_tx_ingest,
-            self.live_execution
+            self.live_execution,
+            self.live_smoke_max
         )
     }
 }
@@ -1076,6 +1101,21 @@ mod tests {
             );
         }
         assert_eq!(IGNORED_ENV_ALIASES.len(), 4);
+    }
+
+    #[test]
+    fn smoke_allows_only_inside_a_positive_budget() {
+        assert!(!smoke_allows(0, 0), "default off");
+        assert!(smoke_allows(0, 2));
+        assert!(smoke_allows(1, 2));
+        assert!(!smoke_allows(2, 2));
+        assert!(!smoke_allows(3, 2));
+        assert_eq!(smoke_remaining(0, 2), 2);
+        assert_eq!(smoke_remaining(2, 2), 0);
+        assert_eq!(smoke_remaining(5, 2), 0);
+        // The cap is a named const so a compile-time check is enough; a
+        // runtime `assert!(const)` is optimized out and trips clippy.
+        const _: () = assert!(LIVE_SMOKE_MAX_CAP >= 2 && LIVE_SMOKE_MAX_CAP <= 5);
     }
 
     #[test]

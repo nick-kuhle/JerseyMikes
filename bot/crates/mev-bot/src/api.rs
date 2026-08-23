@@ -194,6 +194,7 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
             "relayCallBundle": e.sim.relay.is_some(),
         },
         "inventory": e.inventory.snapshot(),
+        "liveSmoke": live_smoke(e),
         // Persistence queue health: a rising `dropped` means the writer
         // cannot keep up and telemetry rows are being shed to protect the
         // hot path.
@@ -203,6 +204,16 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         },
         "latency": e.latency.snapshot(),
     }))
+}
+
+fn live_smoke(e: &Engine) -> serde_json::Value {
+    let used = e.store.smoke_used().unwrap_or(0);
+    let max = e.cfg.live_smoke_max;
+    json!({
+        "max": max,
+        "used": used,
+        "remaining": crate::config::smoke_remaining(used, max),
+    })
 }
 
 async fn config(State(s): State<ApiState>) -> impl IntoResponse {
@@ -583,6 +594,7 @@ async fn metrics(State(s): State<ApiState>) -> Response {
         "stats": e.stats.snapshot(),
         "latency": e.latency.snapshot(),
         "inventory": e.inventory.snapshot(),
+        "liveSmoke": live_smoke(e),
         // Persistence queue health: a rising `dropped` means the writer
         // cannot keep up and telemetry rows are being shed to protect the
         // hot path.

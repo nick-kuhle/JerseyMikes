@@ -131,6 +131,8 @@ export interface StatusResponse {
     availableWei: string;
     gate: boolean;
   };
+  /** Bounded pre-qualification live shots. Absent on older bots. */
+  liveSmoke?: {max: number; used: number; remaining: number};
   latency?: LatencySnapshot;
   demo?: boolean;
 }

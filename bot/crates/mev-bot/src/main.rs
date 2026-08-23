@@ -59,9 +59,16 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(Config::from_env()?);
     tracing::info!("{}", cfg.summary());
     if cfg.live_execution && cfg.broadcast_enabled {
-        tracing::warn!(
-            "LIVE EXECUTION AND BROADCAST CAPABILITY ARE ENABLED — only qualification-passing bundles may be sent"
-        );
+        if cfg.live_smoke_max > 0 {
+            tracing::warn!(
+                max = cfg.live_smoke_max,
+                "LIVE EXECUTION AND BROADCAST ARE ENABLED — qualification-passing bundles may be sent; LIVE_SMOKE_MAX also allows that many un-qualified live-candidate sends"
+            );
+        } else {
+            tracing::warn!(
+                "LIVE EXECUTION AND BROADCAST CAPABILITY ARE ENABLED — only qualification-passing bundles may be sent"
+            );
+        }
     } else if cfg.live_execution {
         tracing::warn!("live mode is armed, but BROADCAST_ENABLED=false — shadow recording only");
     } else {
@@ -201,6 +208,31 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         cfg.qualification_hours,
         cfg.qualification_min_actual_matches
     );
+    {
+        let used = {
+            let db = std::path::Path::new(&cfg.api.db_path);
+            if db.exists() {
+                mev_bot::store::Store::open(&cfg.api.db_path)
+                    .and_then(|s| s.smoke_used())
+                    .ok()
+            } else {
+                Some(0)
+            }
+        };
+        let used = used.unwrap_or(0);
+        let remaining = mev_bot::config::smoke_remaining(used, cfg.live_smoke_max);
+        if cfg.live_smoke_max > 0 {
+            println!(
+                "{} live smoke         LIVE_SMOKE_MAX={} used={} remaining={} (still needs arming, broadcast, risk, inventory, live-candidate, exact sim)",
+                if remaining > 0 { "!" } else { "·" },
+                cfg.live_smoke_max,
+                used,
+                remaining
+            );
+        } else {
+            println!("· live smoke         off (LIVE_SMOKE_MAX=0)");
+        }
+    }
 
     match tokio::process::Command::new(&cfg.sim.anvil_bin)
         .arg("--version")
@@ -426,7 +458,7 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
     // Day-0 state photograph: everything the money switch depends on.
     let understands = std::env::var("I_UNDERSTAND_LIVE_RISK").unwrap_or_else(|_| "no".into());
     println!(
-        "\nmode: {} | broadcast: {} | I_UNDERSTAND_LIVE_RISK={understands} | inventory gate: {}",
+        "\nmode: {} | broadcast: {} | smoke: {} | I_UNDERSTAND_LIVE_RISK={understands} | inventory gate: {}",
         if cfg.live_execution {
             "LIVE"
         } else {
@@ -436,6 +468,11 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
             "enabled"
         } else {
             "disabled"
+        },
+        if cfg.live_smoke_max > 0 {
+            format!("LIVE_SMOKE_MAX={}", cfg.live_smoke_max)
+        } else {
+            "off".into()
         },
         cfg.inventory_gate,
     );
