@@ -116,7 +116,10 @@ impl Inventory {
     /// We do **not** increment on reservation: in simulation mode nothing is
     /// sent, so the on-chain nonce does not move, and two concurrent
     /// simulations are alternative futures that both start from the same
-    /// nonce. Live execution (Phase 3) will commit on submission.
+    /// nonce. The live lane commits separately: `Engine::submit_live_candidate`
+    /// reserves and advances the nonce (`reserve_nonces`) only on the
+    /// serialized submission path, re-simulating the exact reserved-nonce
+    /// payload before anything is signed and sent.
     pub fn nonce_for(&self, _opp: &Opportunity) -> u64 {
         self.nonce()
     }
