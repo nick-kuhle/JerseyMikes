@@ -1,7 +1,7 @@
 /**
  * DEX Aggregator & Swapping utilities for the New Token Sniper.
  *
- * Provides deep links to top DEX aggregators (1inch, Uniswap, KyberSwap, DexScreener, Odos)
+ * Provides deep links to top DEX aggregators (1inch, Uniswap, KyberSwap, DexScreener)
  * and ABI definitions for ERC20 approvals and on-chain swap interactions.
  */
 
