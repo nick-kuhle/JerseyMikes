@@ -119,13 +119,22 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
     use mev_bot::rpc::RpcClient;
     use serde_json::json;
 
+    // Hard-failure accumulator. `doctor` reports everything it can, but a
+    // caller like `make doctor` must be able to rely on the exit code: any
+    // of these means the data plane is wrong or `run` would fail, so the
+    // process exits non-zero. Soft warnings (!/) never affect the code.
+    let mut hard_failures: Vec<String> = Vec::new();
+
     let http = RpcClient::new(cfg.endpoints.http_url.clone())?;
     match http.call_raw("eth_blockNumber", json!([])).await {
         Ok(v) => println!(
             "✓ http rpc          {} (head {})",
             cfg.endpoints.http_url, v
         ),
-        Err(e) => println!("✗ http rpc          {}: {e}", cfg.endpoints.http_url),
+        Err(e) => {
+            println!("✗ http rpc          {}: {e}", cfg.endpoints.http_url);
+            hard_failures.push(format!("http rpc unreachable: {e}"));
+        }
     }
 
     match cfg.validate() {
@@ -150,6 +159,7 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
             for line in e.to_string().lines() {
                 println!("                    {line}");
             }
+            hard_failures.push(format!("configuration invalid: {e}"));
         }
     }
 
@@ -174,15 +184,24 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
                 Some(id) if id == cfg.chain.chain_id => {
                     println!("✓ chain id          {v} (profile {profile_name}, WETH {weth})");
                 }
-                Some(id) => println!(
-                    "✗ chain id          {v} — RPC is chain {id} but CHAIN_ID is {} \
-                     (WETH {weth}); the profile and the RPC disagree",
-                    cfg.chain.chain_id
-                ),
+                Some(id) => {
+                    println!(
+                        "✗ chain id          {v} — RPC is chain {id} but CHAIN_ID is {} \
+                         (WETH {weth}); the profile and the RPC disagree",
+                        cfg.chain.chain_id
+                    );
+                    hard_failures.push(format!(
+                        "chain id mismatch: RPC reports {id}, CHAIN_ID is {}",
+                        cfg.chain.chain_id
+                    ));
+                }
                 None => println!("✓ chain id          {v} (profile {profile_name}, WETH {weth})"),
             }
         }
-        Err(e) => println!("✗ chain id          {e}"),
+        Err(e) => {
+            println!("✗ chain id          {e}");
+            hard_failures.push(format!("eth_chainId failed: {e}"));
+        }
     }
     // Transport + qualification shape for this chain, so the operator sees
     // how a live send and the PASS gate actually work before arming.
@@ -366,6 +385,10 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
                      same address ({}) — split them before arming",
                     cfg.endpoints.searcher_address
                 );
+                hard_failures.push(
+                    "FLASHBOTS_SIGNER_KEY and SEARCHER_PRIVATE_KEY derive the same address"
+                        .to_string(),
+                );
             }
             Ok(_) => println!("✓ key separation   flashbots signer differs from the searcher key"),
             Err(e) => println!("! key separation   FLASHBOTS_SIGNER_KEY unparseable: {e}"),
@@ -383,9 +406,12 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
                 Ok(code) if code.as_str().is_some_and(|s| s.len() > 4) => {
                     println!("✓ executor          {addr} has on-chain code");
                 }
-                _ => println!(
-                    "✗ executor          {addr} has no on-chain code — deploy per docs/GO_LIVE.md"
-                ),
+                _ => {
+                    println!(
+                        "✗ executor          {addr} has no on-chain code — deploy per docs/GO_LIVE.md"
+                    );
+                    hard_failures.push(format!("executor {addr} has no on-chain code"));
+                }
             }
 
             // searchers(address) — public mapping getter on MevExecutor.
@@ -483,10 +509,16 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         let probe = parent.join(".doctor-write-probe");
         match std::fs::write(&probe, b"ok").and_then(|_| std::fs::remove_file(&probe)) {
             Ok(()) => println!("✓ database dir      {} writable", parent.display()),
-            Err(e) => println!(
-                "✗ database dir      {} not writable: {e} — qualification cannot persist",
-                parent.display()
-            ),
+            Err(e) => {
+                println!(
+                    "✗ database dir      {} not writable: {e} — qualification cannot persist",
+                    parent.display()
+                );
+                hard_failures.push(format!(
+                    "database dir {} not writable: {e}",
+                    parent.display()
+                ));
+            }
         }
     }
 
@@ -539,6 +571,17 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         cfg.risk.max_drawdown_wei,
         cfg.risk.max_gas_per_bundle
     );
+    if !hard_failures.is_empty() {
+        println!(
+            "\n✗ doctor FAILED ({} hard failure(s)):",
+            hard_failures.len()
+        );
+        for f in &hard_failures {
+            println!("  - {f}");
+        }
+        anyhow::bail!("doctor found {} hard failure(s)", hard_failures.len());
+    }
+    println!("\n✓ doctor passed: no hard failures");
     Ok(())
 }
 

@@ -30,10 +30,22 @@ use crate::types::{
     PendingTx, RelayBlock, TxSource,
 };
 
+// Pending is the hot variant and deliberately held inline (it crosses the
+// whole mempool funnel per transaction); the frame variant is boxed. The
+// spread between them is intentional, so the size-difference lint is waived
+// here rather than shoving the hot variant behind a pointer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum IngestEvent {
     Block(BlockHead),
     Pending(PendingTx),
+    /// A preconfirmed-state frame arrived (Flashblocks). Emitted once per
+    /// accepted frame — even one that adds no transactions, because the state
+    /// identity itself advanced and TTL/expiry bookkeeping depends on it.
+    /// Always precedes the transactions parsed from the same frame.
+    /// Boxed: ten frames a second must not bloat every `IngestEvent` copy out
+    /// of the mempool-hot `Pending` variant's class.
+    PreconfirmedState(Box<crate::flashblocks::PreconfirmedFrame>),
     /// MEV-Share hint: we know *something* happened but not always what.
     Hint {
         hash: B256,
@@ -58,13 +70,24 @@ pub enum IngestEvent {
 
 pub struct Ingest {
     pub rx: mpsc::Receiver<IngestEvent>,
+    /// Feed counters when `FLASHBLOCKS_WS_URL` is configured; surfaced on
+    /// `/api/status` so a dead/broken/gapping preconfirmation feed is
+    /// distinguishable from calm order flow at a glance.
+    pub flashblocks: Option<Arc<crate::flashblocks::FlashblockStats>>,
 }
 
 impl Ingest {
-    /// Wire up every configured source.
-    pub fn start(cfg: Arc<Config>) -> Self {
+    /// Wire up every configured source. `stats_slot` lets the caller (the
+    /// engine) hand in the `FlashblockStats` handle it already published for
+    /// `/api/status`, so the counters the operator watches are the ones the
+    /// parser actually increments.
+    pub fn start(
+        cfg: Arc<Config>,
+        stats_slot: Option<Arc<crate::flashblocks::FlashblockStats>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(8192);
         let http = RpcClient::new(cfg.endpoints.http_url.clone()).expect("http rpc");
+        let mut flashblocks: Option<Arc<crate::flashblocks::FlashblockStats>> = None;
 
         if let Some(ws) = cfg.endpoints.ws_url.clone() {
             spawn_new_heads(ws.clone(), tx.clone());
@@ -94,7 +117,8 @@ impl Ingest {
         // block. On a private-mempool chain this is the earliest state a
         // searcher can see at all.
         if let Some(url) = cfg.endpoints.flashblocks_ws.clone() {
-            spawn_flashblocks(url, tx.clone());
+            let stats = spawn_flashblocks(url, tx.clone(), stats_slot.clone());
+            flashblocks = Some(stats);
         }
 
         for relay in cfg.endpoints.relay_data_urls.clone() {
@@ -117,7 +141,7 @@ impl Ingest {
             spawn_chain_blocks(http.clone(), cfg.chain.block_time_ms, tx.clone());
         }
 
-        Self { rx }
+        Self { rx, flashblocks }
     }
 }
 
@@ -304,6 +328,7 @@ pub fn parse_tx_object(v: &Value, source: TxSource) -> Option<PendingTx> {
         source,
         // Live flow by default; the relay backfill stamps this after parsing.
         mined_at: None,
+        preconfirmed: None,
         seen_at_ms: now_ms(),
     })
 }
@@ -452,78 +477,59 @@ fn spawn_sequencer_feed(url: String, tx: mpsc::Sender<IngestEvent>) {
 /// Everything emitted is tagged [`TxSource::Flashblock`], which is
 /// `backrun_only()`: once a Flashblock is sealed its ordering is final, so
 /// there is no front position to buy at any price.
-fn spawn_flashblocks(url: String, tx: mpsc::Sender<IngestEvent>) {
-    let mut sub = WsSubscription::spawn(url, json!(["newFlashblocks"]), "flashblocks");
+/// Returns the shared feed counters (`/api/status` reads them).
+fn spawn_flashblocks(
+    url: String,
+    tx: mpsc::Sender<IngestEvent>,
+    stats_slot: Option<Arc<crate::flashblocks::FlashblockStats>>,
+) -> Arc<crate::flashblocks::FlashblockStats> {
+    let stats =
+        stats_slot.unwrap_or_else(|| Arc::new(crate::flashblocks::FlashblockStats::default()));
+    let reconnects = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut sub = WsSubscription::spawn_observed(
+        url,
+        json!(["newFlashblocks"]),
+        "flashblocks",
+        Some(reconnects.clone()),
+    );
+    let parser_stats = stats.clone();
     tokio::spawn(async move {
+        let mut parser = crate::flashblocks::FlashblockParser::new();
+        let mut noticed_reconnects = 0u64;
         while let Some(v) = sub.rx.recv().await {
-            for ptx in parse_flashblock(&v) {
+            // Bridge the transport's reconnect counter into the feed's.
+            let now = reconnects.load(std::sync::atomic::Ordering::Relaxed);
+            if now > noticed_reconnects {
+                parser_stats.reconnects.fetch_add(
+                    now - noticed_reconnects,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                noticed_reconnects = now;
+            }
+            let parsed = parser.parse(&v, Some(&parser_stats));
+            if let Some(state) = parsed.state {
+                // The frame itself moves the state identity even when it adds
+                // no transactions — TTL/expiry bookkeeping must see it.
+                let tx_hashes: Vec<alloy_primitives::B256> =
+                    parsed.txs.iter().map(|t| t.hash).collect();
+                if tx
+                    .send(IngestEvent::PreconfirmedState(Box::new(
+                        crate::flashblocks::PreconfirmedFrame { state, tx_hashes },
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            for ptx in parsed.txs {
                 if tx.send(IngestEvent::Pending(ptx)).await.is_err() {
                     return;
                 }
             }
         }
     });
-}
-
-/// Extract transactions from one Flashblock notification.
-///
-/// Tolerates the shapes the feed is documented to use: the diff may sit at the
-/// top level or under `diff`, and transactions may be raw hex strings or
-/// objects carrying the raw payload. Anything that does not decode is skipped
-/// rather than guessed at, so a payload change costs coverage, not accuracy.
-fn parse_flashblock(v: &Value) -> Vec<PendingTx> {
-    let diff = v.get("diff").unwrap_or(v);
-    let txs = diff
-        .get("transactions")
-        .or_else(|| v.get("transactions"))
-        .and_then(|t| t.as_array());
-    let Some(txs) = txs else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::with_capacity(txs.len());
-    for item in txs {
-        // Raw hex string, or an object with the raw bytes on a known key.
-        let raw_hex = item.as_str().or_else(|| {
-            item.get("rawTransaction")
-                .or_else(|| item.get("raw"))
-                .or_else(|| item.get("input"))
-                .and_then(|r| r.as_str())
-        });
-        let Some(raw_hex) = raw_hex else {
-            // Some providers inline a full tx object; fall back to it.
-            if let Some(ptx) = parse_tx_object(item, TxSource::Flashblock) {
-                out.push(ptx);
-            }
-            continue;
-        };
-        let Ok(bytes) = hex::decode(raw_hex.trim_start_matches("0x")) else {
-            continue;
-        };
-        let Some(d) = crate::rlp::decode_raw_transaction(&bytes) else {
-            continue;
-        };
-        out.push(PendingTx {
-            hash: d.hash,
-            from: d.from,
-            to: d.to,
-            value: d.value,
-            gas: d.gas_limit,
-            max_fee_per_gas: d.max_fee_per_gas,
-            max_priority_fee_per_gas: d.max_priority_fee_per_gas,
-            nonce: d.nonce,
-            input: d.input,
-            // The whole point of this feed: we hold the signed bytes, so a
-            // bundle can actually carry this transaction.
-            raw: Some(bytes),
-            source: TxSource::Flashblock,
-            // A preconfirmation is not yet canonical: it is live flow, priced
-            // against the head, not a mined transaction.
-            mined_at: None,
-            seen_at_ms: now_ms(),
-        });
-    }
-    out
+    stats
 }
 
 // ---------------------------------------------------------------------------
@@ -883,108 +889,4 @@ fn txs_from_block(block: &Value) -> Vec<PendingTx> {
             t
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::signer::{Eip1559Tx, Signer};
-
-    fn signed_tx(nonce: u64) -> (String, PendingTx) {
-        let signer = Signer::simulation();
-        let tx = Eip1559Tx {
-            chain_id: 8453,
-            nonce,
-            max_priority_fee_per_gas: U256::from(1_000u64),
-            max_fee_per_gas: U256::from(2_000u64),
-            gas_limit: 100_000,
-            to: Some(alloy_primitives::Address::repeat_byte(0x42)),
-            value: U256::ZERO,
-            data: vec![0x11, 0x22, 0x33, 0x44],
-        };
-        let (raw, hash) = signer.sign_eip1559(&tx);
-        let hex_str = format!("0x{}", hex::encode(&raw));
-        let expect = PendingTx {
-            hash,
-            from: Some(signer.address()),
-            to: Some(alloy_primitives::Address::repeat_byte(0x42)),
-            value: U256::ZERO,
-            gas: 100_000,
-            max_fee_per_gas: U256::from(2_000u64),
-            max_priority_fee_per_gas: U256::from(1_000u64),
-            nonce,
-            input: vec![0x11, 0x22, 0x33, 0x44],
-            raw: Some(raw),
-            source: TxSource::Flashblock,
-            mined_at: None,
-            seen_at_ms: 0,
-        };
-        (hex_str, expect)
-    }
-
-    #[test]
-    fn parses_raw_transactions_out_of_a_flashblock() {
-        let (hex_a, want_a) = signed_tx(1);
-        let (hex_b, _) = signed_tx(2);
-        let payload = json!({
-            "payload_id": "0x01",
-            "index": 3,
-            "diff": { "transactions": [hex_a, hex_b] }
-        });
-
-        let got = parse_flashblock(&payload);
-        assert_eq!(got.len(), 2, "both transactions must be decoded");
-        assert_eq!(got[0].hash, want_a.hash);
-        assert_eq!(got[0].from, want_a.from, "sender recovered from signature");
-        assert_eq!(got[0].to, want_a.to);
-        assert_eq!(got[0].input, want_a.input);
-        assert_eq!(got[1].nonce, 2);
-    }
-
-    #[test]
-    fn flashblock_transactions_carry_raw_bytes_and_are_backrun_only() {
-        let (hex_a, _) = signed_tx(7);
-        let got = parse_flashblock(&json!({"diff": {"transactions": [hex_a]}}));
-        let tx = &got[0];
-        // Raw bytes are what makes a victim-carrying bundle transportable —
-        // the object-shaped feeds cannot supply them.
-        assert!(tx.raw.is_some(), "raw signed bytes must be retained");
-        assert_eq!(tx.source, TxSource::Flashblock);
-        assert!(
-            tx.source.backrun_only(),
-            "a sealed Flashblock's ordering is final"
-        );
-        // A preconfirmation is live flow, not a mined transaction.
-        assert!(tx.mined_at.is_none());
-    }
-
-    #[test]
-    fn accepts_a_top_level_transactions_array() {
-        // Not every provider nests the diff.
-        let (hex_a, _) = signed_tx(9);
-        let got = parse_flashblock(&json!({"index": 0, "transactions": [hex_a]}));
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].nonce, 9);
-    }
-
-    #[test]
-    fn skips_undecodable_entries_instead_of_guessing() {
-        let (good, _) = signed_tx(4);
-        let payload = json!({"diff": {"transactions": [
-            "0xnothex",
-            "0x02c0",          // well-formed hex, not a decodable tx
-            good,
-            "0x7e00",          // deposit transaction: no recoverable sender
-        ]}});
-        let got = parse_flashblock(&payload);
-        assert_eq!(got.len(), 1, "only the valid transaction survives");
-        assert_eq!(got[0].nonce, 4);
-    }
-
-    #[test]
-    fn a_flashblock_without_transactions_yields_nothing() {
-        assert!(parse_flashblock(&json!({"index": 0})).is_empty());
-        assert!(parse_flashblock(&json!({"diff": {"transactions": []}})).is_empty());
-        assert!(parse_flashblock(&Value::Null).is_empty());
-    }
 }

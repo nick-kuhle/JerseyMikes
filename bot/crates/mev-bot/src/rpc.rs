@@ -6,6 +6,7 @@
 //! feeds) that ship their own namespaces.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -272,9 +273,23 @@ pub struct WsSubscription {
 impl WsSubscription {
     /// Spawn a task that keeps `eth_subscribe(<args>)` alive forever.
     pub fn spawn(url: String, subscribe_params: Value, label: &'static str) -> Self {
+        Self::spawn_observed(url, subscribe_params, label, None)
+    }
+
+    /// `spawn` with an optional reconnect counter: bumped once per lost
+    /// connection, after the first successful (re)subscribe. Feeds whose
+    /// state can silently gap during a reconnect (Flashblocks) need the
+    /// count to distinguish "no frames" from "feed broke".
+    pub fn spawn_observed(
+        url: String,
+        subscribe_params: Value,
+        label: &'static str,
+        reconnects: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(4096);
         tokio::spawn(async move {
             let mut backoff_ms = 500u64;
+            let mut first = true;
             loop {
                 match run_subscription(&url, &subscribe_params, &tx).await {
                     Ok(()) => {
@@ -283,6 +298,11 @@ impl WsSubscription {
                     Err(e) => {
                         tracing::warn!(target: "ingest", %label, error = %e, "subscription failed");
                     }
+                }
+                if first {
+                    first = false;
+                } else if let Some(c) = &reconnects {
+                    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(15_000);

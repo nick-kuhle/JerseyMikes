@@ -2815,6 +2815,7 @@ mod tests {
             raw: None,
             source: TxSource::RelayDelivered,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         };
 
@@ -2913,6 +2914,7 @@ mod tests {
             raw: None,
             source: crate::types::TxSource::RelayDelivered,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         }
     }

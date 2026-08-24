@@ -19,6 +19,65 @@ pub struct MinedAt {
     pub base_fee_per_gas: U256,
 }
 
+/// Identity of the preconfirmed sequencer state a transaction arrived
+/// with — the Flashblocks-era replacement for "the mempool".
+///
+/// Base seals a preconfirmed sub-block every ~200 ms; each frame carries an
+/// incremental diff of ordered, signed transactions plus a block-hash-shaped
+/// identity for the resulting preconfirmed state. That identity is what a
+/// quote, a simulation, and eventually a send must agree on — a candidate
+/// priced against one frame and simulated against another is an invented
+/// arbitrage, so the identity travels with every transaction the frame
+/// produced.
+///
+/// Wire-format facts this type encodes (Base Flashblocks, verified against a
+/// live capture 2026-08-24; see `tests/fixtures/flashblocks/README.md`):
+///
+/// - `state_id` is the frame's `diff.block_hash`: unique per frame, changes
+///   as transactions are appended, and is deliberately *not* the sealed
+///   canonical block hash;
+/// - `(block_number, flashblock_index)` restarts at `(N+1, 0)` per block;
+/// - `prev_frame_id` chains frames as `"<block_number>-<index>"` and is the
+///   sequence/reorg signal the ingest layer watches for gaps;
+/// - the ordering of a preconfirmed frame is final — this state can only be
+///   back-run, never front-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreconfirmedState {
+    /// Provider/feed label, so counters and dedupe never merge two feeds.
+    pub feed: String,
+    /// Canonical block this state builds towards.
+    pub block_number: u64,
+    /// Frame index inside the block (0 is rollover/system-only).
+    pub flashblock_index: u64,
+    /// Immutable identity of this exact preconfirmed state (`diff.block_hash`).
+    pub state_id: B256,
+    /// Payload id grouping every frame of one block build.
+    pub payload_id: String,
+    /// Chain link to the previous frame, when the feed supplies one
+    /// (`metadata.prev_flashblock_id`, `"<block>-<index>"`).
+    pub prev_frame_id: Option<String>,
+    /// Parent block hash when the feed supplies one (index-0 `base` object).
+    pub parent_hash: Option<B256>,
+    /// Local observation time (ms); lead time is measured against it.
+    pub observed_at_ms: u64,
+    /// Whether the transaction order in this state is preconfirmed by the
+    /// sequencer. Always true for the Flashblocks feed; carried explicitly so
+    /// a future "pending hint" feed cannot silently claim ordering.
+    pub ordered: bool,
+}
+
+impl PreconfirmedState {
+    /// A frame `(block_number, index)` that builds on `self` within the same
+    /// block — the only descendant relation the recheck path accepts: the
+    /// pinned state's transactions are a prefix of the descendant's.
+    pub fn is_descendant_of(&self, earlier: &PreconfirmedState) -> bool {
+        self.feed == earlier.feed
+            && self.block_number == earlier.block_number
+            && self.flashblock_index >= earlier.flashblock_index
+            && self.payload_id == earlier.payload_id
+    }
+}
+
 /// A transaction observed in the public mempool or in a private orderflow stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingTx {
@@ -40,6 +99,12 @@ pub struct PendingTx {
     /// live flow, which is evaluated against the current head.
     #[serde(default)]
     pub mined_at: Option<MinedAt>,
+    /// Preconfirmed-state identity this transaction was observed in. Present
+    /// on sequencer preconfirmation feeds (Flashblocks); `None` for ordinary
+    /// pending flow. This is *provenance*, not a `victim_hashes` dependency:
+    /// nothing here needs to be re-broadcast by the searcher.
+    #[serde(default)]
+    pub preconfirmed: Option<PreconfirmedState>,
     pub seen_at_ms: u64,
 }
 
@@ -644,6 +709,7 @@ mod tests {
             raw: None,
             source: TxSource::PublicMempool,
             mined_at,
+            preconfirmed: None,
             seen_at_ms: 0,
         }
     }

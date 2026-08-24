@@ -18,9 +18,11 @@ data/
 
 # secrets
 .env
+.env.base
 .env.local
 .env.*.local
 !.env.example
+!.env.example.base
 
 # editors / os
 .DS_Store

@@ -44,6 +44,19 @@ impl StrategyImpl for AtomicArbStrategy {
         }
         ctx.pools.refresh_all(head.number).await;
 
+        // Aerodrome volatile core pools (opt-in): same seed-and-refresh
+        // shape as the V2 lane, through its own cache so the fee-off-input
+        // math never touches a UniV2 formula. `pool_for(_, _, false)` is the
+        // volatile lane; stable pools are never seeded (work order P4).
+        if ctx.cfg.dex_aerodrome_arb {
+            for token in ctx.cfg.addresses.core_tokens() {
+                if let Some(pool) = ctx.pools_aero.pool_for(weth, token, false).await {
+                    ctx.pools_aero.load(pool, head.number).await;
+                }
+            }
+            ctx.pools_aero.refresh_all(head.number).await;
+        }
+
         // Cycle search over the whole cached graph. With `arb_max_cycle_len`
         // at its default of 2 this reproduces the original pair-to-pair scan;
         // raising it adds longer cycles through the pools discovery brings in.
@@ -66,10 +79,11 @@ impl StrategyImpl for AtomicArbStrategy {
                 out.push(opp);
             }
         }
-        // Mixed-venue (V3↔V2 / V3↔V3) search is opt-in so a default mainnet
-        // boot stays byte-identical to the historical V2 enumerator.
-        if ctx.cfg.dex_univ3_arb {
-            out.extend(v3_cross_opportunities(ctx, head).await);
+        // Mixed-venue (V3↔V2 / V3↔V3 / Aero↔any) search is opt-in so a
+        // default mainnet boot stays byte-identical to the historical V2
+        // enumerator.
+        if ctx.cfg.dex_univ3_arb || ctx.cfg.dex_aerodrome_arb {
+            out.extend(cross_venue_opportunities(ctx, head).await);
         }
         out
     }
@@ -290,11 +304,12 @@ fn select_v3_pools(pools: &[V3Pool], weth: Address) -> Vec<V3Pool> {
     weth_quoted
 }
 
-/// Probe QuoterV2 at the discrete book sizes and search the mixed graph.
+/// Probe QuoterV2 at the discrete book sizes and return the V3 lane's edges.
 ///
-/// V2-only cycles are dropped: `on_block` already emitted those from
-/// [`graph::search`]. A book miss is `None` (never an interpolated V2 quote).
-async fn v3_cross_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Opportunity> {
+/// A book miss is `None` (never an interpolated V2 quote). Returns an empty
+/// vec when the chain has no V3 router/quoter, no actionable V3 pools, or no
+/// usable probe sizes — callers treat that as "no V3 lane this block".
+async fn v3_probed_edges(ctx: &StrategyCtx, head: &BlockHead) -> Vec<PricedEdge> {
     let (Some(quoter), Some(router)) = (
         ctx.cfg.addresses.univ3_quoter_v2,
         ctx.cfg.addresses.univ3_swap_router_02,
@@ -303,11 +318,8 @@ async fn v3_cross_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Oppo
     };
     let weth = ctx.cfg.chain.weth;
     let v3_pools = select_v3_pools(&ctx.pools_v3.all(), weth);
-    if v3_pools.is_empty() {
-        return Vec::new();
-    }
     let sizes = edge::probe_sizes(ctx.max_position());
-    if sizes.is_empty() {
+    if v3_pools.is_empty() || sizes.is_empty() {
         return Vec::new();
     }
 
@@ -341,16 +353,52 @@ async fn v3_cross_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Oppo
         }
     }
 
+    hops.into_iter()
+        .zip(books)
+        .filter_map(|((pool, token_in, token_out), book)| {
+            PricedEdge::v3(pool, token_in, token_out, router, book)
+        })
+        .collect()
+}
+
+/// Search the mixed venue graph and emit every cycle that a purely-V2 pass
+/// could not have found.
+///
+/// Edge inventory per lane, each opt-in:
+///   - V2 (always): the same pools [`graph::search`] priced this block.
+///   - V3 (`DEX_UNIV3_ARB`): QuoterV2-probed books only.
+///   - Aerodrome volatile (`DEX_AERODROME_ARB`): closed-form per-pool-fee
+///     math, executed through the Aerodrome router.
+///
+/// V2-only cycles are dropped: `on_block` already emitted those from
+/// [`graph::search`], and double-emitting corrupts the funnel counts.
+async fn cross_venue_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Opportunity> {
+    let weth = ctx.cfg.chain.weth;
     let mut edges: Vec<PricedEdge> = Vec::new();
     for p in &ctx.pools.all() {
         edges.extend(PricedEdge::from_v2(p));
     }
-    for ((pool, token_in, token_out), book) in hops.into_iter().zip(books) {
-        if let Some(e) = PricedEdge::v3(pool, token_in, token_out, router, book) {
-            edges.push(e);
+
+    if ctx.cfg.dex_univ3_arb {
+        edges.extend(v3_probed_edges(ctx, head).await);
+    }
+    if ctx.cfg.dex_aerodrome_arb {
+        // Router and factory are a deployment pair (`router.defaultFactory()`
+        // returned this factory on Base); with either missing there is no
+        // Aero lane — fail closed, never guess an address.
+        if let (Some(router), Some(factory)) = (
+            ctx.cfg.addresses.aerodrome_router,
+            ctx.cfg.addresses.aerodrome_factory,
+        ) {
+            for p in ctx.pools_aero.all_volatile() {
+                edges.extend(PricedEdge::from_aero(&p, router, factory));
+            }
         }
     }
-    if !edges.iter().any(|e| e.is_v3()) {
+
+    // Without at least one non-V2 edge every cycle here would be a duplicate
+    // of the byte-pinned V2 pass.
+    if !edges.iter().any(|e| !e.is_v2()) {
         return Vec::new();
     }
 
@@ -363,7 +411,7 @@ async fn v3_cross_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Oppo
     );
     found
         .into_iter()
-        .filter(|c| c.uses_v3(&edges))
+        .filter(|c| c.uses_non_v2(&edges))
         .filter_map(|c| build_priced_opportunity(ctx, &c, &edges, head))
         .collect()
 }
@@ -401,7 +449,7 @@ fn build_priced_opportunity(
         target_block: head.number + ctx.cfg.sim.target_block_offset,
         created_at_ms: now_ms(),
         notes: format!(
-            "arb {legs}-leg [{}] in {} gross {} (v3)",
+            "arb {legs}-leg [{}] in {} gross {} (mixed)",
             candidate.route_label(edges),
             candidate.amount_in,
             candidate.gross_profit
@@ -585,6 +633,62 @@ mod tests {
         assert!(
             found.iter().all(|c| !c.uses_v3(&edges)),
             "without a V3 book every cycle is V2-only and must be filtered"
+        );
+    }
+
+    #[test]
+    fn mixed_search_drops_v2_only_cycles_but_keeps_aero_cross() {
+        // Two identical-price V2 pools (no V2-only profit, and even if there
+        // were it must not be double-emitted) plus an Aerodrome pool priced
+        // far enough off to make a WETH→USDC→WETH cross-venue cycle.
+        let uni = pool(Venue::UniV2, 1_000e18 as u128, 2_000_000e6 as u128);
+        let sushi = pool(Venue::SushiV2, 1_000e18 as u128, 2_000_000e6 as u128);
+        let aero = crate::dex::AeroPool {
+            address: Address::with_last_byte(9),
+            token0: known::WETH,
+            token1: known::USDC,
+            reserve0: U256::from(1_000e18 as u128),
+            reserve1: U256::from(2_200_000e6 as u128),
+            fee_bps: 30,
+            stable: false,
+            block: 1,
+        };
+        let router = known::BASE_AERODROME_ROUTER;
+        let factory = known::BASE_AERODROME_FACTORY;
+
+        let mut edges = PricedEdge::from_v2(&uni);
+        edges.extend(PricedEdge::from_v2(&sushi));
+        edges.extend(PricedEdge::from_aero(&aero, router, factory));
+
+        let found = edge::search_priced(
+            &edges,
+            known::WETH,
+            U256::from(10u128.pow(21)),
+            2,
+            std::time::Duration::from_secs(1),
+        );
+        let cross: Vec<_> = found.iter().filter(|c| c.uses_non_v2(&edges)).collect();
+        assert!(
+            !cross.is_empty(),
+            "the V2↔Aero cycle survives the same drop-V2-only filter the V3 lane uses"
+        );
+        assert!(
+            cross
+                .iter()
+                .all(|c| c.edges.iter().any(|&i| edges[i].venue == Venue::AeroVolatile)),
+            "every kept cycle actually touches Aerodrome"
+        );
+        // And the callee chain is executable: the Aero leg approves the
+        // Aerodrome router, never a UniV2 pair swap.
+        let calls = cross[0]
+            .build_calls(&edges, Address::with_last_byte(0xee))
+            .expect("executable");
+        assert!(calls.iter().any(|c| c.target == router));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.data[..4] == dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR),
+            "a swapExactTokensForTokens call is present"
         );
     }
 

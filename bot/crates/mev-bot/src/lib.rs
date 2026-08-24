@@ -25,6 +25,7 @@ pub mod competition;
 pub mod config;
 pub mod dex;
 pub mod engine;
+pub mod flashblocks;
 pub mod ingest;
 pub mod inventory;
 pub mod latency;

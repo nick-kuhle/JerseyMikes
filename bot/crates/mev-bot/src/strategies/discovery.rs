@@ -32,10 +32,11 @@ sol! {
 }
 use parking_lot::RwLock;
 
-use crate::dex::{self, V2Pool, V3Pool, Venue};
+use crate::dex::{self, AeroPool, V2Pool, V3Pool, Venue};
 use crate::rpc::RpcClient;
 use crate::strategies::{
-    try_scan_pair_created, try_scan_pool_created, PoolCache, StrategyCtx, V3PoolCache,
+    try_scan_aero_pool_created, try_scan_pair_created, try_scan_pool_created, AeroPoolCache,
+    AeroPoolSeed, PoolCache, StrategyCtx, V3PoolCache,
 };
 use crate::types::BlockHead;
 
@@ -74,15 +75,28 @@ pub trait DiscoverySource: Send + Sync {
     async fn scan_pairs(&self, from: u64, to: u64) -> Option<Vec<(Venue, Address)>>;
     async fn fetch_pool(&self, pair: Address, venue: Venue, block: u64) -> Option<V2Pool>;
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>>;
+    /// Aerodrome creation-log scan. Default is "no lane on this chain":
+    /// an *empty success*, which is honest for a source that genuinely has
+    /// nothing to scan — callers only run the lane when the registry has an
+    /// Aerodrome factory, so this default never advances a real cursor.
+    async fn scan_aero_pools(&self, _from: u64, _to: u64) -> Option<Vec<AeroPoolSeed>> {
+        Some(Vec::new())
+    }
+    /// Full Aerodrome pool read (tokens, reserves, per-pool fee, on-chain
+    /// `stable()`). `None` means the call failed — retryable.
+    async fn fetch_aero(&self, _pool: Address, _block: u64) -> Option<AeroPool> {
+        None
+    }
 }
 
 /// The production source: plain JSON-RPC against the chain's registered
-/// factories (from the address registry — a chain without a V3 factory
-/// simply scans nothing on that lane).
+/// factories (from the address registry — a chain without a V3 or Aerodrome
+/// factory simply scans nothing on that lane).
 pub struct RpcSource<'a> {
     pub rpc: &'a RpcClient,
     pub pair_factories: &'a [(Venue, Address)],
     pub v3_factory: Option<Address>,
+    pub aero_factory: Option<Address>,
 }
 
 #[async_trait]
@@ -103,6 +117,16 @@ impl DiscoverySource for RpcSource<'_> {
     async fn scan_v3_pools(&self, from: u64, to: u64) -> Option<Vec<V3Pool>> {
         let factory = self.v3_factory?;
         try_scan_pool_created(self.rpc, factory, from, to).await
+    }
+
+    async fn scan_aero_pools(&self, from: u64, to: u64) -> Option<Vec<AeroPoolSeed>> {
+        let factory = self.aero_factory?;
+        try_scan_aero_pool_created(self.rpc, factory, from, to).await
+    }
+
+    async fn fetch_aero(&self, pool: Address, block: u64) -> Option<AeroPool> {
+        let factory = self.aero_factory?;
+        dex::fetch_aero_pool(self.rpc, factory, pool, block).await.ok()
     }
 }
 
@@ -131,8 +155,15 @@ pub struct PoolDiscovery {
     dust: RwLock<HashMap<Address, u64>>,
     /// V3 pools already in the V3 cache or permanently rejected.
     seen_v3: RwLock<HashSet<Address>>,
+    /// Aerodrome pools in the Aero cache — same acceptance bookkeeping as
+    /// the V2 lane, kept in separate sets because the lanes are separate
+    /// caches (accepting a pool into the wrong cache prices it wrong).
+    seen_aero: RwLock<HashSet<Address>>,
+    non_weth_aero: RwLock<HashSet<Address>>,
+    dust_aero: RwLock<HashMap<Address, u64>>,
     last_log_block: RwLock<u64>,
     last_log_block_v3: RwLock<u64>,
+    last_log_block_aero: RwLock<u64>,
 }
 
 impl Default for PoolDiscovery {
@@ -148,8 +179,12 @@ impl PoolDiscovery {
             non_weth: RwLock::new(HashSet::new()),
             dust: RwLock::new(HashMap::new()),
             seen_v3: RwLock::new(HashSet::new()),
+            seen_aero: RwLock::new(HashSet::new()),
+            non_weth_aero: RwLock::new(HashSet::new()),
+            dust_aero: RwLock::new(HashMap::new()),
             last_log_block: RwLock::new(0),
             last_log_block_v3: RwLock::new(0),
+            last_log_block_aero: RwLock::new(0),
         }
     }
 
@@ -357,6 +392,94 @@ impl PoolDiscovery {
         stats
     }
 
+    /// Scan the Aerodrome factory and load qualifying **volatile** pools into
+    /// `pools_aero`. Stable pools are recorded-and-skipped permanently: the
+    /// flag is immutable and nothing can price them until the P4 invariant
+    /// work lands. Same three invariants as the V2 lane — fetch before
+    /// insert, cursor advances only over genuinely scanned ranges, separate
+    /// cache.
+    pub async fn discover_aero_with<S: DiscoverySource + ?Sized>(
+        &self,
+        src: &S,
+        pools_aero: &AeroPoolCache,
+        weth: Address,
+        head: u64,
+    ) -> DiscoveryStats {
+        let (from, to) = Self::window(*self.last_log_block_aero.read(), head);
+
+        let Some(seeds) = src.scan_aero_pools(from, to).await else {
+            return DiscoveryStats::default();
+        };
+
+        let min_reserve = U256::from(MIN_WETH_RESERVE);
+        let mut stats = DiscoveryStats {
+            scanned_blocks: to.saturating_sub(from) + 1,
+            ..Default::default()
+        };
+
+        for seed in seeds {
+            if seed.stable {
+                // Unpriceable by construction until work order P4; immutable,
+                // so this rejection is permanent.
+                self.seen_aero.write().insert(seed.address);
+                continue;
+            }
+            if self.seen_aero.read().contains(&seed.address)
+                || self.non_weth_aero.read().contains(&seed.address)
+            {
+                continue;
+            }
+            match self.dust_aero.read().get(&seed.address) {
+                Some(&checked_at) if head.saturating_sub(checked_at) < DUST_RECHECK_BLOCKS => {
+                    continue
+                }
+                _ => {}
+            }
+
+            // Fetch first, insert second — a failed read leaves the pool
+            // eligible for retry next pass (invariant 1).
+            let Some(pool) = src.fetch_aero(seed.address, head).await else {
+                stats.retryable += 1;
+                continue;
+            };
+            // Belt and braces: the creation log's indexed `stable` flag said
+            // volatile, but pricing keys off the on-chain getter.
+            if pool.stable {
+                self.seen_aero.write().insert(seed.address);
+                continue;
+            }
+            let Some((weth_reserve, _)) = pool.reserves_for(weth) else {
+                self.non_weth_aero.write().insert(seed.address);
+                continue;
+            };
+            if weth_reserve < min_reserve {
+                self.dust_aero.write().insert(seed.address, head);
+                continue;
+            }
+
+            self.seen_aero.write().insert(seed.address);
+            self.dust_aero.write().remove(&seed.address);
+            pools_aero.insert(pool);
+            stats.loaded += 1;
+            tracing::info!(
+                target: "pools",
+                pool = ?pool.address,
+                token = ?pool.other_token(weth),
+                fee_bps = pool.fee_bps,
+                "discovered new WETH-quoted Aerodrome volatile pool"
+            );
+        }
+
+        *self.last_log_block_aero.write() = to;
+        stats
+    }
+
+    /// Count of Aerodrome pools discovery has resolved (accepted or
+    /// permanently classified).
+    pub fn seen_aero_count(&self) -> usize {
+        self.seen_aero.read().len()
+    }
+
     /// Production entry point: run whichever scans are enabled for this block.
     pub async fn discover(&self, ctx: &StrategyCtx, head: &BlockHead) -> usize {
         let pair_factories = ctx.cfg.addresses.pair_factories();
@@ -364,6 +487,7 @@ impl PoolDiscovery {
             rpc: &ctx.rpc,
             pair_factories: &pair_factories,
             v3_factory: ctx.cfg.addresses.univ3_factory,
+            aero_factory: ctx.cfg.addresses.aerodrome_factory,
         };
         let weth = ctx.cfg.chain.weth;
 
@@ -381,14 +505,23 @@ impl PoolDiscovery {
             DiscoveryStats::default()
         };
 
-        if v2.retryable > 0 {
+        // The Aero lane only runs when the arb graph can price Aerodrome
+        // pools — scanning a lane nothing consumes would waste RPC budget.
+        let aero = if ctx.cfg.dex_aerodrome_arb && ctx.cfg.addresses.aerodrome_factory.is_some() {
+            self.discover_aero_with(&src, &ctx.pools_aero, weth, head.number)
+                .await
+        } else {
+            DiscoveryStats::default()
+        };
+
+        if v2.retryable > 0 || aero.retryable > 0 {
             tracing::debug!(
                 target: "pools",
-                retryable = v2.retryable,
+                retryable = v2.retryable + aero.retryable,
                 "pool reads failed this pass; they stay eligible for retry"
             );
         }
-        v2.loaded + v3.loaded
+        v2.loaded + v3.loaded + aero.loaded
     }
 }
 

@@ -147,6 +147,13 @@ pub struct Engine {
     last_discovery_block: std::sync::atomic::AtomicU64,
     /// Block number of the last inventory refresh (`u64::MAX` = never run).
     last_inventory_block: std::sync::atomic::AtomicU64,
+    /// Live view of the preconfirmed stream (Flashblocks): current state
+    /// identity plus a bounded frame window used for sealed-block matching,
+    /// state-pinned simulation and TTL rechecks. Empty until a feed runs.
+    pub preconfirmed: Arc<crate::flashblocks::PreconfirmedTracker>,
+    /// Feed counters for `/api/status`, populated when a Flashblocks feed is
+    /// configured. `run` hands this exact handle to the ingest spawn.
+    pub flashblocks: Option<Arc<crate::flashblocks::FlashblockStats>>,
 }
 
 /// A delivered block waiting to be scored: the block and its transactions.
@@ -839,6 +846,13 @@ impl Engine {
             sniper.clone(),
         ));
 
+        let flashblocks_stats = cfg
+            .endpoints
+            .flashblocks_ws
+            .is_some()
+            .then(crate::flashblocks::FlashblockStats::default)
+            .map(Arc::new);
+
         Ok(Self {
             cfg,
             store,
@@ -873,6 +887,8 @@ impl Engine {
             // unset so the first observed block always does a full pass.
             last_discovery_block: std::sync::atomic::AtomicU64::new(NEVER),
             last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
+            preconfirmed: Arc::new(crate::flashblocks::PreconfirmedTracker::new()),
+            flashblocks: flashblocks_stats,
         })
     }
 
@@ -1004,12 +1020,19 @@ impl Engine {
         if let Some(rx) = self.replay_rx.lock().take() {
             self.spawn_replay_worker(rx);
         }
-        let mut ingest = Ingest::start(self.cfg.clone());
+        let mut ingest = Ingest::start(self.cfg.clone(), self.flashblocks.clone());
         tracing::info!(target: "engine", "ingest started: {}", self.cfg.summary());
 
         while let Some(ev) = ingest.rx.recv().await {
             match ev {
                 IngestEvent::Block(head) => self.clone().on_block(head).await,
+                IngestEvent::PreconfirmedState(frame) => {
+                    // Bookkeeping only: the frame advances the TTL/recheck
+                    // identity; its transactions arrive as Pending events
+                    // right behind it and flow through the normal funnel.
+                    self.preconfirmed
+                        .observe_frame(&frame.state, &frame.tx_hashes);
+                }
                 IngestEvent::Pending(tx) => self.clone().on_pending(tx).await,
                 IngestEvent::Hint {
                     hash,
@@ -1167,6 +1190,37 @@ impl Engine {
     /// is still busy, and the block is dropped with a counter rather than
     /// applying back-pressure all the way up into ingestion.
     fn enqueue_replay_block(&self, block: crate::types::RelayBlock, txs: Vec<PendingTx>) {
+        // Chain-native blocks (CHAIN_BLOCK_INGEST): when a preconfirmed feed
+        // is live, grade its frames against what actually sealed. A feed
+        // whose cumulative transactions do not equal the canonical sequence
+        // cannot be trusted to trigger sends, and the mismatch is counted.
+        if block.relay == "chain" {
+            let hashes: Vec<alloy_primitives::B256> = txs.iter().map(|t| t.hash).collect();
+            if let Some((matched, lead_ms)) =
+                self.preconfirmed
+                    .observe_sealed(block.block_number, &hashes, now_ms())
+            {
+                if let Some(stats) = &self.flashblocks {
+                    stats
+                        .last_sealed_lead_ms
+                        .store(lead_ms, std::sync::atomic::Ordering::Relaxed);
+                    if matched {
+                        stats
+                            .sealed_matches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        stats
+                            .sealed_mismatches
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "engine",
+                            block = block.block_number,
+                            "preconfirmed stream did not match the sealed block's transaction sequence"
+                        );
+                    }
+                }
+            }
+        }
         if let Some(q) = &self.replay_tx {
             if q.try_send((block, txs)).is_err() {
                 let n = self
@@ -2078,6 +2132,7 @@ fn hint_to_pending(
         raw: None,
         source: TxSource::MevShare,
         mined_at: None,
+        preconfirmed: None,
         seen_at_ms: now_ms(),
     })
 }
