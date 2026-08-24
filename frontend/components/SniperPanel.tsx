@@ -11,7 +11,7 @@
  * 4. Swapping & Selling Features: 1-click partial/full sells and DEX Aggregators (1inch, Uniswap, KyberSwap, DexScreener).
  */
 
-import {memo, useCallback, useEffect, useMemo, useState} from "react";
+import {memo, useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {readActiveChain, withChain} from "@/lib/chain";
 import {ago, shortHash, signedEth, weiToEth} from "@/lib/format";
 import {addressUrl, txUrl} from "@/lib/explorer";
@@ -148,7 +148,7 @@ function SniperPanel() {
   const [vault, setVault] = useState<SniperVaultStatus | null>(null);
   const [demo, setDemo] = useState(false);
   const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "gates">("portfolio");
-  const [portfolioSubTab, setPortfolioSubTab] = useState<"open" | "wallet" | "closed">("open");
+  const [portfolioSubTab, setPortfolioSubTab] = useState<"all" | "open" | "wallet" | "closed">("all");
 
   // Wallet and chain state
   const wallet = useWallet();
@@ -160,6 +160,10 @@ function SniperPanel() {
   const [feedback, setFeedback] = useState<{type: "success" | "error" | "info"; msg: string} | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isHalting, setIsHalting] = useState(false);
+
+  // Do not let the 4-second refresh overwrite an operator's unsaved form.
+  const isFormDirty = useRef(false);
+  const formInitialized = useRef(false);
 
   // Editable parameter form state
   const [formBuySizeEth, setFormBuySizeEth] = useState("0.05");
@@ -234,12 +238,16 @@ function SniperPanel() {
         setPf(p);
         setCfg(c);
         setDemo(Boolean(p.demo || c.demo));
+        if (!formInitialized.current || !isFormDirty.current) {
+          populateFormFromConfig(c.params);
+          formInitialized.current = true;
+        }
       }
       if (vRes.ok) setVault((await vRes.json()) as SniperVaultStatus & {demo?: boolean});
     } catch {
       /* maintain existing data on transient fetch error */
     }
-  }, []);
+  }, [populateFormFromConfig]);
 
   // Initial load and periodic polling
   useEffect(() => {
@@ -247,13 +255,6 @@ function SniperPanel() {
     const t = setInterval(load, 4000);
     return () => clearInterval(t);
   }, [load]);
-
-  // Populate form on first load
-  useEffect(() => {
-    if (cfg?.params && !isSaving) {
-      populateFormFromConfig(cfg.params);
-    }
-  }, [cfg?.params, populateFormFromConfig, isSaving]);
 
   // Viem client for contract reads
   const publicClient = useMemo(() => {
@@ -323,10 +324,66 @@ function SniperPanel() {
   }, [wallet.address, publicClient, pf, customTokenInput]);
 
   useEffect(() => {
-    if (wallet.address && tab === "portfolio" && portfolioSubTab === "wallet") {
+    if (wallet.address && tab === "portfolio") {
       scanWalletBalances();
     }
-  }, [wallet.address, tab, portfolioSubTab, scanWalletBalances]);
+  }, [wallet.address, tab, scanWalletBalances]);
+
+  // Combine bot positions and connected-wallet balances without losing the
+  // provenance of either source. This is intentionally computed before the
+  // loading return so hook order is invariant across polling updates.
+  const unifiedHoldings = useMemo(() => {
+    const holdings = new Map<string, {
+      token: string;
+      symbol: string;
+      pair?: string;
+      state?: string;
+      entryCostWei: string;
+      markValueWei: string;
+      unrealizedPnlWei: string;
+      netPnlBps: number;
+      markStale: boolean;
+      inBot: boolean;
+      inWallet: boolean;
+      walletBalance?: string;
+    }>();
+    for (const pos of pf?.open ?? []) {
+      holdings.set(pos.token.toLowerCase(), {
+        token: pos.token,
+        symbol: pos.symbol || shortHash(pos.token, 4),
+        pair: pos.pair,
+        state: pos.state,
+        entryCostWei: pos.entryCostWei,
+        markValueWei: pos.markValueWei,
+        unrealizedPnlWei: pos.unrealizedPnlWei,
+        netPnlBps: pos.netPnlBps,
+        markStale: pos.markStale,
+        inBot: true,
+        inWallet: false,
+      });
+    }
+    for (const token of walletTokens) {
+      const current = holdings.get(token.address.toLowerCase());
+      if (current) {
+        current.inWallet = true;
+        current.walletBalance = token.balance;
+      } else {
+        holdings.set(token.address.toLowerCase(), {
+          token: token.address,
+          symbol: token.symbol,
+          entryCostWei: "0",
+          markValueWei: "0",
+          unrealizedPnlWei: "0",
+          netPnlBps: 0,
+          markStale: false,
+          inBot: false,
+          inWallet: true,
+          walletBalance: token.balance,
+        });
+      }
+    }
+    return [...holdings.values()];
+  }, [pf?.open, walletTokens]);
 
   // Patch parameters API call
   const handleSaveParams = async (overridePatch?: Partial<SniperParamsPatch>) => {
@@ -364,6 +421,8 @@ function SniperPanel() {
       const data = await res.json();
       if (res.ok && data.ok) {
         setFeedback({type: "success", msg: "Sniper parameters updated successfully!"});
+        isFormDirty.current = false;
+        if (data.params) populateFormFromConfig(data.params);
         await load();
       } else {
         const errorMsg = data.errors?.join("; ") || data.error || "Failed to update sniper parameters";
@@ -496,6 +555,7 @@ function SniperPanel() {
     setFormMaxBuyTaxPct(String(p.maxTaxPct));
     setFormMaxSellTaxPct(String(p.maxTaxPct));
     setFormRequireHoneypot(p.requireHoneypot);
+    isFormDirty.current = true;
     setFeedback({type: "info", msg: `Loaded ${key.toUpperCase()} preset. Click 'Save & Apply Parameters' to save.`});
   };
 
@@ -812,6 +872,20 @@ function SniperPanel() {
           <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8}}>
             <div style={{display: "flex", gap: 6}}>
               <button
+                onClick={() => setPortfolioSubTab("all")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "all" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "all" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                All Holdings ({unifiedHoldings.length})
+              </button>
+              <button
                 onClick={() => setPortfolioSubTab("open")}
                 style={{
                   padding: "4px 10px",
@@ -886,6 +960,33 @@ function SniperPanel() {
               <button onClick={() => void handleManualBuy()} disabled={isSaving || !isArmed} style={{...chipButtonStyle, color: "var(--amber)", borderColor: "var(--amber)", padding: "6px 10px"}}>{isArmed ? "submit manual buy" : "lane not armed"}</button>
             </div>
           </div>
+
+          {/* Unified Holdings Table */}
+          {portfolioSubTab === "all" && (
+            <div style={{overflowX: "auto"}}>
+              {unifiedHoldings.length === 0 ? (
+                <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>No bot positions or connected-wallet token balances yet.</div>
+              ) : (
+                <table className="grid" style={{width: "100%", fontSize: 12}}>
+                  <thead><tr><th>TOKEN</th><th>SOURCE</th><th style={{textAlign: "right"}}>ENTRY</th><th style={{textAlign: "right"}}>MARK</th><th style={{textAlign: "right"}}>UNREALIZED PNL</th><th style={{textAlign: "right"}}>WALLET BALANCE</th><th>ACTION</th></tr></thead>
+                  <tbody>{unifiedHoldings.map((holding) => {
+                    const positive = BigInt(holding.unrealizedPnlWei || "0") > 0n;
+                    const negative = BigInt(holding.unrealizedPnlWei || "0") < 0n;
+                    const links = getAggregatorLinks(holding.token, currentChainId, activeChainSlug);
+                    return <tr key={holding.token}>
+                      <td><strong>{holding.symbol}</strong><div className="muted" style={{fontSize: 10}}>{shortHash(holding.token, 6)}</div></td>
+                      <td><span className="badge" style={{fontSize: 9, color: holding.inBot ? "var(--green)" : "var(--cyan)"}}>{holding.inBot && holding.inWallet ? "bot + wallet" : holding.inBot ? "sniper position" : "wallet"}</span></td>
+                      <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.entryCostWei, 4)} Ξ` : "—"}</td>
+                      <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.markValueWei, 4)} Ξ` : "—"}</td>
+                      <td style={{textAlign: "right", color: positive ? "var(--green)" : negative ? "var(--red)" : "var(--muted)"}}>{holding.inBot ? `${signedEth(holding.unrealizedPnlWei, 4)} Ξ (${bpsFormatted(holding.netPnlBps)})` : "—"}</td>
+                      <td style={{textAlign: "right"}}>{holding.walletBalance || "—"}</td>
+                      <td><div style={{display: "inline-flex", gap: 4}}><button onClick={() => { setSwapTarget({token: holding.token, symbol: holding.symbol, pair: holding.pair}); setTab("swap"); }} style={{...chipButtonStyle, color: "var(--cyan)", borderColor: "var(--cyan)"}}>TRADE</button><a href={links.dexscreener} target="_blank" rel="noreferrer" style={{...chipButtonStyle, textDecoration: "none"}}>CHART ↗</a></div></td>
+                    </tr>;
+                  })}</tbody>
+                </table>
+              )}
+            </div>
+          )}
 
           {/* Active Open Positions Table */}
           {portfolioSubTab === "open" && (
@@ -1343,7 +1444,7 @@ function SniperPanel() {
                   step="0.005"
                   min="0"
                   value={formBuySizeEth}
-                  onChange={(e) => setFormBuySizeEth(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormBuySizeEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 0.05"
                 />
@@ -1351,7 +1452,7 @@ function SniperPanel() {
                   {["0.01", "0.025", "0.05", "0.1", "0.25"].map((val) => (
                     <button
                       key={val}
-                      onClick={() => setFormBuySizeEth(val)}
+                      onClick={() => { isFormDirty.current = true; setFormBuySizeEth(val); }}
                       style={chipButtonStyle}
                     >
                       {val} Ξ
@@ -1370,7 +1471,7 @@ function SniperPanel() {
                   step="0.05"
                   min="0"
                   value={formDailyBudgetEth}
-                  onChange={(e) => setFormDailyBudgetEth(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormDailyBudgetEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 0.25"
                 />
@@ -1389,7 +1490,7 @@ function SniperPanel() {
                   step="0.1"
                   min="0"
                   value={formTotalBudgetEth}
-                  onChange={(e) => setFormTotalBudgetEth(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormTotalBudgetEth(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1404,7 +1505,7 @@ function SniperPanel() {
                   min="1"
                   max="32"
                   value={formMaxPositions}
-                  onChange={(e) => setFormMaxPositions(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxPositions(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1426,7 +1527,7 @@ function SniperPanel() {
                   min="5"
                   step="10"
                   value={formTakeProfitPct}
-                  onChange={(e) => setFormTakeProfitPct(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormTakeProfitPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 100"
                 />
@@ -1434,7 +1535,7 @@ function SniperPanel() {
                   {["25", "50", "100", "200", "500"].map((val) => (
                     <button
                       key={val}
-                      onClick={() => setFormTakeProfitPct(val)}
+                      onClick={() => { isFormDirty.current = true; setFormTakeProfitPct(val); }}
                       style={chipButtonStyle}
                     >
                       +{val}%
@@ -1453,7 +1554,7 @@ function SniperPanel() {
                   step="0.01"
                   min="0"
                   value={formTakeProfitAbsEth}
-                  onChange={(e) => setFormTakeProfitAbsEth(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormTakeProfitAbsEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="0 (off)"
                 />
@@ -1473,7 +1574,7 @@ function SniperPanel() {
                   max="100"
                   step="10"
                   value={formSellFractionPct}
-                  onChange={(e) => setFormSellFractionPct(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormSellFractionPct(e.target.value); }}
                   style={inputStyle}
                 />
                 <div style={{display: "flex", gap: 4, marginTop: 4}}>
@@ -1505,7 +1606,7 @@ function SniperPanel() {
                   max="100"
                   step="5"
                   value={formStopLossPct}
-                  onChange={(e) => setFormStopLossPct(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormStopLossPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 50"
                 />
@@ -1522,7 +1623,7 @@ function SniperPanel() {
                   max="90"
                   step="5"
                   value={formTrailingStopPct}
-                  onChange={(e) => setFormTrailingStopPct(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormTrailingStopPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="0 (off)"
                 />
@@ -1538,7 +1639,7 @@ function SniperPanel() {
                   min="0"
                   step="5"
                   value={formMaxHoldMins}
-                  onChange={(e) => setFormMaxHoldMins(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxHoldMins(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1556,7 +1657,7 @@ function SniperPanel() {
                   type="checkbox"
                   id="reqHoneypot"
                   checked={formRequireHoneypot}
-                  onChange={(e) => setFormRequireHoneypot(e.target.checked)}
+                  onChange={(e) => { isFormDirty.current = true; setFormRequireHoneypot(e.target.checked); }}
                   style={{cursor: "pointer"}}
                 />
                 <label htmlFor="reqHoneypot" style={{fontSize: 11, cursor: "pointer"}}>
@@ -1574,7 +1675,7 @@ function SniperPanel() {
                   step="0.5"
                   min="0.1"
                   value={formMinLiquidityEth}
-                  onChange={(e) => setFormMinLiquidityEth(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormMinLiquidityEth(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1590,7 +1691,7 @@ function SniperPanel() {
                   min="0.5"
                   max="20"
                   value={formMaxPriceImpactPct}
-                  onChange={(e) => setFormMaxPriceImpactPct(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxPriceImpactPct(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1603,7 +1704,7 @@ function SniperPanel() {
                     type="number"
                     step="0.5"
                     value={formMaxBuyTaxPct}
-                    onChange={(e) => setFormMaxBuyTaxPct(e.target.value)}
+                    onChange={(e) => { isFormDirty.current = true; setFormMaxBuyTaxPct(e.target.value); }}
                     style={inputStyle}
                   />
                 </div>
@@ -1613,7 +1714,7 @@ function SniperPanel() {
                     type="number"
                     step="0.5"
                     value={formMaxSellTaxPct}
-                    onChange={(e) => setFormMaxSellTaxPct(e.target.value)}
+                    onChange={(e) => { isFormDirty.current = true; setFormMaxSellTaxPct(e.target.value); }}
                     style={inputStyle}
                   />
                 </div>
@@ -1629,7 +1730,7 @@ function SniperPanel() {
                   min="1"
                   max="20"
                   value={formMinHoldBlocks}
-                  onChange={(e) => setFormMinHoldBlocks(e.target.value)}
+                  onChange={(e) => { isFormDirty.current = true; setFormMinHoldBlocks(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1640,7 +1741,7 @@ function SniperPanel() {
                   type="checkbox"
                   id="reqLp"
                   checked={formRequireLpLocked}
-                  onChange={(e) => setFormRequireLpLocked(e.target.checked)}
+                  onChange={(e) => { isFormDirty.current = true; setFormRequireLpLocked(e.target.checked); }}
                   style={{cursor: "pointer"}}
                 />
                 <label htmlFor="reqLp" style={{fontSize: 11, cursor: "pointer"}}>
@@ -1667,7 +1768,7 @@ function SniperPanel() {
             </div>
             <div style={{display: "flex", gap: 8}}>
               <button
-                onClick={() => populateFormFromConfig(cfg.params)}
+                onClick={() => { isFormDirty.current = false; populateFormFromConfig(cfg.params); }}
                 style={{
                   padding: "6px 14px",
                   background: "var(--panel-2)",

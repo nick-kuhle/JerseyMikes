@@ -646,8 +646,42 @@ let demoSniperState = {
   haltReason: null as string | null,
 };
 
-export function updateDemoSniperParams(patch: Partial<typeof demoSniperState>) {
-  demoSniperState = {...demoSniperState, ...patch};
+export function updateDemoSniperParams(patch: Record<string, unknown>) {
+  if (typeof patch.enabled === "boolean") demoSniperState.enabled = patch.enabled;
+  if (typeof patch.buySizeWei === "string") demoSniperState.buySizeWei = patch.buySizeWei;
+  if (typeof patch.buy_size_wei === "string") demoSniperState.buySizeWei = patch.buy_size_wei;
+  if (typeof patch.dailyBudgetWei === "string") demoSniperState.dailyBudgetWei = patch.dailyBudgetWei;
+  if (typeof patch.daily_budget_wei === "string") demoSniperState.dailyBudgetWei = patch.daily_budget_wei;
+  if (typeof patch.totalBudgetWei === "string") demoSniperState.totalBudgetWei = patch.totalBudgetWei;
+  if (typeof patch.total_budget_wei === "string") demoSniperState.totalBudgetWei = patch.total_budget_wei;
+  if (typeof patch.takeProfitBps === "number") demoSniperState.takeProfitBps = patch.takeProfitBps;
+  if (typeof patch.take_profit_bps === "number") demoSniperState.takeProfitBps = patch.take_profit_bps;
+  if (typeof patch.takeProfitAbsWei === "string") demoSniperState.takeProfitAbsWei = patch.takeProfitAbsWei;
+  if (typeof patch.take_profit_abs_wei === "string") demoSniperState.takeProfitAbsWei = patch.take_profit_abs_wei;
+  if (typeof patch.sellFractionBps === "number") demoSniperState.sellFractionBps = patch.sellFractionBps;
+  if (typeof patch.sell_fraction_bps === "number") demoSniperState.sellFractionBps = patch.sell_fraction_bps;
+  if (typeof patch.stopLossBps === "number") demoSniperState.stopLossBps = patch.stopLossBps;
+  if (typeof patch.stop_loss_bps === "number") demoSniperState.stopLossBps = patch.stop_loss_bps;
+  if (typeof patch.trailingStopBps === "number") demoSniperState.trailingStopBps = patch.trailingStopBps;
+  if (typeof patch.trailing_stop_bps === "number") demoSniperState.trailingStopBps = patch.trailing_stop_bps;
+  if (typeof patch.maxHoldSecs === "number") demoSniperState.maxHoldSecs = patch.maxHoldSecs;
+  if (typeof patch.max_hold_secs === "number") demoSniperState.maxHoldSecs = patch.max_hold_secs;
+  if (typeof patch.maxConcurrentPositions === "number") demoSniperState.maxConcurrentPositions = patch.maxConcurrentPositions;
+  if (typeof patch.max_concurrent_positions === "number") demoSniperState.maxConcurrentPositions = patch.max_concurrent_positions;
+  if (typeof patch.minLiquidityWei === "string") demoSniperState.minLiquidityWei = patch.minLiquidityWei;
+  if (typeof patch.min_liquidity_wei === "string") demoSniperState.minLiquidityWei = patch.min_liquidity_wei;
+  if (typeof patch.maxPriceImpactBps === "number") demoSniperState.maxPriceImpactBps = patch.maxPriceImpactBps;
+  if (typeof patch.max_price_impact_bps === "number") demoSniperState.maxPriceImpactBps = patch.max_price_impact_bps;
+  if (typeof patch.maxBuyTaxBps === "number") demoSniperState.maxBuyTaxBps = patch.maxBuyTaxBps;
+  if (typeof patch.max_buy_tax_bps === "number") demoSniperState.maxBuyTaxBps = patch.max_buy_tax_bps;
+  if (typeof patch.maxSellTaxBps === "number") demoSniperState.maxSellTaxBps = patch.maxSellTaxBps;
+  if (typeof patch.max_sell_tax_bps === "number") demoSniperState.maxSellTaxBps = patch.max_sell_tax_bps;
+  if (typeof patch.minHoldBlocks === "number") demoSniperState.minHoldBlocks = patch.minHoldBlocks;
+  if (typeof patch.min_hold_blocks === "number") demoSniperState.minHoldBlocks = patch.min_hold_blocks;
+  if (typeof patch.requireHoneypotPass === "boolean") demoSniperState.requireHoneypotPass = patch.requireHoneypotPass;
+  if (typeof patch.require_honeypot_pass === "boolean") demoSniperState.requireHoneypotPass = patch.require_honeypot_pass;
+  if (typeof patch.requireLpLocked === "boolean") demoSniperState.requireLpLocked = patch.requireLpLocked;
+  if (typeof patch.require_lp_locked === "boolean") demoSniperState.requireLpLocked = patch.require_lp_locked;
   return demoSniperParams();
 }
 

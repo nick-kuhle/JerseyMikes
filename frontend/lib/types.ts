@@ -574,7 +574,7 @@ export interface SniperPortfolio {
 
 export interface SniperParams {
   enabled: boolean;
-  vaultAddress: string | null;
+  vaultAddress?: string | null;
   buySizeWei: string;
   minLiquidityWei: string;
   maxPriceImpactBps: number;
