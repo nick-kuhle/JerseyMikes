@@ -182,11 +182,8 @@ contract MevExecutorTest is Test {
         uint256 builderBefore = builder.balance;
 
         MevExecutor.Call[] memory calls = new MevExecutor.Call[](1);
-        calls[0] = MevExecutor.Call({
-            target: address(this),
-            value: 0,
-            data: abi.encodeWithSignature("donate()")
-        });
+        calls[0] =
+            MevExecutor.Call({target: address(this), value: 0, data: abi.encodeWithSignature("donate()")});
 
         // bribeBps stays 0 (the Base configuration). The whole 1 ETH gross is
         // retained, so even a 1 ETH retained-profit floor passes.
@@ -201,9 +198,7 @@ contract MevExecutorTest is Test {
         // would have reverted on this 1 ETH gross.
         vm.prank(searcher);
         MevExecutor.Guard memory g2 = _guard(address(0), 1.1 ether);
-        vm.expectRevert(
-            abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 1 ether, 1.1 ether)
-        );
+        vm.expectRevert(abi.encodeWithSelector(MevExecutor.Unprofitable.selector, 1 ether, 1.1 ether));
         exec.execute(bytes32("base-arb-2"), calls, g2);
     }
 
