@@ -279,6 +279,23 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
         headers: {"content-type": "application/json", "x-data-source": "bot"},
       });
     } catch {
+      // In demo mode / fallback when bot is offline:
+      const {updateDemoSniperParams, setDemoSniperHalted, demoSniperParams} = await import("@/lib/demo");
+      if (route === "sniper/halt") {
+        const h = body as {reason?: string};
+        setDemoSniperHalted(true, h.reason || "halted from console");
+        return jsonResponse({ok: true, halted: true, reason: h.reason || "halted from console", demo: true}, true);
+      }
+      if (route === "sniper/resume") {
+        setDemoSniperHalted(false, null);
+        return jsonResponse({ok: true, halted: false, demo: true}, true);
+      }
+      if (route === "sniper/params") {
+        const patch = body as Record<string, unknown>;
+        updateDemoSniperParams(patch);
+        const res = demoSniperParams();
+        return jsonResponse({ok: true, ...res, demo: true}, true);
+      }
       return new Response(
         JSON.stringify({
           ok: false,
