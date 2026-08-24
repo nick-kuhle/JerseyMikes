@@ -25,7 +25,6 @@ jobs:
           version: stable
       - run: forge --version
       - run: forge fmt --check
-        continue-on-error: true
       - run: forge build --sizes
       - run: forge test -vvv
 
@@ -70,7 +69,6 @@ jobs:
         with:
           workspaces: bot
       - run: cargo fmt --all -- --check
-        continue-on-error: true
       - run: cargo clippy --all-targets -- -A clippy::too_many_arguments
       - run: cargo test --all
 
