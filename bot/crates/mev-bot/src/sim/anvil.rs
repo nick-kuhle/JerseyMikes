@@ -118,8 +118,10 @@ fn decode_revert_data_at(data: &[u8], depth: u8) -> String {
     let selector: [u8; 4] = [data[0], data[1], data[2], data[3]];
     let words = |from: usize| -> Vec<U256> {
         data[4 + from * 32..]
-            .chunks_exact(32)
-            .map(U256::from_be_slice)
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|c| U256::from_be_slice(c))
             .collect()
     };
     if selector == ERROR_STRING {

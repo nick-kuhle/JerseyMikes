@@ -498,6 +498,8 @@ mod tests {
             pool_discovery_v3: false,
             decode_universal_router: false,
             dex_univ3_arb: false,
+            dex_aerodrome_arb: false,
+            dex_aerodrome_stable: false,
             arb_max_cycle_len: 2,
             relay_tx_ingest: false,
             relay_tx_concurrency: 4,

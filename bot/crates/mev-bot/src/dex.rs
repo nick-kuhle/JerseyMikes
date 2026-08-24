@@ -111,12 +111,64 @@ sol! {
     }
 }
 
+sol! {
+    /// Aerodrome (Base, Solidly lineage). Volatile pools are constant-product
+    /// WITH A DIFFERENT FEE LOCATION than UniV2 (see
+    /// [`aero_volatile_amount_out`]); stable pools use an iterative invariant
+    /// that is deliberately out of scope until `DEX_AERODROME_STABLE` work
+    /// (work order P4) lands.
+    interface IAerodromeFactory {
+        function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool);
+        function getFee(address pool, bool stable) external view returns (uint256);
+        function allPoolsLength() external view returns (uint256);
+        function allPools(uint256 index) external view returns (address);
+    }
+
+    interface IAerodromePool {
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function stable() external view returns (bool);
+        function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
+        function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
+    }
+
+    interface IAerodromeRouter {
+        struct Route {
+            address from;
+            address to;
+            bool stable;
+            address factory;
+        }
+        function swapExactTokensForTokens(
+            uint256 amountIn,
+            uint256 amountOutMin,
+            Route[] calldata routes,
+            address to,
+            uint256 deadline
+        ) external returns (uint256[] memory amounts);
+        function getAmountsOut(uint256 amountIn, Route[] calldata routes) external view returns (uint256[] memory amounts);
+        function defaultFactory() external view returns (address);
+    }
+}
+
+/// `PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint256)`
+/// — emitted by the Aerodrome (Solidly) pool factory. Three indexed topics
+/// (token0, token1, stable); the pool address is the first word of data.
+/// keccak256 of the canonical signature: verified with `cast keccak` 2026-08-24.
+pub const AERO_POOL_CREATED_TOPIC: &str =
+    "0x2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Venue {
     UniV2,
     SushiV2,
     UniV3,
+    /// Aerodrome volatile (constant-product) pool. Kept venue-distinct from
+    /// UniV2 because the fee location differs (off the input, floored) and
+    /// execution goes through the Aerodrome router's `Route[]` calldata, not
+    /// the pair's `swap()`.
+    AeroVolatile,
 }
 
 impl Venue {
@@ -125,8 +177,100 @@ impl Venue {
             Venue::UniV2 => "univ2",
             Venue::SushiV2 => "sushiv2",
             Venue::UniV3 => "univ3",
+            Venue::AeroVolatile => "aerodrome",
         }
     }
+}
+
+/// Snapshot of an Aerodrome pool. Only `stable = false` pools are priced;
+/// a stable pool returns `None` from [`AeroPool::amount_out`] — fail closed
+/// until the iterative invariant work (work order P4) lands behind
+/// `DEX_AERODROME_STABLE`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct AeroPool {
+    pub address: Address,
+    pub token0: Address,
+    pub token1: Address,
+    pub reserve0: U256,
+    pub reserve1: U256,
+    /// Per-pool fee in basis points, read from `factory.getFee(pool, stable)`
+    /// — Aerodrome fees are per-pool, not a venue constant.
+    pub fee_bps: u32,
+    /// `pool.stable()` as deployed. Volatile-only until work order P4.
+    pub stable: bool,
+    pub block: u64,
+}
+
+impl AeroPool {
+    pub fn venue(&self) -> Venue {
+        Venue::AeroVolatile
+    }
+
+    pub fn reserves_for(&self, token_in: Address) -> Option<(U256, U256)> {
+        if token_in == self.token0 {
+            Some((self.reserve0, self.reserve1))
+        } else if token_in == self.token1 {
+            Some((self.reserve1, self.reserve0))
+        } else {
+            None
+        }
+    }
+
+    pub fn other_token(&self, token: Address) -> Option<Address> {
+        if token == self.token0 {
+            Some(self.token1)
+        } else if token == self.token1 {
+            Some(self.token0)
+        } else {
+            None
+        }
+    }
+
+    /// Exact-in quote using the pool's own per-pool fee. Stable pools refuse
+    /// to quote: the x³y+y³x invariant is not approximated by volatile math,
+    /// and an approximate quote upstream is an invented arbitrage downstream.
+    pub fn amount_out(&self, token_in: Address, amount_in: U256) -> Option<U256> {
+        if self.stable {
+            return None;
+        }
+        let (r_in, r_out) = self.reserves_for(token_in)?;
+        let out = aero_volatile_amount_out(amount_in, r_in, r_out, self.fee_bps);
+        if out.is_zero() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+}
+
+/// Aerodrome volatile `getAmountOut`, exactly as the contract computes it.
+///
+/// **Not** the UniV2 formula: the fee is taken OFF THE INPUT with integer
+/// truncation first (`xin = x - floor(x·fee/10_000)`), then the constant
+/// product is applied to whole units (`xin·rOut / (rIn + xin)`). At small
+/// sizes this differs from UniV2's in-numerator fee by wei — which is why
+/// Aerodrome is its own venue, not a renamed V2 pool. Verified against live
+/// Base `getAmountOut` 2026-08-24 (1 WETH → 2500574490 USDC on the WETH/USDC
+/// volatile pool, matching the pool call and the router call exactly).
+pub fn aero_volatile_amount_out(
+    amount_in: U256,
+    reserve_in: U256,
+    reserve_out: U256,
+    fee_bps: u32,
+) -> U256 {
+    if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+        return U256::ZERO;
+    }
+    let fee = amount_in * U256::from(fee_bps) / U256::from(10_000u32);
+    let xin = amount_in.saturating_sub(fee);
+    if xin.is_zero() {
+        return U256::ZERO;
+    }
+    let denominator = reserve_in + xin;
+    if denominator.is_zero() {
+        return U256::ZERO;
+    }
+    xin * reserve_out / denominator
 }
 
 /// Immutable metadata for a UniswapV3 pool.
@@ -515,6 +659,124 @@ pub async fn get_pair(
     })
 }
 
+/// Resolve an Aerodrome pool address: `factory.getPool(a, b, stable)`.
+pub async fn aero_get_pool(
+    rpc: &RpcClient,
+    factory: Address,
+    a: Address,
+    b: Address,
+    stable: bool,
+) -> Result<Option<Address>> {
+    let data = IAerodromeFactory::getPoolCall {
+        tokenA: a,
+        tokenB: b,
+        stable,
+    }
+    .abi_encode();
+    let out: String = rpc
+        .call("eth_call", eth_call_params(factory, data, "latest"))
+        .await?;
+    let raw = hex::decode(out.strip_prefix("0x").unwrap_or(&out))?;
+    if raw.len() < 32 {
+        return Ok(None);
+    }
+    let addr = Address::from_slice(&raw[12..32]);
+    Ok(if addr == Address::ZERO {
+        None
+    } else {
+        Some(addr)
+    })
+}
+
+/// Per-pool fee in basis points: `factory.getFee(pool, stable)`.
+pub async fn aero_fee_bps(
+    rpc: &RpcClient,
+    factory: Address,
+    pool: Address,
+    stable: bool,
+    block: u64,
+) -> Result<u32> {
+    let data = IAerodromeFactory::getFeeCall { pool, stable }.abi_encode();
+    let out: String = rpc
+        .call(
+            "eth_call",
+            eth_call_params(factory, data, &format!("0x{block:x}")),
+        )
+        .await?;
+    let raw = hex::decode(out.strip_prefix("0x").unwrap_or(&out))?;
+    if raw.len() < 32 {
+        return Err(anyhow!("getFee failed for pool {pool:?}"));
+    }
+    let fee = U256::from_be_slice(&raw[0..32]).to::<u64>();
+    Ok(u32::try_from(fee).unwrap_or(u32::MAX))
+}
+
+/// Fetch an Aerodrome pool snapshot: tokens, reserves, stability flag and
+/// the per-pool fee, in one batch plus one call. Stable pools are returned
+/// with `stable = true` — pricing refuses them until work order P4.
+pub async fn fetch_aero_pool(
+    rpc: &RpcClient,
+    factory: Address,
+    pool: Address,
+    block: u64,
+) -> Result<AeroPool> {
+    let tag = format!("0x{block:x}");
+    let calls = vec![
+        (
+            "eth_call".to_string(),
+            eth_call_params(pool, IAerodromePool::token0Call {}.abi_encode(), &tag),
+        ),
+        (
+            "eth_call".to_string(),
+            eth_call_params(pool, IAerodromePool::token1Call {}.abi_encode(), &tag),
+        ),
+        (
+            "eth_call".to_string(),
+            eth_call_params(
+                pool,
+                IAerodromePool::getReservesCall {}.abi_encode(),
+                &tag,
+            ),
+        ),
+        (
+            "eth_call".to_string(),
+            eth_call_params(pool, IAerodromePool::stableCall {}.abi_encode(), &tag),
+        ),
+    ];
+    let res = rpc.batch(&calls).await?;
+    let token0 = decode_address(res.first())?;
+    let token1 = decode_address(res.get(1))?;
+    let reserves = res
+        .get(2)
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("getReserves failed for {pool:?}"))?;
+    let raw = hex::decode(reserves.strip_prefix("0x").unwrap_or(reserves))?;
+    if raw.len() < 64 {
+        return Err(anyhow!("short getReserves response for {pool:?}"));
+    }
+    let reserve0 = U256::from_be_slice(&raw[0..32]);
+    let reserve1 = U256::from_be_slice(&raw[32..64]);
+    let stable_raw = res
+        .get(3)
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("stable() failed for {pool:?}"))?;
+    let stable = stable_raw.ends_with('1');
+    let fee_bps = aero_fee_bps(rpc, factory, pool, stable, block).await?;
+
+    Ok(AeroPool {
+        address: pool,
+        token0,
+        token1,
+        reserve0,
+        reserve1,
+        fee_bps,
+        stable,
+        block,
+    })
+}
+
 /// Price an exact-in UniswapV3 swap using the on-chain QuoterV2.
 ///
 /// `block` is a JSON-RPC block tag (`"latest"` or `"0x…"`). Replay must pin
@@ -571,6 +833,52 @@ mod tests {
             venue: Venue::UniV2,
             block: 0,
         }
+    }
+
+    #[test]
+    fn aero_volatile_math_matches_live_chain_values() {
+        // Pinned from live Base 2026-08-24: WETH/USDC volatile pool
+        // 0xcDAC0d6c6C59727a65F871236188350531885C43 — reserves
+        // 1718659049920153369322 WETH / 4313067253337 USDC, fee 30 bps;
+        // pool.getAmountOut(1e18, WETH) == router.getAmountsOut == 2500574490.
+        let x = U256::from(10u128.pow(18));
+        let r0 = U256::from(1718659049920153369322u128);
+        let r1 = U256::from(4313067253337u128);
+        assert_eq!(aero_volatile_amount_out(x, r0, r1, 30), U256::from(2500574490u64));
+    }
+
+    #[test]
+    fn aero_volatile_fee_location_differs_from_univ2_at_small_sizes() {
+        // Under ~333 wei of input at 30 bps, floor(x·fee/10_000) is zero, so
+        // Aerodrome charges NOTHING where UniV2's in-numerator fee always
+        // charges. The venues are deliberately not interchangeable.
+        let x = U256::from(100u64);
+        let r_in = U256::from(1_000_000u64);
+        let r_out = U256::from(1_000_000u64);
+        let aero = aero_volatile_amount_out(x, r_in, r_out, 30);
+        let uni = v2_amount_out(x, r_in, r_out, 30);
+        assert_eq!(aero, U256::from(99u64)); // (100·1e6)/(1e6+100)
+        assert_eq!(uni, U256::from(99u64).saturating_sub(U256::from(0u64))); // same rounding here…
+        // …but at a size where the floor bites, they diverge:
+        let x = U256::from(333u64);
+        let aero = aero_volatile_amount_out(x, r_in, r_out, 30);
+        let uni = v2_amount_out(x, r_in, r_out, 30);
+        assert_ne!(aero, uni, "fee location changes integer results");
+    }
+
+    #[test]
+    fn aero_pool_refuses_to_price_stable_pools() {
+        let p = AeroPool {
+            address: Address::with_last_byte(7),
+            token0: Address::with_last_byte(1),
+            token1: Address::with_last_byte(2),
+            reserve0: U256::from(1_000_000u64),
+            reserve1: U256::from(1_000_000u64),
+            fee_bps: 5,
+            stable: true,
+            block: 0,
+        };
+        assert_eq!(p.amount_out(p.token0, U256::from(1_000u64)), None);
     }
 
     #[test]

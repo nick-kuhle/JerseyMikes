@@ -50,6 +50,10 @@ pub struct StrategyCtx {
     /// V2 cache would be priced by `v2_amount_out` and produce quotes that
     /// look plausible, are wrong, and pass every downstream gate.
     pub pools_v3: V3PoolCache,
+    /// Aerodrome pools (volatile and, later, stable), separate for the same
+    /// reason as `pools_v3`: constant-product-with-fee-off-input math is not
+    /// UniV2 math and must never be priced by it.
+    pub pools_aero: AeroPoolCache,
     head: RwLock<BlockHead>,
 }
 
@@ -58,6 +62,7 @@ impl StrategyCtx {
         Self {
             pools: PoolCache::new(rpc.clone(), cfg.addresses.pair_factories()),
             pools_v3: V3PoolCache::new(),
+            pools_aero: AeroPoolCache::new(rpc.clone(), cfg.addresses.aerodrome_factory),
             cfg,
             rpc,
             executor,
@@ -356,6 +361,161 @@ impl V3PoolCache {
 }
 
 // ---------------------------------------------------------------------------
+// Aerodrome pool cache
+// ---------------------------------------------------------------------------
+
+/// Reserve-bearing Aerodrome pools, refreshed per block like the V2 cache
+/// but priced with the venue's own fee-off-input math ([`crate::dex::AeroPool`]).
+///
+/// Deliberately separate from [`PoolCache`]: an Aerodrome pool sitting in the
+/// V2 cache would be priced by UniV2's in-numerator-fee formula and would
+/// produce quotes that look plausible, differ by wei, and pass every
+/// downstream gate.
+#[derive(Clone)]
+pub struct AeroPoolCache {
+    rpc: RpcClient,
+    /// Aerodrome pool factory for this chain (registry), or `None` when the
+    /// chain has none — lookups fail closed with no pools.
+    factory: Option<Address>,
+    inner: Arc<RwLock<HashMap<Address, crate::dex::AeroPool>>>,
+    pair_index: Arc<RwLock<HashMap<(Address, Address, bool), Option<Address>>>>,
+}
+
+impl AeroPoolCache {
+    pub fn new(rpc: RpcClient, factory: Option<Address>) -> Self {
+        Self {
+            rpc,
+            factory,
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            pair_index: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn get(&self, pool: Address) -> Option<crate::dex::AeroPool> {
+        self.inner.read().get(&pool).copied()
+    }
+
+    pub fn insert(&self, pool: crate::dex::AeroPool) {
+        self.inner.write().insert(pool.address, pool);
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn all(&self) -> Vec<crate::dex::AeroPool> {
+        self.inner.read().values().copied().collect()
+    }
+
+    /// Volatile pools only — the only capability the v1 graph can execute.
+    pub fn all_volatile(&self) -> Vec<crate::dex::AeroPool> {
+        self.inner
+            .read()
+            .values()
+            .filter(|p| !p.stable)
+            .copied()
+            .collect()
+    }
+
+    /// Look up (and memoise) the pool address for a token couple.
+    /// `stable = false` is the volatile lane; stable lookups are memoised
+    /// too but only ever loaded once work order P4 exists.
+    pub async fn pool_for(&self, a: Address, b: Address, stable: bool) -> Option<Address> {
+        let (x, y) = if a < b { (a, b) } else { (b, a) };
+        if let Some(hit) = self.pair_index.read().get(&(x, y, stable)) {
+            return *hit;
+        }
+        let factory = self.factory?;
+        let found = dex::aero_get_pool(&self.rpc, factory, x, y, stable)
+            .await
+            .ok()
+            .flatten();
+        self.pair_index.write().insert((x, y, stable), found);
+        found
+    }
+
+    /// Load (or fresh-hit) a pool at `block`.
+    pub async fn load(&self, pool: Address, block: u64) -> Option<crate::dex::AeroPool> {
+        if let Some(p) = self.get(pool) {
+            if p.block == block {
+                return Some(p);
+            }
+        }
+        let factory = self.factory?;
+        match dex::fetch_aero_pool(&self.rpc, factory, pool, block).await {
+            Ok(p) => {
+                self.insert(p);
+                Some(p)
+            }
+            Err(e) => {
+                tracing::debug!(target: "pools", pool = ?pool, error = %e, "aerodrome pool load failed");
+                None
+            }
+        }
+    }
+
+    /// Read a pool's state at a specific historical block, bypassing the
+    /// cache (same replay-pollution argument as [`PoolCache::read_at`]).
+    pub async fn read_at(&self, pool: Address, block: u64) -> Option<crate::dex::AeroPool> {
+        let factory = self.factory?;
+        match dex::fetch_aero_pool(&self.rpc, factory, pool, block).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::debug!(target: "pools", pool = ?pool, block, error = %e, "historical aerodrome read failed");
+                None
+            }
+        }
+    }
+
+    /// Refresh every cached pool's reserves for `block` in one batch, chunk
+    /// of 50, same shape as [`PoolCache::refresh_all`] — Aerodrome's
+    /// `getReserves()` returns the same leading two uint256 words.
+    pub async fn refresh_all(&self, block: u64) {
+        let pools: Vec<Address> = self.inner.read().keys().copied().collect();
+        for chunk in pools.chunks(50) {
+            let calls: Vec<(String, serde_json::Value)> = chunk
+                .iter()
+                .map(|addr| {
+                    (
+                        "eth_call".to_string(),
+                        serde_json::json!([
+                            {
+                                "to": format!("{addr:?}"),
+                                "data": format!("0x{}", hex::encode(dex::IAerodromePool::getReservesCall {}.abi_encode()))
+                            },
+                            format!("0x{block:x}")
+                        ]),
+                    )
+                })
+                .collect();
+            let Ok(results) = self.rpc.batch(&calls).await else {
+                continue;
+            };
+            let mut guard = self.inner.write();
+            for (addr, res) in chunk.iter().zip(results) {
+                let Ok(v) = res else { continue };
+                let Some(s) = v.as_str() else { continue };
+                let Ok(raw) = hex::decode(s.strip_prefix("0x").unwrap_or(s)) else {
+                    continue;
+                };
+                if raw.len() < 64 {
+                    continue;
+                }
+                if let Some(p) = guard.get_mut(addr) {
+                    p.reserve0 = U256::from_be_slice(&raw[0..32]);
+                    p.reserve1 = U256::from_be_slice(&raw[32..64]);
+                    p.block = block;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router calldata decoding
 // ---------------------------------------------------------------------------
 /// A swap intent extracted from a pending transaction.
@@ -606,6 +766,73 @@ pub async fn try_scan_pool_created(
     Some(logs.iter().filter_map(decode_pool_created).collect())
 }
 
+/// An Aerodrome `PoolCreated` log reduced to its immutable seed. Reserves
+/// and the per-pool fee are deliberately **not** in here — they are mutable
+/// (or live on the factory), so the discovery lane fetches the pool itself
+/// rather than quoting from a stale creation-log snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AeroPoolSeed {
+    pub token0: Address,
+    pub token1: Address,
+    pub stable: bool,
+    pub address: Address,
+    pub block: u64,
+}
+
+/// Decode one Aerodrome `PoolCreated(token0, token1, stable, pool, _)`.
+///
+/// All three of `token0`, `token1`, `stable` are **indexed** (topics 1..3);
+/// `pool` is the first word of `data` (right-aligned), followed by the
+/// factory's `allPoolsLength`. Layout verified against a real Base log
+/// 2026-08-24 — mixing indexed and data fields up yields plausible-looking
+/// wrong addresses, the failure mode these guards exist for.
+pub fn decode_aero_pool_created(log: &serde_json::Value) -> Option<AeroPoolSeed> {
+    let topics = log["topics"].as_array()?;
+    if !topics.first()?.as_str()?.eq_ignore_ascii_case(dex::AERO_POOL_CREATED_TOPIC) {
+        return None;
+    }
+    if topics.len() < 4 {
+        return None;
+    }
+    let t1 = crate::types::parse_bytes(&topics[1]);
+    let t2 = crate::types::parse_bytes(&topics[2]);
+    let t3 = crate::types::parse_bytes(&topics[3]);
+    if t1.len() < 32 || t2.len() < 32 || t3.len() < 32 {
+        return None;
+    }
+    let token0 = Address::from_slice(&t1[12..32]);
+    let token1 = Address::from_slice(&t2[12..32]);
+    // bool, right-aligned: only the last byte may be non-zero.
+    let stable = match t3[31] {
+        0 if t3[..31].iter().all(|b| *b == 0) => false,
+        1 if t3[..31].iter().all(|b| *b == 0) => true,
+        _ => return None,
+    };
+    let data = crate::types::parse_bytes(&log["data"]);
+    if data.len() < 32 {
+        return None;
+    }
+    Some(AeroPoolSeed {
+        token0,
+        token1,
+        stable,
+        address: Address::from_slice(&data[12..32]),
+        block: crate::types::parse_u64(&log["blockNumber"]),
+    })
+}
+
+/// Scan the Aerodrome pool factory for `PoolCreated` over `[from, to]`.
+/// `None` means the RPC call failed.
+pub async fn try_scan_aero_pool_created(
+    rpc: &crate::rpc::RpcClient,
+    factory: Address,
+    from: u64,
+    to: u64,
+) -> Option<Vec<AeroPoolSeed>> {
+    let logs = scan_factory_logs(rpc, &[factory], dex::AERO_POOL_CREATED_TOPIC, from, to).await?;
+    Some(logs.iter().filter_map(decode_aero_pool_created).collect())
+}
+
 /// Map the emitting factory address to its venue, using the chain's
 /// registry (`factories`) rather than a hardcoded table — a chain whose
 /// V2 factory differs from mainnet's must still decode its own logs.
@@ -642,6 +869,7 @@ mod tests {
             raw: None,
             source: TxSource::PublicMempool,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         }
     }
@@ -853,6 +1081,67 @@ mod tests {
         assert_eq!(got.tick_spacing, 10);
         assert_eq!(got.block, 18_000_000);
         assert!(crate::dex::V3Pool::is_actionable_fee(got.fee));
+    }
+
+    /// The real Aerodrome `PoolCreated` for the WETH/`0x9c05…e9f6` volatile
+    /// pool `0xb64ce58ed12a84ba00dc4dd58d28771b9308597d`, emitted by Base
+    /// block 50,390,210 (tx index 205, log index 589). Cross-checked live
+    /// 2026-08-24: `factory.getPool(t0, t1, false)` returns the pool,
+    /// `pool.stable()` is false, `factory.getFee(pool, false)` is 30.
+    fn aero_pool_created_log() -> serde_json::Value {
+        serde_json::json!({
+            "address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
+            "blockNumber": "0x300e942",
+            "topics": [
+                crate::dex::AERO_POOL_CREATED_TOPIC,
+                "0x0000000000000000000000004200000000000000000000000000000000000006",
+                "0x0000000000000000000000009c0540faceb85ef926c53e693cf2f3353802e9f6",
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+            ],
+            "data": "0x000000000000000000000000b64ce58ed12a84ba00dc4dd58d28771b9308597d0000000000000000000000000000000000000000000000000000000000006fd9",
+        })
+    }
+
+    #[test]
+    fn decodes_a_real_aerodrome_pool_created_log() {
+        let seed = decode_aero_pool_created(&aero_pool_created_log()).expect("decodes");
+        assert_eq!(
+            seed.token0,
+            address!("4200000000000000000000000000000000000006")
+        );
+        assert_eq!(
+            seed.token1,
+            address!("9c0540faceb85ef926c53e693cf2f3353802e9f6")
+        );
+        assert!(!seed.stable, "the real pool is volatile (topic3 == 0)");
+        assert_eq!(
+            seed.address,
+            address!("b64ce58ed12a84ba00dc4dd58d28771b9308597d")
+        );
+        assert_eq!(seed.block, 50_390_210);
+    }
+
+    #[test]
+    fn aero_decoder_rejects_wrong_shapes_and_foreign_logs() {
+        // A V2 PairCreated log must not decode as an Aero pool.
+        let pair = address!("b4e16d0168e52d35cacd2c6185b44281ec28c9dc");
+        assert!(decode_aero_pool_created(&pair_created_log(known::UNIV2_FACTORY, pair)).is_none());
+        // A V3 PoolCreated log likewise.
+        assert!(decode_aero_pool_created(&pool_created_log()).is_none());
+        // A genuine Aero PoolCreated with stable = true flags the stable lane.
+        let mut stable_log = aero_pool_created_log();
+        stable_log["topics"][3] = serde_json::json!(format!("0x{:064x}", 1u8));
+        let seed = decode_aero_pool_created(&stable_log).expect("stable=true still decodes");
+        assert!(seed.stable);
+        // But a garbage bool word is malformed, not "true".
+        let mut bad = aero_pool_created_log();
+        bad["topics"][3] = serde_json::json!(format!("0x{:064x}", 2u8));
+        assert!(decode_aero_pool_created(&bad).is_none());
+        // Truncated data cannot yield a pool address.
+        let mut short = aero_pool_created_log();
+        short["data"] = serde_json::json!("0x00");
+        assert!(decode_aero_pool_created(&short).is_none());
+        assert!(decode_aero_pool_created(&serde_json::json!({})).is_none());
     }
 
     #[test]
