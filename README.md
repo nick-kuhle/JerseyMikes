@@ -219,11 +219,14 @@ are not yet implemented. Sequencer qualification now accepts a dedicated
   collapse, reorgs) with fire/resolve lifecycle — `GET /api/alerts`, the
   live tape (`alert` events), and Prometheus metrics at `/api/metrics`
   (see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md))
-- **Go-live checklist**: the six-step MevExecutor deployment panel
-  (`docs/GO_LIVE.md` Path A) — connect wallet, gas check, deploy (CI-checked
-  bytecode, free cost estimate), fund, `setSearcher`, verify + copy the
-  `EXECUTOR_ADDRESS` line. Deployment alone changes no execution mode; all
-  broadcast and strategy-specific qualification gates still apply.
+- **Production go-live wizard**: a five-card Ethereum/Base deployment panel
+  (`docs/GO_LIVE.md` Path A) — connect wallet, verify atomic/directional key
+  separation, deploy and verify both contracts, wrap/fund WETH, set vault
+  budgets, run RPC/relay/qualification pre-flight, and independently switch
+  atomic live mode or the sniper lane. Deployment alone changes no execution
+  mode; boot arming, risk, inventory and strategy qualification gates still apply.
+  The soak threshold is operator-selectable at runtime without manufacturing
+  qualification evidence.
 - **W6 go/no-go card** in the funnel panel: the public-mempool gap reading
   (`pendingSeen` vs sandwich/JIT `invocationsEmpty`/`candidatesEmitted`,
   7-day sample gate) that decides whether UniversalRouter decoding gets
@@ -242,16 +245,17 @@ are not yet implemented. Sequencer qualification now accepts a dedicated
   active chain (so a Base console offers "switch wallet to Base", not
   "switch to mainnet").
 
-The browser only ever talks to `/api/bot/*`, which the Next server proxies to
-`BOT_API_URL`; contract reads go through `/api/eth`, a server-side
-read-only RPC proxy (uses the bot's `ETH_HTTP_URL` when set).
+The browser only talks to same-origin Next routes: `/api/bot/*` and the
+canonical `/api/stream?chain=...` feed. Bot URLs and auth tokens stay
+server-side; contract reads go through `/api/eth`, a server-side read-only RPC
+proxy (using `ETH_HTTP_URL` or selected-chain `BASE_HTTP_URL`).
 
 ---
 
 ## Configuration
 
 Everything is environment-driven; see [`.env.example`](.env.example) for the
-annotated list. The only required variable is `ETH_HTTP_URL`.
+annotated list. The required RPC variable is `ETH_HTTP_URL` for Ethereum or `BASE_HTTP_URL` for a Base process; the legacy Base alias `ETH_HTTP_URL` remains accepted.
 
 The bot's API binds `127.0.0.1:8080` by default. Its three mutating endpoints
 (`POST /api/mode`, `/api/risk`, `/api/risk/reset`) can trip the kill switch,
@@ -276,7 +280,8 @@ to measure what is reachable, not to be profitable. See
 | [`docs/SETUP.md`](docs/SETUP.md) | Install walkthrough for all three toolchains, `.env`, `make doctor`, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Wiring, data flow, repo layout, how to add a chain |
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
-| [`docs/SNIPER.md`](docs/SNIPER.md) | The directional new-token sniper: why it is a separate lane, `SniperVault`, every `SNIPER_*` knob, the mini portfolio, and what remains |
+| [`docs/SNIPER.md`](docs/SNIPER.md) | The directional new-token sniper: `SniperVault`, paper trading, manual controls, every `SNIPER_*` knob, and operational risk |
+| [`docs/PRODUCTION_READINESS_AUDIT.md`](docs/PRODUCTION_READINESS_AUDIT.md) | Work-order implementation map, verification evidence and remaining launch blockers |
 | [`docs/RISK.md`](docs/RISK.md) | Fail-closed broadcast predicate, executor guards, nonce/finality and known limitations |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased plan through going live and chains 2–5 |
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
@@ -315,9 +320,11 @@ own halt, its own tables, and its own console panel with a mini portfolio.
 `MevExecutor`'s runtime bytecode is unchanged (11,497 bytes), so nothing about
 the certified atomic path moved.
 
-It **ships disabled with a zero size and a zero budget** and is not yet wired
-to live execution. See [`docs/SNIPER.md`](docs/SNIPER.md) for the full design,
-the parameter reference, and an explicit list of what remains.
+It **ships disabled with a zero size and a zero budget**. Simulation mode now
+has an isolated 1 ETH virtual bankroll for paper entries/exits, while live
+entries require the verified SniperVault, dedicated signer, budget and explicit
+arming sequence. See [`docs/SNIPER.md`](docs/SNIPER.md) for the full design and
+parameter reference.
 
 Being a live *candidate* is a necessary condition, not a sufficient one. Each
 row must still independently earn a `PASS` from continuous canonical

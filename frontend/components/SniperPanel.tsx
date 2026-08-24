@@ -3,24 +3,26 @@
 /**
  * Sniper — New Token Portfolio & Directional Execution Console.
  *
- * Cleaned up and unified for maximum performance and functionality:
- * 1. Master On/Off Switch & Sim/Live Mode Switch with emergency halt/resume.
- * 2. Strategy & Investment Parameters: initial investment (ETH), auto-sell take profit (% and absolute ETH),
- *    sell fraction %, stop loss %, trailing stop %, max hold duration, budgets, and safety filters.
- *    (Fixed: camelCase payload synchronization + unsaved edit protection).
- * 3. Unified Holdings & Positions: Combines active bot positions and wallet token holdings into one seamless portfolio.
- * 4. History: Clean log of closed positions, categorized by Simulation vs. Live Execution.
- * 5. Swapping & Selling: 1-click quick-sells (25%, 50%, 100%) and DEX Aggregators (1inch, Uniswap, KyberSwap, DexScreener).
+ * Designed for high functionality, performance, and clear execution controls:
+ * 1. Master On/Off Switch & Sim/Live Mode Switch.
+ * 2. Parameter configuration: Initial Investment (ETH), Auto-Sell Take-Profit (% and absolute ETH),
+ *    Sell Fraction %, Stop Loss %, Trailing Stop %, Budgets, and Safety Filters.
+ * 3. Mini Portfolio: Active positions, unrealized & realized PnL, and connected wallet holdings.
+ * 4. Swapping & Selling Features: 1-click partial/full sells and DEX Aggregators (1inch, Uniswap, KyberSwap, DexScreener).
  */
 
 import {memo, useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {readActiveChain, withChain} from "@/lib/chain";
 import {ago, shortHash, signedEth, weiToEth} from "@/lib/format";
-import {addressUrl} from "@/lib/explorer";
+import {addressUrl, txUrl} from "@/lib/explorer";
 import {useWallet} from "@/lib/wallet";
 import {getAggregatorLinks, ERC20_ABI} from "@/lib/swap";
+import SniperVaultWizard from "./SniperVaultWizard";
+import TradeTerminal from "./TradeTerminal";
 import {
   createPublicClient,
+  createWalletClient,
+  custom,
   formatEther,
   formatUnits,
   http,
@@ -34,6 +36,8 @@ import type {
   SniperParamsPatch,
   SniperParamsResponse,
   SniperPortfolio,
+  SniperPortfolioRow,
+  SniperVaultStatus,
 } from "@/lib/types";
 
 const EXIT_LABEL: Record<string, string> = {
@@ -92,7 +96,7 @@ function weiFromEth(ethStr: string): string {
   }
 }
 
-// Preset configurations
+// Preset definitions for quick parameter setup
 const PRESETS = {
   conservative: {
     buySizeEth: "0.025",
@@ -141,8 +145,10 @@ const PRESETS = {
 function SniperPanel() {
   const [pf, setPf] = useState<SniperPortfolio | null>(null);
   const [cfg, setCfg] = useState<SniperParamsResponse | null>(null);
+  const [vault, setVault] = useState<SniperVaultStatus | null>(null);
   const [demo, setDemo] = useState(false);
-  const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "history" | "gates">("portfolio");
+  const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "gates">("portfolio");
+  const [portfolioSubTab, setPortfolioSubTab] = useState<"all" | "open" | "wallet" | "closed">("all");
 
   // Wallet and chain state
   const wallet = useWallet();
@@ -155,7 +161,7 @@ function SniperPanel() {
   const [isSaving, setIsSaving] = useState(false);
   const [isHalting, setIsHalting] = useState(false);
 
-  // Form dirty flag: prevents background polling from overwriting user edits while typing
+  // Do not let the 4-second refresh overwrite an operator's unsaved form.
   const isFormDirty = useRef(false);
   const formInitialized = useRef(false);
 
@@ -178,7 +184,7 @@ function SniperPanel() {
   const [formRequireHoneypot, setFormRequireHoneypot] = useState(true);
   const [formRequireLpLocked, setFormRequireLpLocked] = useState(false);
 
-  // Swap / Aggregator state
+  // Swap Drawer / Modal state
   const [swapTarget, setSwapTarget] = useState<{
     token: string;
     symbol: string;
@@ -190,8 +196,14 @@ function SniperPanel() {
   const [customTokenInput, setCustomTokenInput] = useState("");
   const [walletTokens, setWalletTokens] = useState<Array<{address: string; symbol: string; balance: string; decimals: number}>>([]);
   const [isScanningWallet, setIsScanningWallet] = useState(false);
+  // Manual controls require both addresses because an operator must identify
+  // the exact V2 pair. The bot validates the pair against the configured WETH
+  // and still enforces the SniperVault budget/slippage guards.
+  const [manualBuyToken, setManualBuyToken] = useState("");
+  const [manualBuyPair, setManualBuyPair] = useState("");
+  const [manualBuySizeEth, setManualBuySizeEth] = useState("0.05");
 
-  // Sync form from server configuration
+  // Sync form with fetched config
   const populateFormFromConfig = useCallback((params: SniperParams) => {
     setFormBuySizeEth(ethFromWei(params.buySizeWei, 4));
     setFormDailyBudgetEth(ethFromWei(params.dailyBudgetWei, 4));
@@ -215,9 +227,10 @@ function SniperPanel() {
   const load = useCallback(async () => {
     const chain = readActiveChain();
     try {
-      const [pRes, cRes] = await Promise.all([
+      const [pRes, cRes, vRes] = await Promise.all([
         fetch(withChain("/api/bot/sniper/portfolio", chain), {cache: "no-store"}),
         fetch(withChain("/api/bot/sniper/params", chain), {cache: "no-store"}),
+        fetch(withChain("/api/bot/sniper/vault", chain), {cache: "no-store"}),
       ]);
       if (pRes.ok && cRes.ok) {
         const p = (await pRes.json()) as SniperPortfolio & {demo?: boolean};
@@ -225,18 +238,18 @@ function SniperPanel() {
         setPf(p);
         setCfg(c);
         setDemo(Boolean(p.demo || c.demo));
-
-        // Populate form on initial load or if user is not actively editing
-        if (c?.params && (!formInitialized.current || !isFormDirty.current)) {
+        if (!formInitialized.current || !isFormDirty.current) {
           populateFormFromConfig(c.params);
           formInitialized.current = true;
         }
       }
+      if (vRes.ok) setVault((await vRes.json()) as SniperVaultStatus & {demo?: boolean});
     } catch {
-      /* retain cached state on network blip */
+      /* maintain existing data on transient fetch error */
     }
   }, [populateFormFromConfig]);
 
+  // Initial load and periodic polling
   useEffect(() => {
     load();
     const t = setInterval(load, 4000);
@@ -251,7 +264,7 @@ function SniperPanel() {
     });
   }, [activeChainSlug]);
 
-  // Scan user wallet holdings for sniped tokens & custom search
+  // Scan user wallet holdings for portfolio tokens or recent snipes
   const scanWalletBalances = useCallback(async () => {
     if (!wallet.address || !publicClient) return;
     setIsScanningWallet(true);
@@ -299,12 +312,12 @@ function SniperPanel() {
             });
           }
         } catch {
-          // ignore read failure on unverified token
+          // ignore failed token read
         }
       }
       setWalletTokens(results);
     } catch (e) {
-      console.error("Wallet balance scan error:", e);
+      console.error("Wallet token scan error:", e);
     } finally {
       setIsScanningWallet(false);
     }
@@ -316,85 +329,69 @@ function SniperPanel() {
     }
   }, [wallet.address, tab, scanWalletBalances]);
 
-  // Merge bot positions and wallet token balances into a unified list
+  // Combine bot positions and connected-wallet balances without losing the
+  // provenance of either source. This is intentionally computed before the
+  // loading return so hook order is invariant across polling updates.
   const unifiedHoldings = useMemo(() => {
-    const map = new Map<
-      string,
-      {
-        token: string;
-        symbol: string;
-        pair?: string;
-        venue?: string;
-        state?: string;
-        entryCostWei: string;
-        markValueWei: string;
-        unrealizedPnlWei: string;
-        netPnlBps: number;
-        ageSecs: number;
-        openedAtMs: number;
-        markStale: boolean;
-        inBot: boolean;
-        inWallet: boolean;
-        walletBalance?: string;
-      }
-    >();
-
-    // Add bot open positions
-    (pf?.open || []).forEach((pos) => {
-      map.set(pos.token.toLowerCase(), {
+    const holdings = new Map<string, {
+      token: string;
+      symbol: string;
+      pair?: string;
+      state?: string;
+      entryCostWei: string;
+      markValueWei: string;
+      unrealizedPnlWei: string;
+      netPnlBps: number;
+      markStale: boolean;
+      inBot: boolean;
+      inWallet: boolean;
+      walletBalance?: string;
+    }>();
+    for (const pos of pf?.open ?? []) {
+      holdings.set(pos.token.toLowerCase(), {
         token: pos.token,
         symbol: pos.symbol || shortHash(pos.token, 4),
         pair: pos.pair,
-        venue: pos.venue,
         state: pos.state,
         entryCostWei: pos.entryCostWei,
         markValueWei: pos.markValueWei,
         unrealizedPnlWei: pos.unrealizedPnlWei,
         netPnlBps: pos.netPnlBps,
-        ageSecs: pos.ageSecs,
-        openedAtMs: pos.openedAtMs,
         markStale: pos.markStale,
         inBot: true,
         inWallet: false,
       });
-    });
-
-    // Add/merge wallet holdings
-    walletTokens.forEach((wt) => {
-      const key = wt.address.toLowerCase();
-      const existing = map.get(key);
-      if (existing) {
-        existing.inWallet = true;
-        existing.walletBalance = wt.balance;
+    }
+    for (const token of walletTokens) {
+      const current = holdings.get(token.address.toLowerCase());
+      if (current) {
+        current.inWallet = true;
+        current.walletBalance = token.balance;
       } else {
-        map.set(key, {
-          token: wt.address,
-          symbol: wt.symbol,
+        holdings.set(token.address.toLowerCase(), {
+          token: token.address,
+          symbol: token.symbol,
           entryCostWei: "0",
           markValueWei: "0",
           unrealizedPnlWei: "0",
           netPnlBps: 0,
-          ageSecs: 0,
-          openedAtMs: Date.now(),
           markStale: false,
           inBot: false,
           inWallet: true,
-          walletBalance: wt.balance,
+          walletBalance: token.balance,
         });
       }
-    });
-
-    return Array.from(map.values());
+    }
+    return [...holdings.values()];
   }, [pf?.open, walletTokens]);
 
-  // Patch parameters API call (Sends exact camelCase payload)
+  // Patch parameters API call
   const handleSaveParams = async (overridePatch?: Partial<SniperParamsPatch>) => {
     setIsSaving(true);
     setFeedback(null);
     const chain = readActiveChain();
 
     const patch: SniperParamsPatch = {
-      enabled: overridePatch?.enabled !== undefined ? overridePatch.enabled : cfg?.params.enabled,
       buySizeWei: overridePatch?.buySizeWei ?? weiFromEth(formBuySizeEth),
       dailyBudgetWei: overridePatch?.dailyBudgetWei ?? weiFromEth(formDailyBudgetEth),
       totalBudgetWei: overridePatch?.totalBudgetWei ?? (formTotalBudgetEth === "0" ? "0" : weiFromEth(formTotalBudgetEth)),
@@ -410,8 +407,9 @@ function SniperPanel() {
       maxBuyTaxBps: overridePatch?.maxBuyTaxBps ?? Math.round(parseFloat(formMaxBuyTaxPct || "5") * 100),
       maxSellTaxBps: overridePatch?.maxSellTaxBps ?? Math.round(parseFloat(formMaxSellTaxPct || "5") * 100),
       minHoldBlocks: overridePatch?.minHoldBlocks ?? parseInt(formMinHoldBlocks || "1", 10),
-      requireHoneypotPass: overridePatch?.requireHoneypotPass !== undefined ? overridePatch.requireHoneypotPass : formRequireHoneypot,
-      requireLpLocked: overridePatch?.requireLpLocked !== undefined ? overridePatch.requireLpLocked : formRequireLpLocked,
+      requireHoneypotPass: overridePatch?.requireHoneypotPass ?? formRequireHoneypot,
+      requireLpLocked: overridePatch?.requireLpLocked ?? formRequireLpLocked,
+      enabled: overridePatch?.enabled ?? cfg?.params.enabled,
     };
 
     try {
@@ -422,15 +420,13 @@ function SniperPanel() {
       });
       const data = await res.json();
       if (res.ok && data.ok) {
-        setFeedback({type: "success", msg: "✓ Parameters saved and applied successfully!"});
+        setFeedback({type: "success", msg: "Sniper parameters updated successfully!"});
         isFormDirty.current = false;
-        if (data.params) {
-          populateFormFromConfig(data.params);
-        }
+        if (data.params) populateFormFromConfig(data.params);
         await load();
       } else {
-        const errorMsg = data.errors?.join("; ") || data.error || "Failed to update parameters";
-        setFeedback({type: "error", msg: `Save failed: ${errorMsg}`});
+        const errorMsg = data.errors?.join("; ") || data.error || "Failed to update sniper parameters";
+        setFeedback({type: "error", msg: errorMsg});
       }
     } catch (err) {
       setFeedback({type: "error", msg: `Network error: ${(err as Error).message}`});
@@ -473,6 +469,73 @@ function SniperPanel() {
       setFeedback({type: "error", msg: `Error: ${(err as Error).message}`});
     } finally {
       setIsHalting(false);
+    }
+  };
+
+  const handleManualBuy = async () => {
+    if (!isAddress(manualBuyToken) || !isAddress(manualBuyPair)) {
+      setFeedback({type: "error", msg: "Manual buy needs a valid token address and V2 pair address."});
+      return;
+    }
+    const sizeWei = weiFromEth(manualBuySizeEth);
+    if (sizeWei === "0") {
+      setFeedback({type: "error", msg: "Manual buy size must be greater than zero."});
+      return;
+    }
+    if (!window.confirm("Submit this manual buy? This explicitly bypasses the automatic launch probe; the on-chain vault budget and slippage guards still apply.")) return;
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/buy", readActiveChain()), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({token: manualBuyToken, pair: manualBuyPair, sizeWei}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; manualProbeBypass?: boolean};
+      if (!response.ok || !data.ok) throw new Error(data.error || "manual buy rejected");
+      setFeedback({type: "success", msg: "Manual buy submitted through SniperVault. The action bypassed the automatic launch probe by operator request."});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Manual buy failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleManualSell = async (id: string, fractionBps: number) => {
+    if (!window.confirm(`Submit a ${fractionBps === 5000 ? "50%" : "100%"} manual exit for this position?`)) return;
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/sell", readActiveChain()), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({id, sellFractionBps: fractionBps}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; txHash?: string};
+      if (!response.ok || !data.ok) throw new Error(data.error || "manual exit rejected");
+      setFeedback({type: "success", msg: `Manual ${fractionBps === 5000 ? "50%" : "100%"} exit submitted${data.txHash ? ` (${shortHash(data.txHash, 5)})` : ""}.`});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Manual exit failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleResetPaper = async () => {
+    if (!window.confirm("Reset the virtual simulation bankroll to 1 ETH? This does not touch an on-chain balance.")) return;
+    setIsSaving(true);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/paper/reset", readActiveChain()), {method: "POST", headers: {"content-type": "application/json"}});
+      const data = (await response.json()) as {ok?: boolean; error?: string; simulationBalanceWei?: string};
+      if (!response.ok || !data.ok) throw new Error(data.error || "paper funds reset rejected");
+      setFeedback({type: "success", msg: "Virtual simulation bankroll reset to 1 ETH."});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Paper funds reset failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -600,7 +663,7 @@ function SniperPanel() {
           </button>
         </div>
 
-        {/* Quick Active Parameters in Header */}
+        {/* Quick Parameters Display in Header */}
         <div style={{display: "flex", alignItems: "center", gap: 14, fontSize: 11}}>
           <div>
             <span className="muted">BUY SIZE: </span>
@@ -619,7 +682,19 @@ function SniperPanel() {
         </div>
       </div>
 
-      {/* ── Status Feedback Banner ── */}
+      {(cfg.paperMode || !cfg.armed) && (
+        <div className="panel" style={{padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", borderColor: "rgba(34,211,238,0.45)", background: "rgba(34,211,238,0.05)"}}>
+          <div style={{display: "flex", alignItems: "center", gap: 8, fontSize: 11}}>
+            <span className="badge" style={{color: "var(--cyan)", borderColor: "var(--cyan)"}}>SIMULATION WALLET</span>
+            <span className="muted">virtual balance</span>
+            <strong style={{color: "var(--cyan)", fontVariantNumeric: "tabular-nums"}}>{ethFromWei(cfg.simulationBalanceWei ?? "1000000000000000000", 4)} Ξ</strong>
+            <span className="muted">paper only · no RPC funds</span>
+          </div>
+          <button onClick={() => void handleResetPaper()} disabled={isSaving} style={{...chipButtonStyle, color: "var(--cyan)", borderColor: "var(--cyan)"}}>↻ reset 1 ETH paper funds</button>
+        </div>
+      )}
+
+      {/* ── Status Alerts & Feedback Banner ── */}
       {feedback && (
         <div
           style={{
@@ -660,6 +735,9 @@ function SniperPanel() {
         </div>
       )}
 
+      {/* ── SniperVault onboarding ── */}
+      <SniperVaultWizard params={cfg.params} onBound={() => void load()} />
+
       {/* ── Hard Blockers or Warnings Banner ── */}
       {(hardBlockers.length > 0 || isHalted || warnings.length > 0) && (
         <div
@@ -696,7 +774,7 @@ function SniperPanel() {
         </div>
       )}
 
-      {/* ── Mini Portfolio Summary Metrics Strip ── */}
+      {/* ── Mini Portfolio Summary Metrics ── */}
       <div
         className="panel"
         style={{
@@ -706,7 +784,7 @@ function SniperPanel() {
           padding: "12px 16px",
         }}
       >
-        <MetricCard label="Active Holdings" value={`${unifiedHoldings.length}`} />
+        <MetricCard label="Open Positions" value={`${totals.openPositions}`} />
         <MetricCard
           label="Active Held Cost"
           value={`${ethFromWei(totals.openCostWei, 4)} Ξ`}
@@ -742,13 +820,27 @@ function SniperPanel() {
         />
       </div>
 
+      {/* ── On-chain vault status ── */}
+      <div className="panel" style={{padding: "10px 14px", display: "grid", gap: 7, borderColor: vault?.configured ? "rgba(34,197,94,0.45)" : "var(--line)"}}>
+        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap"}}>
+          <strong style={{fontSize: 11}}>SniperVault status · {activeChainSlug === "base" ? "Base" : "Ethereum"}</strong>
+          <span className="badge" style={{color: vault?.configured ? "var(--green)" : "var(--amber)", borderColor: vault?.configured ? "var(--green)" : "var(--amber)"}}>{vault?.configured ? "ON-CHAIN CONFIGURED" : "NOT CONFIGURED"}</span>
+        </div>
+        <div style={{display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", fontSize: 11}}>
+          <span className="muted">address <code>{vault?.address ? shortHash(vault.address, 7) : "—"}</code></span>
+          <span className="muted">spendable <strong>{vault?.spendableRemainingWei ? `${ethFromWei(vault.spendableRemainingWei, 4)} Ξ` : "—"}</strong></span>
+          <span className="muted">daily cap <strong>{vault?.dailyBudgetWei ? `${ethFromWei(vault.dailyBudgetWei, 4)} Ξ` : "—"}</strong></span>
+          <span className="muted">window reset <strong>{vault?.windowResetTimeSecs ? new Date(vault.windowResetTimeSecs * 1000).toLocaleString() : "—"}</strong></span>
+          {vault?.demo && <span className="badge" style={{color: "var(--amber)"}}>DEMO DATA</span>}
+        </div>
+      </div>
+
       {/* ── Sub-Navigation Tabs ── */}
-      <div style={{display: "flex", gap: 8, borderBottom: "1px solid var(--line)", paddingBottom: 6, flexWrap: "wrap"}}>
+      <div style={{display: "flex", gap: 8, borderBottom: "1px solid var(--line)", paddingBottom: 6}}>
         {[
-          {id: "portfolio", label: `📊 Holdings & Positions (${unifiedHoldings.length})`},
+          {id: "portfolio", label: `📊 Mini Portfolio (${pf.open.length} Active)`},
           {id: "parameters", label: "⚙️ Strategy & Investment Parameters"},
-          {id: "swap", label: "⚡ Instant Sell & DEX Aggregators"},
-          {id: "history", label: `📜 Trade History (${pf.recentClosed.length})`},
+          {id: "swap", label: "📈 Trade / Charts"},
           {id: "gates", label: "🛡️ Gate Logs & Honeypots"},
         ].map((t) => (
           <button
@@ -772,32 +864,77 @@ function SniperPanel() {
       </div>
 
       {/* ────────────────────────────────────────────────────────────────────────
-          TAB 1: UNIFIED HOLDINGS & ACTIVE POSITIONS
+          TAB 1: MINI PORTFOLIO & POSITION MANAGEMENT
           ──────────────────────────────────────────────────────────────────────── */}
       {tab === "portfolio" && (
         <div className="panel" style={{padding: 14, display: "grid", gap: 12}}>
-          {/* Top Search & Wallet Status Bar */}
+          {/* Portfolio View Switcher */}
           <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8}}>
-            <div style={{display: "flex", gap: 8, alignItems: "center", flex: 1, maxWidth: 500}}>
-              <input
-                value={customTokenInput}
-                onChange={(e) => setCustomTokenInput(e.target.value)}
-                placeholder="Scan / Import any token address (0x...)..."
+            <div style={{display: "flex", gap: 6}}>
+              <button
+                onClick={() => setPortfolioSubTab("all")}
                 style={{
-                  flex: 1,
-                  background: "#070b11",
-                  border: "1px solid var(--line)",
-                  color: "var(--text)",
-                  padding: "5px 8px",
+                  padding: "4px 10px",
                   fontSize: 11,
                   borderRadius: 3,
+                  background: portfolioSubTab === "all" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "all" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
                 }}
-              />
+              >
+                All Holdings ({unifiedHoldings.length})
+              </button>
+              <button
+                onClick={() => setPortfolioSubTab("open")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "open" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "open" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Active Positions ({pf.open.length})
+              </button>
+              <button
+                onClick={() => setPortfolioSubTab("wallet")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "wallet" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "wallet" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Wallet Holdings ({walletTokens.length})
+              </button>
+              <button
+                onClick={() => setPortfolioSubTab("closed")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "closed" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "closed" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Closed History ({pf.recentClosed.length})
+              </button>
+            </div>
+
+            {portfolioSubTab === "wallet" && (
               <button
                 onClick={() => scanWalletBalances()}
                 disabled={isScanningWallet || !wallet.address}
                 style={{
-                  padding: "5px 10px",
+                  padding: "3px 8px",
                   fontSize: 11,
                   background: "var(--panel-2)",
                   border: "1px solid var(--line)",
@@ -806,214 +943,419 @@ function SniperPanel() {
                   cursor: "pointer",
                 }}
               >
-                {isScanningWallet ? "Scanning..." : "Scan Token"}
+                {isScanningWallet ? "Scanning..." : "↻ Refresh Wallet Balances"}
               </button>
-            </div>
+            )}
+          </div>
 
-            <div style={{fontSize: 11, color: "var(--muted)"}}>
-              {wallet.address ? (
-                <span>
-                  Connected Wallet: <strong style={{color: "var(--cyan)"}}>{shortHash(wallet.address, 6)}</strong>
-                </span>
-              ) : (
-                <button
-                  onClick={() => wallet.connect()}
-                  style={{
-                    padding: "3px 8px",
-                    background: "var(--panel-2)",
-                    border: "1px solid var(--cyan)",
-                    color: "var(--cyan)",
-                    borderRadius: 3,
-                    fontSize: 10,
-                    cursor: "pointer",
-                  }}
-                >
-                  Connect Wallet to View Balances
-                </button>
-              )}
+          {/* Explicit manual buy control. This is separate from the automatic
+              launch detector and is intentionally gated by a confirmation. */}
+          <div style={{display: "grid", gap: 7, padding: "9px 10px", border: "1px solid var(--amber)", borderRadius: 4, background: "rgba(245,181,68,0.06)"}}>
+            <div style={{fontSize: 11, fontWeight: 700, color: "var(--amber)"}}>Manual limit buy · operator override</div>
+            <div className="muted" style={{fontSize: 10}}>Provide the exact Uniswap V2-compatible pair. The bot verifies the pair contains configured WETH and submits through SniperVault; this does not run the automatic honeypot probe.</div>
+            <div style={{display: "flex", gap: 6, flexWrap: "wrap"}}>
+              <input value={manualBuyToken} onChange={(e) => setManualBuyToken(e.target.value)} placeholder="token 0x…" style={{...inputStyle, flex: "1 1 220px", width: 0}} />
+              <input value={manualBuyPair} onChange={(e) => setManualBuyPair(e.target.value)} placeholder="V2 pair 0x…" style={{...inputStyle, flex: "1 1 220px", width: 0}} />
+              <input value={manualBuySizeEth} onChange={(e) => setManualBuySizeEth(e.target.value)} placeholder="ETH size" inputMode="decimal" style={{...inputStyle, flex: "0 0 100px", width: 100}} />
+              <button onClick={() => void handleManualBuy()} disabled={isSaving || !isArmed} style={{...chipButtonStyle, color: "var(--amber)", borderColor: "var(--amber)", padding: "6px 10px"}}>{isArmed ? "submit manual buy" : "lane not armed"}</button>
             </div>
           </div>
 
           {/* Unified Holdings Table */}
-          {unifiedHoldings.length === 0 ? (
-            <div className="muted" style={{padding: "28px 0", textAlign: "center", fontSize: 12}}>
-              No active holdings found.
-              <br />
-              <span style={{fontSize: 11, color: "var(--muted)"}}>
-                When the sniper enters a launch or your wallet holds sniped tokens, they will appear here with live PnL and 1-click aggregator sell buttons.
-              </span>
-            </div>
-          ) : (
+          {portfolioSubTab === "all" && (
             <div style={{overflowX: "auto"}}>
-              <table className="grid" style={{width: "100%", fontSize: 12}}>
-                <thead>
-                  <tr>
-                    <th>TOKEN</th>
-                    <th>SOURCE / TYPE</th>
-                    <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
-                    <th style={{textAlign: "right"}}>CURRENT MARK</th>
-                    <th style={{textAlign: "right"}}>UNREALIZED PNL</th>
-                    <th style={{textAlign: "right"}}>BALANCE</th>
-                    <th style={{textAlign: "center"}}>QUICK ACTIONS (SELL / SWAP)</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {unifiedHoldings.map((h) => {
-                    const aggLinks = getAggregatorLinks(h.token, currentChainId, activeChainSlug);
-                    const isPos = BigInt(h.unrealizedPnlWei || "0") > 0n;
-                    const isNeg = BigInt(h.unrealizedPnlWei || "0") < 0n;
-                    return (
-                      <tr key={h.token} style={{opacity: h.markStale ? 0.7 : 1}}>
-                        <td>
-                          <div style={{display: "flex", alignItems: "center", gap: 6}}>
-                            <span
-                              style={{
-                                width: 7,
-                                height: 7,
-                                borderRadius: "50%",
-                                background: h.state ? STATE_COLOR[h.state] : "var(--cyan)",
-                              }}
-                            />
-                            <strong>{h.symbol}</strong>
-                            <a
-                              href={addressUrl(currentChainId, h.token) || undefined}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="muted"
-                              style={{fontSize: 10, textDecoration: "none"}}
-                              title="View on Explorer"
-                            >
-                              ↗
-                            </a>
-                          </div>
-                          <div className="muted" style={{fontSize: 10}}>
-                            {shortHash(h.token, 6)}
-                          </div>
-                        </td>
+              {unifiedHoldings.length === 0 ? (
+                <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>No bot positions or connected-wallet token balances yet.</div>
+              ) : (
+                <table className="grid" style={{width: "100%", fontSize: 12}}>
+                  <thead><tr><th>TOKEN</th><th>SOURCE</th><th style={{textAlign: "right"}}>ENTRY</th><th style={{textAlign: "right"}}>MARK</th><th style={{textAlign: "right"}}>UNREALIZED PNL</th><th style={{textAlign: "right"}}>WALLET BALANCE</th><th>ACTION</th></tr></thead>
+                  <tbody>{unifiedHoldings.map((holding) => {
+                    const positive = BigInt(holding.unrealizedPnlWei || "0") > 0n;
+                    const negative = BigInt(holding.unrealizedPnlWei || "0") < 0n;
+                    const links = getAggregatorLinks(holding.token, currentChainId, activeChainSlug);
+                    return <tr key={holding.token}>
+                      <td><strong>{holding.symbol}</strong><div className="muted" style={{fontSize: 10}}>{shortHash(holding.token, 6)}</div></td>
+                      <td><span className="badge" style={{fontSize: 9, color: holding.inBot ? "var(--green)" : "var(--cyan)"}}>{holding.inBot && holding.inWallet ? "bot + wallet" : holding.inBot ? "sniper position" : "wallet"}</span></td>
+                      <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.entryCostWei, 4)} Ξ` : "—"}</td>
+                      <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.markValueWei, 4)} Ξ` : "—"}</td>
+                      <td style={{textAlign: "right", color: positive ? "var(--green)" : negative ? "var(--red)" : "var(--muted)"}}>{holding.inBot ? `${signedEth(holding.unrealizedPnlWei, 4)} Ξ (${bpsFormatted(holding.netPnlBps)})` : "—"}</td>
+                      <td style={{textAlign: "right"}}>{holding.walletBalance || "—"}</td>
+                      <td><div style={{display: "inline-flex", gap: 4}}><button onClick={() => { setSwapTarget({token: holding.token, symbol: holding.symbol, pair: holding.pair}); setTab("swap"); }} style={{...chipButtonStyle, color: "var(--cyan)", borderColor: "var(--cyan)"}}>TRADE</button><a href={links.dexscreener} target="_blank" rel="noreferrer" style={{...chipButtonStyle, textDecoration: "none"}}>CHART ↗</a></div></td>
+                    </tr>;
+                  })}</tbody>
+                </table>
+              )}
+            </div>
+          )}
 
-                        <td>
-                          <div style={{display: "flex", gap: 4}}>
-                            {h.inBot && (
-                              <span className="badge" style={{fontSize: 9, color: "var(--green)"}}>
-                                🎯 Sniper Position
-                              </span>
-                            )}
-                            {h.inWallet && (
+          {/* Active Open Positions Table */}
+          {portfolioSubTab === "open" && (
+            <div>
+              {pf.open.length === 0 ? (
+                <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>
+                  No active open positions currently held.
+                  <br />
+                  <span style={{fontSize: 11, color: "var(--muted)"}}>
+                    When the sniper back-runs a new pair launch, your active position and live mark value will appear here.
+                  </span>
+                </div>
+              ) : (
+                <div style={{overflowX: "auto"}}>
+                  <table className="grid" style={{width: "100%", fontSize: 12}}>
+                    <thead>
+                      <tr>
+                        <th>TOKEN</th>
+                        <th>VENUE</th>
+                        <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
+                        <th style={{textAlign: "right"}}>CURRENT MARK</th>
+                        <th style={{textAlign: "right"}}>UNREALIZED PNL</th>
+                        <th style={{textAlign: "right"}}>AGE</th>
+                        <th style={{textAlign: "center"}}>QUICK ACTIONS (SELL / SWAP)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pf.open.map((pos) => {
+                        const aggLinks = getAggregatorLinks(pos.token, currentChainId, activeChainSlug);
+                        const isPos = BigInt(pos.unrealizedPnlWei || "0") > 0n;
+                        const isNeg = BigInt(pos.unrealizedPnlWei || "0") < 0n;
+                        return (
+                          <tr key={pos.id} style={{opacity: pos.markStale ? 0.7 : 1}}>
+                            <td>
+                              <div style={{display: "flex", alignItems: "center", gap: 6}}>
+                                <span
+                                  style={{
+                                    width: 7,
+                                    height: 7,
+                                    borderRadius: "50%",
+                                    background: STATE_COLOR[pos.state] || "var(--green)",
+                                  }}
+                                />
+                                <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
+                                <a
+                                  href={addressUrl(currentChainId, pos.token) || undefined}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="muted"
+                                  style={{fontSize: 10, textDecoration: "none"}}
+                                  title="View on Explorer"
+                                >
+                                  ↗
+                                </a>
+                              </div>
+                              <div className="muted" style={{fontSize: 10}}>
+                                {shortHash(pos.token, 6)}
+                              </div>
+                            </td>
+                            <td>
                               <span className="badge" style={{fontSize: 9, color: "var(--cyan)"}}>
-                                💼 In Wallet
+                                {pos.venue}
                               </span>
-                            )}
-                          </div>
-                        </td>
-
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
-                          {h.inBot ? `${weiToEth(h.entryCostWei, 4)} Ξ` : "—"}
-                        </td>
-
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
-                          {h.inBot ? (
-                            <>
-                              {weiToEth(h.markValueWei, 4)} Ξ
-                              {h.markStale && (
+                            </td>
+                            <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                              {weiToEth(pos.entryCostWei, 4)} Ξ
+                            </td>
+                            <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                              {weiToEth(pos.markValueWei, 4)} Ξ
+                              {pos.markStale && (
                                 <span style={{color: "var(--amber)", fontSize: 9, marginLeft: 4}}>STALE</span>
                               )}
-                            </>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-
-                        <td
-                          style={{
-                            textAlign: "right",
-                            fontVariantNumeric: "tabular-nums",
-                            color: isPos ? "var(--green)" : isNeg ? "var(--red)" : "var(--muted)",
-                          }}
-                        >
-                          {h.inBot ? (
-                            <>
-                              <div>{signedEth(h.unrealizedPnlWei, 4)} Ξ</div>
-                              <div style={{fontSize: 10}}>{bpsFormatted(h.netPnlBps)}</div>
-                            </>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--text)"}}>
-                          {h.walletBalance ? (
-                            <strong>{Number(h.walletBalance).toLocaleString(undefined, {maximumFractionDigits: 4})}</strong>
-                          ) : (
-                            <span className="muted">Active</span>
-                          )}
-                        </td>
-
-                        <td style={{textAlign: "center"}}>
-                          <div style={{display: "inline-flex", gap: 4}}>
-                            <button
-                              onClick={() => {
-                                setSwapTarget({
-                                  token: h.token,
-                                  symbol: h.symbol,
-                                  pair: h.pair,
-                                  markEth: h.markValueWei ? weiToEth(h.markValueWei, 4) : undefined,
-                                });
-                                setTab("swap");
-                              }}
+                            </td>
+                            <td
                               style={{
-                                padding: "3px 8px",
-                                fontSize: 10,
-                                fontWeight: 700,
-                                background: "rgba(34, 211, 238, 0.15)",
-                                border: "1px solid var(--cyan)",
-                                color: "var(--cyan)",
-                                borderRadius: 3,
-                                cursor: "pointer",
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                                color: isPos ? "var(--green)" : isNeg ? "var(--red)" : "var(--muted)",
                               }}
                             >
-                              ⚡ SELL / SWAP
-                            </button>
-                            <a
-                              href={aggLinks.oneInch}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{
-                                padding: "3px 6px",
-                                fontSize: 10,
-                                background: "var(--panel-2)",
-                                border: "1px solid var(--line)",
-                                color: "var(--text)",
-                                borderRadius: 3,
-                                textDecoration: "none",
-                              }}
-                              title="Sell on 1inch Aggregator"
-                            >
-                              1inch ↗
-                            </a>
-                            <a
-                              href={aggLinks.dexscreener}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{
-                                padding: "3px 6px",
-                                fontSize: 10,
-                                background: "var(--panel-2)",
-                                border: "1px solid var(--line)",
-                                color: "var(--text)",
-                                borderRadius: 3,
-                                textDecoration: "none",
-                              }}
-                              title="View on DexScreener"
-                            >
-                              Chart ↗
-                            </a>
-                          </div>
+                              <div>{signedEth(pos.unrealizedPnlWei, 4)} Ξ</div>
+                              <div style={{fontSize: 10}}>{bpsFormatted(pos.netPnlBps)}</div>
+                            </td>
+                            <td style={{textAlign: "right", color: "var(--muted)", fontSize: 11}}>
+                              {ago(pos.openedAtMs)}
+                            </td>
+                            <td style={{textAlign: "center"}}>
+                              <div style={{display: "inline-flex", gap: 4}}>
+                                <button
+                                  onClick={() => {
+                                    setSwapTarget({
+                                      token: pos.token,
+                                      symbol: pos.symbol || "TOKEN",
+                                      pair: pos.pair,
+                                      qty: pos.remainingQty,
+                                      markEth: weiToEth(pos.markValueWei, 4),
+                                    });
+                                    setTab("swap");
+                                  }}
+                                  style={{
+                                    padding: "3px 8px",
+                                    fontSize: 10,
+                                    fontWeight: 700,
+                                    background: "rgba(34, 211, 238, 0.15)",
+                                    border: "1px solid var(--cyan)",
+                                    color: "var(--cyan)",
+                                    borderRadius: 3,
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  ⚡ SELL / SWAP
+                                </button>
+                                <button
+                                  onClick={() => void handleManualSell(pos.id, 5000)}
+                                  disabled={isSaving}
+                                  style={{...chipButtonStyle, padding: "3px 6px", color: "var(--amber)", borderColor: "var(--amber)"}}
+                                  title="Sell 50% through the bot's SniperVault"
+                                >
+                                  50% EXIT
+                                </button>
+                                <button
+                                  onClick={() => void handleManualSell(pos.id, 10000)}
+                                  disabled={isSaving}
+                                  style={{...chipButtonStyle, padding: "3px 6px", color: "var(--red)", borderColor: "var(--red)"}}
+                                  title="Sell 100% through the bot's SniperVault"
+                                >
+                                  100% EXIT
+                                </button>
+                                <a
+                                  href={aggLinks.oneInch}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{
+                                    padding: "3px 6px",
+                                    fontSize: 10,
+                                    background: "var(--panel-2)",
+                                    border: "1px solid var(--line)",
+                                    color: "var(--text)",
+                                    borderRadius: 3,
+                                    textDecoration: "none",
+                                  }}
+                                  title="Sell on 1inch Aggregator"
+                                >
+                                  1inch ↗
+                                </a>
+                                <a
+                                  href={aggLinks.dexscreener}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{
+                                    padding: "3px 6px",
+                                    fontSize: 10,
+                                    background: "var(--panel-2)",
+                                    border: "1px solid var(--line)",
+                                    color: "var(--text)",
+                                    borderRadius: 3,
+                                    textDecoration: "none",
+                                  }}
+                                  title="View on DexScreener"
+                                >
+                                  Chart ↗
+                                </a>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Connected Wallet Holdings View */}
+          {portfolioSubTab === "wallet" && (
+            <div style={{display: "grid", gap: 10}}>
+              {!wallet.address ? (
+                <div style={{textAlign: "center", padding: 20, color: "var(--muted)"}}>
+                  Connect your wallet to view tokens in your address and sell them directly.
+                  <div style={{marginTop: 8}}>
+                    <button
+                      onClick={() => wallet.connect()}
+                      style={{
+                        padding: "6px 14px",
+                        background: "var(--panel-2)",
+                        border: "1px solid var(--cyan)",
+                        color: "var(--cyan)",
+                        borderRadius: 4,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Connect Wallet
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{display: "flex", gap: 8, alignItems: "center"}}>
+                    <input
+                      value={customTokenInput}
+                      onChange={(e) => setCustomTokenInput(e.target.value)}
+                      placeholder="Add custom ERC20 Token Address to scan & sell..."
+                      style={{
+                        flex: 1,
+                        background: "#070b11",
+                        border: "1px solid var(--line)",
+                        color: "var(--text)",
+                        padding: "5px 8px",
+                        fontSize: 11,
+                        borderRadius: 3,
+                      }}
+                    />
+                    <button
+                      onClick={() => scanWalletBalances()}
+                      style={{
+                        padding: "5px 12px",
+                        background: "var(--panel-2)",
+                        border: "1px solid var(--line)",
+                        color: "var(--cyan)",
+                        borderRadius: 3,
+                        cursor: "pointer",
+                        fontSize: 11,
+                      }}
+                    >
+                      Scan Token
+                    </button>
+                  </div>
+
+                  {walletTokens.length === 0 ? (
+                    <div className="muted" style={{padding: 16, textAlign: "center", fontSize: 11}}>
+                      {isScanningWallet
+                        ? "Scanning connected wallet for token balances..."
+                        : "No balances found for sniped tokens in your connected wallet. Paste a token address above to inspect & sell."}
+                    </div>
+                  ) : (
+                    <table className="grid" style={{width: "100%", fontSize: 12}}>
+                      <thead>
+                        <tr>
+                          <th>TOKEN</th>
+                          <th>CONTRACT ADDRESS</th>
+                          <th style={{textAlign: "right"}}>BALANCE</th>
+                          <th style={{textAlign: "center"}}>AGGREGATOR ACTIONS</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {walletTokens.map((t) => {
+                          const links = getAggregatorLinks(t.address, currentChainId, activeChainSlug);
+                          return (
+                            <tr key={t.address}>
+                              <td>
+                                <strong>{t.symbol}</strong>
+                              </td>
+                              <td className="muted" style={{fontSize: 11}}>
+                                {shortHash(t.address, 6)}
+                              </td>
+                              <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                                <strong>{Number(t.balance).toLocaleString(undefined, {maximumFractionDigits: 4})}</strong>
+                              </td>
+                              <td style={{textAlign: "center"}}>
+                                <div style={{display: "inline-flex", gap: 4}}>
+                                  <a
+                                    href={links.oneInch}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 8px",
+                                      background: "rgba(34, 211, 238, 0.15)",
+                                      border: "1px solid var(--cyan)",
+                                      color: "var(--cyan)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                      fontWeight: 600,
+                                    }}
+                                  >
+                                    1inch Swap ↗
+                                  </a>
+                                  <a
+                                    href={links.uniswap}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 6px",
+                                      background: "var(--panel-2)",
+                                      border: "1px solid var(--line)",
+                                      color: "var(--text)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                    }}
+                                  >
+                                    Uniswap ↗
+                                  </a>
+                                  <a
+                                    href={links.dexscreener}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 6px",
+                                      background: "var(--panel-2)",
+                                      border: "1px solid var(--line)",
+                                      color: "var(--text)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                    }}
+                                  >
+                                    Chart ↗
+                                  </a>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Closed Positions History */}
+          {portfolioSubTab === "closed" && (
+            <div style={{overflowX: "auto"}}>
+              {pf.recentClosed.length === 0 ? (
+                <div className="muted" style={{padding: 20, textAlign: "center", fontSize: 11}}>
+                  No closed positions yet.
+                </div>
+              ) : (
+                <table className="grid" style={{width: "100%", fontSize: 12}}>
+                  <thead>
+                    <tr>
+                      <th>TOKEN</th>
+                      <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
+                      <th style={{textAlign: "right"}}>REALISED (ETH)</th>
+                      <th style={{textAlign: "right"}}>NET PNL</th>
+                      <th>EXIT REASON</th>
+                      <th style={{textAlign: "right"}}>CLOSED</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pf.recentClosed.map((pos) => (
+                      <tr key={pos.id}>
+                        <td>
+                          <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
+                          <span className="muted" style={{marginLeft: 6, fontSize: 10}}>
+                            {pos.venue}
+                          </span>
+                        </td>
+                        <td style={{textAlign: "right"}}>{weiToEth(pos.entryCostWei, 4)} Ξ</td>
+                        <td style={{textAlign: "right", color: pnlColor(pos.realizedWei)}}>
+                          {weiToEth(pos.realizedWei, 4)} Ξ
+                        </td>
+                        <td style={{textAlign: "right", color: pnlColor(pos.netPnlWei)}}>
+                          {signedEth(pos.netPnlWei, 4)} Ξ ({bpsFormatted(pos.netPnlBps)})
+                        </td>
+                        <td className="muted" style={{fontSize: 11}}>
+                          {pos.exitReason ? EXIT_LABEL[pos.exitReason] || pos.exitReason : "Closed"}
+                        </td>
+                        <td style={{textAlign: "right", color: "var(--muted)", fontSize: 11}}>
+                          {pos.closedAtMs ? ago(pos.closedAtMs) : "—"}
                         </td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                    ))}
+                  </tbody>
+                </table>
+              )}
             </div>
           )}
         </div>
@@ -1102,10 +1444,7 @@ function SniperPanel() {
                   step="0.005"
                   min="0"
                   value={formBuySizeEth}
-                  onChange={(e) => {
-                    setFormBuySizeEth(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormBuySizeEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 0.05"
                 />
@@ -1113,10 +1452,7 @@ function SniperPanel() {
                   {["0.01", "0.025", "0.05", "0.1", "0.25"].map((val) => (
                     <button
                       key={val}
-                      onClick={() => {
-                        setFormBuySizeEth(val);
-                        isFormDirty.current = true;
-                      }}
+                      onClick={() => { isFormDirty.current = true; setFormBuySizeEth(val); }}
                       style={chipButtonStyle}
                     >
                       {val} Ξ
@@ -1135,10 +1471,7 @@ function SniperPanel() {
                   step="0.05"
                   min="0"
                   value={formDailyBudgetEth}
-                  onChange={(e) => {
-                    setFormDailyBudgetEth(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormDailyBudgetEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 0.25"
                 />
@@ -1157,10 +1490,7 @@ function SniperPanel() {
                   step="0.1"
                   min="0"
                   value={formTotalBudgetEth}
-                  onChange={(e) => {
-                    setFormTotalBudgetEth(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormTotalBudgetEth(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1175,10 +1505,7 @@ function SniperPanel() {
                   min="1"
                   max="32"
                   value={formMaxPositions}
-                  onChange={(e) => {
-                    setFormMaxPositions(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxPositions(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1200,10 +1527,7 @@ function SniperPanel() {
                   min="5"
                   step="10"
                   value={formTakeProfitPct}
-                  onChange={(e) => {
-                    setFormTakeProfitPct(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormTakeProfitPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 100"
                 />
@@ -1211,10 +1535,7 @@ function SniperPanel() {
                   {["25", "50", "100", "200", "500"].map((val) => (
                     <button
                       key={val}
-                      onClick={() => {
-                        setFormTakeProfitPct(val);
-                        isFormDirty.current = true;
-                      }}
+                      onClick={() => { isFormDirty.current = true; setFormTakeProfitPct(val); }}
                       style={chipButtonStyle}
                     >
                       +{val}%
@@ -1233,15 +1554,12 @@ function SniperPanel() {
                   step="0.01"
                   min="0"
                   value={formTakeProfitAbsEth}
-                  onChange={(e) => {
-                    setFormTakeProfitAbsEth(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormTakeProfitAbsEth(e.target.value); }}
                   style={inputStyle}
                   placeholder="0 (off)"
                 />
                 <span className="muted" style={{fontSize: 10}}>
-                  Triggers if position reaches either +% gain OR this absolute ETH profit.
+                  Triggers if position reaches either +% gain OR this ETH profit.
                 </span>
               </div>
 
@@ -1256,10 +1574,7 @@ function SniperPanel() {
                   max="100"
                   step="10"
                   value={formSellFractionPct}
-                  onChange={(e) => {
-                    setFormSellFractionPct(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormSellFractionPct(e.target.value); }}
                   style={inputStyle}
                 />
                 <div style={{display: "flex", gap: 4, marginTop: 4}}>
@@ -1271,10 +1586,7 @@ function SniperPanel() {
                   ].map((item) => (
                     <button
                       key={item.val}
-                      onClick={() => {
-                        setFormSellFractionPct(item.val);
-                        isFormDirty.current = true;
-                      }}
+                      onClick={() => setFormSellFractionPct(item.val)}
                       style={chipButtonStyle}
                     >
                       {item.label}
@@ -1294,10 +1606,7 @@ function SniperPanel() {
                   max="100"
                   step="5"
                   value={formStopLossPct}
-                  onChange={(e) => {
-                    setFormStopLossPct(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormStopLossPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="e.g. 50"
                 />
@@ -1314,10 +1623,7 @@ function SniperPanel() {
                   max="90"
                   step="5"
                   value={formTrailingStopPct}
-                  onChange={(e) => {
-                    setFormTrailingStopPct(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormTrailingStopPct(e.target.value); }}
                   style={inputStyle}
                   placeholder="0 (off)"
                 />
@@ -1333,10 +1639,7 @@ function SniperPanel() {
                   min="0"
                   step="5"
                   value={formMaxHoldMins}
-                  onChange={(e) => {
-                    setFormMaxHoldMins(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxHoldMins(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1354,10 +1657,7 @@ function SniperPanel() {
                   type="checkbox"
                   id="reqHoneypot"
                   checked={formRequireHoneypot}
-                  onChange={(e) => {
-                    setFormRequireHoneypot(e.target.checked);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormRequireHoneypot(e.target.checked); }}
                   style={{cursor: "pointer"}}
                 />
                 <label htmlFor="reqHoneypot" style={{fontSize: 11, cursor: "pointer"}}>
@@ -1375,10 +1675,7 @@ function SniperPanel() {
                   step="0.5"
                   min="0.1"
                   value={formMinLiquidityEth}
-                  onChange={(e) => {
-                    setFormMinLiquidityEth(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormMinLiquidityEth(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1394,10 +1691,7 @@ function SniperPanel() {
                   min="0.5"
                   max="20"
                   value={formMaxPriceImpactPct}
-                  onChange={(e) => {
-                    setFormMaxPriceImpactPct(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormMaxPriceImpactPct(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1410,10 +1704,7 @@ function SniperPanel() {
                     type="number"
                     step="0.5"
                     value={formMaxBuyTaxPct}
-                    onChange={(e) => {
-                      setFormMaxBuyTaxPct(e.target.value);
-                      isFormDirty.current = true;
-                    }}
+                    onChange={(e) => { isFormDirty.current = true; setFormMaxBuyTaxPct(e.target.value); }}
                     style={inputStyle}
                   />
                 </div>
@@ -1423,10 +1714,7 @@ function SniperPanel() {
                     type="number"
                     step="0.5"
                     value={formMaxSellTaxPct}
-                    onChange={(e) => {
-                      setFormMaxSellTaxPct(e.target.value);
-                      isFormDirty.current = true;
-                    }}
+                    onChange={(e) => { isFormDirty.current = true; setFormMaxSellTaxPct(e.target.value); }}
                     style={inputStyle}
                   />
                 </div>
@@ -1442,10 +1730,7 @@ function SniperPanel() {
                   min="1"
                   max="20"
                   value={formMinHoldBlocks}
-                  onChange={(e) => {
-                    setFormMinHoldBlocks(e.target.value);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormMinHoldBlocks(e.target.value); }}
                   style={inputStyle}
                 />
               </div>
@@ -1456,10 +1741,7 @@ function SniperPanel() {
                   type="checkbox"
                   id="reqLp"
                   checked={formRequireLpLocked}
-                  onChange={(e) => {
-                    setFormRequireLpLocked(e.target.checked);
-                    isFormDirty.current = true;
-                  }}
+                  onChange={(e) => { isFormDirty.current = true; setFormRequireLpLocked(e.target.checked); }}
                   style={{cursor: "pointer"}}
                 />
                 <label htmlFor="reqLp" style={{fontSize: 11, cursor: "pointer"}}>
@@ -1486,11 +1768,7 @@ function SniperPanel() {
             </div>
             <div style={{display: "flex", gap: 8}}>
               <button
-                onClick={() => {
-                  populateFormFromConfig(cfg.params);
-                  isFormDirty.current = false;
-                  setFeedback({type: "info", msg: "Form reset to saved backend parameters."});
-                }}
+                onClick={() => { isFormDirty.current = false; populateFormFromConfig(cfg.params); }}
                 style={{
                   padding: "6px 14px",
                   background: "var(--panel-2)",
@@ -1525,299 +1803,21 @@ function SniperPanel() {
       )}
 
       {/* ────────────────────────────────────────────────────────────────────────
-          TAB 3: INSTANT SELL & DEX AGGREGATOR SWAPPING HUB
+          TAB 3: TRADE / CHARTS TERMINAL
           ──────────────────────────────────────────────────────────────────────── */}
       {tab === "swap" && (
-        <div className="panel" style={{padding: 16, display: "grid", gap: 14}}>
-          <div className="panel-head" style={{padding: "0 0 8px 0"}}>
-            <span>⚡ Instant Token Sell & DEX Aggregator Hub</span>
-            <span className="muted" style={{fontSize: 11}}>
-              Route via 1inch, Uniswap, KyberSwap or DexScreener
-            </span>
-          </div>
-
-          <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16}}>
-            {/* Left: Position / Token Selection */}
-            <div style={{display: "grid", gap: 10}}>
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Select Token from Active Holdings:</strong>
-                </label>
-                <select
-                  style={inputStyle}
-                  value={swapTarget?.token || ""}
-                  onChange={(e) => {
-                    const match = unifiedHoldings.find((p) => p.token.toLowerCase() === e.target.value.toLowerCase());
-                    if (match) {
-                      setSwapTarget({
-                        token: match.token,
-                        symbol: match.symbol,
-                        pair: match.pair,
-                        markEth: match.markValueWei ? weiToEth(match.markValueWei, 4) : undefined,
-                      });
-                    } else if (e.target.value) {
-                      setSwapTarget({token: e.target.value, symbol: "CUSTOM"});
-                    } else {
-                      setSwapTarget(null);
-                    }
-                  }}
-                >
-                  <option value="">-- Choose token from holdings or enter address --</option>
-                  {unifiedHoldings.map((h) => (
-                    <option key={h.token} value={h.token}>
-                      {h.symbol} ({shortHash(h.token, 4)}) {h.inBot ? `— Mark: ${weiToEth(h.markValueWei, 3)} ETH` : `— Balance: ${h.walletBalance}`}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Or Enter Any Token Contract Address:</strong>
-                </label>
-                <input
-                  type="text"
-                  value={swapTarget?.token || ""}
-                  onChange={(e) =>
-                    setSwapTarget({
-                      token: e.target.value,
-                      symbol: "CUSTOM",
-                    })
-                  }
-                  placeholder="0x..."
-                  style={inputStyle}
-                />
-              </div>
-
-              {/* Sell Quantity Fraction */}
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Sell Amount (% of Holdings):</strong>
-                </label>
-                <div style={{display: "flex", gap: 6}}>
-                  {[25, 50, 75, 100].map((f) => (
-                    <button
-                      key={f}
-                      onClick={() => setSwapFraction(f)}
-                      style={{
-                        flex: 1,
-                        padding: "6px",
-                        fontSize: 11,
-                        fontWeight: swapFraction === f ? 700 : 500,
-                        background: swapFraction === f ? "var(--cyan)" : "var(--panel-2)",
-                        color: swapFraction === f ? "#05240f" : "var(--text)",
-                        border: "1px solid",
-                        borderColor: swapFraction === f ? "var(--cyan)" : "var(--line)",
-                        borderRadius: 3,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {f}%
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Right: Aggregator Links & Launchpad */}
-            <div style={{display: "grid", gap: 10}}>
-              {swapTarget && isAddress(swapTarget.token) ? (
-                (() => {
-                  const links = getAggregatorLinks(swapTarget.token, currentChainId, activeChainSlug);
-                  return (
-                    <div style={{background: "var(--panel-2)", padding: 12, borderRadius: 6, border: "1px solid var(--line)"}}>
-                      <div style={{fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--cyan)"}}>
-                        DEX Aggregator Execution for {swapTarget.symbol || "Token"}:
-                      </div>
-
-                      <div style={{display: "grid", gap: 8}}>
-                        <a
-                          href={links.oneInch}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "rgba(34, 211, 238, 0.12)",
-                            border: "1px solid var(--cyan)",
-                            borderRadius: 4,
-                            color: "var(--cyan)",
-                            textDecoration: "none",
-                            fontWeight: 700,
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>🦄 1inch DEX Aggregator (Optimal Route)</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.uniswap}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--text)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>🦄 Uniswap / Aerodrome Direct Swap</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.kyberswap}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--text)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>⚡ KyberSwap Meta-Aggregator</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.dexscreener}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--amber)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>📈 DexScreener Live Pool & Chart</span>
-                          <span>View ↗</span>
-                        </a>
-                      </div>
-                    </div>
-                  );
-                })()
-              ) : (
-                <div
-                  style={{
-                    padding: 24,
-                    textAlign: "center",
-                    color: "var(--muted)",
-                    border: "1px dashed var(--line)",
-                    borderRadius: 6,
-                    fontSize: 11,
-                  }}
-                >
-                  Select a token from your holdings or enter an address on the left to generate aggregator swap links.
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <TradeTerminal
+          pf={pf}
+          wallet={wallet}
+          publicClient={publicClient}
+          activeChainSlug={activeChainSlug}
+          currentChainId={currentChainId}
+          initialTarget={swapTarget}
+        />
       )}
 
       {/* ────────────────────────────────────────────────────────────────────────
-          TAB 4: TRADE HISTORY (SIMULATIONS & REAL TRADES)
-          ──────────────────────────────────────────────────────────────────────── */}
-      {tab === "history" && (
-        <div className="panel" style={{padding: 14, display: "grid", gap: 12}}>
-          <div className="panel-head" style={{padding: 0}}>
-            <span>📜 Historical Snipes & Trade Logs</span>
-            <span className="muted" style={{fontSize: 11}}>
-              Displays both simulated paper executions and live closed trades
-            </span>
-          </div>
-
-          {pf.recentClosed.length === 0 ? (
-            <div className="muted" style={{padding: 24, textAlign: "center", fontSize: 11}}>
-              No trade history recorded yet.
-            </div>
-          ) : (
-            <div style={{overflowX: "auto"}}>
-              <table className="grid" style={{width: "100%", fontSize: 12}}>
-                <thead>
-                  <tr>
-                    <th>TYPE / MODE</th>
-                    <th>TOKEN</th>
-                    <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
-                    <th style={{textAlign: "right"}}>REALISED (ETH)</th>
-                    <th style={{textAlign: "right"}}>NET PNL</th>
-                    <th>EXIT REASON</th>
-                    <th style={{textAlign: "right"}}>CLOSED</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pf.recentClosed.map((pos) => {
-                    const isLive = isArmed;
-                    return (
-                      <tr key={pos.id}>
-                        <td>
-                          <span
-                            className="badge"
-                            style={{
-                              fontSize: 9,
-                              color: isLive ? "var(--green)" : "var(--amber)",
-                              borderColor: isLive ? "var(--green)" : "var(--amber)",
-                            }}
-                          >
-                            {isLive ? "LIVE TRADE" : "SIMULATION"}
-                          </span>
-                        </td>
-                        <td>
-                          <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
-                          <span className="muted" style={{marginLeft: 6, fontSize: 10}}>
-                            {pos.venue}
-                          </span>
-                        </td>
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
-                          {weiToEth(pos.entryCostWei, 4)} Ξ
-                        </td>
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums", color: pnlColor(pos.realizedWei)}}>
-                          {weiToEth(pos.realizedWei, 4)} Ξ
-                        </td>
-                        <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums", color: pnlColor(pos.netPnlWei)}}>
-                          {signedEth(pos.netPnlWei, 4)} Ξ ({bpsFormatted(pos.netPnlBps)})
-                        </td>
-                        <td className="muted" style={{fontSize: 11}}>
-                          {pos.exitReason ? EXIT_LABEL[pos.exitReason] || pos.exitReason : "Closed"}
-                        </td>
-                        <td style={{textAlign: "right", color: "var(--muted)", fontSize: 11}}>
-                          {pos.closedAtMs ? ago(pos.closedAtMs) : "—"}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ────────────────────────────────────────────────────────────────────────
-          TAB 5: SAFETY GATES & HONEYPOT DIAGNOSTICS
+          TAB 4: SAFETY GATES & HONEYPOT DIAGNOSTICS
           ──────────────────────────────────────────────────────────────────────── */}
       {tab === "gates" && (
         <div className="panel" style={{padding: 16, display: "grid", gap: 14}}>

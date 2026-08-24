@@ -539,6 +539,7 @@ pub async fn oracle_price(ctx: &StrategyCtx, oracle: Address) -> Option<U256> {
 /// Build a full-close liquidation for a Morpho position. Public: the oracle
 /// front-runner rebuilds the same bundle from a stale [`LeadAction::Morpho`]
 /// (the simulation is the arbiter of whether it still lands).
+#[allow(clippy::too_many_arguments)]
 pub async fn build_opportunity(
     ctx: &StrategyCtx,
     params: &IMorpho::MarketParams,

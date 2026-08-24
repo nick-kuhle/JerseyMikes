@@ -437,8 +437,10 @@ mod tests {
                 mev_blocker_ws: None,
                 flashbots_signer_key: None,
                 searcher_private_key: None,
+                sniper_searcher_private_key: None,
                 executor: None,
                 searcher_address: Address::ZERO,
+                sniper_searcher_address: Address::ZERO,
             },
             risk: crate::config::RiskConfig {
                 min_net_profit_wei: U256::from(1u8),

@@ -1,568 +1,600 @@
 "use client";
-import {readActiveChain, withChain} from "@/lib/chain";
 
 /**
- * Go-live readiness: the six-step MevExecutor deployment checklist.
+ * Production go-live wizard.
  *
- * This is `docs/GO_LIVE.md` "Path A" as a panel:
- *   1. connect a wallet on mainnet        (EIP-6963, one-click chain switch)
- *   2. confirm the wallet holds gas money (≥ 0.05 ETH recommended)
- *   3. deploy MevExecutor                 (creation bytecode + constructor
- *                                          args encoded in the browser; the
- *                                          hex is a CI-checked copy of the
- *                                          bot artifact)
- *   4. optionally fund the executor       (native call value only; the searcher
- *                                          EOA pays transaction gas)
- *   5. allowlist the bot's searcher EOA   (setSearcher(searcher, true))
- *   6. verify + point the bot at it       (owner / searcher checks, then
- *                                          EXECUTOR_ADDRESS in .env)
- *
- * Reads and the free deployment estimate ride the server's read-only
- * `/api/eth` proxy. Only steps 3–5 open the wallet, and every step unlocks
- * only when the ones before it make sense. Deploying changes nothing about
- * the bot's behaviour: it stays simulation-only until the two-key arming.
+ * This panel intentionally separates deployment, funding, configuration and
+ * arming. Connecting a wallet or deploying a contract must never implicitly
+ * enable a trading lane. The browser can write only through the connected
+ * operator wallet; private bot keys remain server-side and are never accepted
+ * by this component.
  */
 
-import {useCallback, useEffect, useMemo, useState} from "react";
+import {useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode} from "react";
 import {
   createPublicClient,
   createWalletClient,
   custom,
-  http,
+  encodeAbiParameters,
   formatEther,
+  http,
   isAddress,
   parseEther,
   type Address,
 } from "viem";
 import {base, mainnet} from "viem/chains";
-import EXECUTOR_ABI from "@/lib/MevExecutor.abi.json";
-import creationHex from "@/lib/MevExecutor.creation.hex";
-import {addressUrl, explorerName, txUrl} from "@/lib/explorer";
+import {onChainChange, readActiveChain, withChain} from "@/lib/chain";
+import {explorerName} from "@/lib/explorer";
 import {useWallet} from "@/lib/wallet";
+import EXECUTOR_ABI from "@/lib/MevExecutor.abi.json";
+import executorCreationHex from "@/lib/MevExecutor.creation.hex";
+import SNIPER_VAULT_ABI from "@/lib/SniperVault.abi.json";
+import vaultCreationHex from "@/lib/SniperVault.creation.hex";
+import type {ConfigResponse, SniperParamsResponse, SniperVaultStatus, StatusResponse} from "@/lib/types";
 
-/**
- * Per-chain constructor arguments for `MevExecutor(balancerVault, weth)`.
- * Balancer V2's vault is deployed at the *same* address on mainnet and Base
- * (verified — see `bot/crates/mev-bot/src/config.rs::known::BASE_BALANCER_VAULT`);
- * WETH is the 0xC02… wrapper on mainnet and Base's canonical `0x4200…0006`.
- * The active chain's row below is picked from `chainSlug` before the deploy
- * call is built (work order WS-H2).
- */
-const CHAIN_LABEL: Record<string, string> = {
-  ethereum: "Ethereum mainnet",
-  base: "Base",
-};
-const CHAIN_DEFAULT_ID: Record<string, number> = {
-  ethereum: 1,
-  base: 8453,
-};
-const CONSTRUCTOR_ARGS: Record<
-  string,
-  {balancerVault: `0x${string}`; weth: `0x${string}`}
-> = {
-  ethereum: {
-    balancerVault: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-    weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-  },
-  base: {
-    // Same-address Balancer V2 vault on Base (see config.rs::known).
-    balancerVault: "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-    weth: "0x4200000000000000000000000000000000000006",
-  },
-};
+const WETH_ABI = [
+  {type: "function", name: "deposit", stateMutability: "payable", inputs: [], outputs: []},
+  {type: "function", name: "transfer", stateMutability: "nonpayable", inputs: [{name: "to", type: "address"}, {name: "value", type: "uint256"}], outputs: [{type: "bool"}]},
+  {type: "function", name: "balanceOf", stateMutability: "view", inputs: [{name: "account", type: "address"}], outputs: [{type: "uint256"}]},
+] as const;
 
-/** LocalStorage key: scoped per chain so an Ethereum deploy doesn't leak
- *  into the Base panel and vice versa. Back-compat: the legacy unsuffixed
- *  key is read once as a fallback for the ethereum slug. */
-const STORAGE_KEY_BASE = "jerseymikes.executor";
-const storageKey = (slug: string | null) =>
-  `${STORAGE_KEY_BASE}.${(slug ?? "ethereum").toLowerCase()}`;
+const CHAIN_IDS: Record<string, number> = {ethereum: 1, mainnet: 1, base: 8453};
+const CHAIN_LABELS: Record<string, string> = {ethereum: "Ethereum mainnet", mainnet: "Ethereum mainnet", base: "Base"};
+const WETH_BY_CHAIN: Record<string, Address> = {
+  ethereum: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  mainnet: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  base: "0x4200000000000000000000000000000000000006",
+};
+const BALANCER_VAULT = "0xBA12222222228d8Ba445958a75a0704d566BF2C8" as Address;
+const GAS_THRESHOLD_WEI = parseEther("0.005");
+const STORAGE_EXECUTOR = "jerseymikes.executor";
+const STORAGE_VAULT = "jerseymikes.sniper-vault";
 
-function padAddress(a: string): string {
-  return a.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+function chainKey(slug: string | null): string {
+  return (slug || "ethereum").toLowerCase();
 }
 
-/** Creation bytecode + ABI-encoded constructor args (two static address words). */
-function deployData(slug: string | null): `0x${string}` {
-  const hex = creationHex.trim().replace(/^0x/, "");
-  const args = CONSTRUCTOR_ARGS[(slug ?? "ethereum").toLowerCase()] ?? CONSTRUCTOR_ARGS.ethereum;
-  return `0x${hex}${padAddress(args.balancerVault)}${padAddress(args.weth)}` as `0x${string}`;
+function keyFor(baseKey: string, slug: string): string {
+  return `${baseKey}.${slug}`;
 }
 
-interface Step {
-  key: string;
-  title: string;
-  state: "done" | "todo" | "locked";
-  node: React.ReactNode;
+function storageGet(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
 }
 
-export default function GoLivePanel({
-  executor,
-  armed,
-  /** The chain the bot behind the console is running against (from
-   *  `/api/bot/status`). Falls back to the slug map when the bot is
-   *  unreachable, so the panel still labels itself correctly (WS-H2). */
-  chainId: botChainId,
-}: {
-  /** What the bot currently uses (sim fixture until EXECUTOR_ADDRESS is set). */
+function storageSet(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // The deployment address is still visible in the current session.
+  }
+}
+
+function asHex(raw: string): `0x${string}` {
+  const clean = raw.trim().replace(/^0x/, "");
+  return `0x${clean}` as `0x${string}`;
+}
+
+function deployData(kind: "executor" | "vault", slug: string, daily: string, total: string): `0x${string}` {
+  const creation = kind === "executor" ? asHex(executorCreationHex) : asHex(vaultCreationHex);
+  const weth = WETH_BY_CHAIN[slug] ?? WETH_BY_CHAIN.ethereum;
+  const args = kind === "executor"
+    ? encodeAbiParameters([{type: "address"}, {type: "address"}], [BALANCER_VAULT, weth])
+    : encodeAbiParameters(
+        [{type: "address"}, {type: "uint256"}, {type: "uint256"}],
+        [weth, parseEther(daily || "0"), parseEther(total || "0")],
+      );
+  return `${creation}${args.slice(2)}` as `0x${string}`;
+}
+
+function safeWei(eth: string): bigint | null {
+  try {
+    if (!eth.trim() || Number(eth) < 0 || !Number.isFinite(Number(eth))) return null;
+    return parseEther(eth.trim());
+  } catch {
+    return null;
+  }
+}
+
+function errText(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).split("\n")[0];
+}
+
+function shorten(value: string | null | undefined): string {
+  return value && value.length > 14 ? `${value.slice(0, 10)}…${value.slice(-4)}` : value || "—";
+}
+
+interface BotConfig extends ConfigResponse {
+  sniperSearcher?: string;
+  sniperSearcherKeyConfigured?: boolean;
+}
+
+interface PreflightResponse {
+  rpc: boolean;
+  relay: boolean;
+  qualification: unknown;
+  demo?: boolean;
+}
+
+interface ContractCheck {
+  codeBytes: number | null;
+  owner: string | null;
+  weth: string | null;
+  searcherAllowed: boolean | null;
+  error: string | null;
+}
+
+const emptyCheck: ContractCheck = {codeBytes: null, owner: null, weth: null, searcherAllowed: null, error: null};
+
+export default function GoLivePanel({executor: runtimeExecutor, armed: runtimeArmed, chainId: botChainId}: {
   executor?: string;
-  /** Boot-time two-key arming state, for the final note. */
   armed?: boolean;
   chainId?: number;
 }) {
-  const {address, chainId, balanceWei, connect, disconnect, activeName, eip1193, switchChain} = useWallet();
-
-  const [searcher, setSearcher] = useState("");
-  const [deployed, setDeployed] = useState<string | null>(null);
-  const [deploying, setDeploying] = useState(false);
-  const [deployHash, setDeployHash] = useState<string | null>(null);
-  const [estimate, setEstimate] = useState<string | null>(null);
-  const [fundAmount, setFundAmount] = useState("0.03");
-  const [searcherInput, setSearcherInput] = useState("");
-  const [allowTx, setAllowTx] = useState<string | null>(null);
-  const [fundTx, setFundTx] = useState<string | null>(null);
-  const [verify, setVerify] = useState<{
-    code?: string;
-    owner?: string;
-    searcherAllowed?: boolean;
-    executorBalance?: string;
-  }>({});
-  const [status, setStatus] = useState("");
-  const [known, setKnown] = useState("");
-
-  // Multi-chain: the panel talks to the active chain's bot config and RPC.
-  const chainSlug = readActiveChain();
-  const chainKey = (chainSlug ?? "ethereum").toLowerCase();
-  const chainLabel = CHAIN_LABEL[chainKey] ?? chainKey;
-  // Expected chain id: prefer the bot's own report (the bot knows for sure
-  // which chain it's forking); fall back to the slug map for a first paint
-  // before status has landed.
-  const expectedChainId = botChainId ?? CHAIN_DEFAULT_ID[chainKey] ?? 1;
+  const wallet = useWallet();
+  const [slug, setSlug] = useState(() => chainKey(readActiveChain()));
+  const expectedChainId = botChainId ?? CHAIN_IDS[slug] ?? 1;
+  const label = CHAIN_LABELS[slug] ?? slug;
+  const weth = WETH_BY_CHAIN[slug] ?? WETH_BY_CHAIN.ethereum;
   const publicClient = useMemo(
-    () => createPublicClient({chain: chainSlug === "base" ? base : mainnet, transport: http(withChain("/api/eth", chainSlug))}),
-    [chainSlug]
+    () => createPublicClient({chain: slug === "base" ? base : mainnet, transport: http(withChain("/api/eth", slug))}),
+    [slug],
   );
 
-  // Bot's own signer EOA — prefills the allowlist step. Refetched on chain
-  // change so the Base panel doesn't prefill with the mainnet searcher.
-  useEffect(() => {
-    fetch(withChain("/api/bot/config", chainSlug), {cache: "no-store"})
-      .then((r) => r.json())
-      .then((c: {searcher?: string}) => {
-        if (c.searcher && isAddress(c.searcher)) {
-          setSearcher(c.searcher);
-          setSearcherInput(c.searcher);
-        }
-      })
-      .catch(() => {});
-  }, [chainSlug]);
+  const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [botConfig, setBotConfig] = useState<BotConfig | null>(null);
+  const [sniperParams, setSniperParams] = useState<SniperParamsResponse | null>(null);
+  const [vaultStatus, setVaultStatus] = useState<SniperVaultStatus | null>(null);
+  const [executorAddress, setExecutorAddress] = useState("");
+  const [vaultAddress, setVaultAddress] = useState("");
+  const [executorCheck, setExecutorCheck] = useState<ContractCheck>(emptyCheck);
+  const [vaultCheck, setVaultCheck] = useState<ContractCheck>(emptyCheck);
+  const [searcherInput, setSearcherInput] = useState("");
+  const [sniperSearcherInput, setSniperSearcherInput] = useState("");
+  const [dailyBudget, setDailyBudget] = useState("0.25");
+  const [totalBudget, setTotalBudget] = useState("0");
+  const [fundAmount, setFundAmount] = useState("0.10");
+  const [fundTarget, setFundTarget] = useState<"vault" | "executor">("vault");
+  const [soakHours, setSoakHours] = useState("168");
+  const [deploying, setDeploying] = useState<"executor" | "vault" | null>(null);
+  const [preflight, setPreflight] = useState({rpc: false, bot: false, relay: false, qualification: false});
+  const [message, setMessage] = useState<{tone: "info" | "good" | "bad" | "warn"; text: string} | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  // Remember a deployment across reloads — per-chain so an Ethereum
-  // executor never bleeds into the Base panel (work order R6).
-  useEffect(() => {
-    const saved = localStorage.getItem(storageKey(chainSlug));
-    if (saved && isAddress(saved)) {
-      setDeployed(saved);
-      return;
+  useEffect(() => onChainChange((next) => setSlug(chainKey(next))), []);
+
+  const load = useCallback(async () => {
+    const get = async <T,>(path: string): Promise<T | null> => {
+      try {
+        const response = await fetch(withChain(`/api/bot/${path}`, slug), {cache: "no-store"});
+        if (!response.ok) return null;
+        return (await response.json()) as T;
+      } catch {
+        return null;
+      }
+    };
+    const [s, c, p, v, pf] = await Promise.all([
+      get<StatusResponse>("status"),
+      get<BotConfig>("config"),
+      get<SniperParamsResponse>("sniper/params"),
+      get<SniperVaultStatus>("sniper/vault"),
+      get<PreflightResponse>("preflight"),
+    ]);
+    if (s) {
+      setStatus(s);
+      if (s.qualification) setSoakHours(String(s.qualification.requiredHours));
     }
-    // Back-compat: the legacy unsuffixed key predates multi-chain; treat it
-    // as the mainnet deployment only.
-    if (chainKey === "ethereum") {
-      const legacy = localStorage.getItem(STORAGE_KEY_BASE);
-      if (legacy && isAddress(legacy)) setDeployed(legacy);
-    } else {
-      setDeployed(null);
+    if (pf) {
+      setPreflight({rpc: Boolean(pf.rpc), bot: !pf.demo, relay: Boolean(pf.relay), qualification: Boolean(pf.qualification)});
+    } else if (s) {
+      setPreflight((old) => ({...old, bot: !s.demo, qualification: Boolean(s.qualification)}));
     }
-  }, [chainSlug, chainKey]);
+    if (c) {
+      setBotConfig(c);
+      if (c.searcher) {
+        setSearcherInput(c.searcher);
+      }
+      if (c.sniperSearcher) setSniperSearcherInput(c.sniperSearcher);
+    }
+    if (p) {
+      setSniperParams(p);
+      if (p.params.vaultAddress && isAddress(p.params.vaultAddress)) setVaultAddress((old) => old || p.params.vaultAddress || "");
+    }
+    if (v) setVaultStatus(v);
+  }, [slug]);
 
-  const target = known && isAddress(known) ? known : deployed ?? "";
+  useEffect(() => {
+    void load();
+    const timer = setInterval(() => void load(), 10_000);
+    return () => clearInterval(timer);
+  }, [load]);
 
-  const refreshVerify = useCallback(async () => {
+  useEffect(() => {
+    const savedExecutor = storageGet(keyFor(STORAGE_EXECUTOR, slug));
+    const savedVault = storageGet(keyFor(STORAGE_VAULT, slug));
+    setExecutorAddress(savedExecutor && isAddress(savedExecutor) ? savedExecutor : "");
+    setVaultAddress(savedVault && isAddress(savedVault) ? savedVault : "");
+    setExecutorCheck(emptyCheck);
+    setVaultCheck(emptyCheck);
+  }, [slug]);
+
+  const executorTarget = executorAddress.trim();
+  const vaultTarget = vaultAddress.trim();
+  const gasReady = Boolean(wallet.address && wallet.chainId === expectedChainId && BigInt(wallet.balanceWei ?? 0n) >= GAS_THRESHOLD_WEI);
+  const walletReady = Boolean(wallet.address && wallet.chainId === expectedChainId);
+  const configuredSearcher = searcherInput.trim();
+  const configuredSniperSearcher = sniperSearcherInput.trim();
+  const searcherSeparated = Boolean(
+    wallet.address && configuredSearcher && isAddress(configuredSearcher) && configuredSearcher.toLowerCase() !== wallet.address.toLowerCase(),
+  );
+  const sniperSeparated = Boolean(
+    configuredSearcher && configuredSniperSearcher && isAddress(configuredSearcher) && isAddress(configuredSniperSearcher)
+      && configuredSearcher.toLowerCase() !== configuredSniperSearcher.toLowerCase(),
+  );
+  const executorReady = executorCheck.codeBytes !== null && executorCheck.codeBytes > 0 && !executorCheck.error;
+  const vaultReady = vaultCheck.codeBytes !== null && vaultCheck.codeBytes > 0 && !vaultCheck.error;
+  const preflightReady = preflight.rpc && preflight.bot && preflight.relay && preflight.qualification;
+
+  const verifyContract = useCallback(async (kind: "executor" | "vault", target: string) => {
     if (!isAddress(target)) return;
+    const searcher = kind === "executor" ? configuredSearcher : configuredSniperSearcher;
     try {
-      const [code, owner, executorBalance] = await Promise.all([
-        publicClient.getCode({address: target as Address}),
-        publicClient.readContract({address: target as Address, abi: EXECUTOR_ABI, functionName: "owner"}),
-        publicClient.getBalance({address: target as Address}),
-      ]);
-      let searcherAllowed: boolean | undefined;
-      if (searcher && isAddress(searcher)) {
-        searcherAllowed = Boolean(
-          await publicClient.readContract({
-            address: target as Address,
-            abi: EXECUTOR_ABI,
-            functionName: "searchers",
-            args: [searcher as Address],
-          }),
-        );
+      const code = await publicClient.getCode({address: target as Address});
+      if (!code || code === "0x") throw new Error("no contract bytecode at this address");
+      const owner = await publicClient.readContract({address: target as Address, abi: kind === "executor" ? EXECUTOR_ABI : SNIPER_VAULT_ABI, functionName: "owner"});
+      const wethOnChain = await publicClient.readContract({address: target as Address, abi: SNIPER_VAULT_ABI, functionName: "WETH"}).catch(() => null);
+      const allowed = searcher && isAddress(searcher)
+        ? await publicClient.readContract({address: target as Address, abi: kind === "executor" ? EXECUTOR_ABI : SNIPER_VAULT_ABI, functionName: "searchers", args: [searcher as Address]}).catch(() => null)
+        : null;
+      if (wethOnChain && String(wethOnChain).toLowerCase() !== weth.toLowerCase()) {
+        throw new Error(`WETH mismatch: contract uses ${String(wethOnChain)}, expected ${weth}`);
       }
-      setVerify({code: `${(code?.length ?? 2) / 2 - 1} bytes`, owner: String(owner), searcherAllowed, executorBalance: formatEther(executorBalance)});
-    } catch (e) {
-      setVerify({code: `read failed: ${(e as Error).message.split("\n")[0]}`});
+      const result: ContractCheck = {
+        codeBytes: Math.max(0, Math.floor((code.length - 2) / 2)),
+        owner: String(owner),
+        weth: wethOnChain ? String(wethOnChain) : null,
+        searcherAllowed: allowed === null ? null : Boolean(allowed),
+        error: null,
+      };
+      if (kind === "executor") setExecutorCheck(result);
+      else setVaultCheck(result);
+    } catch (error) {
+      const result = {...emptyCheck, error: errText(error)};
+      if (kind === "executor") setExecutorCheck(result);
+      else setVaultCheck(result);
     }
-  }, [target, searcher, publicClient]);
+  }, [configuredSearcher, configuredSniperSearcher, publicClient, weth]);
 
   useEffect(() => {
-    void refreshVerify();
-    const t = setInterval(() => void refreshVerify(), 20_000);
-    return () => clearInterval(t);
-  }, [refreshVerify]);
+    if (isAddress(executorTarget)) void verifyContract("executor", executorTarget);
+    if (isAddress(vaultTarget)) void verifyContract("vault", vaultTarget);
+  }, [executorTarget, vaultTarget, verifyContract]);
 
-  const onWalletReady = chainId === expectedChainId && Boolean(address);
-  const walletFunded = onWalletReady && BigInt(balanceWei ?? 0) >= parseEther("0.005");
-
-  const doEstimate = useCallback(async () => {
-    if (!address) return;
-    setStatus("estimating deployment cost…");
+  const updatePreflight = useCallback(async () => {
     try {
-      const gas = await publicClient.estimateGas({account: address as Address, data: deployData(chainSlug)});
-      const price = await publicClient.getGasPrice();
-      setEstimate(`~${formatEther(BigInt(gas) * price).slice(0, 6)} ETH (${gas.toLocaleString()} gas @ ${Number(price) / 1e9} gwei)`);
-      setStatus("");
-    } catch (e) {
-      setEstimate(null);
-      setStatus(`estimate failed: ${(e as Error).message.split("\n")[0]}`);
+      const chain = await publicClient.getChainId();
+      await publicClient.getBlockNumber();
+      setPreflight((old) => ({...old, rpc: chain === expectedChainId}));
+    } catch {
+      setPreflight((old) => ({...old, rpc: false}));
     }
-  }, [address, publicClient, chainSlug]);
-
-  const doDeploy = useCallback(async () => {
-    if (!address || !eip1193) return;
-    setDeploying(true);
-    setStatus("confirm the deployment in your wallet…");
     try {
-      const wallet = createWalletClient({transport: custom(eip1193)});
-      const hash = (await wallet.sendTransaction({
-        account: address as Address,
-        data: deployData(chainSlug),
-        chain: null,
-        // The deployer pays gas; constructor has no payable side.
-      })) as `0x${string}`;
-      setDeployHash(hash);
-      setStatus("mining — waiting for the receipt…");
-      const receipt = await publicClient.waitForTransactionReceipt({hash});
-      const ca = (receipt as unknown as {contractAddress?: string}).contractAddress;
-      if (ca && isAddress(ca)) {
-        setDeployed(ca);
-        localStorage.setItem(storageKey(chainSlug), ca);
-        setStatus(`deployed at ${ca}`);
-      } else {
-        setStatus("receipt has no contract address — was the tx a deployment?");
+      const response = await fetch(withChain("/api/bot/preflight", slug), {cache: "no-store"});
+      const check = (await response.json()) as PreflightResponse & {demo?: boolean};
+      if (response.ok && !check.demo) {
+        setPreflight((old) => ({...old, bot: true, relay: Boolean(check.relay), qualification: Boolean(check.qualification)}));
       }
-    } catch (e) {
-      setStatus(`deploy failed: ${(e as Error).message.split("\n")[0]}`);
-    } finally {
-      setDeploying(false);
+    } catch {
+      setPreflight((old) => ({...old, bot: false}));
     }
-  }, [address, eip1193, publicClient, chainSlug]);
+  }, [expectedChainId, publicClient, slug]);
 
-  const doFund = useCallback(async () => {
-    if (!address || !eip1193 || !isAddress(target)) return;
-    setStatus("confirm the funding transfer in your wallet…");
-    try {
-      const wallet = createWalletClient({transport: custom(eip1193)});
-      const hash = (await wallet.sendTransaction({
-        account: address as Address,
-        to: target as Address,
-        value: parseEther(fundAmount || "0"),
-        chain: null,
-      })) as `0x${string}`;
-      setFundTx(hash);
-      setStatus(`funded ${fundAmount} ETH (tx pending)`);
-      setTimeout(() => void refreshVerify(), 8_000);
-    } catch (e) {
-      setStatus(`fund failed: ${(e as Error).message.split("\n")[0]}`);
-    }
-  }, [address, eip1193, target, fundAmount, refreshVerify]);
+  useEffect(() => {
+    void updatePreflight();
+  }, [updatePreflight]);
 
-  const doAllowSearcher = useCallback(async () => {
-    if (!address || !eip1193 || !isAddress(target)) return;
-    const who = searcherInput.trim();
-    if (!isAddress(who)) {
-      setStatus("searcher address is not valid");
+  const txWrite = useCallback(async (kind: "executor" | "vault") => {
+    if (!wallet.address || !wallet.eip1193 || wallet.chainId !== expectedChainId) {
+      setMessage({tone: "bad", text: `Connect the operator wallet to ${label} first.`});
       return;
     }
-    setStatus("confirm setSearcher in your wallet…");
+    setDeploying(kind);
+    setMessage({tone: "info", text: `Confirm ${kind} deployment in your wallet…`});
     try {
-      const wallet = createWalletClient({transport: custom(eip1193)});
-      const hash = (await wallet.writeContract({
-        account: address as Address,
-        address: target as Address,
-        abi: EXECUTOR_ABI,
-        functionName: "setSearcher",
-        args: [who as Address, true],
-        chain: null,
-      })) as `0x${string}`;
-      setAllowTx(hash);
-      setStatus(`setSearcher sent (tx pending)`);
-      setTimeout(() => {
-        setSearcher(who);
-        void refreshVerify();
-      }, 8_000);
-    } catch (e) {
-      setStatus(`setSearcher failed: ${(e as Error).message.split("\n")[0]}`);
+      const daily = safeWei(dailyBudget);
+      const total = safeWei(totalBudget);
+      if (kind === "vault" && (daily === null || total === null)) throw new Error("enter valid non-negative ETH budgets");
+      const data = deployData(kind, slug, dailyBudget, totalBudget);
+      const client = createWalletClient({transport: custom(wallet.eip1193)});
+      const hash = await client.sendTransaction({account: wallet.address as Address, data, chain: null});
+      setMessage({tone: "info", text: `${kind} deployment ${shorten(hash)} is mining…`});
+      const receipt = await publicClient.waitForTransactionReceipt({hash});
+      const address = receipt.contractAddress;
+      if (!address) throw new Error("receipt did not contain a contract address");
+      if (kind === "executor") {
+        setExecutorAddress(address);
+        storageSet(keyFor(STORAGE_EXECUTOR, slug), address);
+      } else {
+        setVaultAddress(address);
+        storageSet(keyFor(STORAGE_VAULT, slug), address);
+        setMessage({tone: "good", text: `SniperVault deployed at ${address}. Verify it before funding.`});
+      }
+      setMessage({tone: "good", text: `${kind} deployed at ${address}.`});
+    } catch (error) {
+      setMessage({tone: "bad", text: `${kind} deployment failed: ${errText(error)}`});
+    } finally {
+      setDeploying(null);
     }
-  }, [address, eip1193, target, searcherInput, refreshVerify]);
+  }, [dailyBudget, expectedChainId, label, publicClient, slug, totalBudget, wallet.address, wallet.chainId, wallet.eip1193]);
 
-  const deployedOk = isAddress(target) && Boolean(verify.code) && !verify.code?.startsWith("read failed") && verify.code !== "0 bytes";
-  const fundedOk = deployedOk && Boolean(verify.executorBalance) && Number(verify.executorBalance ?? 0) > 0;
-  const allowedOk = deployedOk && verify.searcherAllowed === true;
-  const usingIt = !!executor && executor !== "" && executor.toLowerCase() === target.toLowerCase();
+  const sendNative = useCallback(async () => {
+    const amount = safeWei(fundAmount);
+    const target = fundTarget === "vault" ? vaultTarget : executorTarget;
+    if (!amount || !isAddress(target) || !wallet.address || !wallet.eip1193) {
+      setMessage({tone: "bad", text: "Choose a deployed target and a valid ETH amount."});
+      return;
+    }
+    setBusy(true);
+    try {
+      const client = createWalletClient({transport: custom(wallet.eip1193)});
+      const hash = await client.sendTransaction({account: wallet.address as Address, to: target as Address, value: amount, chain: null});
+      await publicClient.waitForTransactionReceipt({hash});
+      setMessage({tone: "good", text: `Native ETH funding confirmed: ${shorten(hash)}.`});
+    } catch (error) {
+      setMessage({tone: "bad", text: `Funding failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [executorTarget, fundAmount, fundTarget, publicClient, vaultTarget, wallet.address, wallet.eip1193]);
 
-  const steps: Step[] = [
-    {
-      key: "wallet",
-      title: `1 · Connect a wallet on ${chainLabel}`,
-      state: onWalletReady ? "done" : "todo",
-      node: (
-        <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
-          {address ? (
-            <>
-              <span style={{fontSize: 11}}>
-                {activeName ?? "wallet"} · <code>{address.slice(0, 10)}…</code>{" "}
-                {chainId === expectedChainId ? (
-                  <span style={{color: "var(--green)"}}>chain {expectedChainId} ✓</span>
-                ) : (
-                  <span style={{color: "var(--amber)"}}>chain {chainId}</span>
-                )}
-              </span>
-              {chainId !== expectedChainId && (
-                <button onClick={() => void switchChain(expectedChainId)} style={btn}>
-                  switch wallet to {chainLabel}
-                </button>
-              )}
-              <button onClick={() => disconnect()} style={btn}>
-                disconnect
-              </button>
-            </>
-          ) : (
-            <button onClick={() => void connect()} style={{...btn, borderColor: "var(--cyan)", color: "var(--cyan)"}}>
-              connect wallet
-            </button>
-          )}
-        </div>
-      ),
-    },
-    {
-      key: "gas",
-      title: "2 · Confirm the wallet holds gas money",
-      state: walletFunded ? "done" : onWalletReady ? "todo" : "locked",
-      node: (
-        <span style={{fontSize: 11}} className="muted">
-          {address ? (
-            <>
-              balance <strong>{formatEther(BigInt(balanceWei ?? 0)).slice(0, 6)} ETH</strong> —{" "}
-              {walletFunded ? (
-                <span style={{color: "var(--green)"}}>≥ 0.005 ETH ok (0.05 recommended)</span>
-              ) : (
-                <span style={{color: "var(--amber)"}}>top up: deployment + admin txs + headroom</span>
-              )}
-            </>
-          ) : (
-            "connect first"
-          )}
-        </span>
-      ),
-    },
-    {
-      key: "deploy",
-      title: "3 · Deploy MevExecutor",
-      state: deployedOk ? "done" : walletFunded ? "todo" : "locked",
-      node: (
-        <div style={{display: "grid", gap: 6}}>
-          <div style={{display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center"}}>
-            <button onClick={() => void doEstimate()} disabled={!walletFunded} style={btn}>
-              estimate cost (free)
-            </button>
-            <button
-              onClick={() => void doDeploy()}
-              disabled={!walletFunded || deploying}
-              style={{...btn, borderColor: deployedOk ? "var(--line)" : "var(--green)", color: deployedOk ? "var(--muted)" : "var(--green)"}}
-              title={`${deployedOk ? "redeploy" : "deploy"} MevExecutor on ${chainLabel}`}
-            >
-              {deploying ? "deploying…" : deployedOk ? `redeploy · ${chainLabel}` : `deploy · ${chainLabel}`}
-            </button>
-            {estimate && <span style={{fontSize: 11, color: "var(--cyan)"}}>{estimate}</span>}
-          </div>
-          <p className="muted" style={{fontSize: 10, margin: 0}}>
-            constructor <code>MevExecutor(balancerVault, weth)</code> — prefilled with the {chainLabel} Balancer V2 vault +
-            WETH ({CONSTRUCTOR_ARGS[chainKey]?.balancerVault.slice(0, 10)}… /{" "}
-            {CONSTRUCTOR_ARGS[chainKey]?.weth.slice(0, 10)}…). The creation bytecode is the CI-checked copy of the bot&apos;s
-            artifact, so what you deploy is what the bot simulates against.
-          </p>
-          <div style={{display: "flex", gap: 8, alignItems: "center", fontSize: 11}}>
-            <span className="muted">already deployed? paste the address:</span>
-            <input value={known} onChange={(e) => setKnown(e.target.value)} placeholder="0x…" style={{...input, width: 320}} />
-          </div>
-          {deployHash && (
-            <a href={txUrl(expectedChainId, deployHash) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
-              deployment tx ↗
-            </a>
-          )}
-        </div>
-      ),
-    },
-    {
-      key: "fund",
-      title: "4 · Optional executor native-call funding",
-      state: deployedOk ? "done" : "locked",
-      node: (
-        <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
-          <input value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} style={{...input, width: 80}} />
-          <span className="muted" style={{fontSize: 11}}>ETH →</span>
-          <code style={{fontSize: 11}}>{target || "(deploy first)"}</code>
-          <button onClick={() => void doFund()} disabled={!deployedOk} style={btn}>
-            send
-          </button>
-          <span className="muted" style={{fontSize: 10}}>
-            Optional. The searcher EOA pays transaction gas; fund the contract only when calls need native value. The owner can sweep it back.
-          </span>
-          {verify.executorBalance && (
-            <span style={{fontSize: 11, color: fundedOk ? "var(--green)" : "var(--amber)"}}>
-              holds {verify.executorBalance.slice(0, 6)} ETH
-            </span>
-          )}
-          {fundTx && (
-            <a href={txUrl(expectedChainId, fundTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
-              tx ↗
-            </a>
-          )}
-        </div>
-      ),
-    },
-    {
-      key: "allow",
-      title: "5 · Allowlist the bot's searcher EOA",
-      state: allowedOk ? "done" : deployedOk ? "todo" : "locked",
-      node: (
-        <div style={{display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"}}>
-          <input value={searcherInput} onChange={(e) => setSearcherInput(e.target.value)} placeholder="searcher address" style={{...input, width: 320}} />
-          <button
-            onClick={() => void doAllowSearcher()}
-            disabled={!deployedOk}
-            style={btn}
-            title={`setSearcher(address, true) on the ${chainLabel} executor`}
-          >
-            setSearcher(…, true) · {chainLabel}
-          </button>
-          <span className="muted" style={{fontSize: 10}}>
-            prefilled from the bot&apos;s SEARCHER_ADDRESS. The executor only accepts bundles from allowlisted addresses.
-          </span>
-          {verify.searcherAllowed === true && <span style={{fontSize: 11, color: "var(--green)"}}>allowlisted ✓</span>}
-          {verify.searcherAllowed === false && <span style={{fontSize: 11, color: "var(--amber)"}}>not allowlisted yet</span>}
-          {allowTx && (
-            <a href={txUrl(expectedChainId, allowTx) ?? undefined} target="_blank" rel="noreferrer" style={{fontSize: 11, color: "var(--cyan)"}}>
-              tx ↗
-            </a>
-          )}
-        </div>
-      ),
-    },
-    {
-      key: "verify",
-      title: "6 · Verify & point the bot at it",
-      state: usingIt ? "done" : allowedOk ? "todo" : "locked",
-      node: (
-        <div style={{display: "grid", gap: 6, fontSize: 11}}>
-          <div className="muted">
-            code: <strong>{verify.code ?? "—"}</strong> · owner:{" "}
-            {verify.owner ? (
-              <a href={addressUrl(expectedChainId, verify.owner) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
-                {verify.owner.slice(0, 10)}… ↗
-              </a>
-            ) : (
-              "—"
-            )}
-            {target && (
-              <>
-                {" "}· contract:{" "}
-                <a href={addressUrl(expectedChainId, target) ?? undefined} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>
-                  {target.slice(0, 10)}… on {explorerName(expectedChainId)} ↗
-                </a>
-              </>
-            )}
-          </div>
-          <div className="muted">
-            last step: set <code>EXECUTOR_ADDRESS={target || "<the deployed address>"}</code> in <code>.env</code> and
-            restart — the bot is currently using{" "}
-            <code>{executor ? executor.slice(0, 10) + "…" : "the simulation fixture"}</code>. Deploying changes nothing
-            else: the bot stays simulation-only until{" "}
-            <code>LIVE_EXECUTION=true</code> + <code>I_UNDERSTAND_LIVE_RISK=yes</code>
-            {armed === false && <span style={{color: "var(--green)"}}> (currently unarmed ✓)</span>}.
-          </div>
-          <button
-            onClick={() => {
-              void navigator.clipboard.writeText(`EXECUTOR_ADDRESS=${target}`);
-              setStatus(`copied EXECUTOR_ADDRESS to clipboard (${chainLabel})`);
-            }}
-            disabled={!isAddress(target)}
-            style={{...btn, justifySelf: "start"}}
-            title={`copy the EXECUTOR_ADDRESS line for the ${chainLabel} bot's .env`}
-          >
-            copy EXECUTOR_ADDRESS line · {chainLabel}
-          </button>
-        </div>
-      ),
-    },
-  ];
+  const wrapAndTransfer = useCallback(async () => {
+    const amount = safeWei(fundAmount);
+    const target = fundTarget === "vault" ? vaultTarget : executorTarget;
+    if (!amount || !isAddress(target) || !wallet.address || !wallet.eip1193) {
+      setMessage({tone: "bad", text: "Choose a deployed target and a valid ETH amount."});
+      return;
+    }
+    setBusy(true);
+    try {
+      const client = createWalletClient({transport: custom(wallet.eip1193)});
+      const wrapHash = await client.writeContract({account: wallet.address as Address, address: weth, abi: WETH_ABI, functionName: "deposit", value: amount, chain: null});
+      await publicClient.waitForTransactionReceipt({hash: wrapHash});
+      const transferHash = await client.writeContract({account: wallet.address as Address, address: weth, abi: WETH_ABI, functionName: "transfer", args: [target as Address, amount], chain: null});
+      await publicClient.waitForTransactionReceipt({hash: transferHash});
+      setMessage({tone: "good", text: `Wrapped and transferred ${fundAmount} WETH to ${shorten(target)}.`});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `WETH funding failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [executorTarget, fundAmount, fundTarget, load, publicClient, vaultTarget, wallet.address, wallet.eip1193, weth]);
 
-  const done = steps.filter((s) => s.state === "done").length;
+  const allowVaultSearcher = useCallback(async () => {
+    if (!isAddress(vaultTarget) || !isAddress(configuredSniperSearcher) || !wallet.address || !wallet.eip1193) {
+      setMessage({tone: "bad", text: "A verified vault, valid dedicated sniper address and owner wallet are required."});
+      return;
+    }
+    setBusy(true);
+    try {
+      const client = createWalletClient({transport: custom(wallet.eip1193)});
+      const hash = await client.writeContract({account: wallet.address as Address, address: vaultTarget as Address, abi: SNIPER_VAULT_ABI, functionName: "setSearcher", args: [configuredSniperSearcher as Address, true], chain: null});
+      await publicClient.waitForTransactionReceipt({hash});
+      setMessage({tone: "good", text: `Dedicated sniper searcher allowlisted: ${shorten(hash)}.`});
+      void verifyContract("vault", vaultTarget);
+    } catch (error) {
+      setMessage({tone: "bad", text: `Sniper searcher allowlist failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [configuredSniperSearcher, publicClient, vaultTarget, verifyContract, wallet.address, wallet.eip1193]);
+
+  const setVaultBudget = useCallback(async () => {
+    const daily = safeWei(dailyBudget);
+    const total = safeWei(totalBudget);
+    if (daily === null || total === null || !isAddress(vaultTarget) || !wallet.address || !wallet.eip1193) {
+      setMessage({tone: "bad", text: "A verified SniperVault, owner wallet and valid budgets are required."});
+      return;
+    }
+    setBusy(true);
+    try {
+      const client = createWalletClient({transport: custom(wallet.eip1193)});
+      const hash = await client.writeContract({account: wallet.address as Address, address: vaultTarget as Address, abi: SNIPER_VAULT_ABI, functionName: "setBudget", args: [daily, total], chain: null});
+      await publicClient.waitForTransactionReceipt({hash});
+      setMessage({tone: "good", text: `SniperVault budget updated: ${shorten(hash)}.`});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `Budget update failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [dailyBudget, load, publicClient, totalBudget, vaultTarget, wallet.address, wallet.eip1193]);
+
+  const applyVaultRuntime = useCallback(async () => {
+    if (!isAddress(vaultTarget)) return;
+    setBusy(true);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/params", slug), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({vaultAddress: vaultTarget}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; errors?: string[]; demo?: boolean};
+      if (!response.ok || !data.ok || data.demo) throw new Error(data.errors?.join("; ") || data.error || "bot rejected the runtime vault binding");
+      setMessage({tone: "good", text: "SniperVault address applied to the running bot. Persist it in the bot .env before restart."});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `Runtime vault binding failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [load, slug, vaultTarget]);
+
+  const setSoak = useCallback(async () => {
+    const hours = Number(soakHours);
+    if (!Number.isInteger(hours) || hours < 1 || hours > 8760) {
+      setMessage({tone: "bad", text: "Soak threshold must be an integer from 1 to 8760 hours."});
+      return;
+    }
+    setBusy(true);
+    try {
+      const response = await fetch(withChain("/api/bot/qualification", slug), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({requiredHours: hours}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; demo?: boolean};
+      if (!response.ok || !data.ok || data.demo) throw new Error(data.error || "bot rejected the soak threshold");
+      setMessage({tone: "good", text: `Dynamic soak threshold set to ${hours} hour${hours === 1 ? "" : "s"}. Evidence gates remain active.`});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `Soak update failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [load, slug, soakHours]);
+
+  const armAtomic = useCallback(async () => {
+    if (!preflightReady || !status?.liveArmed) {
+      setMessage({tone: "bad", text: "Atomic live mode is not boot-armed or preflight is incomplete. Set LIVE_EXECUTION=true and I_UNDERSTAND_LIVE_RISK=yes, then restart."});
+      return;
+    }
+    if (!window.confirm("Enable the atomic engine runtime LIVE mode? This permits real bundle submission when every risk and qualification gate passes.")) return;
+    setBusy(true);
+    try {
+      const response = await fetch(withChain("/api/bot/mode", slug), {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify({live: true})});
+      const data = (await response.json()) as {ok?: boolean; error?: string; demo?: boolean};
+      if (!response.ok || !data.ok || data.demo) throw new Error(data.error || "bot refused live mode");
+      setMessage({tone: "warn", text: "Atomic runtime mode is LIVE. Submission is still gated per strategy, risk, nonce, inventory and qualification."});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `Atomic live switch failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [load, preflightReady, slug, status?.liveArmed]);
+
+  const armSniper = useCallback(async () => {
+    if (!preflightReady || !vaultReady || !isAddress(vaultTarget) || !botConfig?.sniperSearcherKeyConfigured) {
+      setMessage({tone: "bad", text: "Sniper preflight requires a verified vault, reachable bot and dedicated SNIPER_SEARCHER_PRIVATE_KEY."});
+      return;
+    }
+    if (!window.confirm("Arm the directional SniperVault lane? It can lose the full buy amount; the atomic engine may remain in simulation.")) return;
+    setBusy(true);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/params", slug), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({enabled: true, vaultAddress: vaultTarget}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; errors?: string[]; demo?: boolean};
+      if (!response.ok || !data.ok || data.demo) throw new Error(data.errors?.join("; ") || data.error || "bot refused sniper arming");
+      setMessage({tone: "warn", text: "Directional sniper enabled. Confirm the parameter card shows non-zero size/budget before expecting entries."});
+      void load();
+    } catch (error) {
+      setMessage({tone: "bad", text: `Sniper arm failed: ${errText(error)}`});
+    } finally {
+      setBusy(false);
+    }
+  }, [botConfig?.sniperSearcherKeyConfigured, load, preflightReady, slug, vaultReady, vaultTarget]);
+
+  const copy = async (text: string, labelText: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setMessage({tone: "good", text: `${labelText} copied.`});
+    } catch {
+      setMessage({tone: "bad", text: "Clipboard access was denied; copy the text manually."});
+    }
+  };
+
+  const dynamicBotStatus = status?.qualification;
+  const cliRpc = expectedChainId === 8453 ? "$BASE_HTTP_URL" : "$ETH_HTTP_URL";
+  const executorCli = `cd contracts\nforge script script/Deploy.s.sol --rpc-url ${cliRpc} --broadcast --verify`;
+  const vaultCli = `cd contracts\nforge script script/DeploySniperVault.s.sol --rpc-url ${cliRpc} --broadcast`;
+  const envSnippet = `EXECUTOR_ADDRESS=${executorTarget || "<executor>"}\nSEARCHER_ADDRESS=${configuredSearcher || "<atomic-searcher>"}\nSNIPER_VAULT_ADDRESS=${vaultTarget || "<sniper-vault>"}\nSNIPER_SEARCHER_ADDRESS=${configuredSniperSearcher || "<dedicated-searcher>"}`;
+  const doneCount = [walletReady, gasReady, executorReady && vaultReady, Boolean(vaultStatus?.configured && vaultStatus.address), preflightReady].filter(Boolean).length;
 
   return (
     <div style={{display: "grid", gap: 10}}>
-      <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
-        <span className="muted" style={{fontSize: 11}}>
-          {done}/6 steps complete · full walkthrough in <code>docs/GO_LIVE.md</code>
-        </span>
-        {status && (
-          <span style={{fontSize: 11, color: "var(--amber)"}}>{status}</span>
-        )}
-      </div>
-      {steps.map((s) => (
-        <div
-          key={s.key}
-          style={{
-            display: "grid",
-            gridTemplateColumns: "20px 1fr",
-            gap: 10,
-            padding: "8px 10px",
-            border: "1px solid var(--line)",
-            borderRadius: 4,
-            background: s.state === "locked" ? "transparent" : "var(--panel-2)",
-            opacity: s.state === "locked" ? 0.5 : 1,
-          }}
-        >
-          <span style={{color: s.state === "done" ? "var(--green)" : "var(--muted)", fontSize: 13, lineHeight: "20px"}}>
-            {s.state === "done" ? "✓" : s.state === "locked" ? "🔒" : "○"}
-          </span>
-          <div style={{display: "grid", gap: 6}}>
-            <span style={{fontSize: 12, fontWeight: 600, color: s.state === "done" ? "var(--muted)" : "inherit"}}>
-              {s.title}
-            </span>
-            {s.node}
-          </div>
+      <div style={{display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", flexWrap: "wrap"}}>
+        <div>
+          <strong>Production Go-Live Wizard · {label}</strong>
+          <span className="muted" style={{fontSize: 11, marginLeft: 8}}>{doneCount}/5 cards ready</span>
         </div>
-      ))}
+        <span className="badge" style={{color: "var(--amber)", borderColor: "var(--amber)"}}>deploy ≠ armed</span>
+      </div>
+      {message && <div style={{...noticeStyle, color: toneColor(message.tone), borderColor: toneColor(message.tone)}} role="status">{message.text}<button onClick={() => setMessage(null)} style={dismiss}>×</button></div>}
+
+      <WizardCard number="1" title={`Network & wallet · ${label}`} state={walletReady ? "done" : "todo"}>
+        <div style={rowStyle}>
+          {wallet.address ? <code>{shorten(wallet.address)}</code> : <span className="muted">No operator wallet connected</span>}
+          {wallet.address && <span className={wallet.chainId === expectedChainId ? "good" : "warn"}>{wallet.chainId === expectedChainId ? `chain ${expectedChainId} ✓` : `wallet chain ${wallet.chainId} · need ${expectedChainId}`}</span>}
+          {!wallet.address && <button style={buttonStyle} onClick={() => void wallet.connect()}>connect wallet</button>}
+          {wallet.address && wallet.chainId !== expectedChainId && <button style={buttonStyle} onClick={() => void wallet.switchChain(expectedChainId)}>switch to {label}</button>}
+          {wallet.address && <button style={buttonStyle} onClick={() => void wallet.disconnect()}>disconnect</button>}
+        </div>
+        <div className="muted" style={{fontSize: 10}}>The connected wallet is the contract owner for browser deployments. It is not accepted as a bot signer unless you explicitly allowlist it.</div>
+      </WizardCard>
+
+      <WizardCard number="2" title="EOA & searcher-key verification" state={gasReady && Boolean(configuredSearcher) ? "done" : walletReady ? "todo" : "locked"}>
+        <div style={{display: "grid", gap: 6}}>
+          <div style={rowStyle}><span className="muted">owner/deployer</span><code>{shorten(wallet.address)}</code><span className={gasReady ? "good" : "warn"}>{formatEther(BigInt(wallet.balanceWei ?? 0n)).slice(0, 8)} ETH · {gasReady ? "gas buffer ok" : "≥ 0.005 ETH required"}</span></div>
+          <div style={rowStyle}><span className="muted">atomic searcher</span><input value={searcherInput} onChange={(e) => setSearcherInput(e.target.value)} placeholder="SEARCHER_ADDRESS" style={inputStyle} /><span className={searcherSeparated ? "good" : "warn"}>{searcherSeparated ? "separate from owner ✓" : "verify separation"}</span></div>
+          <div style={rowStyle}><span className="muted">sniper searcher</span><input value={sniperSearcherInput} onChange={(e) => setSniperSearcherInput(e.target.value)} placeholder="SNIPER_SEARCHER_ADDRESS" style={inputStyle} /><span className={sniperSeparated ? "good" : "warn"}>{botConfig?.sniperSearcherKeyConfigured ? "private key configured ✓" : "dedicated key not configured"}</span></div>
+          <div className="muted" style={{fontSize: 10}}>Addresses are public. Private keys are never returned by the bot API. Live directional execution is refused at boot without SNIPER_SEARCHER_PRIVATE_KEY.</div>
+        </div>
+      </WizardCard>
+
+      <WizardCard number="3" title="Deploy & verify MevExecutor + SniperVault" state={executorReady && vaultReady ? "done" : gasReady ? "todo" : "locked"}>
+        <div style={{display: "grid", gap: 8}}>
+          <div style={rowStyle}><strong>MevExecutor</strong><input value={executorAddress} onChange={(e) => setExecutorAddress(e.target.value)} placeholder="0x executor address" style={inputStyle} /><button style={buttonStyle} disabled={!gasReady || deploying !== null} onClick={() => void txWrite("executor")}>{deploying === "executor" ? "deploying…" : "deploy / verify"}</button><span className={executorReady ? "good" : "muted"}>{executorCheck.error || (executorCheck.codeBytes !== null ? `${executorCheck.codeBytes.toLocaleString()} bytes` : "not checked")}</span></div>
+          <div style={rowStyle}><strong>SniperVault</strong><input value={vaultAddress} onChange={(e) => setVaultAddress(e.target.value)} placeholder="0x sniper vault address" style={inputStyle} /><button style={buttonStyle} disabled={!gasReady || deploying !== null} onClick={() => void txWrite("vault")}>{deploying === "vault" ? "deploying…" : "deploy / verify"}</button><button style={buttonStyle} disabled={!vaultReady || busy || !isAddress(configuredSniperSearcher)} onClick={() => void allowVaultSearcher()}>allow sniper searcher</button><span className={vaultReady ? "good" : "muted"}>{vaultCheck.error || (vaultCheck.codeBytes !== null ? `${vaultCheck.codeBytes.toLocaleString()} bytes` : "not checked")}</span></div>
+          <div style={rowStyle}><button style={buttonStyle} onClick={() => void copy(executorCli, "MevExecutor forge command")}>copy executor CLI</button><button style={buttonStyle} onClick={() => void copy(vaultCli, "SniperVault forge command")}>copy vault CLI</button><button style={buttonStyle} onClick={() => void copy(envSnippet, "contract env lines")}>copy env lines</button></div>
+          <pre style={preStyle}>{executorCli}\n\n{vaultCli}</pre>
+          <div className="muted" style={{fontSize: 10}}>Expected constructor bindings: Balancer V2 {shorten(BALANCER_VAULT)} · WETH {shorten(weth)}. Verify owner, WETH and searcher allowlisting before funding.</div>
+          <div style={rowStyle}><span className="muted">executor owner {shorten(executorCheck.owner)} · searcher</span><span className={executorCheck.searcherAllowed ? "good" : "warn"}>{executorCheck.searcherAllowed === null ? "not checked" : executorCheck.searcherAllowed ? "allowlisted ✓" : "not allowlisted"}</span><span className="muted">vault owner {shorten(vaultCheck.owner)} · searcher</span><span className={vaultCheck.searcherAllowed ? "good" : "warn"}>{vaultCheck.searcherAllowed === null ? "not checked" : vaultCheck.searcherAllowed ? "allowlisted ✓" : "not allowlisted"}</span></div>
+        </div>
+      </WizardCard>
+
+      <WizardCard number="4" title="Funding, WETH deposit and budget ceilings" state={vaultStatus?.configured && vaultStatus.address ? "done" : vaultReady ? "todo" : "locked"}>
+        <div style={{display: "grid", gap: 8}}>
+          <div style={rowStyle}><span className="muted">daily budget ETH</span><input value={dailyBudget} onChange={(e) => setDailyBudget(e.target.value)} style={smallInput} /><span className="muted">lifetime (0 = unlimited)</span><input value={totalBudget} onChange={(e) => setTotalBudget(e.target.value)} style={smallInput} /><button style={buttonStyle} disabled={!vaultReady || busy} onClick={() => void setVaultBudget()}>set vault budget</button></div>
+          <div style={rowStyle}><span className="muted">fund target</span><select value={fundTarget} onChange={(e) => setFundTarget(e.target.value as "vault" | "executor")} style={smallInput}><option value="vault">SniperVault</option><option value="executor">MevExecutor</option></select><input value={fundAmount} onChange={(e) => setFundAmount(e.target.value)} style={smallInput} /><span className="muted">ETH</span><button style={buttonStyle} disabled={busy || !walletReady} onClick={() => void wrapAndTransfer()}>wrap + transfer WETH</button><button style={buttonStyle} disabled={busy || !walletReady} onClick={() => void sendNative()}>send native ETH</button></div>
+          <div style={rowStyle}><span className="muted">vault spendable</span><strong>{vaultStatus?.spendableRemainingWei ? `${formatEther(BigInt(vaultStatus.spendableRemainingWei))} WETH` : "—"}</strong><span className="muted">reset {vaultStatus?.windowResetTimeSecs ? new Date(vaultStatus.windowResetTimeSecs * 1000).toLocaleString() : "—"}</span><button style={buttonStyle} disabled={busy || !vaultReady} onClick={() => void applyVaultRuntime()}>apply vault to running bot</button></div>
+          <div className="muted" style={{fontSize: 10}}>WETH is transferred to the contract, not the connected wallet. Daily/total ceilings are enforced on-chain; drawdown is configured separately in the Sniper Parameters panel and remains off-chain lane risk.</div>
+        </div>
+      </WizardCard>
+
+      <WizardCard number="5" title="Pre-flight, dynamic soak and independent live switches" state={preflightReady ? "done" : "todo"}>
+        <div style={{display: "grid", gap: 8}}>
+          <div style={rowStyle}><Check label="RPC" ok={preflight.rpc} /><Check label="bot API" ok={preflight.bot} /><Check label={expectedChainId === 8453 ? "Base feed / raw path" : "relay data"} ok={preflight.relay} /><Check label="qualification loaded" ok={preflight.qualification} /><button style={buttonStyle} onClick={() => {void updatePreflight(); void load();}}>refresh preflight</button></div>
+          <div style={rowStyle}><span className="muted">operator soak threshold</span><input type="number" min="1" max="8760" value={soakHours} onChange={(e) => setSoakHours(e.target.value)} style={smallInput} /><span className="muted">hours · current evidence {dynamicBotStatus?.elapsedHours ?? 0}h / {dynamicBotStatus?.requiredHours ?? soakHours}h</span><button style={buttonStyle} disabled={busy || !preflight.bot} onClick={() => void setSoak()}>apply threshold</button></div>
+          <div style={rowStyle}><button style={{...buttonStyle, borderColor: "var(--amber)", color: "var(--amber)"}} disabled={busy || !preflightReady} onClick={() => void armAtomic()}>confirm & enable atomic runtime LIVE</button><button style={{...buttonStyle, borderColor: "var(--amber)", color: "var(--amber)"}} disabled={busy || !preflightReady} onClick={() => void armSniper()}>confirm & enable sniper lane</button><span className="muted">atomic: {status?.mode ?? "—"} · boot armed: {status?.liveArmed ? "yes" : "no"} · sniper: {sniperParams?.armed ? "armed" : "shadow"}</span></div>
+          <div className="muted" style={{fontSize: 10}}>These buttons only change runtime state. Boot capability remains explicit: LIVE_EXECUTION=true plus I_UNDERSTAND_LIVE_RISK=yes for atomic, and SNIPER_DIRECTIONAL=true plus dedicated key/budget/vault for the sniper. A qualification PASS is still checked before atomic submission.</div>
+        </div>
+      </WizardCard>
+
+      <div className="muted" style={{fontSize: 10}}>Runtime executor: <code>{shorten(runtimeExecutor)}</code> · runtime atomic mode: <code>{runtimeArmed ? "armed" : "simulation"}</code> · {explorerName(expectedChainId)} links are shown after verified addresses and receipts.</div>
     </div>
   );
 }
 
-const btn: React.CSSProperties = {
-  background: "#111a25",
-  border: "1px solid #24334a",
-  borderRadius: 4,
-  color: "#d7e2f0",
-  padding: "4px 10px",
-  cursor: "pointer",
-  fontFamily: "inherit",
-  fontSize: 11,
-};
+function WizardCard({number, title, state, children}: {number: string; title: string; state: "done" | "todo" | "locked"; children: ReactNode}) {
+  const color = state === "done" ? "var(--green)" : state === "locked" ? "var(--muted)" : "var(--cyan)";
+  return <section style={{border: "1px solid var(--line)", borderRadius: 5, padding: "10px 12px", background: state === "locked" ? "transparent" : "var(--panel-2)", opacity: state === "locked" ? 0.58 : 1}}><div style={{display: "flex", gap: 8, alignItems: "center", marginBottom: 8}}><span style={{color, fontWeight: 800}}>{state === "done" ? "✓" : state === "locked" ? "🔒" : number}</span><strong style={{fontSize: 12}}>{title}</strong><span className="muted" style={{marginLeft: "auto", fontSize: 10}}>{state}</span></div>{children}</section>;
+}
 
-const input: React.CSSProperties = {
-  background: "#070b11",
-  border: "1px solid #1b2532",
-  borderRadius: 4,
-  color: "#d7e2f0",
-  padding: "5px 8px",
-  fontFamily: "inherit",
-  fontSize: 11,
-};
+function Check({label, ok}: {label: string; ok: boolean}) { return <span className={ok ? "good" : "warn"} style={{fontSize: 11}}>{label}: {ok ? "ok" : "pending"}</span>; }
+
+const toneColor = (tone: "info" | "good" | "bad" | "warn") => tone === "good" ? "var(--green)" : tone === "bad" ? "var(--red)" : tone === "warn" ? "var(--amber)" : "var(--cyan)";
+const rowStyle: CSSProperties = {display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap"};
+const buttonStyle: CSSProperties = {background: "#111a25", border: "1px solid #24334a", borderRadius: 4, color: "#d7e2f0", padding: "4px 9px", cursor: "pointer", fontFamily: "inherit", fontSize: 11};
+const inputStyle: CSSProperties = {...buttonStyle, background: "#070b11", minWidth: 220, flex: "1 1 220px"};
+const smallInput: CSSProperties = {...inputStyle, minWidth: 72, width: 100, flex: "0 0 auto"};
+const preStyle: CSSProperties = {background: "#070b11", color: "var(--cyan)", border: "1px solid var(--line)", borderRadius: 4, padding: 8, margin: 0, overflowX: "auto", fontSize: 10};
+const noticeStyle: CSSProperties = {padding: "7px 10px", border: "1px solid", borderRadius: 4, fontSize: 11};
+const dismiss: CSSProperties = {float: "right", marginLeft: 12, background: "transparent", border: 0, color: "inherit", cursor: "pointer"};

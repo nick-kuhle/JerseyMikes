@@ -121,7 +121,17 @@ let count = 0;
 for (const [file, contracts] of Object.entries(out.contracts || {})) {
   if (!file.startsWith(path.join(ROOT, "src") + path.sep)) continue;
   for (const [name, c] of Object.entries(contracts)) {
-    fs.writeFileSync(path.join(abiDir, `${name}.json`), JSON.stringify(c.abi, null, 2) + "\n");
+    const abiJson = JSON.stringify(c.abi, null, 2) + "\n";
+    fs.writeFileSync(path.join(abiDir, `${name}.json`), abiJson);
+    // The console deploys and verifies both production contracts in-browser.
+    // Keep its checked-in ABI/creation artifacts generated from the same
+    // solc-js compilation used by the artifact-drift check.
+    if (name === "MevExecutor" || name === "SniperVault" || name === "JerseyMikesFeeRouter") {
+      const frontendDir = path.resolve(ROOT, "..", "frontend", "lib");
+      fs.mkdirSync(frontendDir, {recursive: true});
+      fs.writeFileSync(path.join(frontendDir, `${name}.abi.json`), abiJson);
+      fs.writeFileSync(path.join(frontendDir, `${name}.creation.hex`), "0x" + c.evm.bytecode.object);
+    }
     const size = (c.evm.deployedBytecode.object.length / 2) | 0;
     if (name === "MevExecutor") {
       // The Rust simulator embeds this with include_str! and injects it into the

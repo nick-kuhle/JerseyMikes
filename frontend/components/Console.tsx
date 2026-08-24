@@ -76,7 +76,7 @@ export default function Console() {
   const [strategyFilter, setStrategyFilter] = useState("all");
   // Batched + typed SSE consumption: frames accumulate off-render and flush
   // together, so a 200-event burst costs one render instead of 200.
-  const {events, connected} = useFeed(withChain("/api/bot/stream", chainSlug), FEED_MAX);
+  const {events, connected} = useFeed(withChain("/api/stream", chainSlug), FEED_MAX);
 
   const load = useCallback(async () => {
     const get = async <T,>(p: string, fallback: T): Promise<T> => {
@@ -668,8 +668,8 @@ export default function Console() {
       {/* go-live checklist — deploying MevExecutor (Phase 3 readiness) */}
       <Section
         id="golive"
-        title="Go live — deploy MevExecutor to mainnet"
-        subtitle="six-step checklist · docs/GO_LIVE.md"
+        title="Production go-live wizard · deploy & arm independently"
+        subtitle="five-card wallet, vault, funding, pre-flight & live controls · docs/GO_LIVE.md"
         defaultOpen={false}
       >
         <div style={{padding: 4, display: "grid", gap: 12}}>

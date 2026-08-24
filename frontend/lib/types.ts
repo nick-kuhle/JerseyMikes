@@ -32,6 +32,8 @@ export interface ConfigResponse {
   weth?: string;
   executor: string;
   searcher?: string;
+  sniperSearcher?: string;
+  sniperSearcherKeyConfigured?: boolean;
   liveExecution: boolean;
   liveArmed: boolean;
   broadcastEnabled?: boolean;
@@ -42,6 +44,8 @@ export interface ConfigResponse {
     relays: number;
     sequencerFeed: boolean;
     externalMempools: number;
+    flashblocks?: boolean;
+    chainBlockIngest?: boolean;
   };
   bloxrouteRelay?: {url: string; txIngest: boolean};
   demo?: boolean;
@@ -468,6 +472,33 @@ export type FeedEvent =
     };
 
 // ---------------------------------------------------------------------------
+// In-app trade terminal
+
+export type TradeSide = "buy" | "sell";
+export type TradeRoutePreference = "fastest" | "mev_safe" | "best_price";
+
+export interface InAppTradePreferences {
+  side: TradeSide;
+  slippageBps: number;
+  route: TradeRoutePreference;
+}
+
+export interface InAppTradeRequest extends InAppTradePreferences {
+  token?: string;
+  pair?: string;
+  amountWei?: string;
+  positionId?: string;
+  sellFractionBps?: number;
+}
+
+export interface PlatformFeeQuote {
+  feeBps: number;
+  feeWei: string;
+  feeRecipient: string | null;
+  atomicRouterConfigured: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Directional sniper lane
 //
 // A separate surface from the risk/strategy types above, mirroring the
@@ -566,6 +597,7 @@ export interface SniperParams {
 
 export interface SniperParamsPatch {
   enabled?: boolean;
+  /** Runtime vault binding; never a private key. */
   vaultAddress?: string;
   buySizeWei?: string;
   minLiquidityWei?: string;
@@ -589,6 +621,9 @@ export interface SniperParamsPatch {
 
 export interface SniperParamsResponse {
   params: SniperParams;
+  /** True when trades can be simulated against the virtual bankroll. */
+  paperMode?: boolean;
+  simulationBalanceWei?: string;
   armed: boolean;
   bootEnabled: boolean;
   halted: boolean;

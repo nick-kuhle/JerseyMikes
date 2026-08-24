@@ -136,6 +136,9 @@ pub struct Engine {
     /// Qualification is recomputed once per head off the hot path. Candidate
     /// checks and API reads are lock-only and never scan SQLite.
     qualification: Arc<parking_lot::RwLock<crate::qualification::QualificationStatus>>,
+    /// Operator-selected dynamic soak threshold. The evidence window is still
+    /// evaluated normally; this only replaces the boot default from config.
+    qualification_hours: Arc<std::sync::atomic::AtomicU64>,
     qualification_refreshing: Arc<std::sync::atomic::AtomicBool>,
     qualification_refreshed_at_ms: Arc<std::sync::atomic::AtomicU64>,
     own_reconciliation_running: Arc<std::sync::atomic::AtomicBool>,
@@ -504,6 +507,14 @@ impl Engine {
             Some(k) => Signer::from_hex(k)?,
             None => Signer::simulation(),
         });
+        // The directional lane is a separate trust and nonce domain. Do not
+        // silently reuse the atomic searcher key: doing so would couple a
+        // compromised sniper lane to the executor's bundle account and would
+        // defeat the operator's ability to revoke the lanes independently.
+        let sniper_signer = match &cfg.endpoints.sniper_searcher_private_key {
+            Some(k) => Some(Signer::from_hex(k)?),
+            None => None,
+        };
         // The raw transport (sequencer chains) needs the tx signer, the
         // searcher address and the chain RPC — it signs same-nonce
         // replacement transactions for cancellation. Bundle mode ignores
@@ -702,7 +713,9 @@ impl Engine {
         // a lane that vanishes when it is off is a lane operators cannot
         // reason about. Its own `enabled` switch (`SNIPER_DIRECTIONAL`,
         // default false) is what decides whether it may ever buy.
-        let sniper = Arc::new(crate::sniper::SniperLane::from_env());
+        let sniper = Arc::new(crate::sniper::SniperLane::from_env_with_mode(
+            !cfg.live_execution,
+        ));
         {
             // Open exposure must survive a restart. Recover positions before
             // anything else can open new ones, so the concurrency and budget
@@ -831,12 +844,14 @@ impl Engine {
         // The replay lane count stays at 1 unless the operator provisioned
         // more isolated replay forks; see `Config::replay_lanes`.
         let replay_lanes = cfg.replay_lanes;
+        let qualification_hours = cfg.qualification_hours;
 
         let sniper_execution = Arc::new(crate::sniper::execution::SniperExecution::new(
             http.clone(),
-            Some((*transaction_signer).clone()),
+            sniper_signer,
             store.clone(),
             sniper.clone(),
+            !cfg.live_execution,
         ));
 
         Ok(Self {
@@ -864,6 +879,7 @@ impl Engine {
             inventory,
             submission,
             qualification,
+            qualification_hours: Arc::new(std::sync::atomic::AtomicU64::new(qualification_hours)),
             qualification_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             qualification_refreshed_at_ms: Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
             own_reconciliation_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -877,7 +893,31 @@ impl Engine {
     }
 
     pub fn qualification_status(&self) -> crate::qualification::QualificationStatus {
-        self.qualification.read().clone()
+        let mut status = self.qualification.read().clone();
+        // The next background pass recomputes reasons and evidence; expose the
+        // newly selected threshold immediately so the console cannot display a
+        // stale soak target after an operator update.
+        status.required_hours = self.qualification_hours();
+        status
+    }
+
+    pub fn qualification_hours(&self) -> u64 {
+        self.qualification_hours
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Change the operator's soak threshold and force an immediate evidence
+    /// refresh. This never marks a strategy passed by itself; the full
+    /// qualification evaluation still decides the result.
+    pub fn set_qualification_hours(&self, hours: u64) -> Result<(), &'static str> {
+        if !(1..=8_760).contains(&hours) {
+            return Err("qualification hours must be between 1 and 8760");
+        }
+        self.qualification_hours
+            .store(hours, std::sync::atomic::Ordering::Release);
+        self.qualification_refreshed_at_ms
+            .store(0, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     fn strategy_qualified(&self, strategy: Strategy) -> bool {
@@ -922,11 +962,12 @@ impl Engine {
             .store(now, Ordering::Release);
         let engine = self.clone();
         tokio::task::spawn_blocking(move || {
-            let status = crate::qualification::evaluate(
+            let status = crate::qualification::evaluate_with_required_hours(
                 &engine.cfg,
                 &engine.store,
                 &engine.writes,
                 now_ms(),
+                engine.qualification_hours(),
             );
             *engine.qualification.write() = status;
             engine

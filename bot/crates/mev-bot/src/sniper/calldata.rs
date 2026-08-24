@@ -66,6 +66,7 @@ pub fn make_tag(position_id: &str, fill_index: u32) -> B256 {
 }
 
 /// Build `openPosition` calldata and guards for acquiring `token` with `size_wei` WETH.
+#[allow(clippy::too_many_arguments)]
 pub fn build_entry(
     vault: Address,
     pair: Address,
@@ -136,6 +137,7 @@ pub fn build_entry(
 }
 
 /// Build `closePosition` calldata and guards for selling `token_amount` of `token` for WETH.
+#[allow(clippy::too_many_arguments)]
 pub fn build_exit(
     vault: Address,
     pair: Address,

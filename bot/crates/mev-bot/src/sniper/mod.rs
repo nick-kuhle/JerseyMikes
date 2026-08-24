@@ -58,6 +58,10 @@ use std::sync::Arc;
 use alloy_primitives::{Address, U256};
 use parking_lot::RwLock;
 
+/// Initial paper-trading bankroll. It is deliberately separate from every
+/// on-chain balance and is never used by a live signer.
+pub const INITIAL_PAPER_BALANCE_WEI: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+
 pub use gates::{Admission, ExposureSnapshot, HoneypotVerdict, LaunchCandidate, Rejection};
 pub use params::{SniperParams, SniperParamsPatch};
 pub use portfolio::{Mark, Portfolio, PortfolioRow, PortfolioTotals};
@@ -70,11 +74,16 @@ pub use position::{ExitDecision, ExitReason, Position, PositionState};
 #[derive(Clone)]
 pub struct SniperLane {
     params: Arc<RwLock<SniperParams>>,
+    /// Paper bankroll used only by the simulation lane.
+    paper_balance_wei: Arc<RwLock<U256>>,
     /// Boot envelope — a runtime patch may not exceed the boot arming state.
     /// Mirrors how `RuntimeRisk` treats strategy toggles: runtime can only
     /// *narrow* what the environment allowed. A bot booted with
     /// `SNIPER_DIRECTIONAL=false` cannot be armed from the dashboard.
     boot_enabled: bool,
+    /// Simulation is an explicit non-live mode, so its paper lane may be
+    /// enabled at runtime without a deployed vault or a live signer.
+    paper_mode: bool,
     positions: Arc<RwLock<HashMap<String, Position>>>,
     marks: Arc<RwLock<HashMap<String, Mark>>>,
     symbols: Arc<RwLock<HashMap<Address, String>>>,
@@ -87,10 +96,16 @@ pub struct SniperLane {
 
 impl SniperLane {
     pub fn new(params: SniperParams) -> Self {
+        Self::new_with_mode(params, false)
+    }
+
+    pub fn new_with_mode(params: SniperParams, paper_mode: bool) -> Self {
         let boot_enabled = params.enabled;
         Self {
             params: Arc::new(RwLock::new(params)),
+            paper_balance_wei: Arc::new(RwLock::new(INITIAL_PAPER_BALANCE_WEI)),
             boot_enabled,
+            paper_mode,
             positions: Arc::new(RwLock::new(HashMap::new())),
             marks: Arc::new(RwLock::new(HashMap::new())),
             symbols: Arc::new(RwLock::new(HashMap::new())),
@@ -102,7 +117,34 @@ impl SniperLane {
     }
 
     pub fn from_env() -> Self {
-        Self::new(SniperParams::from_env())
+        Self::from_env_with_mode(false)
+    }
+
+    pub fn from_env_with_mode(paper_mode: bool) -> Self {
+        Self::new_with_mode(SniperParams::from_env(), paper_mode)
+    }
+
+    pub fn paper_mode(&self) -> bool {
+        self.paper_mode
+    }
+
+    pub fn paper_ready(&self) -> bool {
+        let params = self.params();
+        self.paper_mode
+            && !self.is_halted()
+            && params.enabled
+            && !params.buy_size_wei.is_zero()
+            && !params.daily_budget_wei.is_zero()
+            && params.max_concurrent_positions > 0
+    }
+
+    pub fn effective_armed(&self) -> bool {
+        if self.paper_mode {
+            self.paper_ready()
+        } else {
+            let params = self.params();
+            params.is_armed() && !self.is_halted() && self.boot_enabled
+        }
     }
 
     pub fn params(&self) -> SniperParams {
@@ -113,14 +155,61 @@ impl SniperLane {
         self.boot_enabled
     }
 
+    pub fn paper_balance_wei(&self) -> U256 {
+        *self.paper_balance_wei.read()
+    }
+
+    /// Atomically reserve paper funds for a simulated entry.
+    pub fn reserve_paper(&self, amount: U256) -> bool {
+        let mut balance = self.paper_balance_wei.write();
+        if *balance < amount {
+            return false;
+        }
+        *balance -= amount;
+        true
+    }
+
+    pub fn credit_paper(&self, amount: U256) {
+        let mut balance = self.paper_balance_wei.write();
+        *balance = balance.saturating_add(amount);
+    }
+
+    pub fn reset_paper(&self) {
+        *self.paper_balance_wei.write() = INITIAL_PAPER_BALANCE_WEI;
+    }
+
+    /// Paper mode can be enabled with a non-zero size/budget but no deployed
+    /// vault. A live lane still requires a vault and boot-enabled signer.
+    pub fn admit_paper(
+        &self,
+        candidate: &LaunchCandidate,
+        now_ms: u64,
+    ) -> Result<Admission, Rejection> {
+        let mut params = self.params.read().clone();
+        params.vault_address = Some(Address::repeat_byte(1));
+        let exposure = self.exposure(now_ms);
+        let result = gates::admit(&params, candidate, &exposure);
+        if let Err(rejection) = &result {
+            self.record_rejection(rejection.code());
+        }
+        result
+    }
+
     /// Apply a runtime patch. Rejects any attempt to arm a lane that was not
     /// armed at boot, and validates the resulting envelope as a whole.
     pub fn patch_params(&self, patch: &SniperParamsPatch) -> Result<SniperParams, Vec<String>> {
         let current = self.params.read().clone();
         let next = current.with_patch(patch)?;
-        if next.enabled && !self.boot_enabled {
+        // A simulation-only envelope may be enabled without a vault so the
+        // paper balance can be exercised. A patch that would enable a funded
+        // live envelope still cannot widen a false boot ceiling.
+        let live_intent = next.enabled
+            && next.vault_address.is_some()
+            && !next.buy_size_wei.is_zero()
+            && !next.daily_budget_wei.is_zero();
+        if live_intent && !self.boot_enabled && !self.paper_mode {
             return Err(vec![
-                "sniper: SNIPER_DIRECTIONAL was false at boot — the lane cannot be armed at \
+                "sniper: SNIPER_DIRECTIONAL was false at boot — the live lane cannot be armed at \
                  runtime. Set SNIPER_DIRECTIONAL=true and restart."
                     .to_string(),
             ]);
@@ -156,44 +245,9 @@ impl SniperLane {
         self.blacklist.read().contains(&token)
     }
 
-    /// Manual buy trigger from console.
-    pub fn manual_buy(
-        &self,
-        token: Address,
-        pair: Address,
-        size_wei: U256,
-        chain_id: u64,
-        opened_block: u64,
-        now_ms: u64,
-    ) -> Position {
-        let pos_id = uuid::Uuid::new_v4().to_string();
-        let p = Position {
-            id: pos_id.clone(),
-            chain_id,
-            token,
-            pair,
-            venue: "univ2".into(),
-            state: PositionState::Pending,
-            trigger_tx: None,
-            entry_tx: None,
-            entry_cost_wei: size_wei,
-            entry_qty: U256::ZERO,
-            remaining_qty: U256::ZERO,
-            realized_wei: U256::ZERO,
-            gas_spent_wei: U256::ZERO,
-            peak_value_wei: size_wei,
-            opened_block,
-            opened_at_ms: now_ms,
-            closed_at_ms: None,
-            exit_reason: None,
-            entry_verdict: "manual".into(),
-            notes: "manual buy from dashboard".into(),
-        };
-        self.upsert_position(p.clone());
-        p
-    }
-
-    /// Manual sell trigger from console.
+    /// Manual sell decision from console. Actual submission lives in
+    /// `SniperExecution`, so this lane remains a state/risk owner rather than
+    /// growing a second transaction path.
     pub fn manual_sell(&self, id: &str, sell_fraction_bps: u32) -> Option<ExitDecision> {
         let mut guard = self.positions.write();
         let p = guard.get_mut(id)?;
@@ -216,6 +270,13 @@ impl SniperLane {
     /// only ever acted on once.
     pub fn claim_token(&self, token: Address) -> bool {
         self.seen_tokens.write().insert(token)
+    }
+
+    /// Explicit operator action may retry a token that was only observed in
+    /// shadow mode. Admission and the existing-position/concurrency gates still
+    /// run; this only releases the de-duplication marker for the manual path.
+    pub fn release_token_claim(&self, token: Address) {
+        self.seen_tokens.write().remove(&token);
     }
 
     pub fn set_symbol(&self, token: Address, symbol: String) {
@@ -312,19 +373,27 @@ impl SniperLane {
         result
     }
 
-    /// Build the console payload.
-    pub fn portfolio(&self, now_ms: u64, recent_closed_limit: usize) -> Portfolio {
-        let params = self.params.read().clone();
+    pub fn effective_arming_blockers(&self) -> Vec<String> {
+        let params = self.params();
         let mut blockers = params.arming_blockers();
-        if let Some(reason) = self.halted.read().clone() {
+        if self.paper_mode {
+            blockers.retain(|blocker| !blocker.contains("SNIPER_VAULT_ADDRESS"));
+        }
+        if let Some(reason) = self.halt_reason() {
             blockers.insert(0, format!("lane halted: {reason}"));
         }
-        if params.enabled && !self.boot_enabled {
+        if params.enabled && !self.boot_enabled && !self.paper_mode {
             blockers.push(
                 "SNIPER_DIRECTIONAL was false at boot; runtime arming is refused".to_string(),
             );
         }
-        let armed = params.is_armed() && !self.is_halted() && self.boot_enabled;
+        blockers
+    }
+
+    /// Build the console payload.
+    pub fn portfolio(&self, now_ms: u64, recent_closed_limit: usize) -> Portfolio {
+        let armed = self.effective_armed();
+        let blockers = self.effective_arming_blockers();
         portfolio::summarize(
             &self.positions(),
             &self.marks(),
@@ -358,6 +427,42 @@ mod tests {
             max_concurrent_positions: 2,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn paper_ledger_starts_at_one_eth_and_is_atomic() {
+        let lane = SniperLane::new_with_mode(SniperParams::default(), true);
+        assert_eq!(lane.paper_balance_wei(), INITIAL_PAPER_BALANCE_WEI);
+        assert!(lane.reserve_paper(U256::from(250_000_000_000_000_000u128)));
+        assert_eq!(
+            lane.paper_balance_wei(),
+            U256::from(750_000_000_000_000_000u128)
+        );
+        lane.credit_paper(U256::from(50_000_000_000_000_000u128));
+        assert_eq!(
+            lane.paper_balance_wei(),
+            U256::from(800_000_000_000_000_000u128)
+        );
+        assert!(!lane.reserve_paper(U256::from(900_000_000_000_000_000u128)));
+        lane.reset_paper();
+        assert_eq!(lane.paper_balance_wei(), INITIAL_PAPER_BALANCE_WEI);
+    }
+
+    #[test]
+    fn paper_lane_can_enable_a_vault_bound_envelope_without_live_boot() {
+        let lane = SniperLane::new_with_mode(SniperParams::default(), true);
+        let result = lane.patch_params(&SniperParamsPatch {
+            enabled: Some(true),
+            vault_address: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            buy_size_wei: Some(eth(1).to_string()),
+            daily_budget_wei: Some(eth(2).to_string()),
+            ..Default::default()
+        });
+        assert!(
+            result.is_ok(),
+            "paper mode must not require live boot arming"
+        );
+        assert!(lane.effective_armed());
     }
 
     fn candidate() -> LaunchCandidate {
