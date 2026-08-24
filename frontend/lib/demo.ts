@@ -617,55 +617,116 @@ export function demoEvent(i: number): FeedEvent {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Directional sniper lane
 // ---------------------------------------------------------------------------
 
+let demoSniperState = {
+  enabled: false,
+  buySizeWei: "0",
+  minLiquidityWei: "2000000000000000000",
+  maxPriceImpactBps: 300,
+  takeProfitBps: 10000,
+  takeProfitAbsWei: "0",
+  sellFractionBps: 10000,
+  stopLossBps: 5000,
+  trailingStopBps: 0,
+  maxHoldSecs: 1800,
+  maxConcurrentPositions: 1,
+  dailyBudgetWei: "0",
+  totalBudgetWei: "0",
+  maxDrawdownWei: "0",
+  requireHoneypotPass: true,
+  maxBuyTaxBps: 500,
+  maxSellTaxBps: 500,
+  minHoldBlocks: 1,
+  requireLpLocked: false,
+  halted: false,
+  haltReason: null as string | null,
+};
+
+export function updateDemoSniperParams(patch: Partial<typeof demoSniperState>) {
+  demoSniperState = {...demoSniperState, ...patch};
+  return demoSniperParams();
+}
+
+export function setDemoSniperHalted(halted: boolean, reason: string | null = null) {
+  demoSniperState.halted = halted;
+  demoSniperState.haltReason = reason;
+  return demoSniperParams();
+}
+
 /**
- * Demo sniper params. Mirrors the bot's shipped defaults exactly: the lane is
- * OFF with a zero size and a zero budget. The demo view must not imply the
- * sniper is armed out of the box, because it is not.
+ * Demo sniper params.
  */
 export function demoSniperParams() {
   const params = {
-    enabled: false,
-    buySizeWei: "0",
-    minLiquidityWei: "2000000000000000000",
-    maxPriceImpactBps: 300,
-    takeProfitBps: 10000,
-    takeProfitAbsWei: "0",
-    sellFractionBps: 10000,
-    stopLossBps: 5000,
-    trailingStopBps: 0,
-    maxHoldSecs: 1800,
-    maxConcurrentPositions: 1,
-    dailyBudgetWei: "0",
-    totalBudgetWei: "0",
-    maxDrawdownWei: "0",
-    requireHoneypotPass: true,
-    maxBuyTaxBps: 500,
-    maxSellTaxBps: 500,
-    minHoldBlocks: 1,
-    requireLpLocked: false,
+    enabled: demoSniperState.enabled,
+    buySizeWei: demoSniperState.buySizeWei,
+    minLiquidityWei: demoSniperState.minLiquidityWei,
+    maxPriceImpactBps: demoSniperState.maxPriceImpactBps,
+    takeProfitBps: demoSniperState.takeProfitBps,
+    takeProfitAbsWei: demoSniperState.takeProfitAbsWei,
+    sellFractionBps: demoSniperState.sellFractionBps,
+    stopLossBps: demoSniperState.stopLossBps,
+    trailingStopBps: demoSniperState.trailingStopBps,
+    maxHoldSecs: demoSniperState.maxHoldSecs,
+    maxConcurrentPositions: demoSniperState.maxConcurrentPositions,
+    dailyBudgetWei: demoSniperState.dailyBudgetWei,
+    totalBudgetWei: demoSniperState.totalBudgetWei,
+    maxDrawdownWei: demoSniperState.maxDrawdownWei,
+    requireHoneypotPass: demoSniperState.requireHoneypotPass,
+    maxBuyTaxBps: demoSniperState.maxBuyTaxBps,
+    maxSellTaxBps: demoSniperState.maxSellTaxBps,
+    minHoldBlocks: demoSniperState.minHoldBlocks,
+    requireLpLocked: demoSniperState.requireLpLocked,
   };
+
+  const blockers: string[] = [];
+  if (!params.enabled) {
+    blockers.push(
+      "SNIPER_DIRECTIONAL is off (shadow mode: launches are observed and honeypot-checked, never bought)",
+    );
+  }
+  if (params.buySizeWei === "0" || BigInt(params.buySizeWei || "0") === 0n) {
+    blockers.push("buySizeWei is 0");
+  }
+  if (params.dailyBudgetWei === "0" || BigInt(params.dailyBudgetWei || "0") === 0n) {
+    blockers.push("dailyBudgetWei is 0");
+  } else if (
+    BigInt(params.buySizeWei || "0") > BigInt(params.dailyBudgetWei || "0")
+  ) {
+    blockers.push("buySizeWei exceeds dailyBudgetWei");
+  }
+  if (!params.requireHoneypotPass) {
+    blockers.push(
+      "WARNING: requireHoneypotPass is off — tokens with unknown honeypot status will be bought",
+    );
+  }
+
+  const isArmed =
+    params.enabled &&
+    BigInt(params.buySizeWei || "0") > 0n &&
+    BigInt(params.dailyBudgetWei || "0") >= BigInt(params.buySizeWei || "0") &&
+    !demoSniperState.halted;
+
   return {
     params,
-    armed: false,
-    bootEnabled: false,
-    halted: false,
-    haltReason: null,
-    // Copied verbatim from `SniperParams::arming_blockers()` so the demo
-    // cannot claim something the bot would not.
-    armingBlockers: [
-      "SNIPER_DIRECTIONAL is off (shadow mode: launches are observed and honeypot-checked, never bought)",
-      "buySizeWei is 0",
-      "dailyBudgetWei is 0",
-    ],
+    armed: isArmed,
+    bootEnabled: true,
+    halted: demoSniperState.halted,
+    haltReason: demoSniperState.haltReason,
+    armingBlockers: blockers,
     rejections: {honeypot: 47, liquidity_thin: 112, tax_too_high: 9, not_armed: 168},
     envSnippet: [
-      "SNIPER_DIRECTIONAL=false",
-      "SNIPER_BUY_SIZE_WEI=0",
-      "SNIPER_DAILY_BUDGET_WEI=0",
+      `SNIPER_DIRECTIONAL=${params.enabled}`,
+      `SNIPER_BUY_SIZE_WEI=${params.buySizeWei}`,
+      `SNIPER_DAILY_BUDGET_WEI=${params.dailyBudgetWei}`,
+      `SNIPER_TAKE_PROFIT_BPS=${params.takeProfitBps}`,
+      `SNIPER_STOP_LOSS_BPS=${params.stopLossBps}`,
+      `SNIPER_SELL_FRACTION_BPS=${params.sellFractionBps}`,
     ].join("\n"),
+    demo: true,
   };
 }
 

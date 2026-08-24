@@ -1,50 +1,57 @@
 "use client";
 
 /**
- * Sniper — mini portfolio.
+ * Sniper — New Token Portfolio & Directional Execution Console.
  *
- * The console's other panels all describe *atomic* work: a bundle either
- * cleared its profit guard or it did not, and nothing is held between blocks.
- * This panel describes the one lane that holds inventory, so it is built
- * around a different question: **what are we holding, what is it worth, and
- * how much of that is real?**
- *
- * Three deliberate choices:
- *
- * 1. **Realised and unrealised are never merged.** They sit in separate cells
- *    with separate colours. A "+2.4 ETH" headline that is entirely paper gain
- *    on an illiquid launch is the most dangerous number this console could
- *    render, so the split is structural, not a tooltip.
- * 2. **A stale mark is shown as stale.** If the pool read failed, the row is
- *    dimmed and flagged rather than quietly showing the last good number.
- * 3. **The arming state is always visible.** When the lane cannot buy, the
- *    panel leads with the exact reasons, copied verbatim from the bot.
+ * Designed for high functionality, performance, and clear execution controls:
+ * 1. Master On/Off Switch & Sim/Live Mode Switch.
+ * 2. Parameter configuration: Initial Investment (ETH), Auto-Sell Take-Profit (% and absolute ETH),
+ *    Sell Fraction %, Stop Loss %, Trailing Stop %, Budgets, and Safety Filters.
+ * 3. Mini Portfolio: Active positions, unrealized & realized PnL, and connected wallet holdings.
+ * 4. Swapping & Selling Features: 1-click partial/full sells and DEX Aggregators (1inch, Uniswap, KyberSwap, DexScreener).
  */
 
-import {memo, useCallback, useEffect, useState} from "react";
+import {memo, useCallback, useEffect, useMemo, useState} from "react";
 import {readActiveChain, withChain} from "@/lib/chain";
 import {ago, shortHash, signedEth, weiToEth} from "@/lib/format";
+import {addressUrl, txUrl} from "@/lib/explorer";
+import {useWallet} from "@/lib/wallet";
+import {getAggregatorLinks, ERC20_ABI} from "@/lib/swap";
+import {
+  createPublicClient,
+  createWalletClient,
+  custom,
+  formatEther,
+  formatUnits,
+  http,
+  isAddress,
+  parseEther,
+  type Address,
+} from "viem";
+import {base, mainnet} from "viem/chains";
 import type {
+  SniperParams,
+  SniperParamsPatch,
   SniperParamsResponse,
   SniperPortfolio,
   SniperPortfolioRow,
 } from "@/lib/types";
 
 const EXIT_LABEL: Record<string, string> = {
-  take_profit_pct: "take profit %",
-  take_profit_abs: "take profit ETH",
-  stop_loss: "stop loss",
-  trailing_stop: "trailing stop",
-  max_hold: "max hold",
-  honeypot_detected: "honeypot",
-  manual: "manual",
-  risk_stop: "risk stop",
+  take_profit_pct: "Take Profit %",
+  take_profit_abs: "Take Profit ETH",
+  stop_loss: "Stop Loss",
+  trailing_stop: "Trailing Stop",
+  max_hold: "Max Hold Timeout",
+  honeypot_detected: "Honeypot Detected",
+  manual: "Manual Exit",
+  risk_stop: "Risk Stop",
 };
 
 const STATE_COLOR: Record<string, string> = {
-  pending: "#eab308",
-  open: "#22c55e",
-  scaling: "#38bdf8",
+  pending: "var(--amber)",
+  open: "var(--green)",
+  scaling: "var(--cyan)",
   closed: "var(--muted)",
   abandoned: "var(--muted)",
 };
@@ -52,99 +59,156 @@ const STATE_COLOR: Record<string, string> = {
 function pnlColor(wei: string): string {
   let v: bigint;
   try {
-    v = BigInt(wei);
+    v = BigInt(wei || "0");
   } catch {
     return "var(--muted)";
   }
-  if (v > 0n) return "#22c55e";
-  if (v < 0n) return "#ef4444";
+  if (v > 0n) return "var(--green)";
+  if (v < 0n) return "var(--red)";
   return "var(--muted)";
 }
 
-function bps(n: number): string {
+function bpsFormatted(n: number): string {
   const pct = n / 100;
   return `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
 }
 
-function Stat({
-  label,
-  value,
-  color,
-  title,
-}: {
-  label: string;
-  value: string;
-  color?: string;
-  title?: string;
-}) {
-  return (
-    <div style={{minWidth: 108}} title={title}>
-      <div className="muted" style={{fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4}}>
-        {label}
-      </div>
-      <div style={{fontSize: 15, fontVariantNumeric: "tabular-nums", color: color ?? "inherit"}}>
-        {value}
-      </div>
-    </div>
-  );
+function ethFromWei(weiStr: string, decimals = 4): string {
+  try {
+    const val = formatEther(BigInt(weiStr || "0"));
+    const num = parseFloat(val);
+    return isNaN(num) ? "0.0000" : num.toFixed(decimals);
+  } catch {
+    return "0.0000";
+  }
 }
 
-function PositionRow({r}: {r: SniperPortfolioRow}) {
-  const closed = r.state === "closed" || r.state === "abandoned";
-  return (
-    <tr style={{opacity: r.markStale ? 0.55 : 1}}>
-      <td>
-        <span
-          style={{
-            display: "inline-block",
-            width: 7,
-            height: 7,
-            borderRadius: "50%",
-            background: STATE_COLOR[r.state] ?? "var(--muted)",
-            marginRight: 7,
-          }}
-        />
-        <strong>{r.symbol ?? shortHash(r.token, 4)}</strong>
-        <span className="muted" style={{marginLeft: 6, fontSize: 11}}>
-          {r.state}
-        </span>
-        {r.markStale && (
-          <span
-            style={{marginLeft: 6, fontSize: 10, color: "#eab308"}}
-            title="the pool could not be re-read; this mark is not current"
-          >
-            STALE
-          </span>
-        )}
-      </td>
-      <td style={{fontVariantNumeric: "tabular-nums"}}>{weiToEth(r.entryCostWei, 4)}</td>
-      <td style={{fontVariantNumeric: "tabular-nums"}}>
-        {closed ? <span className="muted">—</span> : weiToEth(r.markValueWei, 4)}
-      </td>
-      <td style={{fontVariantNumeric: "tabular-nums", color: pnlColor(r.realizedWei)}}>
-        {BigInt(r.realizedWei || "0") > 0n ? weiToEth(r.realizedWei, 4) : "—"}
-      </td>
-      <td
-        style={{fontVariantNumeric: "tabular-nums", color: pnlColor(r.netPnlWei)}}
-        title={`${r.netPnlWei} wei net of gas`}
-      >
-        {signedEth(r.netPnlWei, 4)}
-        <span className="muted" style={{marginLeft: 6, fontSize: 11}}>
-          {bps(r.netPnlBps)}
-        </span>
-      </td>
-      <td className="muted" style={{fontSize: 11}}>
-        {r.exitReason ? EXIT_LABEL[r.exitReason] ?? r.exitReason : ago(r.openedAtMs)}
-      </td>
-    </tr>
-  );
+function weiFromEth(ethStr: string): string {
+  try {
+    const clean = ethStr.trim();
+    if (!clean || isNaN(Number(clean))) return "0";
+    return parseEther(clean).toString();
+  } catch {
+    return "0";
+  }
 }
+
+// Preset definitions for quick parameter setup
+const PRESETS = {
+  conservative: {
+    buySizeEth: "0.025",
+    dailyBudgetEth: "0.1",
+    takeProfitPct: 50,
+    takeProfitAbsEth: "0",
+    sellFractionPct: 100,
+    stopLossPct: 25,
+    trailingStopPct: 15,
+    maxHoldMins: 30,
+    minLiquidityEth: "3.0",
+    maxPriceImpactPct: 2.0,
+    maxTaxPct: 3.0,
+    requireHoneypot: true,
+  },
+  balanced: {
+    buySizeEth: "0.05",
+    dailyBudgetEth: "0.25",
+    takeProfitPct: 100,
+    takeProfitAbsEth: "0",
+    sellFractionPct: 100,
+    stopLossPct: 50,
+    trailingStopPct: 0,
+    maxHoldMins: 45,
+    minLiquidityEth: "2.0",
+    maxPriceImpactPct: 3.0,
+    maxTaxPct: 5.0,
+    requireHoneypot: true,
+  },
+  moonshot: {
+    buySizeEth: "0.1",
+    dailyBudgetEth: "0.5",
+    takeProfitPct: 300,
+    takeProfitAbsEth: "0",
+    sellFractionPct: 50,
+    stopLossPct: 60,
+    trailingStopPct: 20,
+    maxHoldMins: 120,
+    minLiquidityEth: "1.5",
+    maxPriceImpactPct: 5.0,
+    maxTaxPct: 8.0,
+    requireHoneypot: true,
+  },
+};
 
 function SniperPanel() {
   const [pf, setPf] = useState<SniperPortfolio | null>(null);
   const [cfg, setCfg] = useState<SniperParamsResponse | null>(null);
   const [demo, setDemo] = useState(false);
-  const [tab, setTab] = useState<"open" | "closed" | "gates">("open");
+  const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "gates">("portfolio");
+  const [portfolioSubTab, setPortfolioSubTab] = useState<"open" | "wallet" | "closed">("open");
+
+  // Wallet and chain state
+  const wallet = useWallet();
+  const rawChainSlug = readActiveChain();
+  const activeChainSlug = rawChainSlug || "ethereum";
+  const currentChainId = activeChainSlug === "base" ? 8453 : 1;
+
+  // Notification / Feedback state
+  const [feedback, setFeedback] = useState<{type: "success" | "error" | "info"; msg: string} | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isHalting, setIsHalting] = useState(false);
+
+  // Editable parameter form state
+  const [formBuySizeEth, setFormBuySizeEth] = useState("0.05");
+  const [formDailyBudgetEth, setFormDailyBudgetEth] = useState("0.25");
+  const [formTotalBudgetEth, setFormTotalBudgetEth] = useState("0");
+  const [formTakeProfitPct, setFormTakeProfitPct] = useState("100");
+  const [formTakeProfitAbsEth, setFormTakeProfitAbsEth] = useState("0");
+  const [formSellFractionPct, setFormSellFractionPct] = useState("100");
+  const [formStopLossPct, setFormStopLossPct] = useState("50");
+  const [formTrailingStopPct, setFormTrailingStopPct] = useState("0");
+  const [formMaxHoldMins, setFormMaxHoldMins] = useState("30");
+  const [formMaxPositions, setFormMaxPositions] = useState("1");
+  const [formMinLiquidityEth, setFormMinLiquidityEth] = useState("2.0");
+  const [formMaxPriceImpactPct, setFormMaxPriceImpactPct] = useState("3.0");
+  const [formMaxBuyTaxPct, setFormMaxBuyTaxPct] = useState("5.0");
+  const [formMaxSellTaxPct, setFormMaxSellTaxPct] = useState("5.0");
+  const [formMinHoldBlocks, setFormMinHoldBlocks] = useState("1");
+  const [formRequireHoneypot, setFormRequireHoneypot] = useState(true);
+  const [formRequireLpLocked, setFormRequireLpLocked] = useState(false);
+
+  // Swap Drawer / Modal state
+  const [swapTarget, setSwapTarget] = useState<{
+    token: string;
+    symbol: string;
+    pair?: string;
+    qty?: string;
+    markEth?: string;
+  } | null>(null);
+  const [swapFraction, setSwapFraction] = useState<number>(100);
+  const [customTokenInput, setCustomTokenInput] = useState("");
+  const [walletTokens, setWalletTokens] = useState<Array<{address: string; symbol: string; balance: string; decimals: number}>>([]);
+  const [isScanningWallet, setIsScanningWallet] = useState(false);
+
+  // Sync form with fetched config
+  const populateFormFromConfig = useCallback((params: SniperParams) => {
+    setFormBuySizeEth(ethFromWei(params.buySizeWei, 4));
+    setFormDailyBudgetEth(ethFromWei(params.dailyBudgetWei, 4));
+    setFormTotalBudgetEth(params.totalBudgetWei === "0" ? "0" : ethFromWei(params.totalBudgetWei, 4));
+    setFormTakeProfitPct(String(Math.round(params.takeProfitBps / 100)));
+    setFormTakeProfitAbsEth(params.takeProfitAbsWei === "0" ? "0" : ethFromWei(params.takeProfitAbsWei, 4));
+    setFormSellFractionPct(String(Math.round(params.sellFractionBps / 100)));
+    setFormStopLossPct(String(Math.round(params.stopLossBps / 100)));
+    setFormTrailingStopPct(String(Math.round(params.trailingStopBps / 100)));
+    setFormMaxHoldMins(String(Math.round(params.maxHoldSecs / 60)));
+    setFormMaxPositions(String(params.maxConcurrentPositions));
+    setFormMinLiquidityEth(ethFromWei(params.minLiquidityWei, 2));
+    setFormMaxPriceImpactPct((params.maxPriceImpactBps / 100).toFixed(1));
+    setFormMaxBuyTaxPct((params.maxBuyTaxBps / 100).toFixed(1));
+    setFormMaxSellTaxPct((params.maxSellTaxBps / 100).toFixed(1));
+    setFormMinHoldBlocks(String(params.minHoldBlocks));
+    setFormRequireHoneypot(params.requireHoneypotPass);
+    setFormRequireLpLocked(params.requireLpLocked);
+  }, []);
 
   const load = useCallback(async () => {
     const chain = readActiveChain();
@@ -153,285 +217,1710 @@ function SniperPanel() {
         fetch(withChain("/api/bot/sniper/portfolio", chain), {cache: "no-store"}),
         fetch(withChain("/api/bot/sniper/params", chain), {cache: "no-store"}),
       ]);
-      const p = (await pRes.json()) as SniperPortfolio & {demo?: boolean};
-      const c = (await cRes.json()) as SniperParamsResponse & {demo?: boolean};
-      setPf(p);
-      setCfg(c);
-      setDemo(Boolean(p.demo || c.demo));
+      if (pRes.ok && cRes.ok) {
+        const p = (await pRes.json()) as SniperPortfolio & {demo?: boolean};
+        const c = (await cRes.json()) as SniperParamsResponse & {demo?: boolean};
+        setPf(p);
+        setCfg(c);
+        setDemo(Boolean(p.demo || c.demo));
+      }
     } catch {
-      /* leave the previous snapshot rather than blanking the panel */
+      /* maintain existing data on transient fetch error */
     }
   }, []);
 
+  // Initial load and periodic polling
   useEffect(() => {
     load();
-    const t = setInterval(load, 5000);
+    const t = setInterval(load, 4000);
     return () => clearInterval(t);
   }, [load]);
 
-  if (!pf) {
-    return <div className="muted">loading sniper portfolio…</div>;
+  // Populate form on first load
+  useEffect(() => {
+    if (cfg?.params && !isSaving) {
+      populateFormFromConfig(cfg.params);
+    }
+  }, [cfg?.params, populateFormFromConfig, isSaving]);
+
+  // Viem client for contract reads
+  const publicClient = useMemo(() => {
+    return createPublicClient({
+      chain: activeChainSlug === "base" ? base : mainnet,
+      transport: http(withChain("/api/eth", activeChainSlug)),
+    });
+  }, [activeChainSlug]);
+
+  // Scan user wallet holdings for portfolio tokens or recent snipes
+  const scanWalletBalances = useCallback(async () => {
+    if (!wallet.address || !publicClient) return;
+    setIsScanningWallet(true);
+    try {
+      const tokensToScan = new Set<string>();
+      if (pf?.open) {
+        pf.open.forEach((pos) => tokensToScan.add(pos.token.toLowerCase()));
+      }
+      if (pf?.recentClosed) {
+        pf.recentClosed.forEach((pos) => tokensToScan.add(pos.token.toLowerCase()));
+      }
+      if (customTokenInput && isAddress(customTokenInput)) {
+        tokensToScan.add(customTokenInput.toLowerCase());
+      }
+
+      const results: Array<{address: string; symbol: string; balance: string; decimals: number}> = [];
+
+      for (const tokenAddr of Array.from(tokensToScan)) {
+        try {
+          const [bal, dec, sym] = await Promise.all([
+            publicClient.readContract({
+              address: tokenAddr as Address,
+              abi: ERC20_ABI,
+              functionName: "balanceOf",
+              args: [wallet.address as Address],
+            }),
+            publicClient.readContract({
+              address: tokenAddr as Address,
+              abi: ERC20_ABI,
+              functionName: "decimals",
+            }).catch(() => 18),
+            publicClient.readContract({
+              address: tokenAddr as Address,
+              abi: ERC20_ABI,
+              functionName: "symbol",
+            }).catch(() => shortHash(tokenAddr, 4)),
+          ]);
+
+          if (bal > 0n) {
+            results.push({
+              address: tokenAddr,
+              symbol: sym as string,
+              balance: formatUnits(bal, dec as number),
+              decimals: dec as number,
+            });
+          }
+        } catch {
+          // ignore failed token read
+        }
+      }
+      setWalletTokens(results);
+    } catch (e) {
+      console.error("Wallet token scan error:", e);
+    } finally {
+      setIsScanningWallet(false);
+    }
+  }, [wallet.address, publicClient, pf, customTokenInput]);
+
+  useEffect(() => {
+    if (wallet.address && tab === "portfolio" && portfolioSubTab === "wallet") {
+      scanWalletBalances();
+    }
+  }, [wallet.address, tab, portfolioSubTab, scanWalletBalances]);
+
+  // Patch parameters API call
+  const handleSaveParams = async (overridePatch?: Partial<SniperParamsPatch>) => {
+    setIsSaving(true);
+    setFeedback(null);
+    const chain = readActiveChain();
+
+    const patch: SniperParamsPatch = {
+      buy_size_wei: overridePatch?.buy_size_wei ?? weiFromEth(formBuySizeEth),
+      daily_budget_wei: overridePatch?.daily_budget_wei ?? weiFromEth(formDailyBudgetEth),
+      total_budget_wei: overridePatch?.total_budget_wei ?? (formTotalBudgetEth === "0" ? "0" : weiFromEth(formTotalBudgetEth)),
+      take_profit_bps: overridePatch?.take_profit_bps ?? Math.round(parseFloat(formTakeProfitPct || "100") * 100),
+      take_profit_abs_wei: overridePatch?.take_profit_abs_wei ?? (formTakeProfitAbsEth === "0" ? "0" : weiFromEth(formTakeProfitAbsEth)),
+      sell_fraction_bps: overridePatch?.sell_fraction_bps ?? Math.round(parseFloat(formSellFractionPct || "100") * 100),
+      stop_loss_bps: overridePatch?.stop_loss_bps ?? Math.round(parseFloat(formStopLossPct || "0") * 100),
+      trailing_stop_bps: overridePatch?.trailing_stop_bps ?? Math.round(parseFloat(formTrailingStopPct || "0") * 100),
+      max_hold_secs: overridePatch?.max_hold_secs ?? Math.round(parseFloat(formMaxHoldMins || "0") * 60),
+      max_concurrent_positions: overridePatch?.max_concurrent_positions ?? parseInt(formMaxPositions || "1", 10),
+      min_liquidity_wei: overridePatch?.min_liquidity_wei ?? weiFromEth(formMinLiquidityEth),
+      max_price_impact_bps: overridePatch?.max_price_impact_bps ?? Math.round(parseFloat(formMaxPriceImpactPct || "3") * 100),
+      max_buy_tax_bps: overridePatch?.max_buy_tax_bps ?? Math.round(parseFloat(formMaxBuyTaxPct || "5") * 100),
+      max_sell_tax_bps: overridePatch?.max_sell_tax_bps ?? Math.round(parseFloat(formMaxSellTaxPct || "5") * 100),
+      min_hold_blocks: overridePatch?.min_hold_blocks ?? parseInt(formMinHoldBlocks || "1", 10),
+      require_honeypot_pass: overridePatch?.require_honeypot_pass ?? formRequireHoneypot,
+      require_lp_locked: overridePatch?.require_lp_locked ?? formRequireLpLocked,
+      enabled: overridePatch?.enabled ?? cfg?.params.enabled,
+    };
+
+    try {
+      const res = await fetch(withChain("/api/bot/sniper/params", chain), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify(patch),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        setFeedback({type: "success", msg: "Sniper parameters updated successfully!"});
+        await load();
+      } else {
+        const errorMsg = data.errors?.join("; ") || data.error || "Failed to update sniper parameters";
+        setFeedback({type: "error", msg: errorMsg});
+      }
+    } catch (err) {
+      setFeedback({type: "error", msg: `Network error: ${(err as Error).message}`});
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Master On/Off Toggle
+  const handleToggleMasterEnable = async () => {
+    if (!cfg) return;
+    const nextState = !cfg.params.enabled;
+    await handleSaveParams({enabled: nextState});
+  };
+
+  // Emergency Halt / Resume Toggle
+  const handleToggleHalt = async () => {
+    if (!cfg) return;
+    setIsHalting(true);
+    setFeedback(null);
+    const chain = readActiveChain();
+    const endpoint = cfg.halted ? "/api/bot/sniper/resume" : "/api/bot/sniper/halt";
+    try {
+      const res = await fetch(withChain(endpoint, chain), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({reason: "operator action from console"}),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        setFeedback({
+          type: "info",
+          msg: cfg.halted ? "Sniper lane resumed!" : "Sniper lane halted (exits remain active).",
+        });
+        await load();
+      } else {
+        setFeedback({type: "error", msg: data.error || "Failed to toggle halt state"});
+      }
+    } catch (err) {
+      setFeedback({type: "error", msg: `Error: ${(err as Error).message}`});
+    } finally {
+      setIsHalting(false);
+    }
+  };
+
+  // Apply Preset Configuration
+  const applyPreset = (key: keyof typeof PRESETS) => {
+    const p = PRESETS[key];
+    setFormBuySizeEth(p.buySizeEth);
+    setFormDailyBudgetEth(p.dailyBudgetEth);
+    setFormTakeProfitPct(String(p.takeProfitPct));
+    setFormTakeProfitAbsEth(p.takeProfitAbsEth);
+    setFormSellFractionPct(String(p.sellFractionPct));
+    setFormStopLossPct(String(p.stopLossPct));
+    setFormTrailingStopPct(String(p.trailingStopPct));
+    setFormMaxHoldMins(String(p.maxHoldMins));
+    setFormMinLiquidityEth(p.minLiquidityEth);
+    setFormMaxPriceImpactPct(String(p.maxPriceImpactPct));
+    setFormMaxBuyTaxPct(String(p.maxTaxPct));
+    setFormMaxSellTaxPct(String(p.maxTaxPct));
+    setFormRequireHoneypot(p.requireHoneypot);
+    setFeedback({type: "info", msg: `Loaded ${key.toUpperCase()} preset. Click 'Save & Apply Parameters' to save.`});
+  };
+
+  if (!pf || !cfg) {
+    return (
+      <div className="panel" style={{padding: 16}}>
+        <div className="muted">Loading new token sniper console…</div>
+      </div>
+    );
   }
 
-  const t = pf.totals;
+  const totals = pf.totals;
+  const isEnabled = cfg.params.enabled;
+  const isArmed = pf.armed;
+  const isHalted = cfg.halted;
   const blockers = pf.armingBlockers ?? [];
   const hardBlockers = blockers.filter((b) => !b.startsWith("WARNING"));
   const warnings = blockers.filter((b) => b.startsWith("WARNING"));
 
   return (
-    <div>
-      {/* Arming banner: the first thing an operator must see. */}
+    <div style={{display: "grid", gap: 12}}>
+      {/* ── Control Header: Master Switch, Mode Indicator, Emergency Halt & Status ── */}
       <div
+        className="panel"
         style={{
-          border: `1px solid ${pf.armed ? "#22c55e" : "var(--border)"}`,
-          background: pf.armed ? "rgba(34,197,94,0.07)" : "transparent",
-          borderRadius: 6,
-          padding: "8px 10px",
-          marginBottom: 12,
-          fontSize: 12,
-        }}
-      >
-        <div style={{display: "flex", alignItems: "center", gap: 8}}>
-          <span
-            style={{
-              fontSize: 10,
-              fontWeight: 700,
-              letterSpacing: 0.6,
-              padding: "2px 7px",
-              borderRadius: 4,
-              background: pf.armed ? "#22c55e" : "var(--border)",
-              color: pf.armed ? "#05240f" : "var(--muted)",
-            }}
-          >
-            {pf.armed ? "ARMED — CAN BUY" : "SHADOW — CANNOT BUY"}
-          </span>
-          {demo && (
-            <span style={{fontSize: 10, color: "#eab308", letterSpacing: 0.5}}>DEMO DATA</span>
-          )}
-          {cfg?.halted && (
-            <span style={{fontSize: 11, color: "#ef4444"}}>halted: {cfg.haltReason}</span>
-          )}
-        </div>
-        {hardBlockers.length > 0 && (
-          <ul style={{margin: "7px 0 0", paddingLeft: 18, color: "var(--muted)"}}>
-            {hardBlockers.map((b) => (
-              <li key={b}>{b}</li>
-            ))}
-          </ul>
-        )}
-        {warnings.map((w) => (
-          <div key={w} style={{marginTop: 6, color: "#eab308"}}>
-            {w}
-          </div>
-        ))}
-        {pf.armed && (
-          <div style={{marginTop: 6, color: "var(--muted)"}}>
-            This lane is <strong>not</strong> covered by the executor&apos;s profit-or-revert
-            guard. Each entry can lose its full size; the budget is the only bound.
-          </div>
-        )}
-      </div>
-
-      {/* Totals. Realised and unrealised deliberately never merged. */}
-      <div
-        style={{
+          padding: "12px 16px",
           display: "flex",
-          gap: 20,
+          alignItems: "center",
+          justifyContent: "space-between",
           flexWrap: "wrap",
-          padding: "10px 0 14px",
-          borderBottom: "1px solid var(--border)",
-          marginBottom: 12,
+          gap: 12,
+          background: isArmed ? "rgba(34, 197, 94, 0.05)" : "var(--panel)",
+          borderColor: isArmed ? "rgba(34, 197, 94, 0.4)" : "var(--line)",
         }}
       >
-        <Stat label="Open" value={`${t.openPositions}`} />
-        <Stat
-          label="Held (cost)"
-          value={`${weiToEth(t.openCostWei, 4)} Ξ`}
-          title="entry cost of everything still held"
-        />
-        <Stat
-          label="Held (mark)"
-          value={`${weiToEth(t.openValueWei, 4)} Ξ`}
-          color={t.anyMarkStale ? "#eab308" : undefined}
-          title={t.anyMarkStale ? "at least one mark is stale" : "current mark-to-market"}
-        />
-        <Stat
-          label="Unrealised"
-          value={`${signedEth(t.unrealizedPnlWei, 4)} Ξ`}
-          color={pnlColor(t.unrealizedPnlWei)}
-          title="paper only — not booked, and not necessarily exitable at this price"
-        />
-        <Stat
-          label="Realised"
-          value={`${signedEth(t.realizedPnlWei, 4)} Ξ`}
-          color={pnlColor(t.realizedPnlWei)}
-          title="actually booked, net of gas"
-        />
-        <Stat
-          label="Win rate"
-          value={t.wins + t.losses === 0 ? "—" : `${(t.winRateBps / 100).toFixed(0)}%`}
-          title={`${t.wins}W / ${t.losses}L on closed positions`}
-        />
-        <Stat
-          label="Deployed 24h"
-          value={`${weiToEth(t.deployedTodayWei, 4)} Ξ`}
-          title="entry capital committed in the rolling 24h budget window"
-        />
-        <Stat
-          label="Gas"
-          value={`${weiToEth(t.gasSpentWei, 4)} Ξ`}
-          title="gas spent on entries and exits"
-        />
-      </div>
+        <div style={{display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap"}}>
+          {/* Master ON / OFF Toggle */}
+          <div style={{display: "flex", alignItems: "center", gap: 6}}>
+            <span className="muted" style={{fontSize: 11, fontWeight: 700, textTransform: "uppercase"}}>
+              SNIPER:
+            </span>
+            <button
+              onClick={handleToggleMasterEnable}
+              disabled={isSaving}
+              style={{
+                background: isEnabled ? "var(--green)" : "#1e293b",
+                color: isEnabled ? "#05240f" : "var(--muted)",
+                fontWeight: 700,
+                fontSize: 11,
+                padding: "5px 12px",
+                borderRadius: 4,
+                border: "1px solid",
+                borderColor: isEnabled ? "var(--green)" : "var(--line)",
+                cursor: "pointer",
+                transition: "all 0.15s ease",
+              }}
+            >
+              {isEnabled ? "● ENABLED (ON)" : "○ DISABLED (OFF)"}
+            </button>
+          </div>
 
-      <div style={{display: "flex", gap: 6, marginBottom: 8}}>
-        {(["open", "closed", "gates"] as const).map((k) => (
+          {/* SIM / LIVE Mode Badge */}
+          <div style={{display: "flex", alignItems: "center", gap: 6}}>
+            <span
+              className="badge"
+              style={{
+                background: isArmed ? "rgba(34,197,94,0.15)" : "rgba(107,124,147,0.15)",
+                color: isArmed ? "var(--green)" : "var(--muted)",
+                borderColor: isArmed ? "var(--green)" : "var(--line)",
+                padding: "4px 8px",
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+              title={
+                isArmed
+                  ? "Armed for real trades through SniperVault"
+                  : "Shadow / Simulation mode: launches monitored without broadcast"
+              }
+            >
+              {isArmed ? "LIVE TRADING ARMED" : "SIMULATION (SHADOW MODE)"}
+            </span>
+            {demo && (
+              <span className="badge" style={{color: "var(--amber)"}}>
+                DEMO DATA
+              </span>
+            )}
+          </div>
+
+          {/* Emergency Halt / Resume Button */}
           <button
-            key={k}
-            onClick={() => setTab(k)}
-            className={tab === k ? "tab active" : "tab"}
+            onClick={handleToggleHalt}
+            disabled={isHalting}
             style={{
-              fontSize: 11,
-              padding: "3px 10px",
+              background: isHalted ? "rgba(245, 181, 68, 0.15)" : "rgba(255, 92, 92, 0.12)",
+              color: isHalted ? "var(--amber)" : "var(--red)",
+              border: `1px solid ${isHalted ? "var(--amber)" : "rgba(255, 92, 92, 0.4)"}`,
               borderRadius: 4,
-              border: "1px solid var(--border)",
-              background: tab === k ? "var(--border)" : "transparent",
-              color: "inherit",
+              padding: "4px 10px",
+              fontSize: 11,
+              fontWeight: 600,
               cursor: "pointer",
             }}
           >
-            {k === "open"
-              ? `open (${pf.open.length})`
-              : k === "closed"
-                ? `closed (${pf.recentClosed.length})`
-                : "gates"}
+            {isHalted ? "▶ RESUME SNIPER" : "⏸ EMERGENCY HALT"}
+          </button>
+        </div>
+
+        {/* Quick Parameters Display in Header */}
+        <div style={{display: "flex", alignItems: "center", gap: 14, fontSize: 11}}>
+          <div>
+            <span className="muted">BUY SIZE: </span>
+            <strong>{ethFromWei(cfg.params.buySizeWei, 3)} Ξ</strong>
+          </div>
+          <div>
+            <span className="muted">TP / SL: </span>
+            <strong style={{color: "var(--green)"}}>+{(cfg.params.takeProfitBps / 100).toFixed(0)}%</strong>
+            {" / "}
+            <strong style={{color: "var(--red)"}}>-{(cfg.params.stopLossBps / 100).toFixed(0)}%</strong>
+          </div>
+          <div>
+            <span className="muted">DAILY BUDGET: </span>
+            <strong>{ethFromWei(cfg.params.dailyBudgetWei, 2)} Ξ</strong>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Status Alerts & Feedback Banner ── */}
+      {feedback && (
+        <div
+          style={{
+            padding: "8px 12px",
+            borderRadius: 4,
+            fontSize: 11,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            background:
+              feedback.type === "success"
+                ? "rgba(34, 197, 94, 0.15)"
+                : feedback.type === "error"
+                  ? "rgba(255, 92, 92, 0.15)"
+                  : "rgba(34, 211, 238, 0.15)",
+            border: `1px solid ${
+              feedback.type === "success"
+                ? "var(--green)"
+                : feedback.type === "error"
+                  ? "var(--red)"
+                  : "var(--cyan)"
+            }`,
+            color:
+              feedback.type === "success"
+                ? "var(--green)"
+                : feedback.type === "error"
+                  ? "var(--red)"
+                  : "var(--cyan)",
+          }}
+        >
+          <span>{feedback.msg}</span>
+          <button
+            onClick={() => setFeedback(null)}
+            style={{background: "none", border: "none", color: "inherit", cursor: "pointer", fontSize: 13}}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* ── Hard Blockers or Warnings Banner ── */}
+      {(hardBlockers.length > 0 || isHalted || warnings.length > 0) && (
+        <div
+          style={{
+            border: `1px solid ${isHalted ? "var(--red)" : "var(--line)"}`,
+            background: isHalted ? "rgba(255, 92, 92, 0.08)" : "var(--panel-2)",
+            borderRadius: 4,
+            padding: "8px 12px",
+            fontSize: 11,
+          }}
+        >
+          {isHalted && (
+            <div style={{color: "var(--red)", fontWeight: 700, marginBottom: 4}}>
+              ⚠ SNIPER LANE HALTED: {cfg.haltReason || "Stopped by operator"}
+            </div>
+          )}
+          {hardBlockers.length > 0 && (
+            <div>
+              <span className="muted" style={{fontWeight: 600}}>
+                Arming Blockers (Set in Parameters tab to enable live buys):
+              </span>
+              <ul style={{margin: "4px 0 0", paddingLeft: 18, color: "var(--muted)"}}>
+                {hardBlockers.map((b) => (
+                  <li key={b}>{b}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {warnings.map((w) => (
+            <div key={w} style={{marginTop: 4, color: "var(--amber)"}}>
+              {w}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── Mini Portfolio Summary Metrics ── */}
+      <div
+        className="panel"
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+          gap: 10,
+          padding: "12px 16px",
+        }}
+      >
+        <MetricCard label="Open Positions" value={`${totals.openPositions}`} />
+        <MetricCard
+          label="Active Held Cost"
+          value={`${ethFromWei(totals.openCostWei, 4)} Ξ`}
+          title="Initial capital currently committed to active positions"
+        />
+        <MetricCard
+          label="Active Mark Value"
+          value={`${ethFromWei(totals.openValueWei, 4)} Ξ`}
+          tone={totals.anyMarkStale ? "amber" : undefined}
+          title="Current mark-to-market valuation"
+        />
+        <MetricCard
+          label="Unrealized PnL"
+          value={`${signedEth(totals.unrealizedPnlWei, 4)} Ξ`}
+          tone={BigInt(totals.unrealizedPnlWei || "0") > 0n ? "pos" : BigInt(totals.unrealizedPnlWei || "0") < 0n ? "neg" : "muted"}
+          title="Paper gain/loss on currently held tokens"
+        />
+        <MetricCard
+          label="Realized PnL"
+          value={`${signedEth(totals.realizedPnlWei, 4)} Ξ`}
+          tone={BigInt(totals.realizedPnlWei || "0") > 0n ? "pos" : BigInt(totals.realizedPnlWei || "0") < 0n ? "neg" : "muted"}
+          title="Net realized profit after gas and fees"
+        />
+        <MetricCard
+          label="Win Rate"
+          value={totals.wins + totals.losses === 0 ? "—" : `${(totals.winRateBps / 100).toFixed(0)}%`}
+          sub={`${totals.wins}W / ${totals.losses}L`}
+        />
+        <MetricCard
+          label="24h Deployed"
+          value={`${ethFromWei(totals.deployedTodayWei, 3)} / ${ethFromWei(cfg.params.dailyBudgetWei, 3)} Ξ`}
+          title="Capital deployed in rolling 24h window vs daily limit"
+        />
+      </div>
+
+      {/* ── Sub-Navigation Tabs ── */}
+      <div style={{display: "flex", gap: 8, borderBottom: "1px solid var(--line)", paddingBottom: 6}}>
+        {[
+          {id: "portfolio", label: `📊 Mini Portfolio (${pf.open.length} Active)`},
+          {id: "parameters", label: "⚙️ Strategy & Investment Parameters"},
+          {id: "swap", label: "⚡ Instant Sell & DEX Aggregators"},
+          {id: "gates", label: "🛡️ Gate Logs & Honeypots"},
+        ].map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id as typeof tab)}
+            style={{
+              padding: "6px 14px",
+              borderRadius: 4,
+              fontSize: 12,
+              fontWeight: tab === t.id ? 700 : 500,
+              background: tab === t.id ? "var(--panel-2)" : "transparent",
+              border: "1px solid",
+              borderColor: tab === t.id ? "var(--cyan)" : "transparent",
+              color: tab === t.id ? "var(--cyan)" : "var(--text)",
+              cursor: "pointer",
+            }}
+          >
+            {t.label}
           </button>
         ))}
       </div>
 
-      {tab !== "gates" && (
-        <table style={{width: "100%", fontSize: 12}}>
-          <thead>
-            <tr className="muted" style={{textAlign: "left", fontSize: 10}}>
-              <th>TOKEN</th>
-              <th>ENTRY Ξ</th>
-              <th>MARK Ξ</th>
-              <th>REALISED Ξ</th>
-              <th>NET PNL</th>
-              <th>{tab === "open" ? "AGE" : "EXIT"}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(tab === "open" ? pf.open : pf.recentClosed).map((r) => (
-              <PositionRow key={r.id} r={r} />
-            ))}
-          </tbody>
-        </table>
-      )}
+      {/* ────────────────────────────────────────────────────────────────────────
+          TAB 1: MINI PORTFOLIO & POSITION MANAGEMENT
+          ──────────────────────────────────────────────────────────────────────── */}
+      {tab === "portfolio" && (
+        <div className="panel" style={{padding: 14, display: "grid", gap: 12}}>
+          {/* Portfolio View Switcher */}
+          <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8}}>
+            <div style={{display: "flex", gap: 6}}>
+              <button
+                onClick={() => setPortfolioSubTab("open")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "open" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "open" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Active Positions ({pf.open.length})
+              </button>
+              <button
+                onClick={() => setPortfolioSubTab("wallet")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "wallet" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "wallet" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Wallet Holdings ({walletTokens.length})
+              </button>
+              <button
+                onClick={() => setPortfolioSubTab("closed")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: portfolioSubTab === "closed" ? "var(--line)" : "transparent",
+                  color: portfolioSubTab === "closed" ? "var(--text)" : "var(--muted)",
+                  border: "1px solid var(--line)",
+                  cursor: "pointer",
+                }}
+              >
+                Closed History ({pf.recentClosed.length})
+              </button>
+            </div>
 
-      {tab !== "gates" && (tab === "open" ? pf.open : pf.recentClosed).length === 0 && (
-        <div className="muted" style={{padding: "14px 0", fontSize: 12}}>
-          {tab === "open"
-            ? "no open positions — the lane is either disarmed or has not admitted a launch yet"
-            : "no closed positions yet"}
+            {portfolioSubTab === "wallet" && (
+              <button
+                onClick={() => scanWalletBalances()}
+                disabled={isScanningWallet || !wallet.address}
+                style={{
+                  padding: "3px 8px",
+                  fontSize: 11,
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  color: "var(--cyan)",
+                  borderRadius: 3,
+                  cursor: "pointer",
+                }}
+              >
+                {isScanningWallet ? "Scanning..." : "↻ Refresh Wallet Balances"}
+              </button>
+            )}
+          </div>
+
+          {/* Active Open Positions Table */}
+          {portfolioSubTab === "open" && (
+            <div>
+              {pf.open.length === 0 ? (
+                <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>
+                  No active open positions currently held.
+                  <br />
+                  <span style={{fontSize: 11, color: "var(--muted)"}}>
+                    When the sniper back-runs a new pair launch, your active position and live mark value will appear here.
+                  </span>
+                </div>
+              ) : (
+                <div style={{overflowX: "auto"}}>
+                  <table className="grid" style={{width: "100%", fontSize: 12}}>
+                    <thead>
+                      <tr>
+                        <th>TOKEN</th>
+                        <th>VENUE</th>
+                        <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
+                        <th style={{textAlign: "right"}}>CURRENT MARK</th>
+                        <th style={{textAlign: "right"}}>UNREALIZED PNL</th>
+                        <th style={{textAlign: "right"}}>AGE</th>
+                        <th style={{textAlign: "center"}}>QUICK ACTIONS (SELL / SWAP)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pf.open.map((pos) => {
+                        const aggLinks = getAggregatorLinks(pos.token, currentChainId, activeChainSlug);
+                        const isPos = BigInt(pos.unrealizedPnlWei || "0") > 0n;
+                        const isNeg = BigInt(pos.unrealizedPnlWei || "0") < 0n;
+                        return (
+                          <tr key={pos.id} style={{opacity: pos.markStale ? 0.7 : 1}}>
+                            <td>
+                              <div style={{display: "flex", alignItems: "center", gap: 6}}>
+                                <span
+                                  style={{
+                                    width: 7,
+                                    height: 7,
+                                    borderRadius: "50%",
+                                    background: STATE_COLOR[pos.state] || "var(--green)",
+                                  }}
+                                />
+                                <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
+                                <a
+                                  href={addressUrl(currentChainId, pos.token) || undefined}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="muted"
+                                  style={{fontSize: 10, textDecoration: "none"}}
+                                  title="View on Explorer"
+                                >
+                                  ↗
+                                </a>
+                              </div>
+                              <div className="muted" style={{fontSize: 10}}>
+                                {shortHash(pos.token, 6)}
+                              </div>
+                            </td>
+                            <td>
+                              <span className="badge" style={{fontSize: 9, color: "var(--cyan)"}}>
+                                {pos.venue}
+                              </span>
+                            </td>
+                            <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                              {weiToEth(pos.entryCostWei, 4)} Ξ
+                            </td>
+                            <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                              {weiToEth(pos.markValueWei, 4)} Ξ
+                              {pos.markStale && (
+                                <span style={{color: "var(--amber)", fontSize: 9, marginLeft: 4}}>STALE</span>
+                              )}
+                            </td>
+                            <td
+                              style={{
+                                textAlign: "right",
+                                fontVariantNumeric: "tabular-nums",
+                                color: isPos ? "var(--green)" : isNeg ? "var(--red)" : "var(--muted)",
+                              }}
+                            >
+                              <div>{signedEth(pos.unrealizedPnlWei, 4)} Ξ</div>
+                              <div style={{fontSize: 10}}>{bpsFormatted(pos.netPnlBps)}</div>
+                            </td>
+                            <td style={{textAlign: "right", color: "var(--muted)", fontSize: 11}}>
+                              {ago(pos.openedAtMs)}
+                            </td>
+                            <td style={{textAlign: "center"}}>
+                              <div style={{display: "inline-flex", gap: 4}}>
+                                <button
+                                  onClick={() => {
+                                    setSwapTarget({
+                                      token: pos.token,
+                                      symbol: pos.symbol || "TOKEN",
+                                      pair: pos.pair,
+                                      qty: pos.remainingQty,
+                                      markEth: weiToEth(pos.markValueWei, 4),
+                                    });
+                                    setTab("swap");
+                                  }}
+                                  style={{
+                                    padding: "3px 8px",
+                                    fontSize: 10,
+                                    fontWeight: 700,
+                                    background: "rgba(34, 211, 238, 0.15)",
+                                    border: "1px solid var(--cyan)",
+                                    color: "var(--cyan)",
+                                    borderRadius: 3,
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  ⚡ SELL / SWAP
+                                </button>
+                                <a
+                                  href={aggLinks.oneInch}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{
+                                    padding: "3px 6px",
+                                    fontSize: 10,
+                                    background: "var(--panel-2)",
+                                    border: "1px solid var(--line)",
+                                    color: "var(--text)",
+                                    borderRadius: 3,
+                                    textDecoration: "none",
+                                  }}
+                                  title="Sell on 1inch Aggregator"
+                                >
+                                  1inch ↗
+                                </a>
+                                <a
+                                  href={aggLinks.dexscreener}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{
+                                    padding: "3px 6px",
+                                    fontSize: 10,
+                                    background: "var(--panel-2)",
+                                    border: "1px solid var(--line)",
+                                    color: "var(--text)",
+                                    borderRadius: 3,
+                                    textDecoration: "none",
+                                  }}
+                                  title="View on DexScreener"
+                                >
+                                  Chart ↗
+                                </a>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Connected Wallet Holdings View */}
+          {portfolioSubTab === "wallet" && (
+            <div style={{display: "grid", gap: 10}}>
+              {!wallet.address ? (
+                <div style={{textAlign: "center", padding: 20, color: "var(--muted)"}}>
+                  Connect your wallet to view tokens in your address and sell them directly.
+                  <div style={{marginTop: 8}}>
+                    <button
+                      onClick={() => wallet.connect()}
+                      style={{
+                        padding: "6px 14px",
+                        background: "var(--panel-2)",
+                        border: "1px solid var(--cyan)",
+                        color: "var(--cyan)",
+                        borderRadius: 4,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Connect Wallet
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div style={{display: "flex", gap: 8, alignItems: "center"}}>
+                    <input
+                      value={customTokenInput}
+                      onChange={(e) => setCustomTokenInput(e.target.value)}
+                      placeholder="Add custom ERC20 Token Address to scan & sell..."
+                      style={{
+                        flex: 1,
+                        background: "#070b11",
+                        border: "1px solid var(--line)",
+                        color: "var(--text)",
+                        padding: "5px 8px",
+                        fontSize: 11,
+                        borderRadius: 3,
+                      }}
+                    />
+                    <button
+                      onClick={() => scanWalletBalances()}
+                      style={{
+                        padding: "5px 12px",
+                        background: "var(--panel-2)",
+                        border: "1px solid var(--line)",
+                        color: "var(--cyan)",
+                        borderRadius: 3,
+                        cursor: "pointer",
+                        fontSize: 11,
+                      }}
+                    >
+                      Scan Token
+                    </button>
+                  </div>
+
+                  {walletTokens.length === 0 ? (
+                    <div className="muted" style={{padding: 16, textAlign: "center", fontSize: 11}}>
+                      {isScanningWallet
+                        ? "Scanning connected wallet for token balances..."
+                        : "No balances found for sniped tokens in your connected wallet. Paste a token address above to inspect & sell."}
+                    </div>
+                  ) : (
+                    <table className="grid" style={{width: "100%", fontSize: 12}}>
+                      <thead>
+                        <tr>
+                          <th>TOKEN</th>
+                          <th>CONTRACT ADDRESS</th>
+                          <th style={{textAlign: "right"}}>BALANCE</th>
+                          <th style={{textAlign: "center"}}>AGGREGATOR ACTIONS</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {walletTokens.map((t) => {
+                          const links = getAggregatorLinks(t.address, currentChainId, activeChainSlug);
+                          return (
+                            <tr key={t.address}>
+                              <td>
+                                <strong>{t.symbol}</strong>
+                              </td>
+                              <td className="muted" style={{fontSize: 11}}>
+                                {shortHash(t.address, 6)}
+                              </td>
+                              <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>
+                                <strong>{Number(t.balance).toLocaleString(undefined, {maximumFractionDigits: 4})}</strong>
+                              </td>
+                              <td style={{textAlign: "center"}}>
+                                <div style={{display: "inline-flex", gap: 4}}>
+                                  <a
+                                    href={links.oneInch}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 8px",
+                                      background: "rgba(34, 211, 238, 0.15)",
+                                      border: "1px solid var(--cyan)",
+                                      color: "var(--cyan)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                      fontWeight: 600,
+                                    }}
+                                  >
+                                    1inch Swap ↗
+                                  </a>
+                                  <a
+                                    href={links.uniswap}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 6px",
+                                      background: "var(--panel-2)",
+                                      border: "1px solid var(--line)",
+                                      color: "var(--text)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                    }}
+                                  >
+                                    Uniswap ↗
+                                  </a>
+                                  <a
+                                    href={links.dexscreener}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      padding: "3px 6px",
+                                      background: "var(--panel-2)",
+                                      border: "1px solid var(--line)",
+                                      color: "var(--text)",
+                                      borderRadius: 3,
+                                      fontSize: 10,
+                                      textDecoration: "none",
+                                    }}
+                                  >
+                                    Chart ↗
+                                  </a>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Closed Positions History */}
+          {portfolioSubTab === "closed" && (
+            <div style={{overflowX: "auto"}}>
+              {pf.recentClosed.length === 0 ? (
+                <div className="muted" style={{padding: 20, textAlign: "center", fontSize: 11}}>
+                  No closed positions yet.
+                </div>
+              ) : (
+                <table className="grid" style={{width: "100%", fontSize: 12}}>
+                  <thead>
+                    <tr>
+                      <th>TOKEN</th>
+                      <th style={{textAlign: "right"}}>ENTRY (ETH)</th>
+                      <th style={{textAlign: "right"}}>REALISED (ETH)</th>
+                      <th style={{textAlign: "right"}}>NET PNL</th>
+                      <th>EXIT REASON</th>
+                      <th style={{textAlign: "right"}}>CLOSED</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pf.recentClosed.map((pos) => (
+                      <tr key={pos.id}>
+                        <td>
+                          <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
+                          <span className="muted" style={{marginLeft: 6, fontSize: 10}}>
+                            {pos.venue}
+                          </span>
+                        </td>
+                        <td style={{textAlign: "right"}}>{weiToEth(pos.entryCostWei, 4)} Ξ</td>
+                        <td style={{textAlign: "right", color: pnlColor(pos.realizedWei)}}>
+                          {weiToEth(pos.realizedWei, 4)} Ξ
+                        </td>
+                        <td style={{textAlign: "right", color: pnlColor(pos.netPnlWei)}}>
+                          {signedEth(pos.netPnlWei, 4)} Ξ ({bpsFormatted(pos.netPnlBps)})
+                        </td>
+                        <td className="muted" style={{fontSize: 11}}>
+                          {pos.exitReason ? EXIT_LABEL[pos.exitReason] || pos.exitReason : "Closed"}
+                        </td>
+                        <td style={{textAlign: "right", color: "var(--muted)", fontSize: 11}}>
+                          {pos.closedAtMs ? ago(pos.closedAtMs) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {tab === "gates" && cfg && (
-        <div style={{fontSize: 12}}>
-          <div className="muted" style={{marginBottom: 8}}>
-            Why launches were turned down. Every rejection is counted by reason, so a lane
-            that never buys can be diagnosed instead of guessed at.
+      {/* ────────────────────────────────────────────────────────────────────────
+          TAB 2: STRATEGY & INVESTMENT PARAMETERS (USER INPUTS)
+          ──────────────────────────────────────────────────────────────────────── */}
+      {tab === "parameters" && (
+        <div className="panel" style={{padding: 16, display: "grid", gap: 16}}>
+          {/* Preset Buttons Bar */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 8,
+              paddingBottom: 10,
+              borderBottom: "1px solid var(--line)",
+            }}
+          >
+            <span className="muted" style={{fontSize: 11}}>
+              Quick Presets:
+            </span>
+            <div style={{display: "flex", gap: 8}}>
+              <button
+                onClick={() => applyPreset("conservative")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  color: "var(--green)",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                }}
+              >
+                🛡️ Conservative
+              </button>
+              <button
+                onClick={() => applyPreset("balanced")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  color: "var(--cyan)",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                }}
+              >
+                ⚖️ Balanced
+              </button>
+              <button
+                onClick={() => applyPreset("moonshot")}
+                style={{
+                  padding: "4px 10px",
+                  fontSize: 11,
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  color: "var(--amber)",
+                  borderRadius: 4,
+                  cursor: "pointer",
+                }}
+              >
+                🚀 Degen Moonshot
+              </button>
+            </div>
           </div>
-          <table style={{width: "100%", fontSize: 12}}>
-            <tbody>
-              {Object.entries(cfg.rejections ?? {})
-                .sort((a, b) => b[1] - a[1])
-                .map(([code, n]) => (
-                  <tr key={code}>
-                    <td style={{color: "var(--muted)"}}>{code.replace(/_/g, " ")}</td>
-                    <td style={{textAlign: "right", fontVariantNumeric: "tabular-nums"}}>{n}</td>
-                  </tr>
-                ))}
-              {Object.keys(cfg.rejections ?? {}).length === 0 && (
-                <tr>
-                  <td className="muted">no launches evaluated yet</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
 
-          <div className="muted" style={{marginTop: 14, marginBottom: 6}}>
-            Active envelope
+          <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16}}>
+            {/* Section A: Entry & Investment Sizing */}
+            <div style={{display: "grid", gap: 10}}>
+              <div className="muted" style={{fontSize: 11, fontWeight: 700, textTransform: "uppercase"}}>
+                1. Initial Investment & Budgets
+              </div>
+
+              {/* Initial Investment / Buy Size */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Initial Investment per Token (ETH):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.005"
+                  min="0"
+                  value={formBuySizeEth}
+                  onChange={(e) => setFormBuySizeEth(e.target.value)}
+                  style={inputStyle}
+                  placeholder="e.g. 0.05"
+                />
+                <div style={{display: "flex", gap: 4, marginTop: 4}}>
+                  {["0.01", "0.025", "0.05", "0.1", "0.25"].map((val) => (
+                    <button
+                      key={val}
+                      onClick={() => setFormBuySizeEth(val)}
+                      style={chipButtonStyle}
+                    >
+                      {val} Ξ
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Rolling 24h Daily Budget */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Daily Spend Budget (ETH):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  value={formDailyBudgetEth}
+                  onChange={(e) => setFormDailyBudgetEth(e.target.value)}
+                  style={inputStyle}
+                  placeholder="e.g. 0.25"
+                />
+                <span className="muted" style={{fontSize: 10}}>
+                  Ceiling on entry capital deployed within rolling 24 hours.
+                </span>
+              </div>
+
+              {/* Lifetime Total Budget */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Lifetime Budget (ETH, 0 = Unlimited):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={formTotalBudgetEth}
+                  onChange={(e) => setFormTotalBudgetEth(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+
+              {/* Max Concurrent Positions */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Max Concurrent Positions:</strong>
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  max="32"
+                  value={formMaxPositions}
+                  onChange={(e) => setFormMaxPositions(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+            </div>
+
+            {/* Section B: Auto-Sell, Take Profit & Stop Loss */}
+            <div style={{display: "grid", gap: 10}}>
+              <div className="muted" style={{fontSize: 11, fontWeight: 700, textTransform: "uppercase"}}>
+                2. Auto-Sell & Exit Triggers
+              </div>
+
+              {/* Take Profit (%) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Take Profit Gain (%):</strong>
+                </label>
+                <input
+                  type="number"
+                  min="5"
+                  step="10"
+                  value={formTakeProfitPct}
+                  onChange={(e) => setFormTakeProfitPct(e.target.value)}
+                  style={inputStyle}
+                  placeholder="e.g. 100"
+                />
+                <div style={{display: "flex", gap: 4, marginTop: 4}}>
+                  {["25", "50", "100", "200", "500"].map((val) => (
+                    <button
+                      key={val}
+                      onClick={() => setFormTakeProfitPct(val)}
+                      style={chipButtonStyle}
+                    >
+                      +{val}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Take Profit (Absolute ETH Profit) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Take Profit in Absolute Profit (ETH, 0 = Off):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={formTakeProfitAbsEth}
+                  onChange={(e) => setFormTakeProfitAbsEth(e.target.value)}
+                  style={inputStyle}
+                  placeholder="0 (off)"
+                />
+                <span className="muted" style={{fontSize: 10}}>
+                  Triggers if position reaches either +% gain OR this ETH profit.
+                </span>
+              </div>
+
+              {/* Sell Fraction (%) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Sell Fraction on Take Profit (%):</strong>
+                </label>
+                <input
+                  type="number"
+                  min="10"
+                  max="100"
+                  step="10"
+                  value={formSellFractionPct}
+                  onChange={(e) => setFormSellFractionPct(e.target.value)}
+                  style={inputStyle}
+                />
+                <div style={{display: "flex", gap: 4, marginTop: 4}}>
+                  {[
+                    {label: "25% Scale", val: "25"},
+                    {label: "50% Half", val: "50"},
+                    {label: "75%", val: "75"},
+                    {label: "100% Full Close", val: "100"},
+                  ].map((item) => (
+                    <button
+                      key={item.val}
+                      onClick={() => setFormSellFractionPct(item.val)}
+                      style={chipButtonStyle}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Stop Loss (%) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Stop Loss (% Loss, 0 = Off):</strong>
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={formStopLossPct}
+                  onChange={(e) => setFormStopLossPct(e.target.value)}
+                  style={inputStyle}
+                  placeholder="e.g. 50"
+                />
+              </div>
+
+              {/* Trailing Stop (%) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Trailing Stop (% from Peak, 0 = Off):</strong>
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="90"
+                  step="5"
+                  value={formTrailingStopPct}
+                  onChange={(e) => setFormTrailingStopPct(e.target.value)}
+                  style={inputStyle}
+                  placeholder="0 (off)"
+                />
+              </div>
+
+              {/* Max Hold Duration (Minutes) */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Max Hold Duration (Minutes, 0 = Off):</strong>
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="5"
+                  value={formMaxHoldMins}
+                  onChange={(e) => setFormMaxHoldMins(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+            </div>
+
+            {/* Section C: Safety Gates & Honeypot Checks */}
+            <div style={{display: "grid", gap: 10}}>
+              <div className="muted" style={{fontSize: 11, fontWeight: 700, textTransform: "uppercase"}}>
+                3. Safety Gates & Honeypot Filters
+              </div>
+
+              {/* Honeypot Pass Required */}
+              <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                <input
+                  type="checkbox"
+                  id="reqHoneypot"
+                  checked={formRequireHoneypot}
+                  onChange={(e) => setFormRequireHoneypot(e.target.checked)}
+                  style={{cursor: "pointer"}}
+                />
+                <label htmlFor="reqHoneypot" style={{fontSize: 11, cursor: "pointer"}}>
+                  <strong>Require Honeypot Pass (Simulated Buy/Sell)</strong>
+                </label>
+              </div>
+
+              {/* Min Pool Liquidity */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Min Pool Liquidity (ETH):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.1"
+                  value={formMinLiquidityEth}
+                  onChange={(e) => setFormMinLiquidityEth(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+
+              {/* Max Price Impact */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Max Price Impact (%):</strong>
+                </label>
+                <input
+                  type="number"
+                  step="0.5"
+                  min="0.5"
+                  max="20"
+                  value={formMaxPriceImpactPct}
+                  onChange={(e) => setFormMaxPriceImpactPct(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+
+              {/* Max Transfer Tax */}
+              <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8}}>
+                <div>
+                  <label style={{display: "block", fontSize: 10, marginBottom: 2}}>Max Buy Tax (%)</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={formMaxBuyTaxPct}
+                    onChange={(e) => setFormMaxBuyTaxPct(e.target.value)}
+                    style={inputStyle}
+                  />
+                </div>
+                <div>
+                  <label style={{display: "block", fontSize: 10, marginBottom: 2}}>Max Sell Tax (%)</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={formMaxSellTaxPct}
+                    onChange={(e) => setFormMaxSellTaxPct(e.target.value)}
+                    style={inputStyle}
+                  />
+                </div>
+              </div>
+
+              {/* Min Hold Blocks */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 3}}>
+                  <strong>Min Hold Blocks before Exit:</strong>
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={formMinHoldBlocks}
+                  onChange={(e) => setFormMinHoldBlocks(e.target.value)}
+                  style={inputStyle}
+                />
+              </div>
+
+              {/* LP Locked Check */}
+              <div style={{display: "flex", alignItems: "center", gap: 8}}>
+                <input
+                  type="checkbox"
+                  id="reqLp"
+                  checked={formRequireLpLocked}
+                  onChange={(e) => setFormRequireLpLocked(e.target.checked)}
+                  style={{cursor: "pointer"}}
+                />
+                <label htmlFor="reqLp" style={{fontSize: 11, cursor: "pointer"}}>
+                  Require LP Burned / Locked
+                </label>
+              </div>
+            </div>
           </div>
-          <table style={{width: "100%", fontSize: 12}}>
-            <tbody>
-              {[
-                ["buy size", `${weiToEth(cfg.params.buySizeWei, 4)} Ξ`],
-                ["take profit", `${(cfg.params.takeProfitBps / 100).toFixed(0)}%`],
-                [
-                  "take profit (abs)",
-                  cfg.params.takeProfitAbsWei === "0"
-                    ? "off"
-                    : `${weiToEth(cfg.params.takeProfitAbsWei, 4)} Ξ`,
-                ],
-                ["sell fraction", `${(cfg.params.sellFractionBps / 100).toFixed(0)}%`],
-                [
-                  "stop loss",
-                  cfg.params.stopLossBps === 0 ? "off" : `${(cfg.params.stopLossBps / 100).toFixed(0)}%`,
-                ],
-                [
-                  "trailing stop",
-                  cfg.params.trailingStopBps === 0
-                    ? "off"
-                    : `${(cfg.params.trailingStopBps / 100).toFixed(0)}%`,
-                ],
-                [
-                  "max hold",
-                  cfg.params.maxHoldSecs === 0 ? "off" : `${Math.round(cfg.params.maxHoldSecs / 60)} min`,
-                ],
-                ["max positions", `${cfg.params.maxConcurrentPositions}`],
-                ["daily budget", `${weiToEth(cfg.params.dailyBudgetWei, 4)} Ξ`],
-                [
-                  "lifetime budget",
-                  cfg.params.totalBudgetWei === "0"
-                    ? "unlimited"
-                    : `${weiToEth(cfg.params.totalBudgetWei, 4)} Ξ`,
-                ],
-                ["min liquidity", `${weiToEth(cfg.params.minLiquidityWei, 2)} Ξ`],
-                ["max price impact", `${(cfg.params.maxPriceImpactBps / 100).toFixed(2)}%`],
-                ["honeypot check", cfg.params.requireHoneypotPass ? "required" : "OFF"],
-                [
-                  "max tax (buy/sell)",
-                  `${(cfg.params.maxBuyTaxBps / 100).toFixed(1)}% / ${(cfg.params.maxSellTaxBps / 100).toFixed(1)}%`,
-                ],
-                ["min hold", `${cfg.params.minHoldBlocks} blocks`],
-                ["LP lock required", cfg.params.requireLpLocked ? "yes" : "no"],
-              ].map(([k, v]) => (
-                <tr key={k}>
-                  <td style={{color: "var(--muted)"}}>{k}</td>
-                  <td
-                    style={{
-                      textAlign: "right",
-                      fontVariantNumeric: "tabular-nums",
-                      color: v === "OFF" ? "#eab308" : "inherit",
-                    }}
-                  >
-                    {v}
-                  </td>
-                </tr>
+
+          {/* Save & Apply Action Buttons */}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              paddingTop: 12,
+              borderTop: "1px solid var(--line)",
+              flexWrap: "wrap",
+              gap: 8,
+            }}
+          >
+            <div style={{fontSize: 11, color: "var(--muted)"}}>
+              Changes apply immediately to the running sniper lane.
+            </div>
+            <div style={{display: "flex", gap: 8}}>
+              <button
+                onClick={() => populateFormFromConfig(cfg.params)}
+                style={{
+                  padding: "6px 14px",
+                  background: "var(--panel-2)",
+                  border: "1px solid var(--line)",
+                  color: "var(--muted)",
+                  borderRadius: 4,
+                  fontSize: 11,
+                  cursor: "pointer",
+                }}
+              >
+                Reset to Saved
+              </button>
+              <button
+                onClick={() => handleSaveParams()}
+                disabled={isSaving}
+                style={{
+                  padding: "6px 20px",
+                  background: "var(--green)",
+                  border: "1px solid var(--green)",
+                  color: "#05240f",
+                  fontWeight: 700,
+                  borderRadius: 4,
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                {isSaving ? "Saving..." : "✓ Save & Apply Parameters"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ────────────────────────────────────────────────────────────────────────
+          TAB 3: INSTANT SELL & DEX AGGREGATOR SWAPPING HUB
+          ──────────────────────────────────────────────────────────────────────── */}
+      {tab === "swap" && (
+        <div className="panel" style={{padding: 16, display: "grid", gap: 14}}>
+          <div className="panel-head" style={{padding: "0 0 8px 0"}}>
+            <span>⚡ Instant Token Sell & DEX Aggregator Hub</span>
+            <span className="muted" style={{fontSize: 11}}>
+              Route via 1inch, Uniswap, KyberSwap or direct in-wallet execution
+            </span>
+          </div>
+
+          <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16}}>
+            {/* Left: Position / Token Selection */}
+            <div style={{display: "grid", gap: 10}}>
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
+                  <strong>Select Token from Active Positions:</strong>
+                </label>
+                <select
+                  style={inputStyle}
+                  value={swapTarget?.token || ""}
+                  onChange={(e) => {
+                    const match = pf.open.find((p) => p.token.toLowerCase() === e.target.value.toLowerCase());
+                    if (match) {
+                      setSwapTarget({
+                        token: match.token,
+                        symbol: match.symbol || "TOKEN",
+                        pair: match.pair,
+                        qty: match.remainingQty,
+                        markEth: weiToEth(match.markValueWei, 4),
+                      });
+                    } else if (e.target.value) {
+                      setSwapTarget({token: e.target.value, symbol: "CUSTOM"});
+                    } else {
+                      setSwapTarget(null);
+                    }
+                  }}
+                >
+                  <option value="">-- Choose active position or enter address --</option>
+                  {pf.open.map((p) => (
+                    <option key={p.id} value={p.token}>
+                      {p.symbol || "Token"} ({shortHash(p.token, 4)}) — Mark: {weiToEth(p.markValueWei, 3)} ETH
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
+                  <strong>Or Enter Any Token Contract Address:</strong>
+                </label>
+                <input
+                  type="text"
+                  value={swapTarget?.token || ""}
+                  onChange={(e) =>
+                    setSwapTarget({
+                      token: e.target.value,
+                      symbol: "CUSTOM",
+                    })
+                  }
+                  placeholder="0x..."
+                  style={inputStyle}
+                />
+              </div>
+
+              {/* Sell Quantity Fraction */}
+              <div>
+                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
+                  <strong>Sell Amount (% of Holdings):</strong>
+                </label>
+                <div style={{display: "flex", gap: 6}}>
+                  {[25, 50, 75, 100].map((f) => (
+                    <button
+                      key={f}
+                      onClick={() => setSwapFraction(f)}
+                      style={{
+                        flex: 1,
+                        padding: "6px",
+                        fontSize: 11,
+                        fontWeight: swapFraction === f ? 700 : 500,
+                        background: swapFraction === f ? "var(--cyan)" : "var(--panel-2)",
+                        color: swapFraction === f ? "#05240f" : "var(--text)",
+                        border: "1px solid",
+                        borderColor: swapFraction === f ? "var(--cyan)" : "var(--line)",
+                        borderRadius: 3,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {f}%
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Right: Aggregator Links & Launchpad */}
+            <div style={{display: "grid", gap: 10}}>
+              {swapTarget && isAddress(swapTarget.token) ? (
+                (() => {
+                  const links = getAggregatorLinks(swapTarget.token, currentChainId, activeChainSlug);
+                  return (
+                    <div style={{background: "var(--panel-2)", padding: 12, borderRadius: 6, border: "1px solid var(--line)"}}>
+                      <div style={{fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--cyan)"}}>
+                        DEX Aggregator Execution for {swapTarget.symbol || "Token"}:
+                      </div>
+
+                      <div style={{display: "grid", gap: 8}}>
+                        <a
+                          href={links.oneInch}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            background: "rgba(34, 211, 238, 0.12)",
+                            border: "1px solid var(--cyan)",
+                            borderRadius: 4,
+                            color: "var(--cyan)",
+                            textDecoration: "none",
+                            fontWeight: 700,
+                            fontSize: 12,
+                          }}
+                        >
+                          <span>🦄 1inch DEX Aggregator (Optimal Route)</span>
+                          <span>Open ↗</span>
+                        </a>
+
+                        <a
+                          href={links.uniswap}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            background: "var(--panel)",
+                            border: "1px solid var(--line)",
+                            borderRadius: 4,
+                            color: "var(--text)",
+                            textDecoration: "none",
+                            fontSize: 12,
+                          }}
+                        >
+                          <span>🦄 Uniswap / Aerodrome Direct Swap</span>
+                          <span>Open ↗</span>
+                        </a>
+
+                        <a
+                          href={links.kyberswap}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            background: "var(--panel)",
+                            border: "1px solid var(--line)",
+                            borderRadius: 4,
+                            color: "var(--text)",
+                            textDecoration: "none",
+                            fontSize: 12,
+                          }}
+                        >
+                          <span>⚡ KyberSwap Meta-Aggregator</span>
+                          <span>Open ↗</span>
+                        </a>
+
+                        <a
+                          href={links.dexscreener}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            background: "var(--panel)",
+                            border: "1px solid var(--line)",
+                            borderRadius: 4,
+                            color: "var(--amber)",
+                            textDecoration: "none",
+                            fontSize: 12,
+                          }}
+                        >
+                          <span>📈 DexScreener Live Pool & Chart</span>
+                          <span>View ↗</span>
+                        </a>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <div
+                  style={{
+                    padding: 24,
+                    textAlign: "center",
+                    color: "var(--muted)",
+                    border: "1px dashed var(--line)",
+                    borderRadius: 6,
+                    fontSize: 11,
+                  }}
+                >
+                  Select a token from your positions or enter an address on the left to generate aggregator swap links.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ────────────────────────────────────────────────────────────────────────
+          TAB 4: SAFETY GATES & HONEYPOT DIAGNOSTICS
+          ──────────────────────────────────────────────────────────────────────── */}
+      {tab === "gates" && (
+        <div className="panel" style={{padding: 16, display: "grid", gap: 14}}>
+          <div className="panel-head" style={{padding: 0}}>
+            <span>🛡️ Launch Filter Diagnostics & Honeypot Analytics</span>
+          </div>
+
+          <div className="muted" style={{fontSize: 11}}>
+            Every evaluated token launch is scored through the safety filter suite. Rejections are counted by code below to
+            diagnose exactly why candidate launches were approved or turned down.
+          </div>
+
+          <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12}}>
+            {Object.entries(cfg.rejections ?? {})
+              .sort((a, b) => b[1] - a[1])
+              .map(([code, count]) => (
+                <div key={code} style={{background: "var(--panel-2)", border: "1px solid var(--line)", borderRadius: 4, padding: "8px 12px"}}>
+                  <div className="muted" style={{fontSize: 10, textTransform: "uppercase"}}>
+                    {code.replace(/_/g, " ")}
+                  </div>
+                  <div style={{fontSize: 18, fontWeight: 700, marginTop: 4}}>
+                    {count}
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
-          <div className="muted" style={{marginTop: 10, fontSize: 11}}>
-            Edit these with <code>POST /api/sniper/params</code>, or persist them as boot
-            defaults with the <code>SNIPER_*</code> block in <code>.env</code>. A lane booted
-            with <code>SNIPER_DIRECTIONAL=false</code> cannot be armed at runtime.
+          </div>
+
+          <div className="panel" style={{padding: 12, background: "var(--panel-2)", marginTop: 6}}>
+            <div style={{fontSize: 12, fontWeight: 700, marginBottom: 6}}>
+              Durable .env Configuration Snippet:
+            </div>
+            <pre
+              style={{
+                background: "#070b11",
+                padding: 10,
+                borderRadius: 4,
+                fontSize: 11,
+                overflowX: "auto",
+                color: "var(--cyan)",
+              }}
+            >
+              {cfg.envSnippet}
+            </pre>
+            <button
+              onClick={() => {
+                navigator.clipboard.writeText(cfg.envSnippet);
+                setFeedback({type: "info", msg: "Copied .env configuration snippet to clipboard!"});
+              }}
+              style={{
+                marginTop: 8,
+                padding: "4px 12px",
+                fontSize: 11,
+                background: "var(--panel)",
+                border: "1px solid var(--line)",
+                color: "var(--text)",
+                borderRadius: 3,
+                cursor: "pointer",
+              }}
+            >
+              📋 Copy .env Snippet
+            </button>
           </div>
         </div>
       )}
     </div>
   );
 }
+
+function MetricCard({
+  label,
+  value,
+  sub,
+  tone,
+  title,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: "pos" | "neg" | "amber" | "muted";
+  title?: string;
+}) {
+  return (
+    <div
+      style={{
+        background: "var(--panel-2)",
+        border: "1px solid var(--line)",
+        borderRadius: 4,
+        padding: "8px 10px",
+      }}
+      title={title}
+    >
+      <div className="muted" style={{fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em"}}>
+        {label}
+      </div>
+      <div
+        className={tone}
+        style={{
+          fontSize: 14,
+          fontWeight: 700,
+          marginTop: 2,
+          fontVariantNumeric: "tabular-nums",
+          color:
+            tone === "pos"
+              ? "var(--green)"
+              : tone === "neg"
+                ? "var(--red)"
+                : tone === "amber"
+                  ? "var(--amber)"
+                  : "inherit",
+        }}
+      >
+        {value}
+      </div>
+      {sub && (
+        <div className="muted" style={{fontSize: 10, marginTop: 1}}>
+          {sub}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  background: "#070b11",
+  border: "1px solid var(--line)",
+  borderRadius: 4,
+  color: "var(--text)",
+  padding: "6px 8px",
+  fontSize: 12,
+  fontFamily: "inherit",
+};
+
+const chipButtonStyle: React.CSSProperties = {
+  padding: "2px 6px",
+  fontSize: 10,
+  background: "var(--panel-2)",
+  border: "1px solid var(--line)",
+  color: "var(--cyan)",
+  borderRadius: 3,
+  cursor: "pointer",
+};
 
 export default memo(SniperPanel);
