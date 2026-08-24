@@ -3,6 +3,38 @@
 Chains are added one at a time; each one has to survive a week of simulation
 before the next is started.
 
+## Where the project is
+
+**Development finishes before the soak begins.** These are two different
+activities owned by two different groups, and they do not overlap:
+
+| | Owner | Question it answers | Exit condition |
+| --- | --- | --- | --- |
+| **Build** | engineering | Is the system correct, complete and production-grade? | Every CI gate green and blocking; no unimplemented path on the live route; all four operator controls implemented; docs current |
+| **Soak** | operators + testers | Does this correct system actually make money on this chain, safely, over time? | `GET /api/qualification` reports `PASS` per strategy from 7 days of continuous canonical evidence |
+
+The soak is **not** a development phase with a longer feedback loop, and it is
+not where remaining engineering work gets discovered. It is a measurement
+period run by operators against a finished binary. If a soak turns up a code
+defect, that is a build-phase escape — the soak stops, the fix ships through
+CI, and the soak clock **restarts from zero** (`DAY0_RUNBOOK.md` Phase 4).
+Qualification evidence is only meaningful about the exact build that produced
+it.
+
+Practically, that means engineering hands operators: a tagged release that is
+green on all four CI jobs, `mev-bot doctor` passing on the target host, the
+deployment units in `deploy/`, and a runbook they can execute without an
+engineer in the room. Operators hand engineering back: qualification verdicts,
+funnel readings, and alert history.
+
+**Current state:** the build phase is complete for Ethereum mainnet and for the
+Base safety foundation. Phase 0–3 are shipped; the remaining unchecked boxes
+below are either explicitly out of scope for this phase or are *decisions to be
+written down* rather than code to be authored. The two open Base items are
+tracked in [`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md).
+Nothing on the live path is stubbed, and no strategy can broadcast without
+independently earning its own `PASS`.
+
 ## Phase 0 — this PR
 
 - [x] `MevExecutor`: atomic batches, profit guard, Balancer flash loans, V3 mint
@@ -75,9 +107,17 @@ Remaining Phase 2 coverage:
       / `submittable` and `/api/latency` stage `strategy` p95. Revert the
       pair if the pending-path p95 blows the 150 ms budget or the provider
       rate-limits.
-- [ ] Turn W6 on only if the funnel shows a public-mempool gap, and report
-      what it did after a week. If the answer is "nothing", 1inch/0x stay
-      closed.
+- [x] **W6 decision: closed, not flipped.** `DECODE_UNIVERSAL_ROUTER` stays
+      `false` and 1inch/0x/CoW stay out of scope. The gate was "flip only if
+      the funnel shows a public-mempool gap worth decoding"; the answer is
+      that the gap is structural, not a decoding shortfall. Public mempool is
+      now roughly a fifth of DeFi flow and falling — private-orderflow
+      endpoints (Flashbots Protect, MEV-Blocker, CoW, UniswapX) are standard,
+      and a majority of block value arrives privately. A better public
+      decoder competes for a shrinking, adversarially-priced residue. The
+      decoder stays in the tree behind its flag so the decision is reversible
+      if the funnel ever contradicts it. Rationale recorded in
+      [`W6_MEMO.md`](W6_MEMO.md).
 - [ ] Curve / Balancer / Maverick pool math (out of scope for this phase)
 - [x] Compound V3, Morpho and Maker liquidations; oracle-update front-running
       — `liquidation_compound` (absorb + discounted `buyCollateral`),
@@ -140,13 +180,47 @@ Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
       unknowable off-chain or inventory economics.
 - [x] Hardened Docker Compose and systemd deployment targets, metrics, health,
       alerts, and a reconciled runbook.
+- [x] Non-native profit-token valuation (`valuation.rs`): a bundle whose profit
+      arrives as a token rather than ETH is priced in native terms at the
+      pinned pre-bundle fork block (V3 QuoterV2 over the four canonical fee
+      tiers → V2 reserves → fail closed), with a configurable haircut
+      (`VALUATION_HAIRCUT_BPS`). This is what makes a liquidation biddable at
+      all; before it, every non-native profit settled as zero.
+- [x] The four liquidation rows (Aave, Compound V3, Morpho Blue, Maker)
+      promoted from shadow-only to live candidates now that their profit can
+      be valued. Promotion is eligibility, not approval — each still has to
+      earn its own `PASS`.
+- [x] Flashblocks ingest: `eth_subscribe ["newFlashblocks"]` over raw
+      WebSocket (`FLASHBLOCKS_WS_URL`), a raw-transaction RLP decoder with
+      ECDSA sender recovery, and a diff parser that skips what it cannot
+      decode. 200 ms preconfirmations against 2 s blocks, and the only Base
+      feed carrying raw signed bytes a bundle can transport.
+- [x] Console surfaces strategy eligibility. `GET /api/config` already carried
+      `strategyEligibility`; the console now renders it beneath the
+      qualification report, so a shadow-only row shows its reason instead of
+      sitting at `PENDING` and looking like it merely needs more soak time.
+      Uncertified simulation results are also distinguished from ordinary
+      misses in the simulations table.
+- [x] Set `Opportunity.profit_token` at the liquidation construction sites.
+      All four protocols carry their settlement asset (Aave `debt_asset`,
+      Compound V3 USDC, Morpho Blue `loanToken`, Maker DAI) into the simulator,
+      so the valuation path runs end to end and the liquidation rows can
+      produce real qualification evidence. A regression test in
+      `strategies/leads.rs` pins the invariant.
+- [ ] Value non-native profit in the relay and stub simulation backends.
+      `sim/relay.rs:93` and `sim/mod.rs:196` return `net_profit_wei = 0`
+      unconditionally. The fork backend — the only one the broadcast gate
+      reads — is unaffected, so this limits cross-backend comparison rather
+      than live safety.
 - [ ] Automated inventory top-up/profit sweeping policy (manual operator action
       remains safer for the first production period).
 - [ ] Bundle merging across independent opportunities.
 
 See `SIM_TO_LIVE.md` for the implemented broadcast predicate and operating
 procedure. Completion of code does not make a strategy qualified; only its own
-live evidence can produce `PASS`.
+live evidence can produce `PASS` — which is precisely why the soak is an
+operator exercise against a finished build rather than the tail end of
+development.
 
 ## Phase 4 — more chains
 

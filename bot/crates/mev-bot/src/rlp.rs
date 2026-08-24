@@ -211,6 +211,168 @@ fn decode_u256(raw: &[u8]) -> Option<U256> {
     Some(U256::from_be_slice(raw))
 }
 
+/// A signed transaction decoded from its raw wire bytes.
+///
+/// Feeds that push *objects* (`newPendingTransactions` with
+/// `includeTransactions`) hand us fields directly but usually cannot supply
+/// `raw`. Flashblocks is the mirror image: it pushes the signed payload, which
+/// is strictly more useful — the raw bytes are exactly what the bundle
+/// transport requires in order to carry a victim transaction, and every field
+/// below is recovered from the same bytes we would resubmit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedTx {
+    pub hash: alloy_primitives::B256,
+    pub from: Option<alloy_primitives::Address>,
+    pub to: Option<alloy_primitives::Address>,
+    pub value: U256,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: U256,
+    pub max_priority_fee_per_gas: U256,
+    pub input: Vec<u8>,
+}
+
+/// Decode a signed transaction from raw wire bytes, recovering the sender.
+///
+/// Handles legacy, EIP-2930 (`0x01`), EIP-1559 (`0x02`) and EIP-4844 (`0x03`)
+/// envelopes — the shapes an OP-stack chain actually carries. Deposit
+/// transactions (`0x7e`) are intentionally rejected: they are system
+/// transactions with no recoverable signature and nothing to back-run.
+///
+/// Returns `None` for anything malformed rather than guessing, so a feed that
+/// changes shape degrades to "no transactions" instead of to wrong ones.
+pub fn decode_raw_transaction(raw: &[u8]) -> Option<DecodedTx> {
+    use alloy_primitives::keccak256;
+
+    if raw.is_empty() {
+        return None;
+    }
+    let hash = keccak256(raw);
+
+    // (items, signature offset, chain-id-in-payload)
+    let (items, sig_start, typed) = match raw[0] {
+        // Legacy: rlp([nonce, gasPrice, gas, to, value, data, v, r, s])
+        b if b >= 0xc0 => (decode_list(raw)?, 6usize, false),
+        0x01 => (decode_list(&raw[1..])?, 8, true),
+        0x02 => (decode_list(&raw[1..])?, 9, true),
+        0x03 => (decode_list(&raw[1..])?, 11, true),
+        _ => return None,
+    };
+    if items.len() < sig_start + 3 {
+        return None;
+    }
+
+    // Field positions differ only by the leading chain_id and the gas-price
+    // split; normalise both here.
+    let (nonce_i, tip_i, cap_i, gas_i, to_i, val_i, data_i) = match raw[0] {
+        b if b >= 0xc0 => (0usize, 1usize, 1usize, 2usize, 3usize, 4usize, 5usize),
+        _ => (1, 2, 3, 4, 5, 6, 7),
+    };
+
+    let to = {
+        let b = &items[to_i];
+        if b.is_empty() {
+            None // contract creation
+        } else if b.len() == 20 {
+            Some(alloy_primitives::Address::from_slice(b))
+        } else {
+            return None;
+        }
+    };
+
+    let sighash = {
+        // Re-encode the unsigned prefix and hash it the way the signer did.
+        let unsigned: Vec<Vec<u8>> = items[..sig_start]
+            .iter()
+            .map(|i| encode_bytes(i))
+            .collect::<Vec<_>>();
+        // Nested lists (access list, blob hashes) were returned pre-encoded by
+        // `decode_list`, so re-encoding their bytes as a string would corrupt
+        // them. Rebuild using the original encoding for list items.
+        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(sig_start);
+        for (idx, item) in items[..sig_start].iter().enumerate() {
+            // The access list (and, for 4844, the blob-hash list) is the only
+            // nested list before the signature; `decode_list` handed those
+            // back already encoded.
+            let is_list = matches!(
+                (raw[0], idx),
+                (0x01, 7) | (0x02, 8) | (0x03, 9) | (0x03, 10)
+            );
+            if is_list {
+                parts.push(item.clone());
+            } else {
+                parts.push(unsigned[idx].clone());
+            }
+        }
+        let body = encode_list(&parts);
+        if raw[0] >= 0xc0 {
+            // EIP-155 legacy signing hash needs [chain_id, 0, 0] appended,
+            // which we cannot know without the chain id; recover below only
+            // for typed transactions and skip `from` for legacy.
+            keccak256(&body)
+        } else {
+            let mut buf = Vec::with_capacity(body.len() + 1);
+            buf.push(raw[0]);
+            buf.extend_from_slice(&body);
+            keccak256(&buf)
+        }
+    };
+
+    let from = if typed {
+        recover_sender(
+            &sighash,
+            &items[sig_start],
+            &items[sig_start + 1],
+            &items[sig_start + 2],
+        )
+    } else {
+        // Legacy senders need the chain id to rebuild the signing hash; the
+        // strategies that matter here only need `to`/`input`/fees, and an
+        // absent `from` is already an accepted shape upstream.
+        None
+    };
+
+    Some(DecodedTx {
+        hash,
+        from,
+        to,
+        value: decode_u256(&items[val_i])?,
+        nonce: decode_u64(&items[nonce_i])?,
+        gas_limit: decode_u64(&items[gas_i])?,
+        max_fee_per_gas: decode_u256(&items[cap_i])?,
+        max_priority_fee_per_gas: decode_u256(&items[tip_i])?,
+        input: items[data_i].clone(),
+    })
+}
+
+/// Recover the signing address from a `(y_parity, r, s)` triple.
+fn recover_sender(
+    sighash: &alloy_primitives::B256,
+    y_parity: &[u8],
+    r: &[u8],
+    s: &[u8],
+) -> Option<alloy_primitives::Address> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+    if r.len() > 32 || s.len() > 32 {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    sig[32 - r.len()..32].copy_from_slice(r);
+    sig[64 - s.len()..].copy_from_slice(s);
+    let signature = Signature::from_slice(&sig).ok()?;
+    let parity = match y_parity {
+        [] => 0u8,
+        [v] => *v,
+        _ => return None,
+    };
+    let rec = RecoveryId::from_byte(parity)?;
+    let vk = VerifyingKey::recover_from_prehash(sighash.as_slice(), &signature, rec).ok()?;
+    let point = vk.to_encoded_point(false);
+    let h = alloy_primitives::keccak256(&point.as_bytes()[1..]);
+    Some(alloy_primitives::Address::from_slice(&h[12..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +446,68 @@ mod tests {
         }
         assert_eq!(decode_eip1559_nonce(&[]), None);
         assert_eq!(decode_eip1559_nonce(&[0x01, 0xc0]), None);
+    }
+
+    #[test]
+    fn decodes_a_signed_1559_transaction_and_recovers_the_signer() {
+        // Sign with the real signer, then decode the bytes back. This pins the
+        // decoder against the encoder rather than against a hand-copied
+        // fixture, so a change to either side has to break the round trip.
+        use crate::signer::{Eip1559Tx, Signer};
+        let signer = Signer::simulation();
+        let to = alloy_primitives::Address::repeat_byte(0xab);
+        let tx = Eip1559Tx {
+            chain_id: 8453,
+            nonce: 42,
+            max_priority_fee_per_gas: U256::from(1_000_000u64),
+            max_fee_per_gas: U256::from(50_000_000u64),
+            gas_limit: 210_000,
+            to: Some(to),
+            value: U256::from(1_234_567_890u64),
+            data: vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02],
+        };
+        let (raw, hash) = signer.sign_eip1559(&tx);
+
+        let d = decode_raw_transaction(&raw).expect("decodes");
+        assert_eq!(d.hash, hash, "hash must match the signer's");
+        assert_eq!(d.from, Some(signer.address()), "sender must be recovered");
+        assert_eq!(d.to, Some(to));
+        assert_eq!(d.nonce, 42);
+        assert_eq!(d.gas_limit, 210_000);
+        assert_eq!(d.max_fee_per_gas, U256::from(50_000_000u64));
+        assert_eq!(d.max_priority_fee_per_gas, U256::from(1_000_000u64));
+        assert_eq!(d.value, U256::from(1_234_567_890u64));
+        assert_eq!(d.input, vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn decodes_a_contract_creation_as_no_recipient() {
+        use crate::signer::{Eip1559Tx, Signer};
+        let signer = Signer::simulation();
+        let tx = Eip1559Tx {
+            chain_id: 1,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1u64),
+            max_fee_per_gas: U256::from(2u64),
+            gas_limit: 100_000,
+            to: None,
+            value: U256::ZERO,
+            data: vec![0x60, 0x80],
+        };
+        let (raw, _) = signer.sign_eip1559(&tx);
+        let d = decode_raw_transaction(&raw).expect("decodes");
+        assert_eq!(d.to, None, "creation has no recipient");
+        assert_eq!(d.from, Some(signer.address()));
+    }
+
+    #[test]
+    fn rejects_malformed_and_system_payloads() {
+        assert!(decode_raw_transaction(&[]).is_none());
+        // OP-stack deposit transactions have no recoverable signature.
+        assert!(decode_raw_transaction(&[0x7e, 0xc0]).is_none());
+        // Truncated typed envelope.
+        assert!(decode_raw_transaction(&[0x02, 0xc0]).is_none());
+        // Unknown envelope type.
+        assert!(decode_raw_transaction(&[0x09, 0xc0]).is_none());
     }
 }

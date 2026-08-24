@@ -329,4 +329,57 @@ mod tests {
         leads.publish("aave-v3", Vec::new());
         assert!(leads.is_empty());
     }
+
+    /// Every liquidation-flavoured opportunity settles in the protocol's debt
+    /// or loan asset (Aave: `debt_asset`, Compound V3: USDC, Morpho Blue:
+    /// `loanToken`, Maker: DAI) — never in the native asset. That is what
+    /// routes these strategies through `valuation::value_in_native` in the
+    /// fork simulator instead of the native-accounting shortcut, so the
+    /// invariant is load-bearing for their profit numbers rather than
+    /// cosmetic: a regression to `Address::ZERO` here would silently make the
+    /// simulator treat an ERC-20 balance delta as if it were wei.
+    ///
+    /// `liquidation_opportunity` takes `profit_token` positionally between two
+    /// other `Address`-shaped arguments, which is exactly the shape of call
+    /// that survives a careless edit, so pin it.
+    #[test]
+    fn liquidation_opportunities_settle_in_a_non_native_token() {
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        for (strategy, token) in [
+            (Strategy::Liquidation, usdc),
+            (Strategy::LiquidationCompound, usdc),
+            (Strategy::LiquidationMorpho, WETH),
+            (Strategy::LiquidationMaker, crate::config::known::DAI),
+        ] {
+            let opp = liquidation_opportunity(
+                strategy,
+                Vec::new(),
+                vec![token],
+                vec![U256::ONE],
+                token,
+                U256::ONE,
+                U256::ONE,
+                1,
+                String::new(),
+            );
+
+            assert_eq!(
+                opp.profit_token, token,
+                "{strategy:?} must carry its settlement token through to the simulator",
+            );
+            assert_ne!(
+                opp.profit_token,
+                Address::ZERO,
+                "{strategy:?} must never fall back to the native sentinel",
+            );
+            // `live_candidate()` is what admits these rows to the broadcast
+            // path; pairing the two assertions keeps the promotion and the
+            // valuation requirement from drifting apart.
+            assert!(
+                strategy.live_candidate(),
+                "{strategy:?} is expected to be a live candidate",
+            );
+        }
+    }
 }

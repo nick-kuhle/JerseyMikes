@@ -50,6 +50,41 @@ let demoRisk = {
   killSwitch: {tripped: false, cumulativeNetWei: "-1200000000000000"},
 };
 
+/**
+ * Strategy eligibility as the bot reports it on `GET /api/config`.
+ *
+ * Shadow-only is an engineering verdict, not a maturity one: these three are
+ * blocked by how their opportunities settle or how they must be ordered, and
+ * no amount of soak time changes that. The reason strings are copied verbatim
+ * from `Strategy::shadow_only_reason()` so the demo view cannot drift into
+ * saying something the bot would not.
+ */
+const DEMO_ELIGIBILITY = [
+  {name: "sandwich", liveCandidate: true, shadowOnlyReason: null},
+  {name: "sandwich_v3", liveCandidate: true, shadowOnlyReason: null},
+  {name: "atomic_arb", liveCandidate: true, shadowOnlyReason: null},
+  {name: "liquidation", liveCandidate: true, shadowOnlyReason: null},
+  {name: "liquidation_compound", liveCandidate: true, shadowOnlyReason: null},
+  {name: "liquidation_morpho", liveCandidate: true, shadowOnlyReason: null},
+  {name: "liquidation_maker", liveCandidate: true, shadowOnlyReason: null},
+  {
+    name: "jit",
+    liveCandidate: false,
+    shadowOnlyReason: "position is not yet unwound to one profit token",
+  },
+  {
+    name: "sniper",
+    liveCandidate: false,
+    shadowOnlyReason: "round-trip probe is not a certified profitable execution strategy",
+  },
+  {
+    name: "oracle_frontrun",
+    liveCandidate: false,
+    shadowOnlyReason:
+      "requires guaranteed pre-update ordering: no builder market or express-lane bid is wired",
+  },
+];
+
 /** Fallbacks keyed by the bot's own route names. */
 function demoFor(path: string, search: URLSearchParams): unknown {
   const limit = Number(search.get("limit") ?? 100);
@@ -84,6 +119,11 @@ function demoFor(path: string, search: URLSearchParams): unknown {
         searcher: "0x00000000000000000000000000000000000f0000",
         liveExecution: demoLive,
         liveArmed: true,
+        // Mirrors `Strategy::live_candidate()` / `shadow_only_reason()` in the
+        // bot. Kept in sync by hand because the demo generator exists precisely
+        // for when no bot is reachable to ask; the reasons are the shipped ones,
+        // not placeholders, so the panel reviewed here is the panel operators get.
+        strategyEligibility: DEMO_ELIGIBILITY,
         demo: true,
       };
     case "risk":

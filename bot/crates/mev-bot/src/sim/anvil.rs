@@ -54,6 +54,9 @@ pub struct AnvilSim {
     searcher: Address,
     /// Serialises access: one simulation at a time per fork.
     lock: Mutex<()>,
+    /// Block-pinned prices for non-native profit tokens. Keyed by
+    /// `(token, block)` so a quote can never outlive its block.
+    valuation: crate::valuation::ValuationCache,
 }
 
 /// Decode revert bytes into something a human can triage: the executor's own
@@ -347,6 +350,7 @@ impl AnvilSim {
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
             lock: Mutex::new(()),
+            valuation: crate::valuation::ValuationCache::new(),
         };
         sim.prepare_state().await?;
         Ok(sim)
@@ -365,6 +369,7 @@ impl AnvilSim {
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
             lock: Mutex::new(()),
+            valuation: crate::valuation::ValuationCache::new(),
         };
         sim.prepare_state().await?;
         Ok(sim)
@@ -758,18 +763,53 @@ impl AnvilSim {
             gas_cost / U256::from(gas_used)
         };
 
-        // Gas is ETH-denominated. Until a block-pinned token valuation is
-        // available, subtracting it from USDC/DAI/etc. would fabricate a unit.
-        // Such strategies remain visible in shadow mode but fail closed at the
-        // submittable boundary.
+        // Gas is ETH-denominated, profit is denominated in `profit_token`.
+        // Netting one against the other needs a price, and the price has to be
+        // read at the block the profit was measured at.
+        //
+        // Native and wrapped-native need no conversion. Everything else is
+        // priced by `crate::valuation` against the fork itself, at the block
+        // the fork is pinned to — i.e. *pre-bundle* state, so our own
+        // transactions cannot move the price they are then valued at. When
+        // valuation is disabled or no route exists, this falls back to exactly
+        // the previous conservative behaviour: uncertified, not submittable.
         let native_accounting =
             opp.profit_token == Address::ZERO || opp.profit_token == self.cfg.chain.weth;
+        let mut certified = native_accounting;
         let net = if native_accounting {
             to_i128(retained) - to_i128(gas_cost)
+        } else if self.cfg.token_valuation {
+            let block = *self.forked_at.lock().await;
+            match crate::valuation::value_in_native(
+                &self.rpc,
+                &self.cfg,
+                &self.valuation,
+                opp.profit_token,
+                retained,
+                block,
+                self.cfg.valuation_haircut_bps,
+            )
+            .await
+            {
+                Some(v) => {
+                    certified = true;
+                    to_i128(v.wei) - to_i128(gas_cost)
+                }
+                None => {
+                    ok = false;
+                    revert_reason.get_or_insert_with(|| {
+                        format!(
+                            "uncertified accounting: no block-pinned route from {:?} to WETH at block {block}",
+                            opp.profit_token
+                        )
+                    });
+                    0
+                }
+            }
         } else {
             ok = false;
             revert_reason.get_or_insert_with(|| {
-                "uncertified accounting: non-WETH profit cannot be netted against ETH gas without a block-pinned valuation"
+                "uncertified accounting: non-WETH profit cannot be netted against ETH gas without a block-pinned valuation (set TOKEN_VALUATION=true)"
                     .to_string()
             });
             0
@@ -779,7 +819,7 @@ impl AnvilSim {
             opportunity_id: opp.id.clone(),
             strategy: opp.strategy,
             backend: SimBackend::AnvilFork,
-            success: ok && retained > U256::ZERO && native_accounting,
+            success: ok && retained > U256::ZERO && certified,
             gross_profit_wei: gross,
             gas_used,
             gas_price_wei: gas_price,

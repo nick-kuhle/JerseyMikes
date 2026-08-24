@@ -40,3 +40,4 @@ pub mod store;
 pub mod strategies;
 pub mod submission;
 pub mod types;
+pub mod valuation;
