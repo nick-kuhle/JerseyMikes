@@ -5,6 +5,7 @@ import EquityChart from "./EquityChart";
 import LiveFeed from "./LiveFeed";
 import ContractPanel from "./ContractPanel";
 import GoLivePanel from "./GoLivePanel";
+import EligibilityPanel from "./EligibilityPanel";
 import RiskPanel from "./RiskPanel";
 import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
@@ -473,7 +474,7 @@ export default function Console() {
                         )}
                       </td>
                       <td className={s.success ? "pos" : "muted"}>
-                        {s.success ? "profitable" : s.revertReason ?? "no edge"}
+                        <SimVerdict success={s.success} revertReason={s.revertReason} />
                       </td>
                     </tr>
                   );
@@ -658,6 +659,7 @@ export default function Console() {
       >
         <div style={{padding: 4, display: "grid", gap: 12}}>
           <QualificationReport qualification={status?.qualification} />
+          <EligibilityPanel enabled={status?.strategies} />
           <GoLivePanel executor={status?.executor ?? ""} armed={status?.liveArmed} chainId={chainId} />
         </div>
       </Section>
@@ -673,6 +675,42 @@ export default function Console() {
       </footer>
       </div>
     </main>
+  );
+}
+
+/**
+ * The `result` cell of the simulations table.
+ *
+ * Three outcomes, not two. A plain revert and an *uncertified* result both
+ * used to render as grey prose in a `nowrap` cell, which conflated the two
+ * cases that most need telling apart:
+ *
+ *   - "no edge" / a revert reason: the simulator looked and there was nothing
+ *     there, or the bundle would genuinely have failed.
+ *   - "uncertified": the bundle may well have been profitable, but the profit
+ *     landed in a token the bot could not price against ETH gas at the pinned
+ *     fork block, so it refuses to *claim* a number. This is fail-closed
+ *     accounting, and it is usually fixed by configuration
+ *     (`TOKEN_VALUATION=true`) rather than by strategy work.
+ *
+ * Reading the second as the first understates the strategy. The full reason
+ * stays available on hover; only the label is short, because these strings run
+ * to a full sentence and the cell is `nowrap`.
+ */
+function SimVerdict({success, revertReason}: {success: boolean; revertReason: string | null}) {
+  if (success) return <>profitable</>;
+  const reason = revertReason ?? "no edge";
+  if (reason.startsWith("uncertified accounting")) {
+    return (
+      <span style={{color: "var(--amber)"}} title={reason}>
+        uncertified
+      </span>
+    );
+  }
+  return (
+    <span title={reason.length > 40 ? reason : undefined}>
+      {reason.length > 40 ? `${reason.slice(0, 39)}…` : reason}
+    </span>
   );
 }
 

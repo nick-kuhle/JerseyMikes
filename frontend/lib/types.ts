@@ -10,6 +10,43 @@ export type Strategy =
   | "oracle_frontrun"
   | "sniper";
 
+/**
+ * One row of `GET /api/config` → `strategyEligibility`.
+ *
+ * Engineering eligibility, which is a different question from qualification:
+ * this says whether a strategy *may ever* broadcast, while
+ * `StrategyQualification.verdict` says whether it has earned the right to.
+ * A shadow-only row can never reach `PASS`, so showing the reason is what
+ * stops an operator waiting on evidence that will never arrive.
+ */
+export interface StrategyEligibility {
+  name: Strategy;
+  liveCandidate: boolean;
+  /** Null for live candidates; a specific engineering reason otherwise. */
+  shadowOnlyReason: string | null;
+}
+
+/** GET /api/config — boot-time facts about the running bot. */
+export interface ConfigResponse {
+  chainId: number;
+  weth?: string;
+  executor: string;
+  searcher?: string;
+  liveExecution: boolean;
+  liveArmed: boolean;
+  broadcastEnabled?: boolean;
+  strategyEligibility?: StrategyEligibility[];
+  endpoints?: {
+    ws: boolean;
+    mevShare: boolean;
+    relays: number;
+    sequencerFeed: boolean;
+    externalMempools: number;
+  };
+  bloxrouteRelay?: {url: string; txIngest: boolean};
+  demo?: boolean;
+}
+
 /** GET /api/risk — the runtime risk envelope vs its boot values. */
 export interface RiskStateResponse {
   effective: RiskValues;
