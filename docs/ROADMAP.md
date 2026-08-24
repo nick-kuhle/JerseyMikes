@@ -201,11 +201,17 @@ Details in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md).
       sitting at `PENDING` and looking like it merely needs more soak time.
       Uncertified simulation results are also distinguished from ordinary
       misses in the simulations table.
-- [ ] Set `Opportunity.profit_token` at the liquidation construction sites.
-      The field exists and is persisted, but most sites still write
-      `Address::ZERO`, so the valuation path is correct and tested yet not
-      exercised end to end. **This is the last code item before the liquidation
-      rows can produce real qualification evidence.**
+- [x] Set `Opportunity.profit_token` at the liquidation construction sites.
+      All four protocols carry their settlement asset (Aave `debt_asset`,
+      Compound V3 USDC, Morpho Blue `loanToken`, Maker DAI) into the simulator,
+      so the valuation path runs end to end and the liquidation rows can
+      produce real qualification evidence. A regression test in
+      `strategies/leads.rs` pins the invariant.
+- [ ] Value non-native profit in the relay and stub simulation backends.
+      `sim/relay.rs:93` and `sim/mod.rs:196` return `net_profit_wei = 0`
+      unconditionally. The fork backend — the only one the broadcast gate
+      reads — is unaffected, so this limits cross-backend comparison rather
+      than live safety.
 - [ ] Automated inventory top-up/profit sweeping policy (manual operator action
       remains safer for the first production period).
 - [ ] Bundle merging across independent opportunities.

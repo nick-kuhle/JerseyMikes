@@ -142,11 +142,23 @@ caching, haircut arithmetic and overflow). `forge fmt --check`, `forge build
 --sizes` and `forge test` clean, 32 passed. Both formatter checks were made
 **blocking** in CI in the same change (they had been `continue-on-error`).
 
-**Known follow-on.** `Opportunity.profit_token` exists and is persisted, but
-most construction sites still hardcode `Address::ZERO`. Valuation is therefore
-correct and tested but not yet exercised end to end: the liquidation strategies
-must set `profit_token` to the collateral they seize before the new path does
-any work in production. Tracked in `docs/ROADMAP.md`.
+**Valuation reaches production.** Every liquidation strategy settles in its
+protocol's debt or loan asset and carries that address through to the
+simulator: Aave passes `debt_asset`, Compound V3 passes USDC, Morpho Blue
+passes `loanToken`, Maker passes DAI. All four therefore take the
+`valuation::value_in_native` branch in `sim/anvil.rs` rather than the
+native-accounting shortcut, so the path is exercised end to end whenever
+`TOKEN_VALUATION=true`. The remaining `Address::ZERO` literals in the tree are
+all test fixtures, and
+`leads::tests::liquidation_opportunities_settle_in_a_non_native_token` pins the
+invariant so a careless edit to the positional `liquidation_opportunity`
+signature cannot silently reintroduce the native sentinel.
+
+Two simulation backends still report `net_profit_wei = 0` regardless of the
+profit token: `sim/relay.rs:93` and the `sim/mod.rs:196` stub. Only the anvil
+fork backend values non-native profit, and only it is wired into the broadcast
+gate, so this is a completeness gap in the alternate backends rather than a
+correctness gap on the live path.
 
 ## 2026-08-22 — Aave per-reserve liquidation config
 

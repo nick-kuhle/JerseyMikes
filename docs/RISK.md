@@ -191,12 +191,13 @@ is the margin for that, and it is a parameter rather than a proof.
   path prices collateral with a block-pinned quoter call and a haircut. It
   does not model the exit trade, nor other liquidators bidding for the same
   collateral in the same block.
-- **`Opportunity.profit_token` is not yet set at every construction site.**
-  The field exists and is persisted, and the valuation path that consumes it
-  is implemented and tested, but most sites still write `Address::ZERO`. Until
-  the liquidation strategies populate it, those bundles continue to report as
-  native-only. This is a known open item, tracked in `ROADMAP.md`; it fails in
-  the safe direction (a profit is under-counted, never over-counted).
+- **Only the fork backend values non-native profit.** Every live-candidate
+  strategy sets `Opportunity.profit_token`, and the anvil fork simulator prices
+  it through `valuation::value_in_native`. The relay comparison backend
+  (`sim/relay.rs`) and the `sim/mod.rs` stub still report `net_profit_wei = 0`
+  for any bundle, so profit figures read from those two backends are not
+  authoritative and must not be used as qualification evidence. The broadcast
+  gate consumes the fork backend only.
 
 ## Operational notes
 
