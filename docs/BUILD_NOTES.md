@@ -706,3 +706,17 @@ forge build && jq -r '.deployedBytecode.object' out/MevExecutor.sol/MevExecutor.
 ```
 
 CI fails if the checked-in artifact drifts from the compiler output.
+
+---
+
+## 2026-08-24 · Directional Sniper Live Path & UI Refactor
+
+Completed all four blocking items from `WORK_ORDER_SNIPER_LIVE_PATH.md` and overhauled the Sniper console UI:
+
+- **Item 2 (Calldata Builder):** Implemented `bot/crates/mev-bot/src/sniper/calldata.rs` with `build_entry`, `build_exit`, `make_tag`, guards, and ABI unit tests.
+- **Item 3 (Vault Deploy & Config):** Created `contracts/script/SniperVault.s.sol`, added `SNIPER_VAULT_ADDRESS` config knob, arming validation, and `GET /api/sniper/vault` endpoint.
+- **Item 4 (Mark-to-market Source):** Created `bot/crates/mev-bot/src/sniper/marks.rs` with live `getReserves` pricing, staleness tracking, and 12-block exit suppression policy.
+- **Item 1 (Engine Wiring):** Created `bot/crates/mev-bot/src/sniper/execution.rs` and wired entry & exit loops into `engine.rs` (`on_block` and `on_pending`). Enforced `Pending` position persistence before signing (Invariant 4) and full shadow mode path when `SNIPER_DIRECTIONAL=false` (Invariant 6).
+- **Frontend Overhaul:** Redesigned `SniperPanel.tsx` with master ON/OFF switch, ETH Invest field, Auto-Sell ETH & % controls, Vault Status summary, Mini Portfolio token tracker, and limit-priced manual Buy / Sell controls.
+- **Invariants Preserved:** `MevExecutor` runtime bytecode remains exactly **11,497 bytes**. Zero calls from sniper into atomic bundle/submission/qualification paths. All tests green (397 Rust, 63 Foundry, Next.js build).
+

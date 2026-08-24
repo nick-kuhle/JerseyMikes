@@ -98,25 +98,38 @@ pub struct Portfolio {
 }
 
 /// A mark for one position: what the remaining quantity would fetch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Mark {
     pub value_wei: U256,
+    pub block: u64,
+    pub ts: u64,
     /// False when the pool read failed and this is a carried-forward value.
     pub fresh: bool,
 }
 
 impl Mark {
-    pub fn fresh(value_wei: U256) -> Self {
+    pub fn fresh(value_wei: U256, block: u64, ts: u64) -> Self {
         Self {
             value_wei,
+            block,
+            ts,
             fresh: true,
         }
     }
-    pub fn stale(value_wei: U256) -> Self {
+    pub fn stale(value_wei: U256, block: u64, ts: u64) -> Self {
         Self {
             value_wei,
+            block,
+            ts,
             fresh: false,
         }
+    }
+    pub fn is_stale(&self, current_block: u64) -> bool {
+        !self.fresh
+            || (self.block > 0
+                && current_block > 0
+                && current_block.saturating_sub(self.block) > 12)
     }
 }
 
@@ -141,6 +154,8 @@ pub fn summarize(
     for p in positions {
         let mark = marks.get(&p.id).copied().unwrap_or(Mark {
             value_wei: U256::ZERO,
+            block: 0,
+            ts: 0,
             fresh: false,
         });
         // A terminal position holds nothing, so its mark is definitionally
@@ -344,7 +359,7 @@ mod tests {
     fn marks(pairs: &[(&str, U256)]) -> HashMap<String, Mark> {
         pairs
             .iter()
-            .map(|(id, v)| (id.to_string(), Mark::fresh(*v)))
+            .map(|(id, v)| (id.to_string(), Mark::fresh(*v, 0, 0)))
             .collect()
     }
 
@@ -417,7 +432,7 @@ mod tests {
     #[test]
     fn an_explicitly_stale_mark_is_flagged_but_keeps_its_value() {
         let mut m = HashMap::new();
-        m.insert("a".to_string(), Mark::stale(centi(90)));
+        m.insert("a".to_string(), Mark::stale(centi(90), 0, 0));
         let out = sum(&[p("a", PositionState::Open)], &m);
         assert!(out.open[0].mark_stale);
         assert_eq!(out.open[0].mark_value_wei, centi(90).to_string());

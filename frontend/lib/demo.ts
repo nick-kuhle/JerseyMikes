@@ -759,3 +759,14 @@ export function demoSniperPortfolio() {
     generatedAtMs: now,
   };
 }
+
+export function demoSniperVault() {
+  return {
+    configured: true,
+    address: "0x3333333333333333333333333333333333333333",
+    spendableRemainingWei: "250000000000000000",
+    dailyBudgetWei: "250000000000000000",
+    totalBudgetWei: "1000000000000000000",
+    windowResetTimeSecs: Math.floor(Date.now() / 1000) + 43200,
+  };
+}

@@ -8,7 +8,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
+use alloy_sol_types::SolCall;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::http::{header, HeaderValue, Method};
@@ -48,6 +49,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/sniper/params", post(set_sniper_params))
         .route("/api/sniper/halt", post(halt_sniper))
         .route("/api/sniper/resume", post(resume_sniper))
+        .route("/api/sniper/buy", post(manual_sniper_buy))
+        .route("/api/sniper/sell", post(manual_sniper_sell))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Browsers get no cross-origin access by default. The dashboard reaches
@@ -96,6 +99,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/sniper/portfolio", get(sniper_portfolio))
         .route("/api/sniper/params", get(sniper_params))
         .route("/api/sniper/positions", get(sniper_positions))
+        .route("/api/sniper/vault", get(sniper_vault))
         .merge(mutating)
         .layer(cors)
         .with_state(state)
@@ -769,4 +773,153 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+async fn sniper_vault(State(s): State<ApiState>) -> impl IntoResponse {
+    let params = s.engine.sniper.params();
+    let Some(vault_addr) = params.vault_address else {
+        return Json(json!({
+            "configured": false,
+            "address": null,
+            "spendableRemainingWei": "0",
+            "dailyBudgetWei": "0",
+            "totalBudgetWei": "0",
+            "windowResetTimeSecs": 0
+        }));
+    };
+    if vault_addr == Address::ZERO {
+        return Json(json!({
+            "configured": false,
+            "address": null,
+            "spendableRemainingWei": "0",
+            "dailyBudgetWei": "0",
+            "totalBudgetWei": "0",
+            "windowResetTimeSecs": 0
+        }));
+    }
+
+    let call_spendable =
+        crate::sniper::calldata::ISniperVault::spendableRemainingCall {}.abi_encode();
+    let call_daily = crate::sniper::calldata::ISniperVault::dailyBudgetCall {}.abi_encode();
+    let call_total = crate::sniper::calldata::ISniperVault::totalBudgetCall {}.abi_encode();
+    let call_window = crate::sniper::calldata::ISniperVault::windowStartCall {}.abi_encode();
+
+    let head = s.engine.ctx.head().number;
+    let spendable = match s
+        .engine
+        .http
+        .eth_call(vault_addr, call_spendable, head)
+        .await
+    {
+        Ok(b) => crate::sniper::calldata::ISniperVault::spendableRemainingCall::abi_decode_returns(
+            &b, true,
+        )
+        .map(|v| v._0)
+        .unwrap_or(U256::ZERO),
+        Err(_) => U256::ZERO,
+    };
+    let daily = match s.engine.http.eth_call(vault_addr, call_daily, head).await {
+        Ok(b) => {
+            crate::sniper::calldata::ISniperVault::dailyBudgetCall::abi_decode_returns(&b, true)
+                .map(|v| v._0)
+                .unwrap_or(U256::ZERO)
+        }
+        Err(_) => U256::ZERO,
+    };
+    let total = match s.engine.http.eth_call(vault_addr, call_total, head).await {
+        Ok(b) => {
+            crate::sniper::calldata::ISniperVault::totalBudgetCall::abi_decode_returns(&b, true)
+                .map(|v| v._0)
+                .unwrap_or(U256::ZERO)
+        }
+        Err(_) => U256::ZERO,
+    };
+    let window_start = match s.engine.http.eth_call(vault_addr, call_window, head).await {
+        Ok(b) => {
+            crate::sniper::calldata::ISniperVault::windowStartCall::abi_decode_returns(&b, true)
+                .map(|v| v._0.to::<u64>())
+                .unwrap_or(0)
+        }
+        Err(_) => 0,
+    };
+
+    let reset_time = window_start.saturating_add(86_400);
+
+    Json(json!({
+        "configured": true,
+        "address": vault_addr,
+        "spendableRemainingWei": spendable.to_string(),
+        "dailyBudgetWei": daily.to_string(),
+        "totalBudgetWei": total.to_string(),
+        "windowResetTimeSecs": reset_time
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualBuyPayload {
+    token: String,
+    pair: Option<String>,
+    size_wei: String,
+}
+
+async fn manual_sniper_buy(
+    State(s): State<ApiState>,
+    Json(p): Json<ManualBuyPayload>,
+) -> impl IntoResponse {
+    let Ok(token) = p.token.parse::<Address>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "invalid token address"})),
+        )
+            .into_response();
+    };
+    let Ok(size_wei) = p.size_wei.parse::<U256>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "invalid sizeWei"})),
+        )
+            .into_response();
+    };
+    let pair = p
+        .pair
+        .and_then(|addr| addr.parse().ok())
+        .unwrap_or(Address::ZERO);
+    let head = s.engine.ctx.head().number;
+    let now = crate::types::now_ms();
+    let pos = s.engine.sniper.manual_buy(
+        token,
+        pair,
+        size_wei,
+        s.engine.cfg.chain.chain_id,
+        head,
+        now,
+    );
+    (StatusCode::OK, Json(json!({"ok": true, "position": pos}))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualSellPayload {
+    id: String,
+    sell_fraction_bps: Option<u32>,
+}
+
+async fn manual_sniper_sell(
+    State(s): State<ApiState>,
+    Json(p): Json<ManualSellPayload>,
+) -> impl IntoResponse {
+    let fraction = p.sell_fraction_bps.unwrap_or(10_000);
+    match s.engine.sniper.manual_sell(&p.id, fraction) {
+        Some(decision) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "decision": decision})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "position not found or not live"})),
+        )
+            .into_response(),
+    }
 }

@@ -574,3 +574,13 @@ export interface SniperParamsResponse {
   envSnippet: string;
   demo?: boolean;
 }
+
+export interface SniperVaultStatus {
+  configured: boolean;
+  address: string | null;
+  spendableRemainingWei: string;
+  dailyBudgetWei: string;
+  totalBudgetWei: string;
+  windowResetTimeSecs: number;
+  demo?: boolean;
+}

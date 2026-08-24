@@ -44,7 +44,10 @@
 //!   Closed, PnL booked, portfolio updated
 //! ```
 
+pub mod calldata;
+pub mod execution;
 pub mod gates;
+pub mod marks;
 pub mod params;
 pub mod portfolio;
 pub mod position;
@@ -151,6 +154,61 @@ impl SniperLane {
 
     pub fn is_blacklisted(&self, token: Address) -> bool {
         self.blacklist.read().contains(&token)
+    }
+
+    /// Manual buy trigger from console.
+    pub fn manual_buy(
+        &self,
+        token: Address,
+        pair: Address,
+        size_wei: U256,
+        chain_id: u64,
+        opened_block: u64,
+        now_ms: u64,
+    ) -> Position {
+        let pos_id = uuid::Uuid::new_v4().to_string();
+        let p = Position {
+            id: pos_id.clone(),
+            chain_id,
+            token,
+            pair,
+            venue: "univ2".into(),
+            state: PositionState::Pending,
+            trigger_tx: None,
+            entry_tx: None,
+            entry_cost_wei: size_wei,
+            entry_qty: U256::ZERO,
+            remaining_qty: U256::ZERO,
+            realized_wei: U256::ZERO,
+            gas_spent_wei: U256::ZERO,
+            peak_value_wei: size_wei,
+            opened_block,
+            opened_at_ms: now_ms,
+            closed_at_ms: None,
+            exit_reason: None,
+            entry_verdict: "manual".into(),
+            notes: "manual buy from dashboard".into(),
+        };
+        self.upsert_position(p.clone());
+        p
+    }
+
+    /// Manual sell trigger from console.
+    pub fn manual_sell(&self, id: &str, sell_fraction_bps: u32) -> Option<ExitDecision> {
+        let mut guard = self.positions.write();
+        let p = guard.get_mut(id)?;
+        if !p.state.is_live() || p.remaining_qty.is_zero() {
+            return None;
+        }
+        let bps_clamped = sell_fraction_bps.min(10_000);
+        let qty = p.remaining_qty * U256::from(bps_clamped) / U256::from(10_000u64);
+        let decision = ExitDecision {
+            reason: ExitReason::Manual,
+            qty,
+            fraction_bps: bps_clamped,
+            closes_position: bps_clamped >= 10_000 || qty >= p.remaining_qty,
+        };
+        Some(decision)
     }
 
     /// Claim a token for evaluation. Returns false when it has already been
@@ -293,6 +351,7 @@ mod tests {
     fn armed_params() -> SniperParams {
         SniperParams {
             enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
             buy_size_wei: centi(10),
             daily_budget_wei: eth(1),
             min_liquidity_wei: eth(2),
@@ -362,6 +421,7 @@ mod tests {
         let err = lane
             .patch_params(&SniperParamsPatch {
                 enabled: Some(true),
+                vault_address: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 buy_size_wei: Some(centi(10).to_string()),
                 daily_budget_wei: Some(eth(1).to_string()),
                 ..Default::default()
@@ -486,10 +546,10 @@ mod tests {
     fn setting_a_mark_updates_the_positions_peak() {
         let lane = SniperLane::new(armed_params());
         lane.upsert_position(open_position("a", 1));
-        lane.set_mark("a", Mark::fresh(eth(3)));
+        lane.set_mark("a", Mark::fresh(eth(3), 0, 0));
         assert_eq!(lane.position("a").unwrap().peak_value_wei, eth(3));
         // A lower mark does not lower the peak.
-        lane.set_mark("a", Mark::fresh(eth(1)));
+        lane.set_mark("a", Mark::fresh(eth(1), 0, 0));
         assert_eq!(lane.position("a").unwrap().peak_value_wei, eth(3));
     }
 
@@ -526,6 +586,7 @@ mod api_contract_tests {
     fn lane_with_position() -> SniperLane {
         let lane = SniperLane::new(SniperParams {
             enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
             buy_size_wei: eth(1),
             daily_budget_wei: eth(5),
             ..Default::default()
@@ -552,7 +613,7 @@ mod api_contract_tests {
             entry_verdict: "clean".into(),
             notes: String::new(),
         });
-        lane.set_mark("p1", Mark::fresh(eth(2)));
+        lane.set_mark("p1", Mark::fresh(eth(2), 0, 0));
         lane
     }
 
