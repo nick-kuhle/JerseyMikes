@@ -217,6 +217,7 @@ pub fn liquidation_opportunity(
         target_block,
         created_at_ms: now_ms(),
         notes,
+        provenance: Default::default(),
     }
 }
 

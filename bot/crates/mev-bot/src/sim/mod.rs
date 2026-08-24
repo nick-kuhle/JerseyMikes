@@ -5,6 +5,7 @@
 //! with the relay's own `eth_callBundle`.
 
 pub mod anvil;
+pub mod pending;
 pub mod relay;
 
 use std::sync::Arc;
@@ -29,6 +30,10 @@ pub struct Simulator {
     /// a second anvil and remove the thrash entirely.
     pub replay_fork: Option<Arc<anvil::AnvilSim>>,
     pub relay: Option<relay::RelaySim>,
+    /// State-pinned lane for preconfirmation-derived candidates. An anvil
+    /// fork at the sealed head is not proof for a sub-block opportunity
+    /// (work order 2.4), so pinned candidates run here or not at all.
+    pub pending: Option<pending::PendingSim>,
     signer: Arc<Signer>,
     /// Shared runtime risk envelope — bundle guards follow dashboard changes.
     risk: crate::risk::RuntimeRisk,
@@ -49,6 +54,7 @@ impl Simulator {
         fork: Option<Arc<anvil::AnvilSim>>,
         replay_fork: Option<Arc<anvil::AnvilSim>>,
         relay: Option<relay::RelaySim>,
+        pending: Option<pending::PendingSim>,
         signer: Arc<Signer>,
         risk: crate::risk::RuntimeRisk,
     ) -> Self {
@@ -57,6 +63,7 @@ impl Simulator {
             fork,
             replay_fork,
             relay,
+            pending,
             signer,
             risk,
         }
@@ -132,6 +139,26 @@ impl Simulator {
                     opp,
                     "no replay fork: enable REPLAY_FORK to score delivered blocks",
                 ),
+            }
+        } else if opp.provenance.source_state.is_some() {
+            // Preconfirmation-pinned candidates prove on the provider's
+            // preconfirmed state — never against a sealed-head fork, which
+            // answers a question about a state the opportunity never saw.
+            match &self.pending {
+                Some(p) => tokio::time::timeout(
+                    self.cfg.sim.timeout,
+                    p.simulate_pinned(opp, base_fee, std::time::Instant::now()),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "state-pinned simulation timed out after {:?}",
+                        self.cfg.sim.timeout
+                    )
+                })??,
+                None => {
+                    crate::sim::empty_result(opp, "no state-pinned simulation backend configured")
+                }
             }
         } else {
             match &self.fork {

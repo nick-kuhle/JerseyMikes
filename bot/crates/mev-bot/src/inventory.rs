@@ -235,6 +235,7 @@ mod tests {
             target_block: 1,
             created_at_ms: now_ms(),
             notes: String::new(),
+            provenance: Default::default(),
         }
     }
 

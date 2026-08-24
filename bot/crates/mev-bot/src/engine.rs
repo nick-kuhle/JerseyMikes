@@ -357,6 +357,10 @@ pub struct FunnelCounters {
     /// transaction could not be fetched (so the simulation cannot
     /// replay the victim's calldata faithfully).
     pub missing_victim_raw: u64,
+    /// Preconfirmation-pinned candidates dropped by the identity/TTL
+    /// recheck before simulation (TTL expired or the pinned state was
+    /// superseded). Fail-closed by design (work order 2.4).
+    pub state_pin_expired: u64,
     /// Simulations that returned `success = true`. Subset of
     /// `simulations`; useful for the "revert rate" calculation.
     pub simulations_succeeded: u64,
@@ -430,6 +434,7 @@ impl Stats {
                         "candidatesEmitted": v.candidates_emitted,
                         "gatedByRisk": v.gated_by_risk,
                         "missingVictimRaw": v.missing_victim_raw,
+                        "statePinExpired": v.state_pin_expired,
                         "simulationsSucceeded": v.simulations_succeeded,
                         "simulationsReverted": v.simulations_reverted,
                         "simulationsFailed": v.simulations_failed,
@@ -613,6 +618,11 @@ impl Engine {
             fork,
             replay_fork,
             relay,
+            Some(crate::sim::pending::PendingSim::new(
+                cfg.clone(),
+                http.clone(),
+                runtime.clone(),
+            )),
             transaction_signer.clone(),
             runtime.clone(),
         ));
@@ -1798,8 +1808,14 @@ impl Engine {
             }
             return;
         }
-        // A sandwich or JIT without the victim's bytes cannot be simulated faithfully.
-        if !opp.victim_hashes.is_empty() && victims_raw.is_empty() {
+        // A sandwich or JIT without the victim's bytes cannot be simulated
+        // faithfully. Only candidates whose payload must carry the victim are
+        // gated — a preconfirmation-pinned back-run is simulated against the
+        // state that already contains it.
+        if opp.provenance.requires_foreign_payload
+            && !opp.victim_hashes.is_empty()
+            && victims_raw.is_empty()
+        {
             self.stats
                 .record_funnel(lane, kind, |f| f.missing_victim_raw += 1);
             if let Some(suppressed) = MISSING_VICTIM_LOG.allow() {
@@ -1813,9 +1829,37 @@ impl Engine {
             return;
         }
 
+        // Work order 2.4: before a pinned candidate may cost a simulation,
+        // its preconfirmed identity must still be current and inside TTL.
+        // Replay scoring is a post-mortem — the pin is meaningless there.
+        if lane == FunnelLane::Live {
+            if let Err(reject) = crate::flashblocks::check_pin(&opp, now_ms(), &self.preconfirmed) {
+                self.stats
+                    .record_funnel(lane, kind, |f| f.state_pin_expired += 1);
+                tracing::debug!(
+                    target: "engine",
+                    strategy = kind.as_str(),
+                    reason = reject.as_str(),
+                    "dropped: preconfirmed pin recheck failed"
+                );
+                return;
+            }
+        }
+
+        // Simulate the victim's bytes only when the payload actually carries
+        // them. A pinned back-run is priced against the post-victim state
+        // itself; injecting the victim again would double-count its trade.
+        let victims_for_sim: Arc<Vec<Vec<u8>>> = if opp.provenance.requires_foreign_payload {
+            victims_raw.clone()
+        } else {
+            Arc::new(Vec::new())
+        };
+
         Stats::bump(&self.stats.opportunities);
         self.writes.record_opportunity(&opp);
-        let _ = self.feed.send(FeedEvent::Opportunity(opp.clone()));
+        let _ = self
+            .feed
+            .send(FeedEvent::Opportunity(Box::new(opp.clone())));
 
         // Shadow simulation stays fully concurrent. Only a profitable,
         // qualified candidate enters the serialized nonce lane below.
@@ -1826,7 +1870,7 @@ impl Engine {
             .sim
             .run(
                 &opp,
-                &victims_raw,
+                &victims_for_sim,
                 victim_sender_nonce,
                 base_fee,
                 simulation_nonce,
@@ -1949,12 +1993,14 @@ impl Engine {
 
         // Raw transport (sequencer chains) can only send *our* signed
         // transactions: a victim's signed bytes cannot be re-sent, so a
-        // victim-pinned bundle (sandwich/JIT back-runs) is not deliverable
-        // at the transport level. Block-cadence opportunities (atomic_arb:
-        // no victim) are fine. The gateway repeats this check as a
-        // backstop; refusing here means the nonce lane is never touched.
+        // bundle that still requires a foreign payload is undeliverable.
+        // Block-cadence opportunities (atomic_arb: no victim) and
+        // preconfirmation-pinned back-runs — the victim is already inside
+        // the pinned state — carry nothing foreign. The gateway repeats
+        // this check as a backstop; refusing here means the nonce lane is
+        // never touched.
         if self.cfg.submission_mode == crate::config::SubmissionMode::Raw
-            && !opp.victim_hashes.is_empty()
+            && !crate::flashblocks::raw_transportable(opp)
         {
             tracing::warn!(
                 target: "submission",
@@ -1962,6 +2008,19 @@ impl Engine {
                 "raw submission mode cannot include the victim's signed \
                  transaction — refusing (private-orderflow delivery is a \
                  later integration on sequencer chains)"
+            );
+            return initial_bundle;
+        }
+
+        // Work order 2.4: nonce reservation happens only for a candidate
+        // whose preconfirmed identity is still live. A stale pin must cost
+        // no nonce.
+        if let Err(reject) = crate::flashblocks::check_pin(opp, now_ms(), &self.preconfirmed) {
+            tracing::debug!(
+                target: "submission",
+                strategy = opp.strategy.as_str(),
+                reason = reject.as_str(),
+                "refusing nonce reservation: preconfirmed pin expired"
             );
             return initial_bundle;
         }
@@ -2001,11 +2060,20 @@ impl Engine {
 
         if start_nonce != initially_simulated_nonce {
             self.risk.begin(opp.strategy);
+            // Same victim-payload rule as `consider`: a pinned back-run is
+            // re-priced against the post-victim state, never against a
+            // double-injected victim.
+            let empty_victims: &[Vec<u8>] = &[];
+            let victims_for_sim = if opp.provenance.requires_foreign_payload {
+                victims_raw
+            } else {
+                empty_victims
+            };
             let exact = self
                 .sim
                 .run(
                     opp,
-                    victims_raw,
+                    victims_for_sim,
                     victim_sender_nonce,
                     base_fee,
                     start_nonce,
@@ -2056,6 +2124,26 @@ impl Engine {
         {
             let _ = self.inventory.release_nonces(start_nonce, nonce_count);
             tracing::error!(target: "submission", bundle = %bundle.id, "durable nonce reservation failed; refusing broadcast");
+            return bundle;
+        }
+
+        // Work order 2.4: immediately before the wire, the pinned state is
+        // rechecked one final time — identity/TTL could have moved during
+        // the nonce-lane serialization and the exact-payload re-simulation.
+        // Runs before the durable smoke-budget consumption so an expired
+        // pin never burns a slot.
+        if let Err(reject) = crate::flashblocks::check_pin(opp, now_ms(), &self.preconfirmed) {
+            tracing::info!(
+                target: "submission",
+                strategy = opp.strategy.as_str(),
+                bundle = %bundle.id,
+                reason = reject.as_str(),
+                "send aborted: preconfirmed pin expired while serialized"
+            );
+            let _ = self
+                .store
+                .set_nonce_reservation_status(&bundle.id, "cancelled");
+            let _ = self.inventory.release_nonces(start_nonce, nonce_count);
             return bundle;
         }
 

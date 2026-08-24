@@ -404,39 +404,7 @@ impl AnvilSim {
             *self.executor.write() = executor;
             return Ok(());
         }
-        #[derive(serde::Deserialize)]
-        struct ImmutableRef {
-            start: usize,
-            length: usize,
-        }
-        let refs: std::collections::HashMap<String, Vec<ImmutableRef>> =
-            serde_json::from_str(EXECUTOR_IMMUTABLE_REFS)
-                .context("decode executor immutable references")?;
-        let mut runtime = hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
-            .context("decode embedded executor runtime bytecode")?;
-        // Immutables from the chain's registry. A chain without a Balancer
-        // vault (the flash-loan funding source) gets a fixture whose
-        // flashExecute path is dead — the non-flash strategies still work.
-        let mut immutable_values: Vec<(&str, Address)> = Vec::new();
-        if let Some(vault) = self.cfg.addresses.balancer_vault {
-            immutable_values.push(("BALANCER_VAULT", vault));
-        }
-        immutable_values.push(("WETH", self.cfg.chain.weth));
-        for (name, value) in immutable_values {
-            let positions = refs
-                .get(name)
-                .ok_or_else(|| anyhow!("compiler artifact has no {name} immutable references"))?;
-            let mut word = [0u8; 32];
-            word[12..].copy_from_slice(value.as_slice());
-            for position in positions {
-                if position.length > 32 || position.start + position.length > runtime.len() {
-                    bail!("invalid immutable range for {name}");
-                }
-                runtime[position.start..position.start + position.length]
-                    .copy_from_slice(&word[32 - position.length..]);
-            }
-        }
-
+        let runtime = executor_fixture_runtime(&self.cfg)?;
         self.rpc
             .call_raw(
                 "anvil_setCode",
@@ -889,6 +857,50 @@ impl AnvilSim {
             let _ = child.kill().await;
         }
     }
+}
+
+/// The constructor-equivalent executor fixture: runtime bytecode with the
+/// chain's immutable parameters (Balancer vault, WETH from the registry)
+/// patched in. Shared by the anvil fork's `anvil_setCode` and the
+/// state-pinned `eth_simulateV1` state override — one patch routine, so the
+/// two fixtures can never drift apart.
+///
+/// `pub` so the env-gated live fork test patches the same runtime the
+/// engine simulates with.
+pub fn executor_fixture_runtime(cfg: &Config) -> Result<Vec<u8>> {
+    #[derive(serde::Deserialize)]
+    struct ImmutableRef {
+        start: usize,
+        length: usize,
+    }
+    let refs: std::collections::HashMap<String, Vec<ImmutableRef>> =
+        serde_json::from_str(EXECUTOR_IMMUTABLE_REFS)
+            .context("decode executor immutable references")?;
+    let mut runtime = hex::decode(EXECUTOR_RUNTIME_BYTECODE.trim().trim_start_matches("0x"))
+        .context("decode embedded executor runtime bytecode")?;
+    // Immutables from the chain's registry. A chain without a Balancer
+    // vault (the flash-loan funding source) gets a fixture whose
+    // flashExecute path is dead — the non-flash strategies still work.
+    let mut immutable_values: Vec<(&str, Address)> = Vec::new();
+    if let Some(vault) = cfg.addresses.balancer_vault {
+        immutable_values.push(("BALANCER_VAULT", vault));
+    }
+    immutable_values.push(("WETH", cfg.chain.weth));
+    for (name, value) in immutable_values {
+        let positions = refs
+            .get(name)
+            .ok_or_else(|| anyhow!("compiler artifact has no {name} immutable references"))?;
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(value.as_slice());
+        for position in positions {
+            if position.length > 32 || position.start + position.length > runtime.len() {
+                bail!("invalid immutable range for {name}");
+            }
+            runtime[position.start..position.start + position.length]
+                .copy_from_slice(&word[32 - position.length..]);
+        }
+    }
+    Ok(runtime)
 }
 
 pub fn to_i128(v: U256) -> i128 {

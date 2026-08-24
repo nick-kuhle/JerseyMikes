@@ -190,6 +190,7 @@ impl StrategyImpl for JitStrategy {
                 p.amount_in,
                 expected_fee
             ),
+            provenance: Default::default(),
         }]
     }
 }

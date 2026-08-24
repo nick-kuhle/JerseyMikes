@@ -174,7 +174,8 @@ impl StrategyImpl for SniperStrategy {
                 notes: format!(
                     "new pair {pair:?} token {token:?} liquidity {weth_reserve} wei; atomic round-trip probe (honeypot/tax check)"
                 ),
-            });
+            provenance: Default::default(),
+        });
         }
         out
     }
@@ -248,6 +249,7 @@ impl StrategyImpl for SniperStrategy {
             target_block: tx.target_block(&head, ctx.cfg.sim.target_block_offset),
             created_at_ms: now_ms(),
             notes: format!("go-live {sel_hex} on {target:?}; snipe probe for token {token:?} via pair {pair:?}"),
+            provenance: Default::default(),
         }]
     }
 }

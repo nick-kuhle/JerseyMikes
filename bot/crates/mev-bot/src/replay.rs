@@ -313,6 +313,7 @@ mod tests {
                 target_block: 100,
                 created_at_ms: now_ms(),
                 notes: String::new(),
+                provenance: Default::default(),
             })
             .unwrap();
         store
@@ -351,6 +352,7 @@ mod tests {
                 target_block: 100,
                 created_at_ms: now_ms(),
                 notes: String::new(),
+                provenance: Default::default(),
             })
             .unwrap();
         store

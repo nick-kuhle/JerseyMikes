@@ -2935,6 +2935,7 @@ mod tests {
             target_block: 5,
             created_at_ms: now_ms(),
             notes: "hello".into(),
+            provenance: Default::default(),
         };
         s.record_opportunity(&o).unwrap();
         let got = s.recent_opportunities(10).unwrap();

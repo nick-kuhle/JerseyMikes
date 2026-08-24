@@ -103,6 +103,17 @@ impl StrategyCtx {
         }
     }
 
+    /// The Aerodrome counterpart of [`StrategyCtx::pool_at`]: the shared
+    /// cache at the head, a discarded direct read for history (replay reads
+    /// must never pollute the live cache that arb prices).
+    pub async fn aero_pool_at(&self, pool: Address, block: u64) -> Option<crate::dex::AeroPool> {
+        if block >= self.head().number {
+            self.pools_aero.load(pool, block).await
+        } else {
+            self.pools_aero.read_at(pool, block).await
+        }
+    }
+
     /// Capital the bot is willing to commit to a single bundle.
     pub fn max_position(&self) -> U256 {
         self.cfg.risk.max_position_wei

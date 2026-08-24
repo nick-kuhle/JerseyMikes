@@ -19,7 +19,7 @@ use crate::dex::edge::{self, PricedCycle, PricedEdge, QuoteBook};
 use crate::dex::graph::{self, CycleCandidate, DirectedEdge};
 use crate::dex::{self, V2Pool, V3Pool, Venue};
 use crate::strategies::sandwich::build_leg;
-use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
+use crate::strategies::{decode_router, StrategyCtx, StrategyImpl, SwapIntent};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
 
 pub struct AtomicArbStrategy;
@@ -92,12 +92,23 @@ impl StrategyImpl for AtomicArbStrategy {
     /// victim will leave behind.
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
         let weth = ctx.cfg.chain.weth;
-        let Some(intent) = decode_router(
-            tx,
-            weth,
-            ctx.cfg.decode_universal_router,
-            ctx.cfg.addresses.universal_router,
-        ) else {
+        // The Aerodrome router re-uses the UniV2 `swapExactTokensForTokens`
+        // selector with a `Route[]` payload: decode it through its own ABI
+        // first, or the UniV2 decoder misreads the struct array as a token
+        // path and builds an intent out of struct words.
+        let aero_intent = ctx
+            .cfg
+            .addresses
+            .aerodrome_router
+            .and_then(|r| decode_aero_intent(tx, r, ctx.cfg.addresses.aerodrome_factory));
+        let Some(intent) = aero_intent.or_else(|| {
+            decode_router(
+                tx,
+                weth,
+                ctx.cfg.decode_universal_router,
+                ctx.cfg.addresses.universal_router,
+            )
+        }) else {
             return Vec::new();
         };
         if intent.path.len() != 2 {
@@ -108,8 +119,15 @@ impl StrategyImpl for AtomicArbStrategy {
         // block started from, not the state a hundred blocks later.
         let state_block = tx.state_block(&head);
 
-        // The back-run needs the same couple on *two* venues: buy on one,
-        // sell on the other. Walk the registered V2 factories in order.
+        // `try_cycle`-style builders cost gas and stamp the target block from
+        // this head; for a replay that must be the victim's own block, at its
+        // own base fee.
+        let mut ctx_head = head.clone();
+        ctx_head.number = tx
+            .target_block(&head, ctx.cfg.sim.target_block_offset)
+            .saturating_sub(ctx.cfg.sim.target_block_offset);
+        ctx_head.base_fee_per_gas = tx.base_fee(&head);
+
         let venues: Vec<Venue> = ctx
             .cfg
             .addresses
@@ -117,11 +135,79 @@ impl StrategyImpl for AtomicArbStrategy {
             .iter()
             .map(|(v, _)| *v)
             .collect();
-        if venues.len() < 2 {
-            // Single-venue chains have no V2↔V2 back-run. V3 cross-venue
-            // candidates are emitted on the block tick (`DEX_UNIV3_ARB`).
-            return Vec::new();
+
+        let victim_on_aero = ctx.cfg.addresses.aerodrome_router == Some(intent.router);
+
+        if victim_on_aero {
+            // The victim moved the Aerodrome volatile pool; the exit is the
+            // registered V2 venue. Second venue on a single-V2-venue chain,
+            // which is exactly Base's shape. Gated: only when the operator
+            // priced Aerodrome into the arb graph.
+            if !ctx.cfg.dex_aerodrome_arb || venues.is_empty() {
+                return Vec::new();
+            }
+            let Some(victim_aero_addr) = ctx
+                .pools_aero
+                .pool_for(intent.token_in, intent.token_out, false)
+                .await
+            else {
+                return Vec::new();
+            };
+            let Some(victim_aero) = ctx.aero_pool_at(victim_aero_addr, state_block).await else {
+                return Vec::new();
+            };
+            let Some((after_aero, _)) = victim_aero.with_swap(intent.token_in, intent.amount_in)
+            else {
+                return Vec::new();
+            };
+            let Some(v2_pair) = ctx
+                .pools
+                .pair_for(intent.token_in, intent.token_out, venues[0])
+                .await
+            else {
+                return Vec::new();
+            };
+            let Some(v2_side) = ctx.pool_at(v2_pair, venues[0], state_block).await else {
+                return Vec::new();
+            };
+            return mixed_pair_backruns(ctx, tx, &v2_side, &after_aero, weth, &ctx_head);
         }
+
+        if venues.len() < 2 {
+            // Single-V2-venue chains (Base) have no V2↔V2 back-run — but
+            // with DEX_AERODROME_ARB the Aerodrome volatile pool of the same
+            // couple is the exit. Block-cadence mixed cycles are covered by
+            // `cross_venue_opportunities` regardless; this is the
+            // preconfirmation path.
+            if !ctx.cfg.dex_aerodrome_arb || venues.is_empty() {
+                return Vec::new();
+            }
+            let Some(victim_pair) = ctx
+                .pools
+                .pair_for(intent.token_in, intent.token_out, venues[0])
+                .await
+            else {
+                return Vec::new();
+            };
+            let Some(victim_pool) = ctx.pool_at(victim_pair, venues[0], state_block).await else {
+                return Vec::new();
+            };
+            let Some((after, _)) = victim_pool.with_swap(intent.token_in, intent.amount_in) else {
+                return Vec::new();
+            };
+            let Some(aero_addr) = ctx
+                .pools_aero
+                .pool_for(intent.token_in, intent.token_out, false)
+                .await
+            else {
+                return Vec::new();
+            };
+            let Some(aero_side) = ctx.aero_pool_at(aero_addr, state_block).await else {
+                return Vec::new();
+            };
+            return mixed_pair_backruns(ctx, tx, &after, &aero_side, weth, &ctx_head);
+        }
+
         let Some(victim_pair) = ctx
             .pools
             .pair_for(intent.token_in, intent.token_out, venues[0])
@@ -147,14 +233,6 @@ impl StrategyImpl for AtomicArbStrategy {
             return Vec::new();
         };
 
-        // `try_cycle` costs gas and stamps the target block from this head; for a
-        // replay that must be the victim's own block, at its own base fee.
-        let mut ctx_head = head.clone();
-        ctx_head.number = tx
-            .target_block(&head, ctx.cfg.sim.target_block_offset)
-            .saturating_sub(ctx.cfg.sim.target_block_offset);
-        ctx_head.base_fee_per_gas = tx.base_fee(&head);
-
         let mut opps = Vec::new();
         for (a, b) in [(&after, &other), (&other, &after)] {
             if let Some(mut opp) = try_cycle(ctx, a, b, weth, &ctx_head) {
@@ -162,10 +240,114 @@ impl StrategyImpl for AtomicArbStrategy {
                 // Back-run only: nothing goes in front of the victim.
                 opp.back_calls = std::mem::take(&mut opp.front_calls);
                 opp.notes = format!("back-run of {:?}; {}", tx.hash, opp.notes);
+                pin_provenance(&mut opp, tx, ctx.cfg.preconfirmed_ttl_ms);
                 opps.push(opp);
             }
         }
         opps
+    }
+}
+
+/// Decode one Aerodrome `swapExactTokensForTokens(amountIn, amountOutMin,
+/// Route[], to, deadline)` — the selector collides with the UniV2 router's,
+/// so it must be validated through its own ABI before the UniV2 decoder can
+/// misread the `Route[]` struct array as a token path.
+///
+/// Single-hop routes only: `AtomicArbStrategy::on_pending` perturbs exactly
+/// one pool with the victim's trade, and a multi-hop victim alters two — a
+/// state change this path does not model, so the intent is dropped rather
+/// than priced on a half-updated state.
+fn decode_aero_intent(
+    tx: &PendingTx,
+    aero_router: Address,
+    aero_factory: Option<Address>,
+) -> Option<SwapIntent> {
+    if tx.to? != aero_router || tx.input.len() < 4 {
+        return None;
+    }
+    if tx.input[..4] != dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR {
+        return None;
+    }
+    let c =
+        dex::IAerodromeRouter::swapExactTokensForTokensCall::abi_decode(&tx.input, false).ok()?;
+    if c.routes.len() != 1 {
+        return None;
+    }
+    let route = &c.routes[0];
+    // Only pools from the verified registry factory are priced anywhere in
+    // this strategy; a foreign-factory leg is a foreign invariant.
+    if let Some(factory) = aero_factory {
+        if route.factory != factory {
+            return None;
+        }
+    }
+    Some(SwapIntent {
+        token_in: route.from,
+        token_out: route.to,
+        amount_in: c.amountIn,
+        min_out: c.amountOutMin,
+        path: vec![route.from, route.to],
+        router: aero_router,
+        native_in: false,
+    })
+}
+
+/// Cross-venue back-run over one V2 pool and one Aerodrome volatile pool.
+/// Exactly one of them carries the victim's trade (`with_swap` applied by
+/// the caller); the search tries both directions and the profitability/gas
+/// gates keep the honest one.
+fn mixed_pair_backruns(
+    ctx: &StrategyCtx,
+    tx: &PendingTx,
+    v2: &V2Pool,
+    aero: &crate::dex::AeroPool,
+    weth: Address,
+    head: &BlockHead,
+) -> Vec<Opportunity> {
+    let (Some(router), Some(factory)) = (
+        ctx.cfg.addresses.aerodrome_router,
+        ctx.cfg.addresses.aerodrome_factory,
+    ) else {
+        return Vec::new();
+    };
+    let mut edges = PricedEdge::from_v2(v2);
+    edges.extend(PricedEdge::from_aero(aero, router, factory));
+    // Two pools, two legs, both directions: the enumeration fits in a few
+    // milliseconds even on the pending hot path.
+    let found = edge::search_priced(
+        &edges,
+        weth,
+        ctx.max_position(),
+        2,
+        std::time::Duration::from_millis(5),
+    );
+    let mut opps = Vec::new();
+    for candidate in found.into_iter().filter(|c| c.uses_non_v2(&edges)) {
+        let Some(mut opp) = build_priced_opportunity(ctx, &candidate, &edges, head) else {
+            continue;
+        };
+        opp.victim_hashes = vec![tx.hash];
+        // Back-run only: nothing goes in front of the victim.
+        opp.back_calls = std::mem::take(&mut opp.front_calls);
+        opp.notes = format!("back-run of {:?}; {}", tx.hash, opp.notes);
+        pin_provenance(&mut opp, tx, ctx.cfg.preconfirmed_ttl_ms);
+        opps.push(opp);
+    }
+    opps
+}
+
+/// Stamp the preconfirmed-state pin for flashblock-derived candidates. A
+/// mempool/relay victim leaves `provenance.source_state` unset — canonical
+/// mempool provenance — and the payload keeps its requirement for the
+/// victim's foreign bytes.
+fn pin_provenance(opp: &mut Opportunity, tx: &PendingTx, ttl_ms: u64) {
+    if let Some(state) = &tx.preconfirmed {
+        opp.provenance.source_state = Some(state.clone());
+        opp.provenance.ttl_ms = Some(ttl_ms);
+        // The preconfirmed transaction is already inside the state this
+        // candidate is priced and simulated against; the payload carries
+        // our own transactions only (work order 2.4).
+        opp.provenance.requires_foreign_payload = false;
     }
 }
 
@@ -232,6 +414,12 @@ fn build_cycle_opportunity(
             candidate.amount_in,
             candidate.gross_profit
         ),
+        provenance: crate::types::Provenance {
+            route: route.join(" -> "),
+            direction: "forward".into(),
+            predicted_gross_wei: candidate.gross_profit,
+            ..Default::default()
+        },
     })
 }
 
@@ -283,6 +471,18 @@ fn try_cycle(
             amount_in,
             gross
         ),
+        provenance: crate::types::Provenance {
+            route: format!(
+                "{}:{:?} -> {}:{:?}",
+                a.venue.as_str(),
+                a.address,
+                b.venue.as_str(),
+                b.address
+            ),
+            direction: "forward".into(),
+            predicted_gross_wei: gross,
+            ..Default::default()
+        },
     })
 }
 
@@ -454,6 +654,12 @@ fn build_priced_opportunity(
             candidate.amount_in,
             candidate.gross_profit
         ),
+        provenance: crate::types::Provenance {
+            route: candidate.route_label(edges),
+            direction: "forward".into(),
+            predicted_gross_wei: candidate.gross_profit,
+            ..Default::default()
+        },
     })
 }
 

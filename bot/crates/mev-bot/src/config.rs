@@ -98,6 +98,10 @@ pub mod known {
     /// resolves the canonical WETH/USDC volatile pool.
     pub const BASE_AERODROME_FACTORY: Address =
         address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+    /// Canonical Aerodrome WETH/USDC volatile pool — verified live
+    /// 2026-08-24 via `factory.getPool(WETH, USDC, false)`; 30 bps fee.
+    pub const BASE_AERO_WETH_USDC_VOLATILE: Address =
+        address!("cDAC0d6c6C59727a65F871236188350531885C43");
 
     /// Collateral tokens whose feeds the oracle front-runner maps leads to.
     pub fn collateral_universe() -> [Address; 3] {
@@ -663,6 +667,14 @@ pub struct Config {
     pub qualification_max_gap_secs: u64,
     /// Canonical confirmations required before execution outcomes become final.
     pub finality_depth: u64,
+    /// Wall-clock TTL (milliseconds) stamped on a preconfirmation-pinned
+    /// candidate. After `created_at_ms + ttl` the candidate is dead even if
+    /// the feed has not visibly superseded the state — with a Base block of
+    /// 2 000 ms and ~200 ms flashblock frames, a quote derived from a frame
+    /// older than this is about a state nobody can submit against anymore.
+    /// Fail-closed toward shorter. Rechecked before simulation, before nonce
+    /// reservation and immediately before send (work order 2.4).
+    pub preconfirmed_ttl_ms: u64,
     /// Delay between same-UUID relay replacement attempts.
     pub submission_retry_ms: u64,
     /// Maximum relay submission attempts per bundle.
@@ -1485,6 +1497,7 @@ impl Config {
                 .clamp(1, 10_000),
             qualification_max_gap_secs: env_u64("QUALIFICATION_MAX_GAP_SECS", 120).max(15),
             finality_depth: env_u64("FINALITY_DEPTH", 12).max(1),
+            preconfirmed_ttl_ms: env_u64("PRECONFIRMED_TTL_MS", 1_000).clamp(100, 5_000),
             submission_retry_ms: env_u64("SUBMISSION_RETRY_MS", 250).max(50),
             submission_max_attempts: env_u64("SUBMISSION_MAX_ATTEMPTS", 2).clamp(1, 5),
             live_smoke_max: env_u64("LIVE_SMOKE_MAX", 0).min(LIVE_SMOKE_MAX_CAP),

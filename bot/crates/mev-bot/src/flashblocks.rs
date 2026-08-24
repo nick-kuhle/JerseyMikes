@@ -602,6 +602,60 @@ impl PreconfirmedTracker {
     }
 }
 
+/// Why a state-pinned candidate failed a recheck (work order 2.4 gate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinReject {
+    /// Wall-clock TTL expired (`created_at_ms + ttl_ms` has passed): the
+    /// observation is too old to spend capital on even if the feed has not
+    /// visibly moved on (a stalled feed must fail closed too).
+    TtlExpired,
+    /// The pinned state is no longer the feed's current state nor a prefix
+    /// of it — a newer block started arriving or an older payload replaced it.
+    StateSuperseded,
+}
+
+impl PinReject {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PinReject::TtlExpired => "ttl_expired",
+            PinReject::StateSuperseded => "state_superseded",
+        }
+    }
+}
+
+/// Recheck a candidate's preconfirmed pin right before a gate that spends
+/// capital (shadow simulation, nonce reservation, and again immediately
+/// before send). A candidate with no pin is canonical-state work (block
+/// tick / public mempool) and passes trivially — its staleness is governed
+/// by the target-block checks elsewhere.
+pub fn check_pin(
+    opp: &crate::types::Opportunity,
+    now_ms: u64,
+    tracker: &PreconfirmedTracker,
+) -> Result<(), PinReject> {
+    let Some(pin) = &opp.provenance.source_state else {
+        return Ok(());
+    };
+    if let Some(ttl) = opp.provenance.ttl_ms {
+        if now_ms >= opp.created_at_ms.saturating_add(ttl) {
+            return Err(PinReject::TtlExpired);
+        }
+    }
+    if !tracker.pinned_is_current(pin) {
+        return Err(PinReject::StateSuperseded);
+    }
+    Ok(())
+}
+
+/// Whether the payload is deliverable over raw (`eth_sendRawTransaction`)
+/// transport: a single searcher-owned transaction. A candidate that still
+/// needs a foreign transaction in its payload (mempool sandwich, relay
+/// back-run) is structurally undeliverable without a relay and must be
+/// refused — never silently sent without the dependency it was priced with.
+pub fn raw_transportable(opp: &crate::types::Opportunity) -> bool {
+    !opp.provenance.requires_foreign_payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

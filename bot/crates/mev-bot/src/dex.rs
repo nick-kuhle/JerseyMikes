@@ -241,6 +241,23 @@ impl AeroPool {
             Some(out)
         }
     }
+
+    /// The pool state after a swap of `amount_in` of `token_in` — the
+    /// preconfirmation back-run prices against this, never against the
+    /// pre-victim state. Stable pools refuse (same rule as
+    /// [`AeroPool::amount_out`]).
+    pub fn with_swap(&self, token_in: Address, amount_in: U256) -> Option<(AeroPool, U256)> {
+        let out = self.amount_out(token_in, amount_in)?;
+        let mut p = *self;
+        if token_in == self.token0 {
+            p.reserve0 += amount_in;
+            p.reserve1 = p.reserve1.saturating_sub(out);
+        } else {
+            p.reserve1 += amount_in;
+            p.reserve0 = p.reserve0.saturating_sub(out);
+        }
+        Some((p, out))
+    }
 }
 
 /// Aerodrome volatile `getAmountOut`, exactly as the contract computes it.

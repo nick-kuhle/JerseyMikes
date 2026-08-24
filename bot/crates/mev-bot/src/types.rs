@@ -417,6 +417,56 @@ pub struct Opportunity {
     pub created_at_ms: u64,
     /// Human readable trail of how the opportunity was found.
     pub notes: String,
+    /// State / route provenance for preconfirmation-pinned candidates and
+    /// independent qualification samples. `Default` = canonical mempool
+    /// provenance (no pin, foreign payload required when there are victims).
+    pub provenance: Provenance,
+}
+
+/// Where an [`Opportunity`] was derived from and what its execution needs
+/// (work order 2.4 and 3.1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Preconfirmed-state pin for flashblock-derived candidates: identity of
+    /// the exact state the economics were measured against. `None` for
+    /// canonical-state candidates (block tick, public mempool).
+    pub source_state: Option<PreconfirmedState>,
+    /// Wall-clock TTL of a pinned candidate in milliseconds. The pin is dead
+    /// at `created_at_ms + ttl_ms` even if the tracker still accepts the
+    /// state (a stale frame cannot finance a send).
+    pub ttl_ms: Option<u64>,
+    /// Whether the payload must contain a foreign transaction (victim
+    /// bytes). Mempool sandwiches/back-runs need the victim in the bundle;
+    /// a preconfirmed-state back-run does not — the victim is already in
+    /// the state — and raw transport can only deliver our own transactions.
+    pub requires_foreign_payload: bool,
+    /// Stable ordered route label for qualification identity
+    /// (`venue:pool -> venue:pool`), matching
+    /// [`crate::dex::edge::PricedCycle::route_label`].
+    pub route: String,
+    /// Direction of the route relative to the anchor (`"forward"` today;
+    /// carried so the qualification row is never ambiguous).
+    pub direction: String,
+    /// Gross profit of the sized route measured at the source state, before
+    /// gas — the predicted side of an independent state comparison (3.1).
+    /// Zero for candidates that never priced a route (victim strategies).
+    pub predicted_gross_wei: U256,
+}
+
+impl Default for Provenance {
+    /// Canonical mempool provenance: no pin, and victim-hashed candidates
+    /// keep their historical requirement that the victim's bytes ride in the
+    /// payload. Flashblock-derived back-runs override both explicitly.
+    fn default() -> Self {
+        Self {
+            source_state: None,
+            ttl_ms: None,
+            requires_foreign_payload: true,
+            route: String::new(),
+            direction: String::new(),
+            predicted_gross_wei: U256::ZERO,
+        }
+    }
 }
 
 /// Result of simulating an [`Opportunity`].
@@ -459,6 +509,10 @@ pub enum SimBackend {
     RelayCallBundle,
     /// `eth_call` with state overrides against the primary RPC.
     EthCall,
+    /// `eth_simulateV1` at the provider's `"pending"` (preconfirmed) state
+    /// with the executor fixture injected via state overrides — the only
+    /// honest proof for a sub-block opportunity (work order 2.4).
+    EthSimulateV1,
 }
 
 impl SimBackend {
@@ -467,6 +521,7 @@ impl SimBackend {
             SimBackend::AnvilFork => "anvil_fork",
             SimBackend::RelayCallBundle => "relay_call_bundle",
             SimBackend::EthCall => "eth_call",
+            SimBackend::EthSimulateV1 => "eth_simulate_v1",
         }
     }
 }
@@ -516,7 +571,9 @@ pub enum FeedEvent {
         functions: Vec<String>,
         seen_at_ms: u64,
     },
-    Opportunity(Opportunity),
+    /// Boxed: `Opportunity` (with its provenance) dwarfs the other variants;
+    /// serde renders the box transparently so the wire shape never changed.
+    Opportunity(Box<Opportunity>),
     Alert {
         rule: String,
         severity: String,
