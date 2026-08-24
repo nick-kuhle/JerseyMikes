@@ -92,6 +92,21 @@ pub enum ExitReason {
 }
 
 impl ExitReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::TakeProfitPct => "take_profit_pct",
+            Self::TakeProfitAbs => "take_profit_abs",
+            Self::StopLoss => "stop_loss",
+            Self::TrailingStop => "trailing_stop",
+            Self::MaxHold => "max_hold",
+            Self::HoneypotDetected => "honeypot_detected",
+            Self::Manual => "manual",
+            Self::RiskStop => "risk_stop",
+        }
+    }
+}
+
+impl ExitReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             ExitReason::TakeProfitPct => "take_profit_pct",
@@ -210,11 +225,45 @@ impl Position {
         now_ms: u64,
         sell_honeypot: bool,
     ) -> Option<ExitDecision> {
+        self.evaluate_exit_with_staleness(
+            params,
+            mark_value_wei,
+            head_block,
+            now_ms,
+            sell_honeypot,
+            false,
+        )
+    }
+
+    /// Evaluate exit decision, suppressing price-based rules if `mark_is_stale` is true.
+    pub fn evaluate_exit_with_staleness(
+        &self,
+        params: &SniperParams,
+        mark_value_wei: U256,
+        head_block: u64,
+        now_ms: u64,
+        sell_honeypot: bool,
+        mark_is_stale: bool,
+    ) -> Option<ExitDecision> {
         if !matches!(self.state, PositionState::Open | PositionState::Scaling) {
             return None;
         }
         if self.remaining_qty.is_zero() {
             return None;
+        }
+
+        // 1. The sell side started reverting. Leave immediately, at any age:
+        //    waiting out `minHoldBlocks` in a honeypot accomplishes nothing.
+        if sell_honeypot {
+            return Some(self.full_exit(ExitReason::HoneypotDetected));
+        }
+
+        // 2. Time stop (never suppressed by stale mark).
+        if params.max_hold_secs > 0 {
+            let age_ms = now_ms.saturating_sub(self.opened_at_ms);
+            if age_ms >= params.max_hold_secs.saturating_mul(1_000) {
+                return Some(self.full_exit(ExitReason::MaxHold));
+            }
         }
 
         // A position must be allowed to exist for a moment before it can be
@@ -223,17 +272,12 @@ impl Position {
         let age_blocks = head_block.saturating_sub(self.opened_block);
         let seasoned = age_blocks >= params.min_hold_blocks;
 
-        // 1. The sell side started reverting. Leave immediately, at any age:
-        //    waiting out `minHoldBlocks` in a honeypot accomplishes nothing.
-        if sell_honeypot {
-            return Some(self.full_exit(ExitReason::HoneypotDetected));
-        }
-
-        if !seasoned {
+        // Price-based rules require both a seasoned position AND a fresh mark.
+        if !seasoned || mark_is_stale {
             return None;
         }
 
-        // 2. Hard stop on the downside.
+        // 3. Hard stop on the downside.
         if params.stop_loss_bps > 0 {
             let floor = mul_bps(
                 self.entry_cost_wei,
@@ -244,7 +288,7 @@ impl Position {
             }
         }
 
-        // 3. Trailing stop, only meaningful once a peak above entry exists.
+        // 4. Trailing stop, only meaningful once a peak above entry exists.
         if params.trailing_stop_bps > 0
             && self.peak_value_wei > self.entry_cost_wei
             && !self.peak_value_wei.is_zero()
@@ -255,14 +299,6 @@ impl Position {
             );
             if mark_value_wei <= trail_floor {
                 return Some(self.full_exit(ExitReason::TrailingStop));
-            }
-        }
-
-        // 4. Time stop.
-        if params.max_hold_secs > 0 {
-            let age_ms = now_ms.saturating_sub(self.opened_at_ms);
-            if age_ms >= params.max_hold_secs.saturating_mul(1_000) {
-                return Some(self.full_exit(ExitReason::MaxHold));
             }
         }
 
@@ -586,6 +622,36 @@ mod tests {
             .unwrap();
         assert_eq!(d.reason, ExitReason::HoneypotDetected);
         assert!(d.closes_position);
+    }
+
+    #[test]
+    fn stale_mark_suppresses_price_based_exits() {
+        let p = pos(); // 1 ETH entry cost
+                       // Take profit target is +100% (2 ETH)
+                       // Fresh mark at 2 ETH fires take profit
+        assert!(p
+            .evaluate_exit_with_staleness(&params(), eth(2), 105, 1_000_000, false, false)
+            .is_some());
+        // Stale mark at 2 ETH suppresses take profit
+        assert!(p
+            .evaluate_exit_with_staleness(&params(), eth(2), 105, 1_000_000, false, true)
+            .is_none());
+
+        // Stop loss target is -50% (0.5 ETH)
+        // Fresh mark at 0.4 ETH fires stop loss
+        assert!(p
+            .evaluate_exit_with_staleness(&params(), centi(40), 105, 1_000_000, false, false)
+            .is_some());
+        // Stale mark at 0.4 ETH suppresses stop loss
+        assert!(p
+            .evaluate_exit_with_staleness(&params(), centi(40), 105, 1_000_000, false, true)
+            .is_none());
+
+        // But honeypot exit fires even with stale mark
+        let d = p
+            .evaluate_exit_with_staleness(&params(), eth(2), 105, 1_000_000, true, true)
+            .unwrap();
+        assert_eq!(d.reason, ExitReason::HoneypotDetected);
     }
 
     #[test]

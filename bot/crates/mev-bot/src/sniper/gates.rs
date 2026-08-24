@@ -44,6 +44,10 @@ impl HoneypotVerdict {
         }
     }
 
+    pub fn code(&self) -> &'static str {
+        self.as_str()
+    }
+
     /// Round-trip return in bps of the amount spent, where 10_000 means "got
     /// everything back". `None` when no measurement exists.
     pub fn round_trip_bps(&self) -> Option<u32> {
@@ -352,6 +356,7 @@ mod tests {
     fn armed() -> SniperParams {
         SniperParams {
             enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
             buy_size_wei: centi(10), // 0.1 ETH
             daily_budget_wei: eth(1),
             min_liquidity_wei: eth(2),

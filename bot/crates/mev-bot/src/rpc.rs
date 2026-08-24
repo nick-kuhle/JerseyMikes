@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use alloy_primitives::Address;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
@@ -64,6 +66,42 @@ impl RpcClient {
             "params": params,
         });
         self.send(body).await
+    }
+
+    pub async fn eth_call(&self, to: Address, data: Vec<u8>, block_number: u64) -> Result<Vec<u8>> {
+        let tag = if block_number == 0 {
+            "latest".to_string()
+        } else {
+            format!("0x{block_number:x}")
+        };
+        let params = json!([
+            {
+                "to": format!("{to:?}"),
+                "data": format!("0x{}", hex::encode(data)),
+            },
+            tag
+        ]);
+        let res = self.call_raw("eth_call", params).await?;
+        let hex_str = res
+            .as_str()
+            .ok_or_else(|| anyhow!("eth_call result not string"))?;
+        let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        hex::decode(clean).map_err(|e| anyhow!("hex decode error: {e}"))
+    }
+
+    pub async fn get_transaction_count(&self, address: Address, block_number: u64) -> Result<u64> {
+        let tag = if block_number == 0 {
+            "latest".to_string()
+        } else {
+            format!("0x{block_number:x}")
+        };
+        let params = json!([format!("{address:?}"), tag]);
+        let res = self.call_raw("eth_getTransactionCount", params).await?;
+        let hex_str = res
+            .as_str()
+            .ok_or_else(|| anyhow!("getTransactionCount result not string"))?;
+        let clean = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        u64::from_str_radix(clean, 16).map_err(|e| anyhow!("parse u64 error: {e}"))
     }
 
     /// Like [`RpcClient::call_raw`], but surfaces the JSON-RPC **error

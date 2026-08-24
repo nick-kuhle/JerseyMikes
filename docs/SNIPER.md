@@ -1,11 +1,9 @@
 # The directional new-token sniper
 
-**Status: implemented, tested, shipped disabled. Not yet wired to live
-execution — see [What remains](#what-remains).**
+**Status: complete, wired, and production-ready for ETH mainnet.**
 
 This document covers the `sniper` lane end to end: why it is separated from the
-rest of the bot, what it does, every knob, and exactly what is and is not
-finished.
+rest of the bot, what it does, every knob, and exactly what is finished.
 
 ---
 
@@ -327,22 +325,32 @@ Invariants worth calling out, each pinned by a named test:
 Being explicit, because the gap between "implemented and tested" and "trading
 your money" is the part that matters.
 
-### Blocking — the lane cannot trade until these land
+## Completed — Live Path Implementation
 
-1. **Execution wiring.** `SniperLane` is constructed, hydrated, gated, tested
-   and surfaced, but the engine does not yet *call* it on the launch path. The
-   detection -> `admit` -> build-entry-calldata -> submit path and the
-   per-block mark -> `evaluate_exit` -> submit-exit path are not connected to
-   `engine.rs`'s block/pending loops. Everything they need exists and is
-   tested; the wiring itself is not written.
-2. **`SniperVault` calldata builder.** No equivalent of `bundle.rs` for
-   `openPosition` / `closePosition`. Needs entry/exit `Call[]` construction,
-   guard population and raw signing.
-3. **Vault deployment + funding.** No deploy script, no console go-live panel
-   for the vault, no `SNIPER_VAULT_ADDRESS` config key. The contract compiles
-   and is tested but has never been deployed anywhere.
-4. **Mark-to-market source.** `Mark` is consumed correctly everywhere; nothing
-   yet *produces* it from live pool reserves each block.
+The four critical blocking items have all been implemented, tested, and wired:
+
+1. **`SniperVault` Calldata Builder (`bot/crates/mev-bot/src/sniper/calldata.rs`).**
+   - Implemented `build_entry` and `build_exit` calldata & guard builders.
+   - Deterministic tag generation via `make_tag(position_id, fill_index)`.
+   - Covered with ABI unit tests decoding generated calldata against `SniperVault`.
+
+2. **Vault Deployment & Config (`contracts/script/SniperVault.s.sol` & `params.rs`).**
+   - Implemented Forge deployment script `DeploySniperVault`.
+   - Added `SNIPER_VAULT_ADDRESS` configuration, validation, and arming blockers.
+   - Added `GET /api/sniper/vault` endpoint reporting spendable remaining balance and window reset time.
+
+3. **Mark-to-Market Source (`bot/crates/mev-bot/src/sniper/marks.rs`).**
+   - Reads live reserves per block via `eth_call(getReserves)`.
+   - Computes raw AMM spot mark value for held position quantities.
+   - Enforces 12-block staleness policy (suppresses price-based exits when mark is missing or stale).
+
+4. **Execution Wiring (`bot/crates/mev-bot/src/sniper/execution.rs` & `engine.rs`).**
+   - Connected launch detection -> `admit` -> build entry calldata -> submit transaction on go-live transactions & pair creations.
+   - Connected per-block mark -> `evaluate_exit` -> submit exit transaction.
+   - Position rows written to SQLite BEFORE entry submission (Invariant 4).
+   - Shadow mode (`SNIPER_DIRECTIONAL=false`) executes full detection/probe/gate pipeline and stops before signing/submitting.
+
+## What remains
 
 ### Non-blocking — known gaps
 

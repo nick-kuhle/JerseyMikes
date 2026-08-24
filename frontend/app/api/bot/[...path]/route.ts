@@ -15,6 +15,7 @@ import {
   demoSimulations,
   demoSniperParams,
   demoSniperPortfolio,
+  demoSniperVault,
   demoStatus,
 } from "@/lib/demo";
 
@@ -152,6 +153,8 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return demoSniperPortfolio();
     case "sniper/params":
       return demoSniperParams();
+    case "sniper/vault":
+      return demoSniperVault();
     case "sniper/positions":
       return {positions: []};
     default:
@@ -250,7 +253,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
   // panel unchanged. There is deliberately NO demo fallback that "applies" a
   // sniper patch — pretending to arm a lane that commits real capital is the
   // one place a convincing demo would be actively dangerous.
-  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume"];
+  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume", "sniper/buy", "sniper/sell"];
   if (SNIPER_MUTATIONS.includes(route)) {
     let body: unknown = {};
     try {

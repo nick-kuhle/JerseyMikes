@@ -17,7 +17,7 @@
 //! unable to buy — the console renders it verbatim so a disabled sniper is
 //! never a mystery.
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 /// Basis points denominator.
@@ -35,6 +35,9 @@ pub struct SniperParams {
     /// observes launches, runs honeypot checks and records verdicts — it
     /// simply never proposes a buy. This is the shadow mode.
     pub enabled: bool,
+
+    /// Address of the deployed SniperVault contract.
+    pub vault_address: Option<Address>,
 
     // --- entry -----------------------------------------------------------
     /// How much native (WETH) to commit per launch. `x` in "buy (x) eth".
@@ -110,6 +113,7 @@ impl Default for SniperParams {
     fn default() -> Self {
         Self {
             enabled: false,
+            vault_address: None,
             buy_size_wei: U256::ZERO,
             min_liquidity_wei: U256::from(2_000_000_000_000_000_000u128), // 2 ETH
             max_price_impact_bps: 300,                                    // 3%
@@ -252,6 +256,9 @@ impl SniperParams {
         if !self.enabled {
             out.push("SNIPER_DIRECTIONAL is off (shadow mode: launches are observed and honeypot-checked, never bought)".to_string());
         }
+        if self.enabled && matches!(self.vault_address, None | Some(Address::ZERO)) {
+            out.push("vault address not set (SNIPER_VAULT_ADDRESS)".to_string());
+        }
         if self.buy_size_wei.is_zero() {
             out.push("buySizeWei is 0".to_string());
         }
@@ -275,6 +282,7 @@ impl SniperParams {
     /// The honeypot warning is not a hard blocker, so it is excluded here.
     pub fn is_armed(&self) -> bool {
         self.enabled
+            && matches!(self.vault_address, Some(a) if !a.is_zero())
             && !self.buy_size_wei.is_zero()
             && !self.daily_budget_wei.is_zero()
             && self.max_concurrent_positions > 0
@@ -286,6 +294,7 @@ impl SniperParams {
         let d = Self::default();
         Self {
             enabled: env_bool("SNIPER_DIRECTIONAL", d.enabled),
+            vault_address: env_address("SNIPER_VAULT_ADDRESS"),
             buy_size_wei: env_u256("SNIPER_BUY_SIZE_WEI", d.buy_size_wei),
             min_liquidity_wei: env_u256("SNIPER_MIN_LIQUIDITY_WEI", d.min_liquidity_wei),
             max_price_impact_bps: env_u32("SNIPER_MAX_PRICE_IMPACT_BPS", d.max_price_impact_bps),
@@ -341,6 +350,22 @@ impl SniperParams {
 
         if let Some(v) = patch.enabled {
             next.enabled = v;
+        }
+        if let Some(ref v) = patch.vault_address {
+            if v.trim().is_empty()
+                || v == "0x0"
+                || v == "0x0000000000000000000000000000000000000000"
+            {
+                next.vault_address = None;
+            } else {
+                match v.parse::<Address>() {
+                    Ok(addr) => next.vault_address = Some(addr),
+                    Err(_) => errs.push(format!("vaultAddress {v:?} is not a valid EVM address")),
+                }
+            }
+        }
+        if next.enabled && matches!(next.vault_address, None | Some(Address::ZERO)) {
+            errs.push("vault address not set (SNIPER_VAULT_ADDRESS)".to_string());
         }
         if let Some(v) = patch.max_price_impact_bps {
             next.max_price_impact_bps = v;
@@ -438,6 +463,7 @@ impl SniperParams {
 #[serde(rename_all = "camelCase", default)]
 pub struct SniperParamsPatch {
     pub enabled: Option<bool>,
+    pub vault_address: Option<String>,
     pub buy_size_wei: Option<String>,
     pub min_liquidity_wei: Option<String>,
     pub max_price_impact_bps: Option<u32>,
@@ -468,6 +494,10 @@ fn env_raw(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn env_address(key: &str) -> Option<Address> {
+    env_raw(key).and_then(|v| v.parse().ok())
 }
 
 fn env_bool(key: &str, default: bool) -> bool {
@@ -522,6 +552,7 @@ mod tests {
     fn a_fully_armed_envelope_reports_no_blockers() {
         let p = SniperParams {
             enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
             buy_size_wei: eth(1),
             daily_budget_wei: eth(5),
             ..Default::default()
@@ -654,6 +685,7 @@ mod tests {
         let armed = SniperParams::default()
             .with_patch(&SniperParamsPatch {
                 enabled: Some(true),
+                vault_address: Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 buy_size_wei: Some(eth(1).to_string()),
                 daily_budget_wei: Some(eth(3).to_string()),
                 ..Default::default()
@@ -687,6 +719,7 @@ mod tests {
     fn honeypot_check_off_is_surfaced_as_a_warning_not_a_hard_blocker() {
         let p = SniperParams {
             enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
             buy_size_wei: eth(1),
             daily_budget_wei: eth(2),
             require_honeypot_pass: false,

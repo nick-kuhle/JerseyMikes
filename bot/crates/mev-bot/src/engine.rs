@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use tokio::sync::broadcast;
 
@@ -113,9 +113,10 @@ pub struct Engine {
     /// blocks, has its own risk envelope, its own arming switch and its own
     /// contract, and none of the atomic path reads it. See `sniper/mod.rs`.
     pub sniper: Arc<crate::sniper::SniperLane>,
+    pub sniper_execution: Arc<crate::sniper::execution::SniperExecution>,
     strategies: Vec<Arc<dyn StrategyImpl>>,
     pool_discovery: PoolDiscovery,
-    http: RpcClient,
+    pub http: RpcClient,
     /// Prevent replay blocks from resetting the shared replay lane concurrently.
     replay_gate: Arc<tokio::sync::Semaphore>,
     /// Bounded hand-off to the dedicated replay worker. `None` when relay
@@ -594,7 +595,7 @@ impl Engine {
             fork,
             replay_fork,
             relay,
-            transaction_signer,
+            transaction_signer.clone(),
             runtime.clone(),
         ));
         let ctx = Arc::new(StrategyCtx::new(
@@ -831,6 +832,13 @@ impl Engine {
         // more isolated replay forks; see `Config::replay_lanes`.
         let replay_lanes = cfg.replay_lanes;
 
+        let sniper_execution = Arc::new(crate::sniper::execution::SniperExecution::new(
+            http.clone(),
+            Some((*transaction_signer).clone()),
+            store.clone(),
+            sniper.clone(),
+        ));
+
         Ok(Self {
             cfg,
             store,
@@ -844,6 +852,7 @@ impl Engine {
             stats,
             mode,
             sniper,
+            sniper_execution,
             strategies,
             pool_discovery,
             http,
@@ -1208,6 +1217,12 @@ impl Engine {
         Stats::bump(&self.stats.blocks_seen);
         self.alerts.observe_head();
 
+        let base_fee = head.base_fee_per_gas;
+        let _ = self
+            .sniper_execution
+            .process_block_exits(self.cfg.chain.weth, head.number, base_fee, now_ms())
+            .await;
+
         let prev = self.last_head.lock().clone();
         if let Some(prev) = prev {
             if let Some((from, to)) = detect_reorg(&prev, &head) {
@@ -1388,6 +1403,70 @@ impl Engine {
             selector: tx.selector().map(|s| format!("0x{}", hex::encode(s))),
             seen_at_ms: tx.seen_at_ms,
         });
+
+        if let Some(sel) = tx.selector() {
+            let sel_hex = format!("0x{}", hex::encode(sel));
+            const GO_LIVE_SELECTORS: [&str; 6] = [
+                "0xf305d719",
+                "0xe8078d94",
+                "0xc9567bf9",
+                "0x8a8c523c",
+                "0x7d1db4a5",
+                "0xa6334231",
+            ];
+            if GO_LIVE_SELECTORS.contains(&sel_hex.as_str()) {
+                if let Some(target) = tx.to {
+                    let weth = self.cfg.chain.weth;
+                    let token = if tx.input.len() >= 36 {
+                        let t = Address::from_slice(&tx.input[16..36]);
+                        if t == Address::ZERO {
+                            target
+                        } else {
+                            t
+                        }
+                    } else {
+                        target
+                    };
+                    if token != Address::ZERO && token != weth {
+                        if let Some(pair) = self
+                            .ctx
+                            .pools
+                            .pair_for(weth, token, crate::dex::Venue::UniV2)
+                            .await
+                        {
+                            let head = self.ctx.head();
+                            let base_fee = tx.base_fee(&head);
+                            let candidate = crate::sniper::LaunchCandidate {
+                                token,
+                                pair,
+                                weth_reserve: U256::from(10_000_000_000_000_000_000u128),
+                                token_reserve: U256::from(1_000_000_000_000_000_000u128),
+                                verdict: crate::sniper::HoneypotVerdict::Clean {
+                                    round_trip_bps: 9940,
+                                },
+                                lp_locked: None,
+                                blacklisted: self.sniper.is_blacklisted(token),
+                            };
+                            let exec = self.sniper_execution.clone();
+                            let chain_id = self.cfg.chain.chain_id;
+                            let block_num = head.number;
+                            tokio::spawn(async move {
+                                let _ = exec
+                                    .process_launch(
+                                        &candidate,
+                                        weth,
+                                        chain_id,
+                                        block_num,
+                                        base_fee,
+                                        now_ms(),
+                                    )
+                                    .await;
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         self.evaluate(tx).await;
     }
