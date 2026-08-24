@@ -24,6 +24,9 @@ pub struct StrategyQualification {
     pub verdict: String,
     pub fork_samples: u64,
     pub relay_comparisons: u64,
+    /// Alias of `relay_comparisons` with backend-neutral naming. Equal to
+    /// that field; the console prefers this label on sequencer backends.
+    pub independent_comparisons: u64,
     pub actual_comparisons: u64,
     pub relay_within_tolerance: u64,
     pub actual_within_tolerance: u64,
@@ -256,6 +259,7 @@ fn evaluate_strategy(
         verdict: verdict.to_string(),
         fork_samples: evidence.fork_samples,
         relay_comparisons,
+        independent_comparisons: relay_comparisons,
         actual_comparisons,
         relay_within_tolerance,
         actual_within_tolerance,
@@ -281,5 +285,138 @@ mod tests {
         assert_eq!(accuracy_bps(0, 0), 0);
         assert_eq!(accuracy_bps(8, 10), 8_000);
         assert_eq!(accuracy_bps(10, 10), 10_000);
+    }
+
+    #[test]
+    fn thirty_independent_and_thirty_outcomes_can_pass_only_when_both_are_accurate() {
+        use crate::store::Store;
+        use crate::types::{now_ms, SimBackend, SimulationResult};
+        use alloy_primitives::U256;
+
+        let store = Store::open_in_memory().unwrap();
+        let now = now_ms();
+        // Continuity: one canonical block observation so the window is open.
+        store
+            .record_block(&crate::types::BlockHead {
+                number: 1,
+                hash: alloy_primitives::B256::ZERO,
+                parent_hash: alloy_primitives::B256::ZERO,
+                timestamp: 0,
+                base_fee_per_gas: U256::ZERO,
+                gas_used: 0,
+                gas_limit: 30_000_000,
+            })
+            .unwrap();
+
+        for i in 0..30u64 {
+            let id = format!("opp-{i}");
+            let sim = SimulationResult {
+                opportunity_id: id.clone(),
+                strategy: Strategy::AtomicArb,
+                backend: SimBackend::AnvilFork,
+                success: true,
+                gross_profit_wei: U256::from(150u64),
+                gas_used: 21_000,
+                gas_price_wei: U256::from(1u64),
+                gas_cost_wei: U256::from(50u64),
+                bribe_wei: U256::ZERO,
+                net_profit_wei: 100,
+                victim_predicted_out_wei: None,
+                revert_reason: None,
+                target_block: 1,
+                sim_latency_ms: 1,
+                created_at_ms: now,
+            };
+            store.record_simulation(&sim).unwrap();
+            store
+                .record_opportunity(&crate::types::Opportunity {
+                    id: id.clone(),
+                    strategy: Strategy::AtomicArb,
+                    victim_hashes: vec![],
+                    front_calls: vec![],
+                    back_calls: vec![],
+                    flash_tokens: vec![],
+                    flash_amounts: vec![],
+                    profit_token: alloy_primitives::Address::ZERO,
+                    expected_profit_wei: U256::from(100u64),
+                    notional_wei: U256::from(1_000u64),
+                    target_block: 1,
+                    created_at_ms: now,
+                    notes: String::new(),
+                })
+                .unwrap();
+            store
+                .record_state_comparison(
+                    &format!("st-{i}"),
+                    &id,
+                    "atomic_arb",
+                    &format!("head:{i}"),
+                    1,
+                    "0x",
+                    "univ2:0x1 -> univ3:0x2",
+                    "1000",
+                    "weth->usdc->weth",
+                    100,
+                    100,
+                )
+                .unwrap();
+            store
+                .record_actual_mev_match(&crate::store::ActualMevMatch {
+                    opportunity_id: id,
+                    block_number: 1,
+                    victim_hash: String::new(),
+                    mev_tx_hashes: vec![],
+                    actor: None,
+                    gross_weth_wei: U256::from(150u64),
+                    gas_cost_wei: U256::from(50u64),
+                    net_weth_wei: 100,
+                    confidence: "high".into(),
+                    confidence_score_bps: 9_000,
+                    completeness: serde_json::json!({}),
+                    evidence: serde_json::json!({}),
+                })
+                .unwrap();
+        }
+
+        let evidence = store
+            .qualification_evidence(
+                0,
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert_eq!(evidence.relay_errors_bps.len(), 30);
+        assert_eq!(evidence.actual_errors_bps.len(), 30);
+        assert!(evidence.relay_errors_bps.iter().all(|&e| e == 0));
+        assert!(evidence.actual_errors_bps.iter().all(|&e| e == 0));
+
+        // Removing the independent population leaves the strategy unqualified.
+        let empty = Store::open_in_memory().unwrap();
+        empty
+            .record_actual_mev_match(&crate::store::ActualMevMatch {
+                opportunity_id: "only-actual".into(),
+                block_number: 1,
+                victim_hash: String::new(),
+                mev_tx_hashes: vec![],
+                actor: None,
+                gross_weth_wei: U256::from(1u64),
+                gas_cost_wei: U256::ZERO,
+                net_weth_wei: 1,
+                confidence: "high".into(),
+                confidence_score_bps: 9_000,
+                completeness: serde_json::json!({}),
+                evidence: serde_json::json!({}),
+            })
+            .unwrap();
+        let only_actual = empty
+            .qualification_evidence(
+                0,
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert!(only_actual.relay_errors_bps.is_empty());
     }
 }

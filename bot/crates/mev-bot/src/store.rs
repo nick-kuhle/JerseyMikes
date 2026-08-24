@@ -390,6 +390,29 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_block_comparisons_strategy
                 ON block_comparisons (strategy, created_at_ms);
+
+            -- Victimless independent second opinion (WS-R). One row is one
+            -- (opportunity, state, route, amount, direction) sample and cannot
+            -- be reused as a corresponding-outcome match.
+            CREATE TABLE IF NOT EXISTS state_comparisons (
+                id               TEXT PRIMARY KEY,
+                opportunity_id   TEXT NOT NULL,
+                strategy         TEXT NOT NULL,
+                source_state_id  TEXT NOT NULL,
+                canonical_block  INTEGER NOT NULL,
+                canonical_hash   TEXT NOT NULL DEFAULT '',
+                route            TEXT NOT NULL,
+                amount_in        TEXT NOT NULL,
+                direction        TEXT NOT NULL,
+                predicted_wei    TEXT NOT NULL,
+                realized_wei     TEXT NOT NULL,
+                error_bps        INTEGER NOT NULL,
+                canonical        INTEGER NOT NULL DEFAULT 1,
+                created_at_ms    INTEGER NOT NULL,
+                UNIQUE(opportunity_id, source_state_id, route, amount_in, direction)
+            );
+            CREATE INDEX IF NOT EXISTS idx_state_comparisons_strategy
+                ON state_comparisons (strategy, created_at_ms, canonical);
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -765,6 +788,11 @@ impl Store {
         conn.execute(
             "UPDATE actual_mev_matches SET canonical = 0
              WHERE block_number >= ?1 AND block_number <= ?2 AND canonical = 1",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE state_comparisons SET canonical = 0
+             WHERE canonical_block >= ?1 AND canonical_block <= ?2 AND canonical = 1",
             params![from_block as i64, to_block as i64],
         )?;
         conn.execute(
@@ -1407,6 +1435,52 @@ impl Store {
         Ok(())
     }
 
+    /// Independent state-fidelity sample for a victimless strategy.
+    ///
+    /// The unique key is `(opportunity, state, route, amount, direction)`.
+    /// A replay of the same frame is `INSERT OR IGNORE` and does not inflate
+    /// the qualification count. Reorgs flip `canonical` rather than deleting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_state_comparison(
+        &self,
+        sample_id: &str,
+        opportunity_id: &str,
+        strategy: &str,
+        source_state_id: &str,
+        canonical_block: u64,
+        canonical_hash: &str,
+        route: &str,
+        amount_in: &str,
+        direction: &str,
+        predicted_wei: i128,
+        realized_wei: i128,
+    ) -> Result<bool> {
+        let error_bps = relative_error_bps(predicted_wei, realized_wei);
+        let changed = self.conn.lock().execute(
+            "INSERT OR IGNORE INTO state_comparisons
+             (id, opportunity_id, strategy, source_state_id, canonical_block,
+              canonical_hash, route, amount_in, direction,
+              predicted_wei, realized_wei, error_bps, canonical, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)",
+            params![
+                sample_id,
+                opportunity_id,
+                strategy,
+                source_state_id,
+                canonical_block as i64,
+                canonical_hash,
+                route,
+                amount_in,
+                direction,
+                predicted_wei.to_string(),
+                realized_wei.to_string(),
+                error_bps as i64,
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn record_actual_mev_match(&self, matched: &ActualMevMatch) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO actual_mev_matches
@@ -1704,20 +1778,41 @@ impl Store {
                 // (a) Victim-replay fidelity: the fork's predicted victim-leg
                 // delta vs the victim's realised delta in the canonical
                 // block — the included-block second opinion.
-                let mut block_stmt = conn.prepare(
-                    "SELECT error_bps FROM block_comparisons
-                     WHERE strategy = ?1 AND created_at_ms >= ?2",
-                )?;
-                let errs: Vec<u64> = block_stmt
-                    .query_map(params![strategy, since_ms as i64], |row| {
-                        row.get::<_, i64>(0)
-                    })?
-                    .flatten()
-                    .map(|e| e.max(0) as u64)
-                    .collect();
-                // Do not append `actual_mev_matches` here. Those rows feed the
-                // separate corresponding-chain population below; counting one
-                // row in both populations would manufacture independence.
+                // (b) Victimless independent samples (`state_comparisons`):
+                // one (opportunity, state, route, amount, direction) row.
+                // Do not append `actual_mev_matches` here. Those rows feed
+                // the separate corresponding-chain population below;
+                // counting one row in both populations would manufacture
+                // independence.
+                let mut errs: Vec<u64> = Vec::new();
+                {
+                    let mut block_stmt = conn.prepare(
+                        "SELECT error_bps FROM block_comparisons
+                         WHERE strategy = ?1 AND created_at_ms >= ?2",
+                    )?;
+                    errs.extend(
+                        block_stmt
+                            .query_map(params![strategy, since_ms as i64], |row| {
+                                row.get::<_, i64>(0)
+                            })?
+                            .flatten()
+                            .map(|e| e.max(0) as u64),
+                    );
+                }
+                {
+                    let mut state_stmt = conn.prepare(
+                        "SELECT error_bps FROM state_comparisons
+                         WHERE strategy = ?1 AND created_at_ms >= ?2 AND canonical = 1",
+                    )?;
+                    errs.extend(
+                        state_stmt
+                            .query_map(params![strategy, since_ms as i64], |row| {
+                                row.get::<_, i64>(0)
+                            })?
+                            .flatten()
+                            .map(|e| e.max(0) as u64),
+                    );
+                }
                 errs
             }
         };
@@ -2657,5 +2752,176 @@ mod tests {
             0,
             "the writer must durably invalidate the qualification window"
         );
+    }
+
+    #[test]
+    fn state_comparison_is_independent_and_deduped() {
+        let s = Store::open_in_memory().unwrap();
+        let now = now_ms();
+        let id = "arb-state-1";
+        {
+            let conn = s.conn.lock();
+            conn.execute(
+                "INSERT INTO opportunities
+                 (id,strategy,target_block,profit_token,expected_wei,notional_wei,victims,notes,created_at_ms)
+                 VALUES (?1,'atomic_arb',100,'0x0','100','1000','','test',?2)",
+                params![id, now as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO simulations
+                 (opportunity_id,strategy,backend,success,gross_wei,gas_used,gas_cost_wei,bribe_wei,net_wei,revert_reason,target_block,latency_ms,created_at_ms,reorged)
+                 VALUES (?1,'atomic_arb','anvil_fork',1,'150',21000,'50','0','100',NULL,100,1,?2,0)",
+                params![id, now as i64],
+            )
+            .unwrap();
+        }
+        assert!(s
+            .record_state_comparison(
+                "sample-a",
+                id,
+                "atomic_arb",
+                "head:100",
+                100,
+                "0xabc",
+                "univ2:0x1 -> univ3:0x2",
+                "1000",
+                "weth->usdc->weth",
+                100,
+                100,
+            )
+            .unwrap());
+        assert!(
+            !s.record_state_comparison(
+                "sample-a-dup",
+                id,
+                "atomic_arb",
+                "head:100",
+                100,
+                "0xabc",
+                "univ2:0x1 -> univ3:0x2",
+                "1000",
+                "weth->usdc->weth",
+                100,
+                80,
+            )
+            .unwrap(),
+            "same (opp, state, route, amount, direction) must not count twice"
+        );
+        assert!(s
+            .record_state_comparison(
+                "sample-b",
+                id,
+                "atomic_arb",
+                "head:100",
+                100,
+                "0xabc",
+                "univ3:0x2 -> univ2:0x1",
+                "1000",
+                "weth->usdc->weth",
+                100,
+                90,
+            )
+            .unwrap());
+
+        let evidence = s
+            .qualification_evidence(
+                now.saturating_sub(1),
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert_eq!(evidence.fork_samples, 1);
+        assert_eq!(evidence.relay_errors_bps.len(), 2);
+        assert!(evidence.actual_errors_bps.is_empty());
+    }
+
+    #[test]
+    fn reorged_state_comparisons_leave_the_independent_population() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_state_comparison(
+            "s1",
+            "opp",
+            "atomic_arb",
+            "head:50",
+            50,
+            "0xold",
+            "univ2:0x1",
+            "1",
+            "weth->usdc",
+            10,
+            10,
+        )
+        .unwrap();
+        s.record_reorg(50, 50, "0xold", "0xnew").unwrap();
+        let evidence = s
+            .qualification_evidence(
+                0,
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert!(evidence.relay_errors_bps.is_empty());
+    }
+
+    #[test]
+    fn wrong_direction_or_amount_is_a_different_sample() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s
+            .record_state_comparison(
+                "a",
+                "o",
+                "atomic_arb",
+                "st",
+                1,
+                "0x",
+                "r",
+                "100",
+                "weth->usdc",
+                1,
+                1
+            )
+            .unwrap());
+        assert!(s
+            .record_state_comparison(
+                "b",
+                "o",
+                "atomic_arb",
+                "st",
+                1,
+                "0x",
+                "r",
+                "200",
+                "weth->usdc",
+                1,
+                1
+            )
+            .unwrap());
+        assert!(s
+            .record_state_comparison(
+                "c",
+                "o",
+                "atomic_arb",
+                "st",
+                1,
+                "0x",
+                "r",
+                "100",
+                "usdc->weth",
+                1,
+                1
+            )
+            .unwrap());
+        let evidence = s
+            .qualification_evidence(
+                0,
+                Strategy::AtomicArb,
+                8_000,
+                crate::config::QualificationBackend::Sequencer,
+            )
+            .unwrap();
+        assert_eq!(evidence.relay_errors_bps.len(), 3);
     }
 }

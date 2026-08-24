@@ -720,7 +720,7 @@ function QualificationReport({qualification}: {qualification: StatusResponse["qu
                 {row.verdict}
               </td>
               <td style={{textAlign: "right"}}>{row.forkSamples}</td>
-              <td style={{textAlign: "right"}}>{row.relayComparisons}</td>
+              <td style={{textAlign: "right"}}>{row.independentComparisons ?? row.relayComparisons}</td>
               <td style={{textAlign: "right"}}>{row.actualComparisons}</td>
               <td style={{textAlign: "right"}}>{(row.relayAccuracyBps / 100).toFixed(1)}%</td>
               <td style={{textAlign: "right"}}>{(row.actualAccuracyBps / 100).toFixed(1)}%</td>

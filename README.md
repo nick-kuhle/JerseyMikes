@@ -179,8 +179,9 @@ Sequencer chains (Base) use `SUBMISSION_MODE=raw`,
 and a separate wei-denominated raw-smoke exposure cap. Front-run strategies
 are off by default (no public mempool). Base is currently a **shadow
 measurement instance**, not a certified revenue lane: atomic arb prices only
-the V2 graph, Base registers one V2 venue, and preconfirmed-state raw backruns
-are not yet implemented. See `.env.example.base`,
+the V2 graph (V3 legs sit behind `DEX_UNIV3_ARB=false`), Base registers one V2 venue, and preconfirmed-state raw backruns
+are not yet implemented. Sequencer qualification now accepts a dedicated
+`state_comparisons` population for victimless arb. See `.env.example.base`,
 [`docs/BASE_SAFETY_FOUNDATION.md`](docs/BASE_SAFETY_FOUNDATION.md), and
 [`docs/BASE_REVENUE_PATH_WORK_ORDER.md`](docs/BASE_REVENUE_PATH_WORK_ORDER.md).
 

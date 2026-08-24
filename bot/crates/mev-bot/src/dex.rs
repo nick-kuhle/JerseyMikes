@@ -19,6 +19,8 @@ use crate::rpc::RpcClient;
 
 /// Router calldata decoders (V2, UniversalRouter).
 pub mod calldata;
+/// Directed venue edges (V2 adapter + V3 quote-book) for mixed-venue search.
+pub mod edge;
 /// Multi-leg cycle search over the pool graph.
 pub mod graph;
 

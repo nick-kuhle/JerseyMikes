@@ -303,6 +303,7 @@ impl FunnelLane {
             | TxSource::MevShare
             | TxSource::MevBlocker
             | TxSource::Sequencer
+            | TxSource::Flashblock
             | TxSource::ExternalStream => FunnelLane::Live,
         }
     }
@@ -2185,6 +2186,10 @@ mod tests {
         );
         assert_eq!(
             FunnelLane::for_source(TxSource::Sequencer),
+            FunnelLane::Live
+        );
+        assert_eq!(
+            FunnelLane::for_source(TxSource::Flashblock),
             FunnelLane::Live
         );
     }

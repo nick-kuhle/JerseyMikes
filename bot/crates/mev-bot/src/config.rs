@@ -530,6 +530,12 @@ pub struct Config {
     /// public-mempool gap, and turning this on expands the V2 sandwich / arb
     /// surface. The decoder itself is pure calldata parsing.
     pub decode_universal_router: bool,
+    /// Include Uniswap V3 pools from the V3 discovery cache in the
+    /// atomic-arb graph (V3↔V2 and V3↔V3 cycles). Off by default so a
+    /// mainnet boot is byte-identical to the V2-only search; flip
+    /// `DEX_UNIV3_ARB=true` to measure the surface. Quotes come from
+    /// QuoterV2 (never a V2 approximation of concentrated liquidity).
+    pub dex_univ3_arb: bool,
     /// Longest cycle the atomic-arb search will consider, in legs.
     ///
     /// Default is 3 (the first post-funnel-week raise). 2 reproduces the
@@ -1110,7 +1116,12 @@ impl Config {
                 // anchor on the mainnet WETH.
                 weth: addresses.weth,
                 usd_stable: addresses.usdc,
-                block_time_ms: env_u64("BLOCK_TIME_MS", 12_000),
+                // Sequencer chains are ~2 s; defaulting them to mainnet's
+                // 12 s silently mis-labels every latency histogram.
+                block_time_ms: env_u64(
+                    "BLOCK_TIME_MS",
+                    if sequencer_only { 2_000 } else { 12_000 },
+                ),
             },
             addresses,
             endpoints: Endpoints {
@@ -1223,7 +1234,7 @@ impl Config {
                 // cadence); Base defaults to every 6 blocks (2 s cadence)
                 // for the same wall-clock refork rate.
                 refork_every_blocks: env_u64("REFORK_EVERY_BLOCKS", refork_default),
-                use_call_bundle: env_bool("USE_CALL_BUNDLE", true),
+                use_call_bundle: env_bool("USE_CALL_BUNDLE", !sequencer_only),
                 target_block_offset: env_u64("TARGET_BLOCK_OFFSET", 1),
                 timeout: Duration::from_millis(env_u64("SIM_TIMEOUT_MS", 2_500)),
             },
@@ -1245,11 +1256,14 @@ impl Config {
                 eval_secs: env_u64("ALERT_EVAL_SECS", 30).max(5),
             },
             oracle: OracleConfig {
-                watch_feeds: parse_feed_list(&env_or(
-                    "ORACLE_WATCH_FEEDS",
-                    "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,\
-                     0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c:0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
-                )),
+                watch_feeds: match env_opt("ORACLE_WATCH_FEEDS") {
+                    Some(raw) => parse_feed_list(&raw),
+                    None if sequencer_only => Vec::new(),
+                    None => parse_feed_list(
+                        "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,\
+                         0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c:0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+                    ),
+                },
                 max_leads: (env_u64("ORACLE_FRONTRUN_MAX_LEADS", 3) as usize).max(1),
             },
             api: ApiConfig {
@@ -1271,6 +1285,7 @@ impl Config {
             pool_discovery: env_bool("POOL_DISCOVERY", true),
             pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", true),
             decode_universal_router: env_bool("DECODE_UNIVERSAL_ROUTER", false),
+            dex_univ3_arb: env_bool("DEX_UNIV3_ARB", false),
             // Clamped to the enumerator's hard ceiling: config cannot talk the
             // search into an unbounded walk.
             arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 3) as usize)

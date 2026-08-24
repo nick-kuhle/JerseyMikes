@@ -26,6 +26,12 @@ impl StrategyImpl for SandwichStrategy {
     }
 
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
+        // A sandwich is a front-run. Unsigned / sequencer / Flashblock
+        // sources cannot be placed in front of — refuse here so a toggle
+        // left on on Base cannot emit an undeliverable candidate.
+        if tx.source.backrun_only() {
+            return Vec::new();
+        }
         let weth = ctx.cfg.chain.weth;
         let Some(intent) = decode_router(
             tx,

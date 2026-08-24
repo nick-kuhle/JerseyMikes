@@ -73,6 +73,9 @@ impl StrategyImpl for JitStrategy {
     }
 
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
+        if tx.source.backrun_only() {
+            return Vec::new();
+        }
         let Some(p) = decode_v3_swap(tx) else {
             return Vec::new();
         };
