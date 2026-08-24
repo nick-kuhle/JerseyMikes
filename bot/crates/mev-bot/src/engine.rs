@@ -108,6 +108,11 @@ pub struct Engine {
     /// Execution mode: boot-time arming + the runtime simulation/live switch
     /// exposed to the dashboard. See [`LiveMode`].
     pub mode: LiveMode,
+    /// The directional new-token sniper lane. Deliberately a peer of the
+    /// engine rather than a strategy inside it: it holds positions across
+    /// blocks, has its own risk envelope, its own arming switch and its own
+    /// contract, and none of the atomic path reads it. See `sniper/mod.rs`.
+    pub sniper: Arc<crate::sniper::SniperLane>,
     strategies: Vec<Arc<dyn StrategyImpl>>,
     pool_discovery: PoolDiscovery,
     http: RpcClient,
@@ -691,6 +696,63 @@ impl Engine {
             strategies.push(Arc::new(SniperStrategy::new()));
         }
 
+        // The directional sniper lane. Constructed unconditionally so the
+        // console can always show its state and explain why it is disabled —
+        // a lane that vanishes when it is off is a lane operators cannot
+        // reason about. Its own `enabled` switch (`SNIPER_DIRECTIONAL`,
+        // default false) is what decides whether it may ever buy.
+        let sniper = Arc::new(crate::sniper::SniperLane::from_env());
+        {
+            // Open exposure must survive a restart. Recover positions before
+            // anything else can open new ones, so the concurrency and budget
+            // gates see the true picture on the very first block.
+            match store.live_sniper_positions() {
+                Ok(open) if !open.is_empty() => {
+                    tracing::warn!(
+                        target: "sniper",
+                        recovered = open.len(),
+                        "recovered open sniper positions from the previous run — \
+                         these are live exposure and will be marked and managed"
+                    );
+                    sniper.hydrate(open);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Fail closed: if we cannot tell what we are holding, we
+                    // must not open anything new on top of it.
+                    tracing::error!(
+                        target: "sniper",
+                        error = %e,
+                        "could not read sniper positions; halting the lane"
+                    );
+                    sniper.halt("position recovery failed at boot");
+                }
+            }
+            for token in store.sniper_honeypot_tokens().unwrap_or_default() {
+                if let Ok(addr) = token.parse() {
+                    sniper.blacklist(addr);
+                }
+            }
+            let params = sniper.params();
+            if params.is_armed() {
+                tracing::warn!(
+                    target: "sniper",
+                    buy_size_wei = %params.buy_size_wei,
+                    daily_budget_wei = %params.daily_budget_wei,
+                    max_positions = params.max_concurrent_positions,
+                    "DIRECTIONAL SNIPER IS ARMED — this lane can lose the full buy amount \
+                     on every entry. It is not covered by the executor's profit-or-revert \
+                     guard. See docs/SNIPER.md."
+                );
+            } else {
+                tracing::info!(
+                    target: "sniper",
+                    blockers = ?params.arming_blockers(),
+                    "directional sniper in shadow mode"
+                );
+            }
+        }
+
         let (feed, _) = broadcast::channel(cfg.api.feed_capacity.max(64));
         let stats = Arc::new(Stats::default());
         stats
@@ -781,6 +843,7 @@ impl Engine {
             feed,
             stats,
             mode,
+            sniper,
             strategies,
             pool_discovery,
             http,

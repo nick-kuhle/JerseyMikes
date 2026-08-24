@@ -413,6 +413,74 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_state_comparisons_strategy
                 ON state_comparisons (strategy, created_at_ms, canonical);
+
+            -- ---------------------------------------------------------------
+            -- Directional sniper lane (isolated; see docs/SNIPER.md).
+            --
+            -- These two tables are the ONLY durable state the sniper owns, and
+            -- nothing else in the schema references them. An operator who
+            -- wants the lane gone can drop both without affecting a single
+            -- atomic-path query.
+            --
+            -- Open exposure MUST survive a restart: an unmanaged open position
+            -- is the worst failure mode this lane has, so entries are written
+            -- before the buy is submitted, not after it confirms.
+            CREATE TABLE IF NOT EXISTS sniper_positions (
+                id                TEXT PRIMARY KEY,
+                chain_id          INTEGER NOT NULL,
+                token             TEXT NOT NULL,
+                pair              TEXT NOT NULL,
+                venue             TEXT NOT NULL,
+                state             TEXT NOT NULL,
+                trigger_tx        TEXT,
+                entry_tx          TEXT,
+                entry_cost_wei    TEXT NOT NULL,
+                entry_qty         TEXT NOT NULL,
+                remaining_qty     TEXT NOT NULL,
+                realized_wei      TEXT NOT NULL DEFAULT '0',
+                gas_spent_wei     TEXT NOT NULL DEFAULT '0',
+                peak_value_wei    TEXT NOT NULL DEFAULT '0',
+                opened_block      INTEGER NOT NULL,
+                opened_at_ms      INTEGER NOT NULL,
+                closed_at_ms      INTEGER,
+                exit_reason       TEXT,
+                entry_verdict     TEXT NOT NULL DEFAULT 'unknown',
+                notes             TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_sniper_positions_state
+                ON sniper_positions (state, opened_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_sniper_positions_token
+                ON sniper_positions (token);
+
+            -- Every entry and exit fill, append-only. The position row is a
+            -- projection of these; keeping the fills lets an operator audit
+            -- how a position actually got to its current shape.
+            CREATE TABLE IF NOT EXISTS sniper_fills (
+                id             TEXT PRIMARY KEY,
+                position_id    TEXT NOT NULL,
+                side           TEXT NOT NULL,          -- 'buy' | 'sell'
+                reason         TEXT NOT NULL DEFAULT '',
+                qty            TEXT NOT NULL,
+                weth_wei       TEXT NOT NULL,
+                gas_wei        TEXT NOT NULL DEFAULT '0',
+                tx_hash        TEXT,
+                block_number   INTEGER,
+                created_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sniper_fills_position
+                ON sniper_fills (position_id, created_at_ms);
+
+            -- Honeypot verdicts, so a token is probed once and remembered.
+            -- Doubles as the evidence population for the sniper's own
+            -- (non-blocking) qualification track.
+            CREATE TABLE IF NOT EXISTS sniper_token_verdicts (
+                token           TEXT PRIMARY KEY,
+                chain_id        INTEGER NOT NULL,
+                verdict         TEXT NOT NULL,
+                round_trip_bps  INTEGER,
+                probed_at_ms    INTEGER NOT NULL,
+                detail          TEXT NOT NULL DEFAULT ''
+            );
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -2309,6 +2377,260 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Directional sniper lane persistence
+//
+// A separate `impl` block on purpose: everything the sniper stores lives here,
+// touches only the three `sniper_*` tables, and can be lifted out whole. No
+// method in this block is called from the atomic path.
+// ---------------------------------------------------------------------------
+
+impl Store {
+    /// Write (or overwrite) a position. Called before the entry is submitted
+    /// and after every state change, so a crash can never leave open exposure
+    /// that the bot does not know about on restart.
+    pub fn upsert_sniper_position(&self, p: &crate::sniper::Position) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO sniper_positions
+             (id, chain_id, token, pair, venue, state, trigger_tx, entry_tx,
+              entry_cost_wei, entry_qty, remaining_qty, realized_wei, gas_spent_wei,
+              peak_value_wei, opened_block, opened_at_ms, closed_at_ms, exit_reason,
+              entry_verdict, notes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+             ON CONFLICT(id) DO UPDATE SET
+                state          = excluded.state,
+                entry_tx       = excluded.entry_tx,
+                entry_cost_wei = excluded.entry_cost_wei,
+                entry_qty      = excluded.entry_qty,
+                remaining_qty  = excluded.remaining_qty,
+                realized_wei   = excluded.realized_wei,
+                gas_spent_wei  = excluded.gas_spent_wei,
+                peak_value_wei = excluded.peak_value_wei,
+                closed_at_ms   = excluded.closed_at_ms,
+                exit_reason    = excluded.exit_reason,
+                notes          = excluded.notes",
+            params![
+                p.id,
+                p.chain_id as i64,
+                format!("{:?}", p.token),
+                format!("{:?}", p.pair),
+                p.venue,
+                p.state.as_str(),
+                p.trigger_tx.map(|h| format!("{h:?}")),
+                p.entry_tx.map(|h| format!("{h:?}")),
+                p.entry_cost_wei.to_string(),
+                p.entry_qty.to_string(),
+                p.remaining_qty.to_string(),
+                p.realized_wei.to_string(),
+                p.gas_spent_wei.to_string(),
+                p.peak_value_wei.to_string(),
+                p.opened_block as i64,
+                p.opened_at_ms as i64,
+                p.closed_at_ms.map(|v| v as i64),
+                p.exit_reason.map(|r| r.as_str()),
+                p.entry_verdict,
+                p.notes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every position still holding (or awaiting) exposure. This is what the
+    /// lane hydrates from at boot.
+    pub fn live_sniper_positions(&self) -> Result<Vec<crate::sniper::Position>> {
+        self.sniper_positions_where("state IN ('pending','open','scaling')", 4_096)
+    }
+
+    /// Most recent positions regardless of state, newest first.
+    pub fn recent_sniper_positions(&self, limit: usize) -> Result<Vec<crate::sniper::Position>> {
+        self.sniper_positions_where("1=1", limit)
+    }
+
+    fn sniper_positions_where(
+        &self,
+        predicate: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::sniper::Position>> {
+        use crate::sniper::{ExitReason, Position, PositionState};
+
+        let sql = format!(
+            "SELECT id, chain_id, token, pair, venue, state, trigger_tx, entry_tx,
+                    entry_cost_wei, entry_qty, remaining_qty, realized_wei, gas_spent_wei,
+                    peak_value_wei, opened_block, opened_at_ms, closed_at_ms, exit_reason,
+                    entry_verdict, notes
+             FROM sniper_positions WHERE {predicate}
+             ORDER BY opened_at_ms DESC LIMIT {limit}"
+        );
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            let state = match row.get::<_, String>(5)?.as_str() {
+                "pending" => PositionState::Pending,
+                "open" => PositionState::Open,
+                "scaling" => PositionState::Scaling,
+                "abandoned" => PositionState::Abandoned,
+                _ => PositionState::Closed,
+            };
+            let exit_reason = row.get::<_, Option<String>>(17)?.and_then(|r| {
+                Some(match r.as_str() {
+                    "take_profit_pct" => ExitReason::TakeProfitPct,
+                    "take_profit_abs" => ExitReason::TakeProfitAbs,
+                    "stop_loss" => ExitReason::StopLoss,
+                    "trailing_stop" => ExitReason::TrailingStop,
+                    "max_hold" => ExitReason::MaxHold,
+                    "honeypot_detected" => ExitReason::HoneypotDetected,
+                    "manual" => ExitReason::Manual,
+                    "risk_stop" => ExitReason::RiskStop,
+                    _ => return None,
+                })
+            });
+            Ok(Position {
+                id: row.get(0)?,
+                chain_id: row.get::<_, i64>(1)? as u64,
+                token: parse_address(&row.get::<_, String>(2)?),
+                pair: parse_address(&row.get::<_, String>(3)?),
+                venue: row.get(4)?,
+                state,
+                trigger_tx: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|h| parse_b256(&h)),
+                entry_tx: row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|h| parse_b256(&h)),
+                entry_cost_wei: parse_u256_decimal(&row.get::<_, String>(8)?),
+                entry_qty: parse_u256_decimal(&row.get::<_, String>(9)?),
+                remaining_qty: parse_u256_decimal(&row.get::<_, String>(10)?),
+                realized_wei: parse_u256_decimal(&row.get::<_, String>(11)?),
+                gas_spent_wei: parse_u256_decimal(&row.get::<_, String>(12)?),
+                peak_value_wei: parse_u256_decimal(&row.get::<_, String>(13)?),
+                opened_block: row.get::<_, i64>(14)? as u64,
+                opened_at_ms: row.get::<_, i64>(15)? as u64,
+                closed_at_ms: row.get::<_, Option<i64>>(16)?.map(|v| v as u64),
+                exit_reason,
+                entry_verdict: row.get(18)?,
+                notes: row.get(19)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Append an entry or exit fill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_sniper_fill(
+        &self,
+        id: &str,
+        position_id: &str,
+        side: &str,
+        reason: &str,
+        qty: U256,
+        weth_wei: U256,
+        gas_wei: U256,
+        tx_hash: Option<String>,
+        block_number: Option<u64>,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT OR IGNORE INTO sniper_fills
+             (id, position_id, side, reason, qty, weth_wei, gas_wei, tx_hash,
+              block_number, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![
+                id,
+                position_id,
+                side,
+                reason,
+                qty.to_string(),
+                weth_wei.to_string(),
+                gas_wei.to_string(),
+                tx_hash,
+                block_number.map(|b| b as i64),
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Fills for one position, oldest first.
+    pub fn sniper_fills(&self, position_id: &str) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, side, reason, qty, weth_wei, gas_wei, tx_hash, block_number, created_at_ms
+             FROM sniper_fills WHERE position_id = ?1 ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![position_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "side": row.get::<_, String>(1)?,
+                "reason": row.get::<_, String>(2)?,
+                "qty": row.get::<_, String>(3)?,
+                "wethWei": row.get::<_, String>(4)?,
+                "gasWei": row.get::<_, String>(5)?,
+                "txHash": row.get::<_, Option<String>>(6)?,
+                "blockNumber": row.get::<_, Option<i64>>(7)?,
+                "createdAtMs": row.get::<_, i64>(8)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Remember a honeypot verdict so the same token is not re-probed.
+    pub fn record_sniper_verdict(
+        &self,
+        token: &str,
+        chain_id: u64,
+        verdict: &str,
+        round_trip_bps: Option<u32>,
+        detail: &str,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO sniper_token_verdicts
+             (token, chain_id, verdict, round_trip_bps, probed_at_ms, detail)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(token) DO UPDATE SET
+                verdict        = excluded.verdict,
+                round_trip_bps = excluded.round_trip_bps,
+                probed_at_ms   = excluded.probed_at_ms,
+                detail         = excluded.detail",
+            params![
+                token,
+                chain_id as i64,
+                verdict,
+                round_trip_bps.map(|v| v as i64),
+                now_ms() as i64,
+                detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Tokens the probe has rejected outright — the persistent blacklist.
+    pub fn sniper_honeypot_tokens(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT token FROM sniper_token_verdicts WHERE verdict = 'honeypot'")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Counts by verdict, for the sniper's evidence track.
+    pub fn sniper_verdict_counts(&self) -> Result<std::collections::HashMap<String, u64>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT verdict, COUNT(*) FROM sniper_token_verdicts GROUP BY verdict")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+}
+
+fn parse_address(raw: &str) -> alloy_primitives::Address {
+    raw.parse().unwrap_or(alloy_primitives::Address::ZERO)
+}
+
+fn parse_b256(raw: &str) -> Option<alloy_primitives::B256> {
+    raw.parse().ok()
+}
+
 fn relative_error_bps(predicted: i128, observed: i128) -> u64 {
     let difference = U256::from(predicted.abs_diff(observed));
     let denominator = U256::from(observed.unsigned_abs().max(1));
@@ -2923,5 +3245,184 @@ mod tests {
             )
             .unwrap();
         assert_eq!(evidence.relay_errors_bps.len(), 3);
+    }
+
+    // --- directional sniper lane -------------------------------------------
+
+    fn sniper_pos(id: &str, state: crate::sniper::PositionState) -> crate::sniper::Position {
+        use alloy_primitives::Address;
+        crate::sniper::Position {
+            id: id.into(),
+            chain_id: 1,
+            token: Address::with_last_byte(0xAB),
+            pair: Address::with_last_byte(0xCD),
+            venue: "univ2".into(),
+            state,
+            trigger_tx: None,
+            entry_tx: None,
+            entry_cost_wei: U256::from(1_000_000_000_000_000_000u128),
+            entry_qty: U256::from(4_242u64),
+            remaining_qty: U256::from(4_242u64),
+            realized_wei: U256::ZERO,
+            gas_spent_wei: U256::from(777u64),
+            peak_value_wei: U256::from(1_000_000_000_000_000_000u128),
+            opened_block: 21_000_000,
+            opened_at_ms: 1_700_000_000_000,
+            closed_at_ms: None,
+            exit_reason: None,
+            entry_verdict: "clean".into(),
+            notes: "backrun of addLiquidityETH".into(),
+        }
+    }
+
+    #[test]
+    fn sniper_position_round_trips_through_sqlite() {
+        let s = Store::open_in_memory().unwrap();
+        let p = sniper_pos("p1", crate::sniper::PositionState::Open);
+        s.upsert_sniper_position(&p).unwrap();
+
+        let back = s.live_sniper_positions().unwrap();
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+        assert_eq!(b.id, p.id);
+        assert_eq!(b.token, p.token, "address must survive the round trip");
+        assert_eq!(b.pair, p.pair);
+        assert_eq!(b.entry_cost_wei, p.entry_cost_wei, "wei must not be lossy");
+        assert_eq!(b.entry_qty, p.entry_qty);
+        assert_eq!(b.gas_spent_wei, p.gas_spent_wei);
+        assert_eq!(b.opened_block, p.opened_block);
+        assert_eq!(b.state, crate::sniper::PositionState::Open);
+        assert_eq!(b.entry_verdict, "clean");
+        assert_eq!(b.notes, p.notes);
+    }
+
+    #[test]
+    fn sniper_upsert_is_idempotent_and_updates_in_place() {
+        let s = Store::open_in_memory().unwrap();
+        let mut p = sniper_pos("p1", crate::sniper::PositionState::Open);
+        s.upsert_sniper_position(&p).unwrap();
+
+        p.apply_fill(U256::from(2_000u64), U256::from(500u64), U256::ZERO, 42);
+        s.upsert_sniper_position(&p).unwrap();
+
+        let back = s.live_sniper_positions().unwrap();
+        assert_eq!(back.len(), 1, "upsert must not duplicate the row");
+        assert_eq!(back[0].state, crate::sniper::PositionState::Scaling);
+        assert_eq!(back[0].remaining_qty, U256::from(2_242u64));
+        assert_eq!(back[0].realized_wei, U256::from(500u64));
+    }
+
+    #[test]
+    fn only_live_positions_are_hydrated() {
+        let s = Store::open_in_memory().unwrap();
+        for (id, state) in [
+            ("a", crate::sniper::PositionState::Open),
+            ("b", crate::sniper::PositionState::Pending),
+            ("c", crate::sniper::PositionState::Scaling),
+            ("d", crate::sniper::PositionState::Closed),
+            ("e", crate::sniper::PositionState::Abandoned),
+        ] {
+            s.upsert_sniper_position(&sniper_pos(id, state)).unwrap();
+        }
+        let live = s.live_sniper_positions().unwrap();
+        assert_eq!(live.len(), 3);
+        assert!(live.iter().all(|p| p.state.is_live()));
+        assert_eq!(s.recent_sniper_positions(100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn a_closed_position_round_trips_its_exit_reason() {
+        let s = Store::open_in_memory().unwrap();
+        let mut p = sniper_pos("p1", crate::sniper::PositionState::Closed);
+        p.exit_reason = Some(crate::sniper::ExitReason::TrailingStop);
+        p.closed_at_ms = Some(1_700_000_999_000);
+        s.upsert_sniper_position(&p).unwrap();
+        let back = &s.recent_sniper_positions(10).unwrap()[0];
+        assert_eq!(
+            back.exit_reason,
+            Some(crate::sniper::ExitReason::TrailingStop)
+        );
+        assert_eq!(back.closed_at_ms, Some(1_700_000_999_000));
+    }
+
+    #[test]
+    fn sniper_fills_append_and_read_back_in_order() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_fill(
+            "f1",
+            "p1",
+            "buy",
+            "entry",
+            U256::from(1_000u64),
+            U256::from(50u64),
+            U256::from(1u64),
+            None,
+            Some(100),
+        )
+        .unwrap();
+        s.record_sniper_fill(
+            "f2",
+            "p1",
+            "sell",
+            "take_profit_pct",
+            U256::from(500u64),
+            U256::from(90u64),
+            U256::from(1u64),
+            None,
+            Some(120),
+        )
+        .unwrap();
+        let fills = s.sniper_fills("p1").unwrap();
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0]["side"], "buy");
+        assert_eq!(fills[1]["reason"], "take_profit_pct");
+        assert_eq!(fills[1]["qty"], "500");
+    }
+
+    #[test]
+    fn a_replayed_fill_is_ignored() {
+        let s = Store::open_in_memory().unwrap();
+        for _ in 0..3 {
+            s.record_sniper_fill(
+                "f1",
+                "p1",
+                "buy",
+                "entry",
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::ZERO,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.sniper_fills("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn honeypot_verdicts_persist_as_a_blacklist() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_verdict("0xdead", 1, "honeypot", None, "sell reverted")
+            .unwrap();
+        s.record_sniper_verdict("0xbeef", 1, "clean", Some(9_940), "")
+            .unwrap();
+        let blacklist = s.sniper_honeypot_tokens().unwrap();
+        assert_eq!(blacklist, vec!["0xdead".to_string()]);
+
+        let counts = s.sniper_verdict_counts().unwrap();
+        assert_eq!(counts.get("honeypot"), Some(&1));
+        assert_eq!(counts.get("clean"), Some(&1));
+    }
+
+    #[test]
+    fn a_reprobed_token_updates_rather_than_duplicating() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_verdict("0xdead", 1, "clean", Some(9_900), "")
+            .unwrap();
+        s.record_sniper_verdict("0xdead", 1, "honeypot", None, "went dark")
+            .unwrap();
+        let counts = s.sniper_verdict_counts().unwrap();
+        assert_eq!(counts.get("clean"), None);
+        assert_eq!(counts.get("honeypot"), Some(&1));
     }
 }

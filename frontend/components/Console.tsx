@@ -7,6 +7,7 @@ import ContractPanel from "./ContractPanel";
 import GoLivePanel from "./GoLivePanel";
 import EligibilityPanel from "./EligibilityPanel";
 import RiskPanel from "./RiskPanel";
+import SniperPanel from "./SniperPanel";
 import FunnelPanel from "./FunnelPanel";
 import RelayBlocksPanel from "./RelayBlocksPanel";
 import Phase1Panel from "./Phase1Panel";
@@ -258,6 +259,7 @@ export default function Console() {
           ["history", "Transactions"],
           ["relay", "Relay blocks"],
           ["funnel", "Funnel"],
+          ["sniper", "Sniper"],
           ["risk", "Controls"],
           ["golive", "Go live"],
           ["executor", "Executor"],
@@ -643,6 +645,19 @@ export default function Console() {
         chainId={status?.chain.id}
       />
 
+      </Section>
+
+      {/* Directional sniper — its own lane, its own contract, its own risk
+          envelope. Kept as a distinct section rather than a row inside the
+          risk panel because nothing about it shares the atomic path's
+          guarantees. See docs/SNIPER.md. */}
+      <Section
+        id="sniper"
+        title="Sniper — new-token portfolio"
+        subtitle="directional lane · holds positions · docs/SNIPER.md"
+        defaultOpen={false}
+      >
+        <SniperPanel />
       </Section>
 
       {/* risk & strategy controls */}

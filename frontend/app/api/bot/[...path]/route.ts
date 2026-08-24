@@ -13,6 +13,8 @@ import {
   demoReorgs,
   demoSeries,
   demoSimulations,
+  demoSniperParams,
+  demoSniperPortfolio,
   demoStatus,
 } from "@/lib/demo";
 
@@ -144,6 +146,14 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return {summary: {matches: 0, highConfidence: 0}, matches: []};
     case "reorgs":
       return demoReorgs();
+    // Directional sniper lane. The demo view shows a realistic mixed book but
+    // always reports the lane as disarmed, matching the shipped defaults.
+    case "sniper/portfolio":
+      return demoSniperPortfolio();
+    case "sniper/params":
+      return demoSniperParams();
+    case "sniper/positions":
+      return {positions: []};
     default:
       return {error: `unknown endpoint ${path}`};
   }
@@ -235,6 +245,48 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
 
   // The runtime risk endpoints are forwarded verbatim (bar JSON parsing) —
   // validation is the bot's job and its 400 reason must reach the panel.
+  // Sniper-lane mutations are forwarded verbatim exactly like the risk
+  // endpoints: validation lives in the bot and its 400 reasons must reach the
+  // panel unchanged. There is deliberately NO demo fallback that "applies" a
+  // sniper patch — pretending to arm a lane that commits real capital is the
+  // one place a convincing demo would be actively dangerous.
+  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume"];
+  if (SNIPER_MUTATIONS.includes(route)) {
+    let body: unknown = {};
+    try {
+      body = await req.json();
+    } catch {
+      body = {};
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const upstream = await fetch(botUpstreamUrl(`/api/${route}`, chainSlug), {
+        method: "POST",
+        signal: controller.signal,
+        headers: {"content-type": "application/json", ...botAuthHeaders(chainSlug)},
+        body: JSON.stringify(body),
+      });
+      clearTimeout(timer);
+      const data = (await upstream
+        .json()
+        .catch(() => ({error: `bot returned HTTP ${upstream.status}`}))) as Record<string, unknown>;
+      return new Response(JSON.stringify({...data, ok: upstream.ok, demo: false}), {
+        status: upstream.status,
+        headers: {"content-type": "application/json", "x-data-source": "bot"},
+      });
+    } catch {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "bot control plane unreachable — the sniper lane was not changed",
+          demo: false,
+        }),
+        {status: 503, headers: {"content-type": "application/json", "x-data-source": "bot"}},
+      );
+    }
+  }
+
   if (route === "risk" || route === "risk/reset") {
     let body: unknown = {};
     try {

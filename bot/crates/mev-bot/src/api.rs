@@ -42,6 +42,12 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/mode", post(set_mode))
         .route("/api/risk", post(set_risk))
         .route("/api/risk/reset", post(reset_risk))
+        // The sniper lane's mutating surface. Grouped with the other mutating
+        // routes so it inherits the same bearer-token gate: `sniper/params`
+        // can commit real capital, and `sniper/halt` can stop it.
+        .route("/api/sniper/params", post(set_sniper_params))
+        .route("/api/sniper/halt", post(halt_sniper))
+        .route("/api/sniper/resume", post(resume_sniper))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Browsers get no cross-origin access by default. The dashboard reaches
@@ -86,6 +92,10 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/risk", get(risk_state))
         .route("/api/alerts", get(alerts))
         .route("/api/metrics", get(metrics))
+        // Sniper lane reads.
+        .route("/api/sniper/portfolio", get(sniper_portfolio))
+        .route("/api/sniper/params", get(sniper_params))
+        .route("/api/sniper/positions", get(sniper_positions))
         .merge(mutating)
         .layer(cors)
         .with_state(state)
@@ -549,6 +559,135 @@ async fn set_risk(State(s): State<ApiState>, Json(patch): Json<RiskPatch>) -> Re
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Directional sniper lane
+//
+// A completely separate surface from `/api/risk`. Merging them was tempting
+// and would have been wrong: the shared risk envelope governs bundles that
+// cannot lose money, and this one governs a lane that can. Keeping the
+// endpoints apart keeps the blast radius of a mistaken PATCH apart too.
+// ---------------------------------------------------------------------------
+
+/// The mini portfolio: open positions, marks, realised/unrealised PnL split,
+/// and the reasons the lane is or is not armed.
+async fn sniper_portfolio(
+    State(s): State<ApiState>,
+    Query(q): Query<LimitQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(20).clamp(1, 200) as usize;
+    Json(s.engine.sniper.portfolio(crate::types::now_ms(), limit))
+}
+
+/// Current envelope plus everything an operator needs to understand it.
+async fn sniper_params(State(s): State<ApiState>) -> impl IntoResponse {
+    let lane = &s.engine.sniper;
+    let params = lane.params();
+    Json(json!({
+        "params": params,
+        "armed": params.is_armed() && !lane.is_halted() && lane.boot_enabled(),
+        "bootEnabled": lane.boot_enabled(),
+        "halted": lane.is_halted(),
+        "haltReason": lane.halt_reason(),
+        "armingBlockers": params.arming_blockers(),
+        "rejections": lane.rejection_counts(),
+        "envSnippet": params.env_snippet(),
+    }))
+}
+
+/// Positions with their fill history, for the drill-down view.
+async fn sniper_positions(
+    State(s): State<ApiState>,
+    Query(q): Query<LimitQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500) as usize;
+    let positions = s
+        .engine
+        .store
+        .recent_sniper_positions(limit)
+        .unwrap_or_default();
+    let rows: Vec<serde_json::Value> = positions
+        .into_iter()
+        .map(|p| {
+            let fills = s.engine.store.sniper_fills(&p.id).unwrap_or_default();
+            json!({"position": p, "fills": fills})
+        })
+        .collect();
+    Json(json!({"positions": rows}))
+}
+
+/// Update the sniper's envelope. Validated as a whole; a rejected patch
+/// changes nothing.
+async fn set_sniper_params(
+    State(s): State<ApiState>,
+    Json(patch): Json<crate::sniper::SniperParamsPatch>,
+) -> Response {
+    let lane = &s.engine.sniper;
+    match lane.patch_params(&patch) {
+        Ok(effective) => {
+            if effective.is_armed() {
+                tracing::warn!(
+                    target: "sniper",
+                    buy_size_wei = %effective.buy_size_wei,
+                    daily_budget_wei = %effective.daily_budget_wei,
+                    "sniper envelope updated and the lane is ARMED"
+                );
+            } else {
+                tracing::info!(target: "sniper", "sniper envelope updated; lane not armed");
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "params": effective,
+                    "armed": effective.is_armed() && !lane.is_halted(),
+                    "armingBlockers": effective.arming_blockers(),
+                    "envSnippet": effective.env_snippet(),
+                })),
+            )
+                .into_response()
+        }
+        Err(errors) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "errors": errors})),
+        )
+            .into_response(),
+    }
+}
+
+/// Stop opening new positions. Existing positions keep being managed — an
+/// operator halting the lane wants to stop buying, not to be trapped in what
+/// they already hold.
+async fn halt_sniper(State(s): State<ApiState>, Json(body): Json<HaltBody>) -> impl IntoResponse {
+    let reason = body
+        .reason
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or_else(|| "halted from the dashboard".to_string());
+    s.engine.sniper.halt(reason.clone());
+    tracing::warn!(target: "sniper", %reason, "sniper lane halted");
+    Json(json!({"ok": true, "halted": true, "reason": reason}))
+}
+
+async fn resume_sniper(State(s): State<ApiState>) -> impl IntoResponse {
+    let lane = &s.engine.sniper;
+    let was = lane.halt_reason();
+    lane.resume();
+    tracing::warn!(target: "sniper", previous = ?was, "sniper lane resumed");
+    let params = lane.params();
+    Json(json!({
+        "ok": true,
+        "halted": false,
+        "previousReason": was,
+        "armed": params.is_armed() && lane.boot_enabled(),
+        "armingBlockers": params.arming_blockers(),
+    }))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HaltBody {
+    reason: Option<String>,
 }
 
 /// Clear the drawdown kill switch and zero the cumulative PnL it tracks.

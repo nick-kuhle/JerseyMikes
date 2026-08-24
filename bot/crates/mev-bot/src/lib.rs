@@ -36,6 +36,10 @@ pub mod rlp;
 pub mod rpc;
 pub mod signer;
 pub mod sim;
+/// The directional new-token sniper lane. Deliberately isolated from the
+/// atomic profit-or-revert engine above — see `sniper/mod.rs` and
+/// `docs/SNIPER.md` for why.
+pub mod sniper;
 pub mod store;
 pub mod strategies;
 pub mod submission;

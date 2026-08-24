@@ -615,3 +615,147 @@ export function demoEvent(i: number): FeedEvent {
     seen_at_ms: Date.now(),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Directional sniper lane
+// ---------------------------------------------------------------------------
+
+/**
+ * Demo sniper params. Mirrors the bot's shipped defaults exactly: the lane is
+ * OFF with a zero size and a zero budget. The demo view must not imply the
+ * sniper is armed out of the box, because it is not.
+ */
+export function demoSniperParams() {
+  const params = {
+    enabled: false,
+    buySizeWei: "0",
+    minLiquidityWei: "2000000000000000000",
+    maxPriceImpactBps: 300,
+    takeProfitBps: 10000,
+    takeProfitAbsWei: "0",
+    sellFractionBps: 10000,
+    stopLossBps: 5000,
+    trailingStopBps: 0,
+    maxHoldSecs: 1800,
+    maxConcurrentPositions: 1,
+    dailyBudgetWei: "0",
+    totalBudgetWei: "0",
+    maxDrawdownWei: "0",
+    requireHoneypotPass: true,
+    maxBuyTaxBps: 500,
+    maxSellTaxBps: 500,
+    minHoldBlocks: 1,
+    requireLpLocked: false,
+  };
+  return {
+    params,
+    armed: false,
+    bootEnabled: false,
+    halted: false,
+    haltReason: null,
+    // Copied verbatim from `SniperParams::arming_blockers()` so the demo
+    // cannot claim something the bot would not.
+    armingBlockers: [
+      "SNIPER_DIRECTIONAL is off (shadow mode: launches are observed and honeypot-checked, never bought)",
+      "buySizeWei is 0",
+      "dailyBudgetWei is 0",
+    ],
+    rejections: {honeypot: 47, liquidity_thin: 112, tax_too_high: 9, not_armed: 168},
+    envSnippet: [
+      "SNIPER_DIRECTIONAL=false",
+      "SNIPER_BUY_SIZE_WEI=0",
+      "SNIPER_DAILY_BUDGET_WEI=0",
+    ].join("\n"),
+  };
+}
+
+/**
+ * Demo portfolio. Deliberately shows a *mixed* book — one winner, one loser,
+ * one scaled-out runner and one honeypot escape — because a demo that only
+ * shows profit teaches the wrong thing about this lane.
+ */
+export function demoSniperPortfolio() {
+  const now = Date.now();
+  const row = (
+    id: string,
+    symbol: string,
+    state: string,
+    entryEth: number,
+    markEth: number,
+    realizedEth: number,
+    ageMin: number,
+    exitReason: string | null,
+  ) => {
+    const wei = (n: number) => BigInt(Math.round(n * 1e18)).toString();
+    const entry = BigInt(Math.round(entryEth * 1e18));
+    const mark = BigInt(Math.round(markEth * 1e18));
+    const realized = BigInt(Math.round(realizedEth * 1e18));
+    const gas = BigInt(Math.round(0.004 * 1e18));
+    const net = realized + mark - entry - gas;
+    const closed = state === "closed" || state === "abandoned";
+    return {
+      id,
+      token: `0x${id.padEnd(40, "a")}`.slice(0, 42),
+      pair: `0x${id.padEnd(40, "b")}`.slice(0, 42),
+      venue: "univ2",
+      state,
+      symbol,
+      entryCostWei: entry.toString(),
+      entryQty: "1000000000000000000000000",
+      remainingQty: closed ? "0" : "600000000000000000000000",
+      realizedWei: realized.toString(),
+      gasSpentWei: gas.toString(),
+      markValueWei: closed ? "0" : mark.toString(),
+      unrealizedPnlWei: closed ? "0" : (mark - entry).toString(),
+      netPnlWei: net.toString(),
+      netPnlBps: entry === 0n ? 0 : Number((net * 10000n) / entry),
+      markStale: false,
+      openedBlock: 21_000_000 - ageMin,
+      openedAtMs: now - ageMin * 60_000,
+      closedAtMs: closed ? now - Math.floor(ageMin / 2) * 60_000 : null,
+      ageSecs: ageMin * 60,
+      exitReason,
+      entryVerdict: "clean",
+      notes: `backrun of addLiquidityETH; ${wei(entryEth)} wei committed`,
+    };
+  };
+
+  const open = [
+    row("a1", "PEPE2", "open", 0.1, 0.184, 0, 12, null),
+    row("b2", "WOJAK", "scaling", 0.1, 0.062, 0.11, 41, null),
+  ];
+  const closed = [
+    row("c3", "MOON", "closed", 0.1, 0, 0.223, 180, "take_profit_pct"),
+    row("d4", "RUGME", "closed", 0.1, 0, 0.041, 260, "stop_loss"),
+    row("e5", "TRAP", "closed", 0.1, 0, 0.002, 300, "honeypot_detected"),
+  ];
+
+  const sum = (rows: typeof open, f: (r: (typeof open)[number]) => string) =>
+    rows.reduce((acc, r) => acc + BigInt(f(r)), 0n).toString();
+
+  return {
+    totals: {
+      openPositions: open.length,
+      closedPositions: closed.length,
+      openCostWei: sum(open, (r) => r.entryCostWei),
+      openValueWei: sum(open, (r) => r.markValueWei),
+      unrealizedPnlWei: sum(open, (r) => r.unrealizedPnlWei),
+      realizedPnlWei: sum(closed, (r) => r.netPnlWei),
+      totalPnlWei: (
+        BigInt(sum(open, (r) => r.unrealizedPnlWei)) + BigInt(sum(closed, (r) => r.netPnlWei))
+      ).toString(),
+      gasSpentWei: sum([...open, ...closed], (r) => r.gasSpentWei),
+      deployedTotalWei: sum([...open, ...closed], (r) => r.entryCostWei),
+      deployedTodayWei: sum(open, (r) => r.entryCostWei),
+      wins: 1,
+      losses: 2,
+      winRateBps: 3333,
+      anyMarkStale: false,
+    },
+    open,
+    recentClosed: closed,
+    armingBlockers: demoSniperParams().armingBlockers,
+    armed: false,
+    generatedAtMs: now,
+  };
+}

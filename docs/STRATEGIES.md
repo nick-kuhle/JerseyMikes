@@ -21,7 +21,8 @@ approval — a live candidate still cannot broadcast until it earns its own
 | `liquidation_morpho` | live candidate | ditto |
 | `liquidation_maker` | live candidate | ditto |
 | `jit` | shadow-only | Settlement shape |
-| `sniper` | shadow-only | Settlement shape |
+| `sniper` (atomic probe) | shadow-only | Settlement shape |
+| `sniper` (directional lane) | separate lane | Not an atomic strategy at all — see [`SNIPER.md`](SNIPER.md) |
 | `oracle_frontrun` | shadow-only | Ordering assumption |
 
 `Strategy::shadow_only_reason()` carries the specific reason for each
@@ -388,9 +389,15 @@ Only the last case is net-positive, which is exactly the case the executor lets
 through. Everything else is recorded as a rejected observation, which is the
 point: the dashboard shows how much of new-token flow is a trap.
 
-**Not yet.** Holding a position across blocks (this build is atomic-only by
-design), simulating the token's `transfer` hooks for blacklist/cooldown logic,
-and liquidity-lock checks.
+**Not yet.** Simulating the token's `transfer` hooks for blacklist/cooldown
+logic, and liquidity-lock checks.
+
+**Holding a position across blocks is no longer out of scope — but it is not
+this strategy.** The directional sniper is a *separate lane* with its own
+contract, risk envelope, storage and console panel, precisely because holding
+inventory breaks the atomic profit-or-revert invariant every strategy on this
+page depends on. The probe above feeds it: its verdict is the directional
+lane's honeypot admission gate. See [`SNIPER.md`](SNIPER.md).
 
 ## 6. Reading the funnel
 
