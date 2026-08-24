@@ -276,6 +276,7 @@ to measure what is reachable, not to be profitable. See
 | [`docs/SETUP.md`](docs/SETUP.md) | Install walkthrough for all three toolchains, `.env`, `make doctor`, troubleshooting |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Wiring, data flow, repo layout, how to add a chain |
 | [`docs/STRATEGIES.md`](docs/STRATEGIES.md) | Each strategy: trigger, sizing math, traps avoided, what's missing |
+| [`docs/SNIPER.md`](docs/SNIPER.md) | The directional new-token sniper: why it is a separate lane, `SniperVault`, every `SNIPER_*` knob, the mini portfolio, and what remains |
 | [`docs/RISK.md`](docs/RISK.md) | Fail-closed broadcast predicate, executor guards, nonce/finality and known limitations |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phased plan through going live and chains 2–5 |
 | [`docs/MAINTAINING.md`](docs/MAINTAINING.md) | How the codebase thinks: mindset, change patterns, footguns, the landscape ahead |
@@ -300,6 +301,23 @@ values a strategy's profit token in native terms at the pinned pre-bundle fork
 block (Uniswap V3 QuoterV2 across the four canonical fee tiers, falling back to
 V2 reserves, fail-closed to no-bid), so a liquidation paid in a collateral
 token now produces a real `net_profit_wei` instead of zero.
+
+### The directional sniper lane
+
+A **separate** lane was added for buy-and-hold new-token sniping: back-run a
+liquidity deployment after honeypot checks pass, hold the position across
+blocks, and sell a configurable fraction once it reaches a configurable profit
+target (percentage or absolute ETH). It is isolated from the atomic engine at
+every level — its own contract (`SniperVault`, budget-capped spend instead of
+profit-or-revert), its own `SNIPER_*` risk envelope, its own arming switch, its
+own halt, its own tables, and its own console panel with a mini portfolio.
+
+`MevExecutor`'s runtime bytecode is unchanged (11,497 bytes), so nothing about
+the certified atomic path moved.
+
+It **ships disabled with a zero size and a zero budget** and is not yet wired
+to live execution. See [`docs/SNIPER.md`](docs/SNIPER.md) for the full design,
+the parameter reference, and an explicit list of what remains.
 
 Being a live *candidate* is a necessary condition, not a sufficient one. Each
 row must still independently earn a `PASS` from continuous canonical

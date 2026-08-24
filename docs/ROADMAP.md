@@ -28,7 +28,12 @@ engineer in the room. Operators hand engineering back: qualification verdicts,
 funnel readings, and alert history.
 
 **Current state:** the build phase is complete for Ethereum mainnet and for the
-Base safety foundation. Phase 0–3 are shipped; the remaining unchecked boxes
+Base safety foundation. One lane is deliberately outside that statement: the
+**directional new-token sniper** (`docs/SNIPER.md`) is implemented, tested and
+shipped disabled, but is not yet wired to live execution and has its own
+explicit remaining-work list. It is separated from the atomic engine by design
+— different contract, different risk envelope, different arming — so its
+incompleteness blocks nothing else. Phase 0–3 are shipped; the remaining unchecked boxes
 below are either explicitly out of scope for this phase or are *decisions to be
 written down* rather than code to be authored. The two open Base items are
 tracked in [`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md).

@@ -14,15 +14,95 @@ on the merge commit. See "What CI verifies" for the authoritative command list.
 | --- | --- | --- |
 | Rust format | `cargo fmt --all -- --check` | clean |
 | Rust lints | `cargo clippy --all-targets -- -A clippy::too_many_arguments` | clean under `#![deny(warnings)]` |
-| Rust tests | `cargo test --all` | **282 passed, 0 failed** |
+| Rust tests | `cargo test --all` | **388 passed, 0 failed** |
 | Contract format | `forge fmt --check` | clean |
-| Contract build | `forge build --sizes` | `MevExecutor` runtime **11,497 bytes** (limit 24,576) |
-| Contract tests | `forge test -vvv` | **32 passed, 0 failed** |
+| Contract build | `forge build --sizes` | `MevExecutor` runtime **11,497 bytes**, `SniperVault` runtime **7,829 bytes** (limit 24,576) |
+| Contract tests | `forge test -vvv` | **63 passed, 0 failed** |
 | Artifact drift | `node script/compile-check.js` + `git diff --exit-code` | no drift |
 | Frontend | `npx tsc --noEmit`, `next build` | clean on `next@16.3.2` |
 
 Toolchain: Rust stable (1.90+), Foundry stable (1.7+), Node 22, solc 0.8.30.
 `make doctor` checks all four are present and reports versions.
+
+## 2026-08-23 — the directional sniper as a separate lane
+
+The request was a new-token sniper: buy `x` ETH at liquidity deployment
+(back-running the deploy tx after honeypot checks pass), then sell `x%` once it
+has profited `x` ETH or `x%`, with the parameters in the risk surface and the
+gates. The follow-up narrowed it: keep the sniper separate from the rest, with
+a mini portfolio in the console.
+
+**The finding that shaped everything.** A `strategies/sniper.rs` already
+existed, but it is not this. It is an atomic buy->sell round-trip *probe* used
+as a honeypot detector — it never holds a position, and it is marked
+`shadow_only_reason: "round-trip probe is not a certified profitable execution
+strategy"`. Extending it was the wrong move, because the problem is not that
+the probe is small. The problem is structural:
+
+> Every strategy in this repository is atomic profit-or-revert. `MevExecutor`
+> measures a balance delta and reverts below `minProfit`. That invariant is why
+> a losing bundle is free. A buy-and-hold sniper violates it by construction —
+> the buy leg is a pure spend and the position can go to zero between blocks.
+
+So the sniper became a lane, not a strategy. Isolation at every level:
+
+| | Atomic engine | Sniper lane |
+| --- | --- | --- |
+| Contract | `MevExecutor` | `SniperVault` |
+| Envelope | `RiskConfig` | `SniperParams` (`SNIPER_*`) |
+| Arming | `LIVE_EXECUTION` + qualification | `SNIPER_DIRECTIONAL` + budget |
+| Storage | `simulations`, `bundles` | `sniper_positions`, `sniper_fills`, `sniper_token_verdicts` |
+| Console | Risk & strategy controls | Sniper — new-token portfolio |
+
+`MevExecutor` runtime bytecode is **11,497 bytes before and after**, and
+`git diff` over `contracts/abi/` and `bot/crates/mev-bot/artifacts/` is empty.
+The certified atomic path did not move, so nothing that was already qualified
+against it was invalidated.
+
+**`SniperVault` inverts the guarantee.** `MevExecutor` guarantees profit;
+`SniperVault` guarantees *bounded loss* — `maxSpend` per call, `minTokensOut` /
+`minWethOut` slippage floors, and owner-set `dailyBudget` / `totalBudget` that
+the searcher key cannot raise. Three decisions worth recording:
+
+- **Exits are not budget-limited.** Being trapped in a position because the
+  spend ceiling ran out would be the worst bug this lane could have.
+- **Budget books realised spend, not the ceiling.** An entry that used less
+  than `maxSpend` must not consume budget it never spent.
+- **Balance deltas, not router return values.** Fee-on-transfer tokens are then
+  handled with no special case, which matters because they are most of the
+  population this lane looks at.
+
+**Exit ordering is by urgency, not profitability.** A honeypot detection or a
+stop-loss must beat a take-profit that happens to be true in the same block;
+`stop_loss_beats_take_profit_when_both_are_configured` pins it. A partial exit
+moves the position to `Scaling`, which re-arms on the remainder so a runner can
+take profit repeatedly. A scale-out that would round to a zero-quantity sell is
+promoted to a full exit — otherwise a dust remainder loops forever.
+
+**Three independent zeroes.** `SNIPER_DIRECTIONAL=false`,
+`SNIPER_BUY_SIZE_WEI=0`, `SNIPER_DAILY_BUDGET_WEI=0`. All three must be set
+deliberately. `arming_blockers()` is the single source of truth for why the
+lane cannot buy and the console renders it verbatim, because "I turned it on
+and nothing happened" is the failure mode that method exists to prevent.
+`SNIPER_DIRECTIONAL` is also a boot ceiling — a bot started with it false
+refuses runtime arming, matching how strategy toggles already behave.
+
+**The portfolio panel never merges realised and unrealised.** Separate cells,
+separate colours, and the sum offered as its own field in addition to the two
+parts. A "+2.4 ETH" headline that is entirely paper gain on an illiquid launch
+is the most misleading number this console could render.
+
+**Gates:** 388 Rust tests (was 282), 63 Solidity (was 32) — 134 of the new ones
+are specific to this lane. `cargo fmt`, `clippy` under `#![deny(warnings)]`,
+`forge fmt`, artifact drift and the frontend build are all clean.
+
+**What is not done, and is documented as such** in `SNIPER.md` under "What
+remains": the lane is not yet wired into `engine.rs`'s block/pending loops,
+there is no `SniperVault` calldata builder, no deploy path, and no
+mark-to-market producer. Every piece those four need exists and is tested; the
+wiring is not written. `SNIPER_REQUIRE_LP_LOCKED` is a parameter with no
+detector behind it and is off by default. The directional qualification track
+is not built, so arming is governed by the budget gates alone.
 
 ## 2026-08-23 — console: strategy eligibility and uncertified results
 

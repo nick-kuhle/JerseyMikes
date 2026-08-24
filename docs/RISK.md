@@ -165,6 +165,29 @@ liquidation itself competing with other liquidators in the same block, and it
 assumes the collateral can be exited at roughly the quoted depth. The haircut
 is the margin for that, and it is a parameter rather than a proof.
 
+## The directional sniper is the one exception to all of the above
+
+Everything on this page up to here describes a system whose worst case is a
+bundle that reverts and costs nothing. **The directional new-token sniper lane
+does not have that property**, and it is the only thing in the repository that
+does not.
+
+| | Atomic engine | Sniper lane |
+| --- | --- | --- |
+| Worst case | reverted bundle, gas only | the entire buy amount |
+| Enforced by | `MevExecutor` retained-profit guard | `SniperVault` spend/slippage/budget caps |
+| Armed by | `LIVE_EXECUTION` + qualification `PASS` | `SNIPER_DIRECTIONAL` + a non-zero budget |
+| Stopped by | engine drawdown kill switch | `POST /api/sniper/halt`, its own drawdown stop, or the vault's owner-only budget |
+
+The lane is deliberately **not** governed by `RiskConfig` and does **not**
+appear in `POST /api/risk`. It has a parallel surface (`SNIPER_*`,
+`POST /api/sniper/params`) so that tightening the shared envelope and
+tightening the sniper are never the same action performed by accident.
+
+It ships with `SNIPER_DIRECTIONAL=false`, `SNIPER_BUY_SIZE_WEI=0` and
+`SNIPER_DAILY_BUDGET_WEI=0` — three independent zeroes. Read
+[`SNIPER.md`](SNIPER.md) in full before changing any of them.
+
 ## Known limitations
 
 - **Sizing assumes our bundle is the whole block.** Competing searchers'

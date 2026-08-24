@@ -123,6 +123,36 @@ strategies propose opportunities against exactly the transactions that actually
 landed, and the simulator records whether value was extractable. See
 [`BLOXROUTE_RELAY.md`](BLOXROUTE_RELAY.md).
 
+## The directional sniper lane (deliberately outside the engine)
+
+```
+engine.rs  ──▶  strategies ──▶ risk ──▶ sim ──▶ bundle ──▶ submission
+   │                                                          (atomic, profit-or-revert,
+   │                                                           MevExecutor)
+   │
+   └──▶ sniper/  ──▶ gates ──▶ position ──▶ portfolio
+                                                          (directional, budget-bounded,
+                                                           SniperVault)
+```
+
+`sniper/` is a peer of the strategy pipeline, not a member of it. It owns:
+
+- `sniper/params.rs` — the `SNIPER_*` envelope, validation, runtime patching
+- `sniper/gates.rs` — honeypot verdicts and every admission gate
+- `sniper/position.rs` — the position state machine and exit decisions
+- `sniper/portfolio.rs` — pure aggregation for the console panel
+- `sniper/mod.rs` — `SniperLane`, the runtime state holder
+
+plus three SQLite tables (`sniper_positions`, `sniper_fills`,
+`sniper_token_verdicts`), six `/api/sniper/*` routes, and one contract
+(`SniperVault.sol`).
+
+**Nothing in the atomic path reads any of it**, and the lane calls into none of
+`bundle.rs`, `submission.rs` or `qualification.rs`. Deleting the directory, the
+tables and the three call sites in `lib.rs`, `engine.rs` and `api.rs` removes
+the lane whole. See [`SNIPER.md`](SNIPER.md) for why the separation is worth
+this much structure.
+
 ## Multi-chain (Ethereum + Base, one process per chain)
 
 The engine is single-chain by design — one `Config`, one fork, one store, one

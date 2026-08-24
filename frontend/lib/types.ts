@@ -466,3 +466,111 @@ export type FeedEvent =
       new_hash: string;
       seen_at_ms: number;
     };
+
+// ---------------------------------------------------------------------------
+// Directional sniper lane
+//
+// A separate surface from the risk/strategy types above, mirroring the
+// separation on the bot side: these describe a lane that holds positions and
+// can lose money, not an atomic profit-or-revert bundle.
+// ---------------------------------------------------------------------------
+
+export type SniperPositionState = "pending" | "open" | "scaling" | "closed" | "abandoned";
+
+export type SniperExitReason =
+  | "take_profit_pct"
+  | "take_profit_abs"
+  | "stop_loss"
+  | "trailing_stop"
+  | "max_hold"
+  | "honeypot_detected"
+  | "manual"
+  | "risk_stop";
+
+export interface SniperPortfolioRow {
+  id: string;
+  token: string;
+  pair: string;
+  venue: string;
+  state: SniperPositionState;
+  symbol: string | null;
+  /** Wei values are decimal strings: they exceed JS safe integers. */
+  entryCostWei: string;
+  entryQty: string;
+  remainingQty: string;
+  realizedWei: string;
+  gasSpentWei: string;
+  markValueWei: string;
+  unrealizedPnlWei: string;
+  netPnlWei: string;
+  netPnlBps: number;
+  markStale: boolean;
+  openedBlock: number;
+  openedAtMs: number;
+  closedAtMs: number | null;
+  ageSecs: number;
+  exitReason: SniperExitReason | null;
+  entryVerdict: string;
+  notes: string;
+}
+
+export interface SniperPortfolioTotals {
+  openPositions: number;
+  closedPositions: number;
+  openCostWei: string;
+  openValueWei: string;
+  unrealizedPnlWei: string;
+  realizedPnlWei: string;
+  totalPnlWei: string;
+  gasSpentWei: string;
+  deployedTotalWei: string;
+  deployedTodayWei: string;
+  wins: number;
+  losses: number;
+  winRateBps: number;
+  anyMarkStale: boolean;
+}
+
+export interface SniperPortfolio {
+  totals: SniperPortfolioTotals;
+  open: SniperPortfolioRow[];
+  recentClosed: SniperPortfolioRow[];
+  armingBlockers: string[];
+  armed: boolean;
+  generatedAtMs: number;
+  demo?: boolean;
+}
+
+export interface SniperParams {
+  enabled: boolean;
+  buySizeWei: string;
+  minLiquidityWei: string;
+  maxPriceImpactBps: number;
+  takeProfitBps: number;
+  takeProfitAbsWei: string;
+  sellFractionBps: number;
+  stopLossBps: number;
+  trailingStopBps: number;
+  maxHoldSecs: number;
+  maxConcurrentPositions: number;
+  dailyBudgetWei: string;
+  totalBudgetWei: string;
+  maxDrawdownWei: string;
+  requireHoneypotPass: boolean;
+  maxBuyTaxBps: number;
+  maxSellTaxBps: number;
+  minHoldBlocks: number;
+  requireLpLocked: boolean;
+}
+
+export interface SniperParamsResponse {
+  params: SniperParams;
+  armed: boolean;
+  bootEnabled: boolean;
+  halted: boolean;
+  haltReason: string | null;
+  armingBlockers: string[];
+  rejections: Record<string, number>;
+  envSnippet: string;
+  demo?: boolean;
+}
