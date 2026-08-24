@@ -563,6 +563,28 @@ export interface SniperParams {
   requireLpLocked: boolean;
 }
 
+export interface SniperParamsPatch {
+  enabled?: boolean;
+  buy_size_wei?: string;
+  min_liquidity_wei?: string;
+  max_price_impact_bps?: number;
+  take_profit_bps?: number;
+  take_profit_abs_wei?: string;
+  sell_fraction_bps?: number;
+  stop_loss_bps?: number;
+  trailing_stop_bps?: number;
+  max_hold_secs?: number;
+  max_concurrent_positions?: number;
+  daily_budget_wei?: string;
+  total_budget_wei?: string;
+  max_drawdown_wei?: string;
+  require_honeypot_pass?: boolean;
+  max_buy_tax_bps?: number;
+  max_sell_tax_bps?: number;
+  min_hold_blocks?: number;
+  require_lp_locked?: boolean;
+}
+
 export interface SniperParamsResponse {
   params: SniperParams;
   armed: boolean;
