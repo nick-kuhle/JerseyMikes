@@ -3,10 +3,20 @@
 /**
  * Focused SniperVault onboarding flow for the Sniper panel.
  *
- * The larger Go-Live panel covers the complete platform. This compact wizard
- * keeps the sniper's critical path visible at the point where the operator
- * enables the lane: connect -> deploy -> allowlist -> fund/bind. It never
- * accepts or exposes a private key in the browser.
+ * Two distinct flows, one wizard:
+ *
+ * **Simulation** — no wallet, no deployment, no production address. The real
+ * `SniperVault.sol` bytecode runs on the bot's local Anvil fixture; the
+ * wizard only has to confirm that fixture is ready. A simulation fixture is
+ * never called a deployed Mainnet/Base vault.
+ *
+ * **Live** — connect the owner wallet, verify the selected chain, deploy or
+ * paste the production vault, verify bytecode/owner/WETH, authorize the bot
+ * searcher EOA, set budgets, fund, bind, pre-flight, confirm.
+ *
+ * Terminology follows the work order:
+ *   Connected wallet = owner/operator. Bot searcher = transaction signer.
+ *   Keep them separate and verify the address before funding the vault.
  */
 
 import {useCallback, useEffect, useMemo, useState, type CSSProperties} from "react";
@@ -15,7 +25,7 @@ import {base, mainnet} from "viem/chains";
 import {readActiveChain, withChain} from "@/lib/chain";
 import {shortHash} from "@/lib/format";
 import {useWallet} from "@/lib/wallet";
-import type {SniperParams} from "@/lib/types";
+import type {SniperModeResponse, SniperParams} from "@/lib/types";
 import SNIPER_VAULT_ABI from "@/lib/SniperVault.abi.json";
 import vaultCreationHex from "@/lib/SniperVault.creation.hex";
 
@@ -41,6 +51,19 @@ function errorText(error: unknown): string { return (error instanceof Error ? er
 function storageRead(key: string): string { try { return window.localStorage.getItem(key) || ""; } catch { return ""; } }
 function storageWrite(key: string, value: string): void { try { window.localStorage.setItem(key, value); } catch { /* session still works */ } }
 
+interface FixtureStatus {
+  ready?: boolean;
+  blocker?: string;
+  address?: string;
+  weth?: string;
+  owner?: string;
+  searcher?: string;
+  searcherAllowlisted?: boolean;
+  vaultWethBalanceWei?: string;
+  dailyBudgetWei?: string;
+  totalBudgetWei?: string;
+}
+
 export default function SniperVaultWizard({params, onBound}: {params: SniperParams; onBound?: () => void}) {
   const wallet = useWallet();
   const slug = (readActiveChain() || "ethereum").toLowerCase();
@@ -50,8 +73,11 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
   const storageKey = `jerseymikes.sniper-vault.${slug}`;
 
   const [open, setOpen] = useState(!params.vaultAddress);
+  const [modeInfo, setModeInfo] = useState<SniperModeResponse | null>(null);
+  const [fixture, setFixture] = useState<FixtureStatus | null>(null);
   const [vault, setVault] = useState("");
   const [searcher, setSearcher] = useState("");
+  const [ownerConfig, setOwnerConfig] = useState("");
   const [daily, setDaily] = useState(() => {
     try { return Number(formatEther(BigInt(params.dailyBudgetWei || "0"))).toString(); } catch { return "0.25"; }
   });
@@ -62,6 +88,8 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [verified, setVerified] = useState<{code: boolean; owner: string; allowed: boolean | null; weth: boolean}>({code: false, owner: "", allowed: null, weth: false});
+
+  const simulation = (modeInfo?.sniperMode ?? "simulation") === "simulation";
 
   useEffect(() => {
     const saved = storageRead(storageKey);
@@ -76,6 +104,35 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
       .catch(() => {});
   }, [params.vaultAddress, slug, storageKey]);
 
+  const loadMode = useCallback(() => {
+    fetch(withChain("/api/bot/sniper/mode", slug), {cache: "no-store"})
+      .then((response) => (response.ok ? response.json() : null))
+      .then((mode: (SniperModeResponse & {demo?: boolean}) | null) => setModeInfo(mode))
+      .catch(() => {});
+    fetch(withChain("/api/bot/sniper/sim-fixture", slug), {cache: "no-store"})
+      .then((response) => (response.ok ? response.json() : null))
+      .then((fx: FixtureStatus | null) => setFixture(fx))
+      .catch(() => {});
+  }, [slug]);
+
+  useEffect(() => { loadMode(); }, [loadMode]);
+
+  const initFixture = async () => {
+    setBusy("fixture");
+    setMessage("");
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/sim-fixture/init", slug), {method: "POST", headers: {"content-type": "application/json"}, body: "{}"});
+      const body = (await response.json()) as {ok?: boolean; error?: string; fixture?: FixtureStatus};
+      if (!response.ok || !body.ok) throw new Error(body.error || "fixture init refused");
+      setMessage("Simulation vault ready · local Anvil fixture · no deployment required.");
+      loadMode();
+    } catch (error) {
+      setMessage(`Fixture init failed: ${errorText(error)}`);
+    } finally {
+      setBusy("");
+    }
+  };
+
   const verify = useCallback(async () => {
     if (!isAddress(vault)) return;
     try {
@@ -88,13 +145,14 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
         ? Boolean(await client.readContract({address: vault as Address, abi: SNIPER_VAULT_ABI, functionName: "searchers", args: [searcher as Address]}).catch(() => false))
         : null;
       setVerified({code: Boolean(code && code !== "0x"), owner: String(owner), allowed, weth: String(actualWeth).toLowerCase() === weth.toLowerCase()});
+      setOwnerConfig(String(owner));
     } catch (error) {
       setVerified({code: false, owner: "", allowed: null, weth: false});
       setMessage(`Vault verification failed: ${errorText(error)}`);
     }
   }, [client, searcher, vault, weth]);
 
-  useEffect(() => { void verify(); }, [verify]);
+  useEffect(() => { if (!simulation) void verify(); }, [verify, simulation]);
 
   const deploy = async () => {
     if (!wallet.address || !wallet.eip1193 || wallet.chainId !== expectedChainId) { setMessage("Connect the operator wallet to the selected console chain first."); return; }
@@ -109,7 +167,7 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
       const receipt = await client.waitForTransactionReceipt({hash});
       if (!receipt.contractAddress) throw new Error("deployment receipt has no contract address");
       setVault(receipt.contractAddress); storageWrite(storageKey, receipt.contractAddress);
-      setMessage(`SniperVault deployed at ${receipt.contractAddress}. Verify and allowlist the searcher.`);
+      setMessage(`SniperVault deployed at ${receipt.contractAddress}. Verify and authorize the bot searcher EOA.`);
       await verify();
     } catch (error) { setMessage(`Deployment failed: ${errorText(error)}`); }
     finally { setBusy(""); }
@@ -121,8 +179,8 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
     try {
       const walletClient = createWalletClient({transport: custom(wallet.eip1193)});
       const hash = await walletClient.writeContract({account: wallet.address as Address, address: vault as Address, abi: SNIPER_VAULT_ABI, functionName: "setSearcher", args: [searcher as Address, true], chain: null});
-      await client.waitForTransactionReceipt({hash}); setMessage(`Searcher allowlisted: ${shortHash(hash, 6)}.`); await verify();
-    } catch (error) { setMessage(`Allowlist failed: ${errorText(error)}`); }
+      await client.waitForTransactionReceipt({hash}); setMessage(`Bot searcher EOA authorized: ${shortHash(hash, 6)}.`); await verify();
+    } catch (error) { setMessage(`Authorization failed: ${errorText(error)}`); }
     finally { setBusy(""); }
   };
 
@@ -144,19 +202,114 @@ export default function SniperVaultWizard({params, onBound}: {params: SniperPara
     finally { setBusy(""); }
   };
 
-  const step = !wallet.address || wallet.chainId !== expectedChainId ? 1 : !verified.code ? 2 : verified.allowed !== true ? 3 : 4;
   const configured = verified.code && verified.weth && verified.allowed === true;
+  const liveStep = !wallet.address || wallet.chainId !== expectedChainId ? 1 : !verified.code ? 2 : verified.allowed !== true ? 3 : 4;
+
+  const simReady = Boolean(fixture?.ready);
 
   return (
-    <section className="panel" style={{padding: 12, borderColor: configured ? "rgba(34,197,94,0.45)" : "rgba(34,211,238,0.45)"}}>
+    <section className="panel" style={{padding: 12, borderColor: simulation ? "rgba(34,211,238,0.45)" : configured ? "rgba(34,197,94,0.45)" : "rgba(34,211,238,0.45)"}}>
       <button onClick={() => setOpen((value) => !value)} style={headerButton} aria-expanded={open}>
-        <span>🛡️ SniperVault setup wizard</span><span className="muted">{configured ? "configured ✓" : `step ${step} of 4`} {open ? "▴" : "▾"}</span>
+        <span>🛡️ SniperVault setup wizard · {simulation ? "simulation" : "live"}</span>
+        <span className="muted">{simulation ? (simReady ? "fixture ready ✓" : "fixture setup") : configured ? "configured ✓" : `step ${liveStep} of 4`} {open ? "▴" : "▾"}</span>
       </button>
       {open && <div style={{display: "grid", gap: 9, marginTop: 10}}>
-        <div style={stepStyle(step >= 1, 1)}><strong>1. Connect wallet</strong><span className="muted">{wallet.address ? `${shortHash(wallet.address, 6)} · chain ${wallet.chainId}` : "operator owner wallet required"}</span>{!wallet.address && <button style={buttonStyle} onClick={() => void wallet.connect()}>connect wallet</button>}{wallet.address && wallet.chainId !== expectedChainId && <button style={buttonStyle} onClick={() => void wallet.switchChain(expectedChainId)}>switch network</button>}</div>
-        <div style={stepStyle(step >= 2, 2)}><strong>2. Deploy SniperVault</strong><input value={vault} onChange={(event) => setVault(event.target.value)} placeholder="paste deployed vault or deploy" style={inputStyle} /><button style={buttonStyle} disabled={busy !== "" || !wallet.address || wallet.chainId !== expectedChainId} onClick={() => void deploy()}>{busy === "deploy" ? "deploying…" : "deploy vault"}</button><span className="muted">{verified.code ? `${verified.weth ? "WETH binding ✓" : "wrong WETH"}` : "bytecode not verified"}</span></div>
-        <div style={stepStyle(step >= 3, 3)}><strong>3. Allowlist searcher</strong><input value={searcher} onChange={(event) => setSearcher(event.target.value)} placeholder="SNIPER_SEARCHER_ADDRESS" style={inputStyle} /><button style={buttonStyle} disabled={busy !== "" || !verified.code || !isAddress(searcher)} onClick={() => void allowlist()}>{busy === "allowlist" ? "confirming…" : "setSearcher(searcher, true)"}</button><span className={verified.allowed ? "good" : "warn"}>{verified.allowed === null ? "not checked" : verified.allowed ? "allowlisted ✓" : "not allowlisted"}</span></div>
-        <div style={stepStyle(step >= 4, 4)}><strong>4. Fund & bind</strong><input value={fundAmount} onChange={(event) => setFundAmount(event.target.value)} style={smallInput} /><span className="muted">ETH → WETH</span><button style={buttonStyle} disabled={busy !== "" || !configured} onClick={() => void fundAndBind()}>{busy === "fund" ? "funding…" : "wrap, fund + bind"}</button><span className="muted">runtime patch is not a substitute for persisting the env line</span></div>
+
+        {/* The three identities, always visible, always distinct. */}
+        <div style={{display: "grid", gap: 3, fontSize: 11, padding: "7px 9px", border: "1px solid var(--line)", borderRadius: 4, background: "rgba(107,124,147,0.06)"}}>
+          <div><span className="muted">Connected owner/deployer wallet:</span> <code>{wallet.address ? shortHash(wallet.address, 7) : "not connected"}</code> {wallet.address && wallet.chainId !== expectedChainId && <span className="warn">· wrong network</span>}</div>
+          <div><span className="muted">SNIPER_SEARCHER_ADDRESS (bot signer):</span> <code>{searcher ? shortHash(searcher, 7) : "not configured"}</code></div>
+          <div><span className="muted">SNIPER_VAULT_ADDRESS:</span> <code>{params.vaultAddress ? shortHash(params.vaultAddress, 7) : "not bound"}</code></div>
+          {simulation ? (
+            <div><span className="muted">Simulation vault · local Anvil only:</span> <code>{modeInfo?.simulationVaultAddress ? shortHash(modeInfo.simulationVaultAddress, 7) : fixture?.address ? shortHash(fixture.address, 7) : "not deployed"}</code></div>
+          ) : (
+            <div><span className="muted">Production vault · selected chain:</span> <code>{vault ? shortHash(vault, 7) : "—"}</code></div>
+          )}
+        </div>
+
+        {simulation ? (
+          <>
+            {/* ── SIMULATION FLOW ── */}
+            <div style={stepStyle(true, 1)}>
+              <strong>1. Chain context</strong>
+              <span className="muted">{slug === "base" ? "Base" : "Ethereum"} console · simulation needs no injected wallet</span>
+            </div>
+            <div style={stepStyle(simReady, 2)}>
+              <strong>2. Simulation vault</strong>
+              {simReady ? (
+                <span className="good" role="status">Simulation vault ready · local Anvil fixture · no deployment required</span>
+              ) : (
+                <span className="muted">{fixture?.blocker || "fixture not deployed yet"}</span>
+              )}
+              <button style={buttonStyle} disabled={busy !== ""} onClick={() => void initFixture()}>
+                {busy === "fixture" ? "initializing…" : simReady ? "Test simulation vault" : "Initialize simulation fixture"}
+              </button>
+            </div>
+            {simReady && fixture && (
+              <div style={{display: "grid", gap: 3, fontSize: 11, padding: "7px 9px", border: "1px solid rgba(34,211,238,0.35)", borderRadius: 4}}>
+                <div><span className="muted">Fixture WETH:</span> <code>{fixture.weth ? shortHash(fixture.weth, 7) : "—"}</code> · <span className="muted">chain:</span> {slug === "base" ? "Base" : "Ethereum"}</div>
+                <div><span className="muted">Fixture vault WETH balance:</span> <strong>{fixture.vaultWethBalanceWei ? `${formatEther(BigInt(fixture.vaultWethBalanceWei))} Ξ` : "—"}</strong></div>
+                <div><span className="muted">Fixture daily budget:</span> <strong>{fixture.dailyBudgetWei ? `${formatEther(BigInt(fixture.dailyBudgetWei))} Ξ` : "—"}</strong>
+                  {fixture.totalBudgetWei && fixture.totalBudgetWei !== "0" && <> · <span className="muted">lifetime:</span> <strong>{formatEther(BigInt(fixture.totalBudgetWei))} Ξ</strong></>}
+                </div>
+                <div><span className="muted">Paper bankroll:</span> <strong>{formatEther(BigInt(modeInfo?.simulationBalanceWei ?? "1000000000000000000"))} Ξ</strong> <span className="muted">· virtual only</span></div>
+              </div>
+            )}
+            <div className="muted" style={{fontSize: 10}}>
+              Simulation runs the real SniperVault bytecode on the bot&apos;s local fork. It never
+              touches the production vault, the live searcher key, or real funds. Continue to the
+              Parameters tab to tune the simulated strategy — no production address is required.
+            </div>
+          </>
+        ) : (
+          <>
+            {/* ── LIVE FLOW ── */}
+            <div style={stepStyle(liveStep >= 1, 1)}>
+              <strong>1. Connect wallet</strong>
+              <span className="muted">{wallet.address ? `${shortHash(wallet.address, 6)} · chain ${wallet.chainId}` : "operator owner wallet required"}</span>
+              {!wallet.address && <button style={buttonStyle} onClick={() => void wallet.connect()}>connect wallet</button>}
+              {wallet.address && wallet.chainId !== expectedChainId && <button style={buttonStyle} onClick={() => void wallet.switchChain(expectedChainId)}>switch network</button>}
+            </div>
+            <div style={stepStyle(liveStep >= 2, 2)}>
+              <strong>2. Deploy SniperVault</strong>
+              <input value={vault} onChange={(event) => setVault(event.target.value)} placeholder="paste deployed vault or deploy" style={inputStyle} />
+              <button style={buttonStyle} disabled={busy !== "" || !wallet.address || wallet.chainId !== expectedChainId} onClick={() => void deploy()}>{busy === "deploy" ? "deploying…" : "deploy vault"}</button>
+              <span className="muted">{verified.code ? `${verified.weth ? "WETH binding ✓" : `wrong WETH — expected ${shortHash(weth, 6)}`}` : "bytecode not verified"}</span>
+            </div>
+            <div style={stepStyle(liveStep >= 3, 3)}>
+              <strong>3. Authorize bot searcher EOA</strong>
+              <span className="muted" style={{fontSize: 10}}>
+                This is the public address derived from <code>SNIPER_SEARCHER_PRIVATE_KEY</code>. It signs
+                SniperVault buys and sells. It is not the vault address and does not need to be the
+                connected owner wallet. The vault holds the WETH/tokens; the searcher only has the
+                permissions exposed by the contract.
+              </span>
+              <span className="muted" style={{fontSize: 10}} title="Connected wallet = owner/operator. Bot searcher = transaction signer. Keep them separate and verify the address before funding the vault.">
+                ⓘ Connected wallet = owner/operator. Bot searcher = transaction signer. Keep them separate and verify the address before funding the vault.
+              </span>
+              <input value={searcher} onChange={(event) => setSearcher(event.target.value)} placeholder="SNIPER_SEARCHER_ADDRESS" style={inputStyle} />
+              <button style={buttonStyle} disabled={busy !== "" || !verified.code || !isAddress(searcher)} onClick={() => void allowlist()}>{busy === "allowlist" ? "confirming…" : "setSearcher(searcher, true)"}</button>
+              <span className={verified.allowed ? "good" : "warn"}>{verified.allowed === null ? "not checked" : verified.allowed ? "authorized ✓" : "not authorized — live mode is blocked"}</span>
+            </div>
+            <div style={stepStyle(liveStep >= 4, 4)}>
+              <strong>4. Fund & bind</strong>
+              <input value={fundAmount} onChange={(event) => setFundAmount(event.target.value)} style={smallInput} />
+              <span className="muted">ETH → WETH</span>
+              <button style={buttonStyle} disabled={busy !== "" || !configured} onClick={() => void fundAndBind()}>{busy === "fund" ? "funding…" : "wrap, fund + bind"}</button>
+              <span className="muted">runtime patch is not a substitute for persisting the env line</span>
+            </div>
+            {/* Live blockers per the work-order state matrix */}
+            {!configured && (
+              <div style={{fontSize: 11, color: "var(--amber)", display: "grid", gap: 2}}>
+                {!vault && <span>✗ Live mode is blocked: no production vault. Deploy one or paste a deployed address.</span>}
+                {vault && !verified.code && <span>✗ Live mode is blocked: the vault address has no code on {slug === "base" ? "Base" : "Ethereum"}.</span>}
+                {verified.code && !verified.weth && <span>✗ Live mode is blocked: vault WETH does not match {shortHash(weth, 7)}.</span>}
+                {verified.code && verified.weth && verified.allowed === false && <span>✗ Live mode is blocked: bot searcher EOA is not authorized. The connected wallet (owner) must call setSearcher — the bot cannot allowlist itself.</span>}
+              </div>
+            )}
+          </>
+        )}
+
         {message && <div style={{fontSize: 11, color: message.toLowerCase().includes("failed") ? "var(--red)" : "var(--cyan)"}} role="status">{message}</div>}
         <div className="muted" style={{fontSize: 10}}>Constructor: (WETH {shortHash(weth, 6)}, daily {daily} ETH, lifetime {total || "0"} ETH). Change budgets in the Parameters tab before arming; this wizard never handles private keys.</div>
       </div>}
@@ -168,4 +321,4 @@ const headerButton: CSSProperties = {width: "100%", display: "flex", justifyCont
 const buttonStyle: CSSProperties = {background: "#111a25", border: "1px solid #24334a", borderRadius: 4, color: "#d7e2f0", padding: "4px 9px", cursor: "pointer", fontFamily: "inherit", fontSize: 11};
 const inputStyle: CSSProperties = {...buttonStyle, background: "#070b11", minWidth: 210, flex: "1 1 210px"};
 const smallInput: CSSProperties = {...inputStyle, minWidth: 70, width: 80, flex: "0 0 auto"};
-const stepStyle = (done: boolean, number: number): CSSProperties => ({display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "7px 8px", border: "1px solid var(--line)", borderRadius: 4, background: done ? "rgba(34,197,94,0.04)" : "transparent"});
+const stepStyle = (done: boolean, _number: number): CSSProperties => ({display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "7px 8px", border: "1px solid var(--line)", borderRadius: 4, background: done ? "rgba(34,197,94,0.04)" : "transparent"});

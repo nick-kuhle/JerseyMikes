@@ -697,6 +697,31 @@ export function resetDemoSniperFunds() {
 }
 
 /**
+ * Demo sniper mode payload — mirrors `GET /api/sniper/mode`. Demo is always
+ * simulation-only with no live ceiling: the demo generator can never grant a
+ * path to real funds.
+ */
+export function demoSniperMode() {
+  return {
+    atomicMode: "simulation",
+    sniperMode: "simulation",
+    sniperLiveBootEnabled: false,
+    canSwitchLive: false,
+    blockers: [
+      "SNIPER_LIVE_ENABLED was false at boot — restart with the live sniper ceiling to allow Sniper Live",
+      "production SniperVault is not configured (SNIPER_VAULT_ADDRESS)",
+      "SNIPER_SEARCHER_PRIVATE_KEY is not configured",
+    ],
+    simulationVaultAddress: null,
+    productionVaultAddress: null,
+    simulationBalanceWei: demoSniperState.simulationBalanceWei,
+    simulationChainId: 1,
+    activeVault: {kind: "none", address: null},
+    fixture: {available: false, deployed: false, searcher: null, owner: null},
+  };
+}
+
+/**
  * Demo sniper params.
  */
 export function demoSniperParams() {
@@ -823,6 +848,9 @@ export function demoSniperPortfolio() {
       exitReason,
       entryVerdict: "clean",
       notes: `backrun of addLiquidityETH; ${wei(entryEth)} wei committed`,
+      executionMode: "simulation",
+      settlement: "paper",
+      txStatus: closed ? "mined" : "mined",
     };
   };
 
@@ -857,6 +885,42 @@ export function demoSniperPortfolio() {
       losses: 2,
       winRateBps: 3333,
       anyMarkStale: false,
+    },
+    totalsByMode: {
+      simulation: {
+        openPositions: open.length,
+        closedPositions: closed.length,
+        openCostWei: sum(open, (r) => r.entryCostWei),
+        openValueWei: sum(open, (r) => r.markValueWei),
+        unrealizedPnlWei: sum(open, (r) => r.unrealizedPnlWei),
+        realizedPnlWei: sum(closed, (r) => r.netPnlWei),
+        totalPnlWei: (
+          BigInt(sum(open, (r) => r.unrealizedPnlWei)) + BigInt(sum(closed, (r) => r.netPnlWei))
+        ).toString(),
+        gasSpentWei: sum([...open, ...closed], (r) => r.gasSpentWei),
+        deployedTotalWei: sum([...open, ...closed], (r) => r.entryCostWei),
+        deployedTodayWei: sum(open, (r) => r.entryCostWei),
+        wins: 1,
+        losses: 2,
+        winRateBps: 3333,
+        anyMarkStale: false,
+      },
+      live: {
+        openPositions: 0,
+        closedPositions: 0,
+        openCostWei: "0",
+        openValueWei: "0",
+        unrealizedPnlWei: "0",
+        realizedPnlWei: "0",
+        totalPnlWei: "0",
+        gasSpentWei: "0",
+        deployedTotalWei: "0",
+        deployedTodayWei: "0",
+        wins: 0,
+        losses: 0,
+        winRateBps: 0,
+        anyMarkStale: false,
+      },
     },
     open,
     recentClosed: closed,

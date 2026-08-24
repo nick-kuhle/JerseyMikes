@@ -118,11 +118,16 @@ for (const source of Object.values(out.sources || {})) indexImmutableNames(sourc
 const abiDir = path.join(ROOT, "abi");
 fs.mkdirSync(abiDir, {recursive: true});
 let count = 0;
+const MOCK_ARTIFACTS = new Set(["MockERC20", "SimV2Pair", "MockWETH"]);
 for (const [file, contracts] of Object.entries(out.contracts || {})) {
-  if (!file.startsWith(path.join(ROOT, "src") + path.sep)) continue;
+  const isSrc = file.startsWith(path.join(ROOT, "src") + path.sep);
+  const isFixtureMock =
+    file.startsWith(path.join(ROOT, "test", "mocks") + path.sep) &&
+    Object.keys(contracts).some((name) => MOCK_ARTIFACTS.has(name));
+  if (!isSrc && !isFixtureMock) continue;
   for (const [name, c] of Object.entries(contracts)) {
     const abiJson = JSON.stringify(c.abi, null, 2) + "\n";
-    fs.writeFileSync(path.join(abiDir, `${name}.json`), abiJson);
+    if (isSrc) fs.writeFileSync(path.join(abiDir, `${name}.json`), abiJson);
     // The console deploys and verifies both production contracts in-browser.
     // Keep its checked-in ABI/creation artifacts generated from the same
     // solc-js compilation used by the artifact-drift check.
@@ -152,8 +157,36 @@ for (const [file, contracts] of Object.entries(out.contracts || {})) {
         JSON.stringify(refs, null, 2) + "\n",
       );
     }
+    if (name === "SniperVault") {
+      // The sniper's *simulation* fixture deploys this exact bytecode into the
+      // local anvil fork (constructor and all), so simulation exercises the
+      // real contract guards rather than a paper stand-in. The artifact-drift
+      // gate keeps it byte-identical to what a production deployment uses.
+      const artifactDir = path.resolve(ROOT, "..", "bot", "crates", "mev-bot", "artifacts");
+      fs.mkdirSync(artifactDir, {recursive: true});
+      fs.writeFileSync(path.join(artifactDir, "SniperVault.runtime.hex"), "0x" + c.evm.deployedBytecode.object);
+      fs.writeFileSync(path.join(artifactDir, "SniperVault.creation.hex"), "0x" + c.evm.bytecode.object);
+      fs.writeFileSync(path.join(artifactDir, "SniperVault.abi.json"), JSON.stringify(c.abi, null, 2) + "\n");
+      const refs = {};
+      for (const [id, positions] of Object.entries(c.evm.deployedBytecode.immutableReferences || {})) {
+        const refName = immutableNames.get(String(id));
+        if (!refName) throw new Error(`unknown immutable AST id ${id}`);
+        refs[refName] = positions;
+      }
+      fs.writeFileSync(
+        path.join(artifactDir, "SniperVault.immutables.json"),
+        JSON.stringify(refs, null, 2) + "\n",
+      );
+    }
+    if (name === "MockERC20" || name === "SimV2Pair" || name === "MockWETH") {
+      // Deterministic mock liquidity for the sniper simulation fixture:
+      // deployed into the same local fork, never to a production chain.
+      const artifactDir = path.resolve(ROOT, "..", "bot", "crates", "mev-bot", "artifacts");
+      fs.mkdirSync(artifactDir, {recursive: true});
+      fs.writeFileSync(path.join(artifactDir, `${name}.creation.hex`), "0x" + c.evm.bytecode.object);
+    }
     console.log(`ok  ${name.padEnd(24)} runtime ${String(size).padStart(6)} bytes`);
-    count++;
+    if (isSrc) count++;
   }
 }
 console.log(`\ncompiled ${Object.keys(sources).length} sources, ${count} deployable contracts, ${warnings.length} warnings`);

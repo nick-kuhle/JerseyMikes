@@ -488,6 +488,11 @@ pub struct Config {
     pub endpoints: Endpoints,
     pub risk: RiskConfig,
     pub strategies: StrategyToggles,
+    /// The sniper's own simulation/live boot envelope (`SNIPER_MODE` +
+    /// `SNIPER_LIVE_ENABLED`) — independent of the atomic engine's
+    /// `LIVE_EXECUTION`. Simulation needs no live arming at all; live needs
+    /// this ceiling plus its runtime gates.
+    pub sniper_mode: crate::sniper::SniperModeBoot,
     /// Priority fee (wei) the bot bids on its own transactions.
     ///
     /// Mainnet (`SubmissionMode::Bundle`) it is the simulated leg's fee —
@@ -1180,6 +1185,16 @@ impl Config {
             .or_else(|| sniper_signer.as_ref().map(crate::signer::Signer::address))
             .unwrap_or(searcher_address);
 
+        // The sniper's independent mode envelope. Fail closed at boot on a
+        // bad combination rather than silently downgrading: an operator who
+        // typed SNIPER_MODE=live must see exactly which gate refused it.
+        let sniper_mode = crate::sniper::SniperModeBoot::from_env_parts(
+            env_opt("SNIPER_MODE").as_deref(),
+            env_bool("SNIPER_LIVE_ENABLED", false),
+            sniper_searcher_private_key.is_some(),
+        )
+        .map_err(|errs| anyhow::anyhow!("sniper mode: {}", errs.join("; ")))?;
+
         let relay_url = env_or("FLASHBOTS_RELAY_URL", "https://relay.flashbots.net");
         let bundle_relay_urls = {
             let configured = env_list("BUNDLE_RELAY_URLS");
@@ -1304,6 +1319,7 @@ impl Config {
                 oracle_frontrun: env_bool("STRATEGY_ORACLE_FRONTRUN", true),
                 sniper: env_bool("STRATEGY_SNIPER", true),
             },
+            sniper_mode,
             sim: SimConfig {
                 anvil_bin: env_or("ANVIL_BIN", "anvil"),
                 anvil_port: env_u64("ANVIL_PORT", 8548) as u16,
@@ -1503,6 +1519,16 @@ impl Config {
             anyhow::bail!(
                 "SNIPER_SEARCHER_PRIVATE_KEY derives the same address as SEARCHER_PRIVATE_KEY; use separate keys for the atomic and directional nonce/risk domains"
             );
+        }
+        // The sniper mode envelope must be internally consistent — a live
+        // mode without the ceiling or the key is refused here, not at the
+        // first trade attempt.
+        if let Err(errs) = crate::sniper::SniperModeBoot::from_env_parts(
+            env_opt("SNIPER_MODE").as_deref(),
+            env_bool("SNIPER_LIVE_ENABLED", false),
+            self.endpoints.sniper_searcher_private_key.is_some(),
+        ) {
+            anyhow::bail!("sniper mode: {}", errs.join("; "));
         }
         Ok(())
     }

@@ -28,6 +28,108 @@ use serde::{Deserialize, Serialize};
 
 use super::params::{SniperParams, BPS};
 
+/// Which execution domain produced a position or fill.
+///
+/// One domain model, two ledgers: simulation and live share the same row
+/// shape, and this tag is what keeps their balances, histories and totals
+/// from ever bleeding into each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    /// Contract-backed trade on the local Anvil fixture, settled against the
+    /// paper bankroll.
+    Simulation,
+    /// Signed submission to the production vault on the selected chain.
+    /// The serde/SQL default: pre-provenance rows were live-shaped.
+    #[default]
+    Live,
+}
+
+impl ExecutionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionMode::Simulation => "simulation",
+            ExecutionMode::Live => "live",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "live" => ExecutionMode::Live,
+            _ => ExecutionMode::Simulation,
+        }
+    }
+}
+
+/// How a position's fills settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Settlement {
+    /// Virtual bankroll: no chain settles these fills.
+    Paper,
+    /// Mined receipts on the configured chain. The serde/SQL default:
+    /// pre-provenance rows were on-chain-shaped.
+    #[default]
+    OnChain,
+}
+
+impl Settlement {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Settlement::Paper => "paper",
+            Settlement::OnChain => "on_chain",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "on_chain" => Settlement::OnChain,
+            _ => Settlement::Paper,
+        }
+    }
+}
+
+/// Settlement-lifecycle metadata, independent of [`PositionState`]: a row can
+/// be `open` while its entry is still `submitted`, or `abandoned` because the
+/// transaction `reverted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TxStatus {
+    /// Persisted before signing/broadcasting.
+    Intent,
+    /// Broadcast, receipt not yet observed.
+    Submitted,
+    /// Receipt observed and successful.
+    #[default]
+    Mined,
+    /// Receipt observed, reverted (or the simulation call reverted).
+    Reverted,
+    /// Never submitted / dropped.
+    Abandoned,
+}
+
+impl TxStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TxStatus::Intent => "intent",
+            TxStatus::Submitted => "submitted",
+            TxStatus::Mined => "mined",
+            TxStatus::Reverted => "reverted",
+            TxStatus::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "intent" => TxStatus::Intent,
+            "submitted" => TxStatus::Submitted,
+            "reverted" => TxStatus::Reverted,
+            "abandoned" => TxStatus::Abandoned,
+            _ => TxStatus::Mined,
+        }
+    }
+}
+
 /// Where a position is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,6 +258,10 @@ pub struct Position {
     pub trigger_tx: Option<B256>,
     /// Our entry transaction, once known.
     pub entry_tx: Option<B256>,
+    /// The latest submitted exit transaction, while its receipt is pending.
+    /// Receipt reconciliation books the exact fill from the vault's
+    /// `ExitExecuted` event or rolls the optimistic fill back on a revert.
+    pub exit_tx: Option<B256>,
 
     /// WETH committed on entry.
     pub entry_cost_wei: U256,
@@ -179,6 +285,17 @@ pub struct Position {
     /// Honeypot verdict recorded at admission time.
     pub entry_verdict: String,
     pub notes: String,
+
+    // --- provenance (two-ledger model) ------------------------------------
+    /// Which execution domain owns this row. Additive: old rows deserialize
+    /// to the conservative defaults (`live` / `on_chain` / `mined`) and are
+    /// backfilled in SQLite where their notes prove them simulation.
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub settlement: Settlement,
+    #[serde(default)]
+    pub tx_status: TxStatus,
 }
 
 impl Position {
@@ -431,6 +548,8 @@ mod tests {
             state: PositionState::Open,
             trigger_tx: None,
             entry_tx: None,
+
+            exit_tx: None,
             entry_cost_wei: eth(1),
             entry_qty: U256::from(1_000u64),
             remaining_qty: U256::from(1_000u64),
@@ -443,6 +562,9 @@ mod tests {
             exit_reason: None,
             entry_verdict: "clean".into(),
             notes: String::new(),
+            execution_mode: ExecutionMode::Live,
+            settlement: Settlement::OnChain,
+            tx_status: TxStatus::Mined,
         }
     }
 

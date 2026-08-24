@@ -364,9 +364,9 @@ impl SniperParams {
                 }
             }
         }
-        if next.enabled && matches!(next.vault_address, None | Some(Address::ZERO)) {
-            errs.push("vault address not set (SNIPER_VAULT_ADDRESS)".to_string());
-        }
+        // Note: the production-vault requirement is enforced by the lane for
+        // LIVE mode only (`SniperLane::patch_params`) — simulation runs the
+        // local fixture and needs no production address.
         if let Some(v) = patch.max_price_impact_bps {
             next.max_price_impact_bps = v;
         }

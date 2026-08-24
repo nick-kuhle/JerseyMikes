@@ -13,6 +13,7 @@ import {
   demoReorgs,
   demoSeries,
   demoSimulations,
+  demoSniperMode,
   demoSniperParams,
   demoSniperPortfolio,
   demoSniperVault,
@@ -203,6 +204,10 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       return demoSniperVault();
     case "sniper/positions":
       return {positions: []};
+    case "sniper/mode":
+      return demoSniperMode();
+    case "sniper/sim-fixture":
+      return {ready: false, blocker: "demo mode: no local fork", demo: true};
     default:
       return {error: `unknown endpoint ${path}`};
   }
@@ -299,7 +304,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
   // panel unchanged. There is deliberately NO demo fallback that "applies" a
   // sniper patch — pretending to arm a lane that commits real capital is the
   // one place a convincing demo would be actively dangerous.
-  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume", "sniper/buy", "sniper/sell", "sniper/trade", "sniper/paper/reset"];
+  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume", "sniper/buy", "sniper/sell", "sniper/trade", "sniper/paper/reset", "sniper/mode", "sniper/sim-fixture/init"];
   if (SNIPER_MUTATIONS.includes(route)) {
     let body: unknown = {};
     try {

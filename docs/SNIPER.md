@@ -239,6 +239,85 @@ lanes.
 
 ---
 
+## 3.5 Independent Simulation/Live mode & the simulation vault fixture
+
+**The sniper has its own execution mode, independent of the atomic MEV
+engine's `/api/mode`.** `SNIPER_MODE` (default `simulation`) selects it at
+boot; `SNIPER_LIVE_ENABLED` (default `false`) is the boot ceiling that allows
+a runtime switch to live at all. The two lanes can be combined freely:
+
+| Atomic MEV | Sniper | Meaning |
+| --- | --- | --- |
+| Simulation | Simulation | Entire system paper-only |
+| Live | Simulation | Atomic engine live; sniper paper-only |
+| Simulation | Live | Sniper live; atomic engine paper-only |
+| Live | Live | Both live, each behind its own gates |
+
+Runtime switching lives at `GET/POST /api/sniper/mode` (both authenticated).
+Rules:
+
+- A fresh checkout starts in `simulation`.
+- `POST {"mode":"live"}` fails closed unless the boot ceiling is present, the
+  production vault is configured, `SNIPER_SEARCHER_PRIVATE_KEY` is set, and
+  the size/budget envelope is valid. The endpoint returns the exact blockers.
+- Switching back to `simulation` immediately stops new live entries. Open
+  **live positions stay tagged `live`** and keep live exit management — a mode
+  switch never converts live money into paper. Flatten them explicitly before
+  any migration or handoff.
+
+### Contract-backed simulation (the fixture)
+
+Simulation is not a paper stand-in. When the local anvil fork is available the
+lane deploys the **real `SniperVault.sol` bytecode** into it at startup-lazy
+init (wizard: *Initialize simulation fixture*, or first simulated trade):
+
+- constructor-bound **chain-specific WETH** and the configured simulation
+  budget,
+- a deterministic **simulation owner/searcher** derived from the built-in
+  simulation signer — never `SNIPER_SEARCHER_PRIVATE_KEY`,
+- simulated WETH funding via `ownerCall`/mint (never real funds, never a real
+  RPC write),
+- per simulated launch a deterministic mock ERC-20 + V2 pair seeded with the
+  launch's observed reserves.
+
+Entries execute the exact `openPosition` calldata the live lane signs, and
+fills are booked only from the mined `EntryExecuted`/`ExitExecuted` events —
+realised spend/receipts, not quotes. Guards exercised end-to-end: `maxSpend`,
+`minTokensOut`, `dailyBudget`/`totalBudget`, block deadline, max base fee,
+balance deltas, partial exits, honeypot/failed-sell reverts. A reverted
+simulated trade never touches the paper bankroll and is persisted with its
+revert reason. `GET /api/sniper/mode` and `/api/sniper/sim-fixture` report
+fixture state; the production and simulation vault addresses are exposed as
+separate fields (`productionVaultAddress`, `simulationVaultAddress`) and are
+never interchangeable.
+
+If the fork is unavailable the lane stays observation-only and reports a
+clear blocker — it never pretends a paper trade was contract-backed.
+
+### Two ledgers, one domain model
+
+Every position and fill carries provenance: `execution_mode`
+(`simulation|live`), `settlement` (`paper|on_chain`) and `tx_status`
+(`intent|submitted|mined|reverted|abandoned`) — additive SQLite columns with a
+backfill for pre-provenance rows, plus a durable `sniper_simulation_state`
+ledger so the paper bankroll survives restarts and an explicit reset (history
+is never deleted). `GET /api/sniper/portfolio` returns `totalsByMode` so the
+console can render **[Simulation] / [Live] / [All]** views; combined numbers
+are always labelled.
+
+### Wizard terminology
+
+The wizard step formerly called "Allowlist Searcher" is now **Authorize bot
+searcher EOA**: the public address derived from `SNIPER_SEARCHER_PRIVATE_KEY`
+that signs SniperVault buys and sells. It is not the vault address and does
+not not need to be the connected owner wallet; the owner wallet administers
+the vault (the contract also lets the owner call searcher functions — an
+administrative escape hatch, not the recommended bot architecture). The
+wizard shows all three identities (connected owner, `SNIPER_SEARCHER_ADDRESS`,
+`SNIPER_VAULT_ADDRESS`) and labels the fixture *Simulation vault · local Anvil
+only* versus *Production vault · selected chain*. In simulation mode the
+wizard needs no injected wallet and no production address.
+
 ## 4. `SniperVault`
 
 `contracts/src/SniperVault.sol`, 7,829 bytes runtime, 31 Foundry tests.

@@ -11,8 +11,18 @@ contract MockERC20 {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
+    /// Honeypot modelling for the sniper simulation fixture: transfers *from*
+    /// a blocked address revert (the vault trying to sell), while transfers
+    /// *to* it still succeed (the pair paying out the buy). Off by default, so
+    /// every existing test keeps its semantics.
+    mapping(address => bool) public blockedSenders;
+
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    function setBlockedSender(address from, bool blocked) external {
+        blockedSenders[from] = blocked;
+    }
 
     constructor(string memory n, string memory s) {
         name = n;
@@ -38,6 +48,7 @@ contract MockERC20 {
     }
 
     function transfer(address to, uint256 amount) public returns (bool) {
+        require(!blockedSenders[msg.sender], "MockERC20: sender blocked (honeypot)");
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         emit Transfer(msg.sender, to, amount);
@@ -45,6 +56,7 @@ contract MockERC20 {
     }
 
     function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(!blockedSenders[from], "MockERC20: sender blocked (honeypot)");
         uint256 a = allowance[from][msg.sender];
         if (a != type(uint256).max) allowance[from][msg.sender] = a - amount;
         balanceOf[from] -= amount;

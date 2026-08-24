@@ -508,6 +508,23 @@ export interface PlatformFeeQuote {
 
 export type SniperPositionState = "pending" | "open" | "scaling" | "closed" | "abandoned";
 
+/** Which execution domain owns a position/fill — the two-ledger model. */
+export type SniperExecutionMode = "simulation" | "live";
+/** How a fill settles: virtual bankroll vs mined receipts. */
+export type SniperSettlement = "paper" | "on_chain";
+/** Settlement-lifecycle metadata for a position's transactions. */
+export type SniperTxStatus = "intent" | "submitted" | "mined" | "reverted" | "abandoned";
+
+/** Provenance badge rendered on every portfolio/holdings row. */
+export function sniperSourceBadge(
+  executionMode: SniperExecutionMode | undefined,
+  settlement: SniperSettlement | undefined,
+): "SIMULATION" | "LIVE VAULT" {
+  return executionMode === "simulation" || settlement === "paper"
+    ? "SIMULATION"
+    : "LIVE VAULT";
+}
+
 export type SniperExitReason =
   | "take_profit_pct"
   | "take_profit_abs"
@@ -543,6 +560,10 @@ export interface SniperPortfolioRow {
   exitReason: SniperExitReason | null;
   entryVerdict: string;
   notes: string;
+  /** Two-ledger provenance: present on all new rows. */
+  executionMode?: SniperExecutionMode;
+  settlement?: SniperSettlement;
+  txStatus?: SniperTxStatus;
 }
 
 export interface SniperPortfolioTotals {
@@ -564,11 +585,40 @@ export interface SniperPortfolioTotals {
 
 export interface SniperPortfolio {
   totals: SniperPortfolioTotals;
+  /** Same positions split by execution domain — behind the ledger switcher. */
+  totalsByMode?: {
+    simulation: SniperPortfolioTotals;
+    live: SniperPortfolioTotals;
+  };
   open: SniperPortfolioRow[];
   recentClosed: SniperPortfolioRow[];
   armingBlockers: string[];
   armed: boolean;
   generatedAtMs: number;
+  demo?: boolean;
+}
+
+/** `GET /api/sniper/mode` — the sniper's independent execution mode. */
+export interface SniperModeResponse {
+  atomicMode: "simulation" | "live";
+  sniperMode: SniperExecutionMode;
+  sniperLiveBootEnabled: boolean;
+  canSwitchLive: boolean;
+  blockers: string[];
+  simulationVaultAddress: string | null;
+  productionVaultAddress: string | null;
+  simulationBalanceWei: string;
+  simulationChainId: number;
+  activeVault: {
+    kind: "simulation_fixture" | "production" | "none";
+    address: string | null;
+  };
+  fixture?: {
+    available: boolean;
+    deployed: boolean;
+    searcher: string | null;
+    owner: string | null;
+  };
   demo?: boolean;
 }
 
@@ -623,7 +673,15 @@ export interface SniperParamsResponse {
   params: SniperParams;
   /** True when trades can be simulated against the virtual bankroll. */
   paperMode?: boolean;
+  /** The sniper's own mode, independent of the atomic engine. */
+  sniperMode?: SniperExecutionMode;
+  sniperLiveBootEnabled?: boolean;
   simulationBalanceWei?: string;
+  /** Local-anvil-only vault; never the production deployment. */
+  simulationVaultAddress?: string | null;
+  /** The on-chain production vault for the selected chain. */
+  productionVaultAddress?: string | null;
+  activeVaultKind?: "simulation_fixture" | "production" | "none";
   armed: boolean;
   bootEnabled: boolean;
   halted: boolean;

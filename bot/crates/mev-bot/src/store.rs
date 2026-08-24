@@ -520,6 +520,53 @@ impl Store {
             "live_smoke_gas_risk_wei",
             "TEXT NOT NULL DEFAULT '0'",
         );
+
+        // --- two-ledger provenance (additive; work order C.1) -------------
+        // Every position/fill carries its execution domain so the simulation
+        // and live portfolios can never be merged without a label. Defaults
+        // match pre-provenance rows (live-shaped); rows whose notes prove a
+        // paper origin are backfilled below.
+        self.add_column(
+            "sniper_positions",
+            "execution_mode",
+            "TEXT NOT NULL DEFAULT 'live'",
+        );
+        self.add_column(
+            "sniper_positions",
+            "settlement",
+            "TEXT NOT NULL DEFAULT 'on_chain'",
+        );
+        self.add_column(
+            "sniper_positions",
+            "tx_status",
+            "TEXT NOT NULL DEFAULT 'mined'",
+        );
+        self.add_column(
+            "sniper_fills",
+            "execution_mode",
+            "TEXT NOT NULL DEFAULT 'live'",
+        );
+        self.add_column("sniper_positions", "exit_tx", "TEXT");
+        self.conn.lock().execute_batch(
+            "UPDATE sniper_positions
+                SET execution_mode = 'simulation', settlement = 'paper'
+              WHERE execution_mode = 'live' AND notes LIKE 'SIMULATION%';
+             UPDATE sniper_fills
+                SET execution_mode = 'simulation'
+              WHERE execution_mode = 'live' AND reason = 'simulation';",
+        )?;
+
+        // First-class simulation ledger: the paper bankroll survives restarts
+        // and an explicit reset rewrites it rather than silently mutating an
+        // in-memory number.
+        self.conn.lock().execute_batch(
+            "CREATE TABLE IF NOT EXISTS sniper_simulation_state (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                balance_wei   TEXT NOT NULL,
+                reset_at_ms   INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
         Ok(())
     }
 
@@ -2395,11 +2442,12 @@ impl Store {
              (id, chain_id, token, pair, venue, state, trigger_tx, entry_tx,
               entry_cost_wei, entry_qty, remaining_qty, realized_wei, gas_spent_wei,
               peak_value_wei, opened_block, opened_at_ms, closed_at_ms, exit_reason,
-              entry_verdict, notes)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+              entry_verdict, notes, execution_mode, settlement, tx_status, exit_tx)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
              ON CONFLICT(id) DO UPDATE SET
                 state          = excluded.state,
                 entry_tx       = excluded.entry_tx,
+                exit_tx        = excluded.exit_tx,
                 entry_cost_wei = excluded.entry_cost_wei,
                 entry_qty      = excluded.entry_qty,
                 remaining_qty  = excluded.remaining_qty,
@@ -2408,7 +2456,10 @@ impl Store {
                 peak_value_wei = excluded.peak_value_wei,
                 closed_at_ms   = excluded.closed_at_ms,
                 exit_reason    = excluded.exit_reason,
-                notes          = excluded.notes",
+                notes          = excluded.notes,
+                execution_mode = excluded.execution_mode,
+                settlement     = excluded.settlement,
+                tx_status      = excluded.tx_status",
             params![
                 p.id,
                 p.chain_id as i64,
@@ -2430,6 +2481,10 @@ impl Store {
                 p.exit_reason.map(|r| r.as_str()),
                 p.entry_verdict,
                 p.notes,
+                p.execution_mode.as_str(),
+                p.settlement.as_str(),
+                p.tx_status.as_str(),
+                p.exit_tx.map(|h| format!("{h:?}")),
             ],
         )?;
         Ok(())
@@ -2457,7 +2512,8 @@ impl Store {
             "SELECT id, chain_id, token, pair, venue, state, trigger_tx, entry_tx,
                     entry_cost_wei, entry_qty, remaining_qty, realized_wei, gas_spent_wei,
                     peak_value_wei, opened_block, opened_at_ms, closed_at_ms, exit_reason,
-                    entry_verdict, notes
+                    entry_verdict, notes, execution_mode, settlement, tx_status
+                    , exit_tx
              FROM sniper_positions WHERE {predicate}
              ORDER BY opened_at_ms DESC LIMIT {limit}"
         );
@@ -2509,6 +2565,12 @@ impl Store {
                 exit_reason,
                 entry_verdict: row.get(18)?,
                 notes: row.get(19)?,
+                execution_mode: crate::sniper::ExecutionMode::parse(&row.get::<_, String>(20)?),
+                settlement: crate::sniper::Settlement::parse(&row.get::<_, String>(21)?),
+                tx_status: crate::sniper::TxStatus::parse(&row.get::<_, String>(22)?),
+                exit_tx: row
+                    .get::<_, Option<String>>(23)?
+                    .and_then(|h| parse_b256(&h)),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -2527,12 +2589,13 @@ impl Store {
         gas_wei: U256,
         tx_hash: Option<String>,
         block_number: Option<u64>,
+        execution_mode: crate::sniper::ExecutionMode,
     ) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR IGNORE INTO sniper_fills
              (id, position_id, side, reason, qty, weth_wei, gas_wei, tx_hash,
-              block_number, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+              block_number, created_at_ms, execution_mode)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 id,
                 position_id,
@@ -2544,6 +2607,7 @@ impl Store {
                 tx_hash,
                 block_number.map(|b| b as i64),
                 now_ms() as i64,
+                execution_mode.as_str(),
             ],
         )?;
         Ok(())
@@ -2553,7 +2617,8 @@ impl Store {
     pub fn sniper_fills(&self, position_id: &str) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, side, reason, qty, weth_wei, gas_wei, tx_hash, block_number, created_at_ms
+            "SELECT id, side, reason, qty, weth_wei, gas_wei, tx_hash, block_number,
+                    created_at_ms, execution_mode
              FROM sniper_fills WHERE position_id = ?1 ORDER BY created_at_ms ASC",
         )?;
         let rows = stmt.query_map(params![position_id], |row| {
@@ -2567,9 +2632,109 @@ impl Store {
                 "txHash": row.get::<_, Option<String>>(6)?,
                 "blockNumber": row.get::<_, Option<i64>>(7)?,
                 "createdAtMs": row.get::<_, i64>(8)?,
+                "executionMode": row.get::<_, String>(9)?,
             }))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// The persisted paper bankroll. `None` means the ledger has never been
+    /// written — a fresh checkout starts at exactly 1 ETH in memory.
+    pub fn load_simulation_state(&self) -> Result<Option<(U256, u64, u64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT balance_wei, reset_at_ms, updated_at_ms FROM sniper_simulation_state WHERE id = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((
+                parse_u256_decimal(&row.get::<_, String>(0)?),
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the paper bankroll after any reserve/credit/reset. A reset is
+    /// recorded with its timestamp so the audit trail shows when the bankroll
+    /// was returned to 1 ETH — the history itself is never deleted.
+    pub fn save_simulation_state(&self, balance_wei: U256, reset_at_ms: u64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO sniper_simulation_state (id, balance_wei, reset_at_ms, updated_at_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                balance_wei   = excluded.balance_wei,
+                reset_at_ms   = excluded.reset_at_ms,
+                updated_at_ms = excluded.updated_at_ms",
+            params![balance_wei.to_string(), reset_at_ms as i64, now_ms() as i64,],
+        )?;
+        Ok(())
+    }
+
+    /// The optimistic amounts recorded for a position's most recent sell
+    /// fill — what the exit reconciliation needs to undo before booking the
+    /// receipt's exact values.
+    pub fn last_sell_fill_amounts(&self, position_id: &str) -> Result<Option<(U256, U256)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT qty, weth_wei FROM sniper_fills
+              WHERE position_id = ?1 AND side = 'sell'
+              ORDER BY created_at_ms DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![position_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((
+                parse_u256_decimal(&row.get::<_, String>(0)?),
+                parse_u256_decimal(&row.get::<_, String>(1)?),
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Correct the most recent sell fill of a position once the exit receipt
+    /// is known: receipt-based exact accounting replaces the optimistic
+    /// fill recorded at submission.
+    pub fn correct_last_sell_fill(
+        &self,
+        position_id: &str,
+        qty: U256,
+        weth_wei: U256,
+        gas_wei: U256,
+        block_number: u64,
+    ) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE sniper_fills
+                SET qty = ?2, weth_wei = ?3, gas_wei = ?4, block_number = ?5
+              WHERE id = (
+                    SELECT id FROM sniper_fills
+                     WHERE position_id = ?1 AND side = 'sell'
+                     ORDER BY created_at_ms DESC LIMIT 1
+              )",
+            params![
+                position_id,
+                qty.to_string(),
+                weth_wei.to_string(),
+                gas_wei.to_string(),
+                block_number as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the optimistic sell fill of an exit that reverted: a failed
+    /// transaction books nothing.
+    pub fn delete_last_sell_fill(&self, position_id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM sniper_fills
+              WHERE id = (
+                    SELECT id FROM sniper_fills
+                     WHERE position_id = ?1 AND side = 'sell'
+                     ORDER BY created_at_ms DESC LIMIT 1
+              )",
+            params![position_id],
+        )?;
+        Ok(())
     }
 
     /// Remember a honeypot verdict so the same token is not re-probed.
@@ -3260,6 +3425,8 @@ mod tests {
             state,
             trigger_tx: None,
             entry_tx: None,
+
+            exit_tx: None,
             entry_cost_wei: U256::from(1_000_000_000_000_000_000u128),
             entry_qty: U256::from(4_242u64),
             remaining_qty: U256::from(4_242u64),
@@ -3272,6 +3439,9 @@ mod tests {
             exit_reason: None,
             entry_verdict: "clean".into(),
             notes: "backrun of addLiquidityETH".into(),
+            execution_mode: crate::sniper::ExecutionMode::Live,
+            settlement: crate::sniper::Settlement::OnChain,
+            tx_status: crate::sniper::TxStatus::Mined,
         }
     }
 
@@ -3358,6 +3528,7 @@ mod tests {
             U256::from(1u64),
             None,
             Some(100),
+            crate::sniper::ExecutionMode::Live,
         )
         .unwrap();
         s.record_sniper_fill(
@@ -3370,6 +3541,7 @@ mod tests {
             U256::from(1u64),
             None,
             Some(120),
+            crate::sniper::ExecutionMode::Live,
         )
         .unwrap();
         let fills = s.sniper_fills("p1").unwrap();
@@ -3393,10 +3565,192 @@ mod tests {
                 U256::ZERO,
                 None,
                 None,
+                crate::sniper::ExecutionMode::Live,
             )
             .unwrap();
         }
         assert_eq!(s.sniper_fills("p1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sniper_provenance_round_trips_and_defaults_are_live_shaped() {
+        let s = Store::open_in_memory().unwrap();
+        let mut p = sniper_pos("sim1", crate::sniper::PositionState::Open);
+        p.execution_mode = crate::sniper::ExecutionMode::Simulation;
+        p.settlement = crate::sniper::Settlement::Paper;
+        p.tx_status = crate::sniper::TxStatus::Intent;
+        s.upsert_sniper_position(&p).unwrap();
+        s.upsert_sniper_position(&sniper_pos("live1", crate::sniper::PositionState::Open))
+            .unwrap();
+
+        let all: std::collections::HashMap<_, _> = s
+            .recent_sniper_positions(10)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id.clone(), p))
+            .collect();
+        let sim = &all["sim1"];
+        assert_eq!(sim.execution_mode, crate::sniper::ExecutionMode::Simulation);
+        assert_eq!(sim.settlement, crate::sniper::Settlement::Paper);
+        assert_eq!(sim.tx_status, crate::sniper::TxStatus::Intent);
+        let live = &all["live1"];
+        assert_eq!(live.execution_mode, crate::sniper::ExecutionMode::Live);
+        assert_eq!(live.settlement, crate::sniper::Settlement::OnChain);
+    }
+
+    #[test]
+    fn legacy_paper_rows_are_backfilled_from_their_notes() {
+        // A database written before the two-ledger model stored paper fills
+        // with reason='simulation' and positions noted "SIMULATION ...". The
+        // migration must relabel them rather than claim them as live.
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .lock()
+            .execute(
+                "UPDATE sniper_positions SET notes = 'SIMULATION paper entry' WHERE id = 'legacy'",
+                [],
+            )
+            .ok();
+        // Insert a legacy-shaped row directly (defaults: live/on_chain).
+        let mut legacy = sniper_pos("legacy", crate::sniper::PositionState::Open);
+        legacy.notes = "SIMULATION paper entry".into();
+        s.upsert_sniper_position(&legacy).unwrap();
+        // Simulate the migration on a pre-existing default row: reset it to
+        // the SQL defaults, then run the backfill statement again.
+        s.conn
+            .lock()
+            .execute(
+                "UPDATE sniper_positions SET execution_mode = 'live', settlement = 'on_chain' WHERE id = 'legacy'",
+                [],
+            )
+            .unwrap();
+        s.conn
+            .lock()
+            .execute_batch(
+                "UPDATE sniper_positions
+                    SET execution_mode = 'simulation', settlement = 'paper'
+                  WHERE execution_mode = 'live' AND notes LIKE 'SIMULATION%';",
+            )
+            .unwrap();
+        let back = &s.recent_sniper_positions(10).unwrap()[0];
+        assert_eq!(
+            back.execution_mode,
+            crate::sniper::ExecutionMode::Simulation
+        );
+        assert_eq!(back.settlement, crate::sniper::Settlement::Paper);
+    }
+
+    #[test]
+    fn the_simulation_bankroll_persists_and_resets_explicitly() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(
+            s.load_simulation_state().unwrap().is_none(),
+            "a fresh ledger has no persisted balance"
+        );
+        let one_eth = U256::from(1_000_000_000_000_000_000u128);
+        s.save_simulation_state(one_eth, 0).unwrap();
+        let half = U256::from(500_000_000_000_000_000u128);
+        s.save_simulation_state(half, 0).unwrap();
+        let (balance, reset_at, _) = s.load_simulation_state().unwrap().unwrap();
+        assert_eq!(balance, half);
+        assert_eq!(reset_at, 0);
+        // An explicit reset rewrites the balance and stamps it — history rows
+        // elsewhere are untouched by design.
+        s.save_simulation_state(one_eth, 1_234).unwrap();
+        let (balance, reset_at, _) = s.load_simulation_state().unwrap().unwrap();
+        assert_eq!(balance, one_eth);
+        assert_eq!(reset_at, 1_234);
+    }
+
+    #[test]
+    fn exit_tx_round_trips_for_receipt_reconciliation() {
+        let s = Store::open_in_memory().unwrap();
+        let mut p = sniper_pos("x1", crate::sniper::PositionState::Scaling);
+        p.tx_status = crate::sniper::TxStatus::Submitted;
+        p.exit_tx = Some(alloy_primitives::B256::repeat_byte(0x77));
+        s.upsert_sniper_position(&p).unwrap();
+        let back = &s.recent_sniper_positions(10).unwrap()[0];
+        assert_eq!(
+            back.exit_tx,
+            Some(alloy_primitives::B256::repeat_byte(0x77))
+        );
+        assert_eq!(back.tx_status, crate::sniper::TxStatus::Submitted);
+    }
+
+    #[test]
+    fn optimistic_sell_fills_are_corrected_or_deleted_from_receipts() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_fill(
+            "sb",
+            "p9",
+            "buy",
+            "entry",
+            U256::from(1_000u64),
+            U256::from(100u64),
+            U256::ZERO,
+            None,
+            Some(1),
+            crate::sniper::ExecutionMode::Live,
+        )
+        .unwrap();
+        s.record_sniper_fill(
+            "ss",
+            "p9",
+            "sell",
+            "take_profit_pct",
+            U256::from(1_000u64),
+            U256::from(150u64),
+            U256::ZERO,
+            Some("0xabc".into()),
+            Some(2),
+            crate::sniper::ExecutionMode::Live,
+        )
+        .unwrap();
+
+        // Reconciliation replaces the optimistic amounts with the receipt's.
+        let (qty, weth) = s.last_sell_fill_amounts("p9").unwrap().unwrap();
+        assert_eq!(qty, U256::from(1_000u64));
+        assert_eq!(weth, U256::from(150u64));
+        s.correct_last_sell_fill(
+            "p9",
+            U256::from(990u64),
+            U256::from(148u64),
+            U256::from(3u64),
+            9,
+        )
+        .unwrap();
+        let (qty, weth) = s.last_sell_fill_amounts("p9").unwrap().unwrap();
+        assert_eq!(qty, U256::from(990u64));
+        assert_eq!(weth, U256::from(148u64));
+        // The buy fill is untouched.
+        assert_eq!(s.sniper_fills("p9").unwrap().len(), 2);
+
+        // A reverted exit deletes the optimistic fill entirely.
+        s.delete_last_sell_fill("p9").unwrap();
+        let fills = s.sniper_fills("p9").unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0]["side"], "buy");
+        assert!(s.last_sell_fill_amounts("p9").unwrap().is_none());
+    }
+
+    #[test]
+    fn fill_provenance_is_recorded_per_fill() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_fill(
+            "fs",
+            "p1",
+            "buy",
+            "simulation",
+            U256::from(1u64),
+            U256::from(1u64),
+            U256::ZERO,
+            None,
+            None,
+            crate::sniper::ExecutionMode::Simulation,
+        )
+        .unwrap();
+        let fills = s.sniper_fills("p1").unwrap();
+        assert_eq!(fills[0]["executionMode"], "simulation");
     }
 
     #[test]
