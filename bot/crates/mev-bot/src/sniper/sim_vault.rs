@@ -221,8 +221,10 @@ fn decode_revert_bytes(data: &[u8]) -> String {
     }
     let words = |from: usize| -> Vec<U256> {
         data[4 + from * 32..]
-            .chunks_exact(32)
-            .map(U256::from_be_slice)
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|c| U256::from_be_slice(c))
             .collect()
     };
     if selector == SniperVaultErrors::OverSpend::SELECTOR {

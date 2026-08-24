@@ -96,7 +96,8 @@ pub mod known {
     /// Aerodrome pool factory — verified live 2026-08-24 two ways:
     /// `router.defaultFactory()` returns it, and `getPool(WETH, USDC, false)`
     /// resolves the canonical WETH/USDC volatile pool.
-    pub const BASE_AERODROME_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+    pub const BASE_AERODROME_FACTORY: Address =
+        address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
 
     /// Collateral tokens whose feeds the oracle front-runner maps leads to.
     pub fn collateral_universe() -> [Address; 3] {

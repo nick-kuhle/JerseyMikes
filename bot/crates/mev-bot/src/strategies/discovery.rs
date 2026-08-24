@@ -126,7 +126,9 @@ impl DiscoverySource for RpcSource<'_> {
 
     async fn fetch_aero(&self, pool: Address, block: u64) -> Option<AeroPool> {
         let factory = self.aero_factory?;
-        dex::fetch_aero_pool(self.rpc, factory, pool, block).await.ok()
+        dex::fetch_aero_pool(self.rpc, factory, pool, block)
+            .await
+            .ok()
     }
 }
 

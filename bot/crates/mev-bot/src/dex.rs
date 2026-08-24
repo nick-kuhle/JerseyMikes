@@ -732,11 +732,7 @@ pub async fn fetch_aero_pool(
         ),
         (
             "eth_call".to_string(),
-            eth_call_params(
-                pool,
-                IAerodromePool::getReservesCall {}.abi_encode(),
-                &tag,
-            ),
+            eth_call_params(pool, IAerodromePool::getReservesCall {}.abi_encode(), &tag),
         ),
         (
             "eth_call".to_string(),
@@ -844,7 +840,10 @@ mod tests {
         let x = U256::from(10u128.pow(18));
         let r0 = U256::from(1718659049920153369322u128);
         let r1 = U256::from(4313067253337u128);
-        assert_eq!(aero_volatile_amount_out(x, r0, r1, 30), U256::from(2500574490u64));
+        assert_eq!(
+            aero_volatile_amount_out(x, r0, r1, 30),
+            U256::from(2500574490u64)
+        );
     }
 
     #[test]
@@ -859,7 +858,7 @@ mod tests {
         let uni = v2_amount_out(x, r_in, r_out, 30);
         assert_eq!(aero, U256::from(99u64)); // (100·1e6)/(1e6+100)
         assert_eq!(uni, U256::from(99u64).saturating_sub(U256::from(0u64))); // same rounding here…
-        // …but at a size where the floor bites, they diverge:
+                                                                             // …but at a size where the floor bites, they diverge:
         let x = U256::from(333u64);
         let aero = aero_volatile_amount_out(x, r_in, r_out, 30);
         let uni = v2_amount_out(x, r_in, r_out, 30);

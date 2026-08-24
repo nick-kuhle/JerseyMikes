@@ -569,9 +569,7 @@ fn size_cycle(
         let first = edges.get(*cycle.first()?)?;
         let hi = match &first.kind {
             EdgeKind::V2 { pool } => max_in.min(pool.reserves_for(first.token_in)?.0),
-            EdgeKind::AeroVolatile { pool, .. } => {
-                max_in.min(pool.reserves_for(first.token_in)?.0)
-            }
+            EdgeKind::AeroVolatile { pool, .. } => max_in.min(pool.reserves_for(first.token_in)?.0),
             EdgeKind::V3 { .. } => max_in,
         };
         if hi.is_zero() {
@@ -812,8 +810,12 @@ mod tests {
         let edges = PricedEdge::from_aero(&volatile, router, factory);
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().all(|e| e.venue == Venue::AeroVolatile));
-        assert!(edges.iter().all(|e| e.caps.volatile && !e.caps.concentrated));
-        assert!(PricedEdge::from_aero(&aero_pool(2, 1_000, 1_000, true), router, factory).is_empty());
+        assert!(edges
+            .iter()
+            .all(|e| e.caps.volatile && !e.caps.concentrated));
+        assert!(
+            PricedEdge::from_aero(&aero_pool(2, 1_000, 1_000, true), router, factory).is_empty()
+        );
         assert!(PricedEdge::from_aero(&aero_pool(3, 0, 0, false), router, factory).is_empty());
     }
 

@@ -371,6 +371,10 @@ impl V3PoolCache {
 /// V2 cache would be priced by UniV2's in-numerator-fee formula and would
 /// produce quotes that look plausible, differ by wei, and pass every
 /// downstream gate.
+/// Memoised `(tokenA, tokenB, stable)` → pool lookups for the Aerodrome
+/// factory, tokens stored sorted like the V2 index.
+type AeroPairKey = (Address, Address, bool);
+
 #[derive(Clone)]
 pub struct AeroPoolCache {
     rpc: RpcClient,
@@ -378,7 +382,7 @@ pub struct AeroPoolCache {
     /// chain has none — lookups fail closed with no pools.
     factory: Option<Address>,
     inner: Arc<RwLock<HashMap<Address, crate::dex::AeroPool>>>,
-    pair_index: Arc<RwLock<HashMap<(Address, Address, bool), Option<Address>>>>,
+    pair_index: Arc<RwLock<HashMap<AeroPairKey, Option<Address>>>>,
 }
 
 impl AeroPoolCache {
@@ -788,7 +792,11 @@ pub struct AeroPoolSeed {
 /// wrong addresses, the failure mode these guards exist for.
 pub fn decode_aero_pool_created(log: &serde_json::Value) -> Option<AeroPoolSeed> {
     let topics = log["topics"].as_array()?;
-    if !topics.first()?.as_str()?.eq_ignore_ascii_case(dex::AERO_POOL_CREATED_TOPIC) {
+    if !topics
+        .first()?
+        .as_str()?
+        .eq_ignore_ascii_case(dex::AERO_POOL_CREATED_TOPIC)
+    {
         return None;
     }
     if topics.len() < 4 {

@@ -673,9 +673,10 @@ mod tests {
             "the V2↔Aero cycle survives the same drop-V2-only filter the V3 lane uses"
         );
         assert!(
-            cross
+            cross.iter().all(|c| c
+                .edges
                 .iter()
-                .all(|c| c.edges.iter().any(|&i| edges[i].venue == Venue::AeroVolatile)),
+                .any(|&i| edges[i].venue == Venue::AeroVolatile)),
             "every kept cycle actually touches Aerodrome"
         );
         // And the callee chain is executable: the Aero leg approves the
@@ -687,7 +688,8 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c.data[..4] == dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR),
+                .any(|c| c.data[..4]
+                    == dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR),
             "a swapExactTokensForTokens call is present"
         );
     }
