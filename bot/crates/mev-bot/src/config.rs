@@ -549,6 +549,19 @@ pub struct Config {
     /// submission. Defaulted off on sequencer chains — bloXroute's data API is
     /// mainnet-only and would bleed mainnet blocks into a Base funnel (R6).
     pub relay_tx_ingest: bool,
+    /// Whether non-native profit tokens may be valued in ETH so that
+    /// ETH-denominated gas can be netted against them.
+    ///
+    /// Off by default. While off, any opportunity whose `profit_token` is
+    /// neither native ETH nor the chain's WETH fails closed at the simulation
+    /// boundary with an "uncertified accounting" reason — the behaviour that
+    /// pinned every liquidation strategy to shadow mode. Turning it on enables
+    /// [`crate::valuation`], which prices the profit token with a block-pinned,
+    /// executable, haircut quote. See `docs/STRATEGIES.md`.
+    pub token_valuation: bool,
+    /// Conservatism applied to every non-native valuation, in basis points
+    /// (200 = 2%). Covers the slippage of the unwind that is not simulated.
+    pub valuation_haircut_bps: u64,
     /// Whether delivered blocks are ingested directly from the chain
     /// (`newHeads` + `eth_getBlockByHash`) instead of a relay data API. This is
     /// the sequencer-chain equivalent of the bloXroute path: the sequencer's
@@ -681,6 +694,16 @@ pub struct Endpoints {
     pub bloxroute_relay_url: String,
     /// Optional L2 sequencer / preconfirmation feed (websocket).
     pub sequencer_feed: Option<String>,
+    /// Base Flashblocks websocket (`newFlashblocks`).
+    ///
+    /// A Flashblock is a 200 ms sub-block preconfirmation; the full block is
+    /// 2 s. Subscribing here is a 10x improvement in event resolution over
+    /// `newHeads`, and on a chain with no public pending queue it is the
+    /// earliest observable state a searcher can react to. Requires a
+    /// Flashblocks-integrated provider — an ordinary Base endpoint will not
+    /// serve the subscription. Ordering inside a sealed Flashblock is already
+    /// final, so everything it yields is strictly back-run material.
+    pub flashblocks_ws: Option<String>,
     /// Optional Blocknative / Blockstream-style mempool stream.
     pub extra_mempool_ws: Vec<String>,
     /// MEV Blocker searcher websocket (`wss://searchers.mevblocker.io`).
@@ -722,6 +745,7 @@ impl std::fmt::Debug for Endpoints {
             .field("relay_data_urls", &self.relay_data_urls)
             .field("bloxroute_relay_url", &self.bloxroute_relay_url)
             .field("sequencer_feed", &self.sequencer_feed)
+            .field("flashblocks_ws", &self.flashblocks_ws)
             .field("extra_mempool_ws", &self.extra_mempool_ws)
             .field("mev_blocker_ws", &self.mev_blocker_ws)
             .field(
@@ -1164,6 +1188,7 @@ impl Config {
                     "https://bloxroute.max-profit.blxrbdn.com",
                 ),
                 sequencer_feed: env_opt("SEQUENCER_FEED_URL"),
+                flashblocks_ws: env_opt("FLASHBLOCKS_WS_URL"),
                 extra_mempool_ws: env_list("EXTRA_MEMPOOL_WS"),
                 mev_blocker_ws: env_opt("MEV_BLOCKER_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
@@ -1297,6 +1322,14 @@ impl Config {
             // and the mainnet data API would bleed cross-chain).
             relay_tx_ingest: env_bool("RELAY_TX_INGEST", !sequencer_only),
             chain_block_ingest: env_bool("CHAIN_BLOCK_INGEST", sequencer_only),
+            // Fail-closed: a non-native profit token is uncertified until an
+            // operator explicitly enables valuation.
+            token_valuation: env_bool("TOKEN_VALUATION", false),
+            valuation_haircut_bps: env_u64(
+                "VALUATION_HAIRCUT_BPS",
+                crate::valuation::DEFAULT_HAIRCUT_BPS,
+            )
+            .min(10_000),
             relay_tx_concurrency: (env_u64("RELAY_TX_CONCURRENCY", 16) as usize).max(1),
             // Sized for the live path: enough in-flight transactions to keep
             // the runtime busy, low enough that a mempool burst sheds instead
@@ -1663,6 +1696,7 @@ mod tests {
             relay_data_urls: vec![],
             bloxroute_relay_url: String::new(),
             sequencer_feed: None,
+            flashblocks_ws: None,
             extra_mempool_ws: vec![],
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
@@ -1689,6 +1723,7 @@ mod tests {
             relay_data_urls: vec![],
             bloxroute_relay_url: String::new(),
             sequencer_feed: None,
+            flashblocks_ws: None,
             extra_mempool_ws: vec![],
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),

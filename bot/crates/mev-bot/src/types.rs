@@ -263,14 +263,34 @@ impl Strategy {
         }
     }
 
-    /// Strategies whose current bundle shape settles into WETH/ETH and has a
-    /// contract-level retained-profit invariant. This is only the engineering
-    /// eligibility ceiling; the seven-day qualification gate can narrow it
-    /// further and broadcasting remains independently disabled by default.
+    /// Strategies whose bundle shape settles into a profit token the accounting
+    /// layer can certify against ETH-denominated gas, and which carry the
+    /// contract-level retained-profit invariant.
+    ///
+    /// This is only the engineering eligibility ceiling. Three further gates
+    /// narrow it at runtime: the profit token must actually price at the
+    /// simulated block (a liquidation settling in an unroutable collateral
+    /// asset fails closed in [`crate::valuation`] and never reports success),
+    /// the qualification gate must return `PASS` for the strategy, and
+    /// broadcasting remains independently disabled by default.
+    ///
+    /// The four liquidation strategies are included because their profit is
+    /// now valued at the pinned fork block rather than discarded. They are also
+    /// the strategy class the market structure actually supports on a
+    /// sequencer chain: liquidations are back-runs, which need no positional
+    /// guarantee inside the block, whereas the sandwich family needs an atomic
+    /// (front, victim, back) ordering that a private-mempool L2 with no builder
+    /// market cannot sell.
     pub fn live_candidate(&self) -> bool {
         matches!(
             self,
-            Strategy::Sandwich | Strategy::SandwichV3 | Strategy::AtomicArb
+            Strategy::Sandwich
+                | Strategy::SandwichV3
+                | Strategy::AtomicArb
+                | Strategy::Liquidation
+                | Strategy::LiquidationCompound
+                | Strategy::LiquidationMorpho
+                | Strategy::LiquidationMaker
         )
     }
 
@@ -280,12 +300,14 @@ impl Strategy {
             Strategy::Sniper => {
                 Some("round-trip probe is not a certified profitable execution strategy")
             }
-            Strategy::Liquidation
-            | Strategy::LiquidationCompound
-            | Strategy::LiquidationMorpho
-            | Strategy::LiquidationMaker
-            | Strategy::OracleFrontrun => {
-                Some("non-WETH profit needs block-pinned token valuation before gas can be netted")
+            // Accounting is no longer the blocker here; position is. Landing an
+            // oracle front-run requires being ordered ahead of a known update
+            // in the same block, which needs either a builder market (mainnet)
+            // or an express lane (Arbitrum TimeBoost). Neither is wired, and on
+            // a private-mempool sequencer chain the ordering simply is not for
+            // sale, so the strategy stays observational.
+            Strategy::OracleFrontrun => {
+                Some("requires guaranteed pre-update ordering: no builder market or express-lane bid is wired")
             }
             _ => None,
         }
