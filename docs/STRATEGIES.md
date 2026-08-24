@@ -4,6 +4,51 @@ All strategies run concurrently and all are gated by the same rule: the bundle
 must be net-positive in a forked simulation, and on chain `MevExecutor` reverts
 anything that does not clear `minProfit`.
 
+## Live-eligible vs shadow-only
+
+A strategy is a **live candidate** when it has the engineering properties a
+submitted bundle needs: atomic settlement into a profit token that can be
+valued, and an executor-enforced retained-profit guard. Eligibility is not
+approval — a live candidate still cannot broadcast until it earns its own
+`PASS` in `GET /api/qualification` (`SIM_TO_LIVE.md`).
+
+| Strategy | Status | Note |
+| --- | --- | --- |
+| `sandwich`, `sandwich_v3` | live candidate | Requires victim raw bytes; economics are chain-dependent (see below) |
+| `atomic_arb` | live candidate | Back-running; the most portable row across chains |
+| `liquidation` (Aave V3) | live candidate | Promoted once collateral could be valued |
+| `liquidation_compound` | live candidate | ditto |
+| `liquidation_morpho` | live candidate | ditto |
+| `liquidation_maker` | live candidate | ditto |
+| `jit` | shadow-only | Settlement shape |
+| `sniper` | shadow-only | Settlement shape |
+| `oracle_frontrun` | shadow-only | Ordering assumption |
+
+`Strategy::shadow_only_reason()` carries the specific reason for each
+shadow-only row and it is reported on the API row, so a strategy is never
+silently excluded.
+
+**Why the liquidations were promoted.** They settle in seized collateral, not
+ETH. The simulator accounts by balance delta, so before `valuation.rs` existed
+every liquidation netted to zero and could not clear `MIN_NET_PROFIT_WEI` — the
+math was correct and tested, but structurally unable to produce a bid. With the
+profit token priced at the pinned pre-bundle fork block (V3 QuoterV2 → V2
+reserves → fail closed, less `VALUATION_HAIRCUT_BPS`; see `RISK.md`), the
+blocker is gone. Pricing does **not** rescue JIT, the sniper, or oracle
+front-running: their limitations are settlement- and ordering-shaped, not
+valuation-shaped.
+
+**Where the value actually is.** Worth being blunt, because it shapes how to
+read the funnel. Sandwiching depends on a transparent mempool and an open
+builder market that can place three transactions atomically. On private-mempool
+rollups neither condition holds: inclusion is probabilistic rather than atomic,
+and measured sandwich attempts there are overwhelmingly unprofitable. The
+strategies that survive contact with current market structure — especially on
+L2 — are the **back-running** ones: atomic arbitrage and liquidations. The
+sandwich rows remain implemented, tested and eligible, but expect the
+liquidation and arb rows to carry the funnel on any chain without a public
+mempool.
+
 ## 1. Sandwich — `strategies/sandwich.rs`
 
 **Trigger.** A UniswapV2-style router swap in the mempool

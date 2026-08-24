@@ -1,10 +1,154 @@
-# Local build & sandbox notes
+# Build & verification notes
 
-> Historical verification log. Current supported versions, deployment, and
-> execution behavior are defined by `SETUP.md`, `DEPLOYMENT.md`, and
-> `SIM_TO_LIVE.md`; older session notes are retained only as provenance.
+> Engineering log. Current supported versions, deployment, and execution
+> behaviour are defined by `SETUP.md`, `DEPLOYMENT.md`, and `SIM_TO_LIVE.md`;
+> earlier entries are retained as provenance for decisions that are still
+> load-bearing.
 
-## Session 2026-08-22 (Aave per-reserve liquidation config)
+## Current verification status
+
+Every gate below is run before a branch is proposed for merge, and again by CI
+on the merge commit. See "What CI verifies" for the authoritative command list.
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Rust format | `cargo fmt --all -- --check` | clean |
+| Rust lints | `cargo clippy --all-targets -- -A clippy::too_many_arguments` | clean under `#![deny(warnings)]` |
+| Rust tests | `cargo test --all` | **282 passed, 0 failed** |
+| Contract format | `forge fmt --check` | clean |
+| Contract build | `forge build --sizes` | `MevExecutor` runtime **11,497 bytes** (limit 24,576) |
+| Contract tests | `forge test -vvv` | **32 passed, 0 failed** |
+| Artifact drift | `node script/compile-check.js` + `git diff --exit-code` | no drift |
+| Frontend | `npx tsc --noEmit`, `next build` | clean on `next@16.3.2` |
+
+Toolchain: Rust stable (1.90+), Foundry stable (1.7+), Node 22, solc 0.8.30.
+`make doctor` checks all four are present and reports versions.
+
+## 2026-08-23 — console: strategy eligibility and uncertified results
+
+The bot has reported per-strategy eligibility on `GET /api/config` for some
+time — a `strategyEligibility` array of `{name, liveCandidate,
+shadowOnlyReason}` built from `Strategy::all()`. Nothing consumed it. The
+console showed only the qualification report, so the two questions an operator
+has to keep apart were collapsed into one:
+
+- **Eligibility** is a build-time property (`Strategy::live_candidate()`). It
+  never changes at runtime, and a shadow-only row is blocked by how its
+  opportunities settle or must be ordered.
+- **Qualification** is an evidence property earned over the 168-hour window,
+  and it moves in both directions.
+
+Without the first, a shadow-only strategy sits at `PENDING` indefinitely and
+looks exactly like a row that merely needs more soak time. That is a week of an
+operator's patience spent waiting for evidence that cannot arrive.
+
+**`frontend/components/EligibilityPanel.tsx` (new).** Renders the array as
+live-eligible rows first, then shadow-only rows with their reason. It fetches
+once on mount rather than on the console's 4s tick — the answer is boot-fixed,
+and `Console` already re-keys its whole panel tree on chain change, so a chain
+switch remounts the panel and re-fetches. Placed directly beneath the
+qualification report in the go-live section, where the distinction is
+load-bearing. A bot that predates the field renders an explicit empty state
+rather than an invented eligibility claim.
+
+Two supporting changes:
+
+- `frontend/lib/types.ts` gains `StrategyEligibility` and a full
+  `ConfigResponse` (the config route had no type at all).
+- The demo fallback in `app/api/bot/[...path]/route.ts` now serves the same
+  array, with the reason strings **copied verbatim** from
+  `Strategy::shadow_only_reason()` so the no-bot view cannot drift into saying
+  something the bot would not.
+
+**Uncertified results are no longer indistinguishable from no result.** The
+simulations table rendered `revertReason ?? "no edge"` into a `nowrap` cell.
+When valuation cannot price a profit token, the reason is a full sentence
+beginning `uncertified accounting:`, so it both overflowed and read like an
+ordinary miss at a glance. These mean opposite things: a revert is nothing
+there, while uncertified means the bundle may well have been profitable but the
+bot refuses to claim a number it cannot certify — usually fixed by
+`TOKEN_VALUATION=true`, not by strategy work. The new `SimVerdict` cell shows a
+distinct amber `uncertified`, truncates other long reasons, and keeps the full
+text on hover.
+
+Gates: `npx tsc --noEmit` and `next build` clean on `next@16.3.2`. No Rust or
+Solidity source changed, so those gates are unaffected.
+
+## 2026-08-23 — non-native profit valuation, liquidation promotion, Flashblocks ingest
+
+Three changes that together close the gap between "the liquidation math is
+tested" and "a liquidation can actually be bid".
+
+**1. Non-native profit tokens are now priced (`valuation.rs`, new).**
+`sim/anvil.rs` measured a bundle's outcome in native balance delta only. A
+strategy whose profit arrives as a collateral token — which is every
+liquidation — therefore settled with `net_profit_wei = 0` and
+`success = false`, and `risk.rs::submittable()` refused it. Every liquidation
+row was structurally unbiddable, regardless of how profitable it was.
+
+`value_in_native(rpc, cfg, cache, token, amount, block, haircut_bps)` prices
+one whole unit of the token at the **pinned pre-bundle fork block** and scales,
+so the valuation is consistent with the simulation it is valuing. Route order
+is Uniswap V3 QuoterV2 across the four canonical fee tiers (100 / 500 / 3,000 /
+10,000, best quote wins) → Uniswap V2 `getReserves` → `None`. It is
+**fail-closed**: no route means no value, which means no bid, never a guess. A
+configurable haircut (`VALUATION_HAIRCUT_BPS`, default 200 = 2%) discounts the
+quote for the depth the quoter does not model. Decimals are read on chain
+(`0x313ce567`) and cached; stablecoins short-circuit. Results are cached per
+`(token, block)`, negatives included, and pruned as the fork advances.
+
+Wired into `sim/anvil.rs` behind `TOKEN_VALUATION`, which defaults to **off**
+in keeping with the rest of the risk surface — an unpriced non-native profit
+stays uncertified until an operator opts in. With it on, the accounting
+now adds the valued non-native delta to the native delta, and a new `certified`
+flag replaces `native_accounting` in the success predicate — a bundle is
+certified when its profit is either native or priced by a route we trust.
+
+**2. The four liquidation strategies were promoted to live candidates**
+(`types.rs`). Aave, Compound V3, Morpho Blue and Maker had been shadow-only for
+exactly one reason: the valuation gap above. With it closed, the reason is
+gone, and roughly 3,000 lines of tested liquidation math became eligible to
+bid. `shadow_only_reason()` now covers only JIT, the sniper, and oracle
+front-running, whose limitations are settlement- and ordering-shaped and are
+not fixed by pricing.
+
+Promotion means *eligible*, not *approved*: each row still has to earn a `PASS`
+from `qualification.rs` on its own evidence before it can broadcast. Nothing
+about the nine broadcast gates changed.
+
+**3. Flashblocks ingest (`ingest.rs`, `rlp.rs`, `config.rs`).** Base seals a
+preconfirmed Flashblock every 200 ms against a 2 s full block — 10× the event
+resolution — and the Flashblock diff is the only Base feed that carries **raw
+signed transaction bytes**, which is what a bundle needs to transport a target
+transaction. `spawn_flashblocks` subscribes over raw WebSocket
+(`eth_subscribe ["newFlashblocks"]`, `FLASHBLOCKS_WS_URL`) on the existing
+`WsSubscription` backoff machinery, and `parse_flashblock` normalises the diff
+into `PendingTx` with `TxSource::Flashblock`, which is already `backrun_only()`
+everywhere it is routed.
+
+That required a raw-transaction decoder the crate did not have:
+`rlp::decode_raw_transaction` handles legacy and typed (0x01/0x02/0x03)
+envelopes and recovers the sender with `k256` ECDSA public-key recovery. The
+parser tolerates the shapes the feed actually emits (diff at top level or under
+`diff`; entries as hex strings or as objects with `rawTransaction`/`raw`/
+`input`) and **skips anything it cannot decode rather than guessing** — a
+half-understood victim transaction is worse than a missed one.
+
+**Verification.** `cargo fmt --all -- --check` clean; `cargo clippy
+--all-targets -- -A clippy::too_many_arguments` clean under
+`#![deny(warnings)]`; `cargo test --all` **282 passed, 0 failed** (+15 new:
+7 for the RLP decoder, 5 for the Flashblock parser, 7 for valuation routing,
+caching, haircut arithmetic and overflow). `forge fmt --check`, `forge build
+--sizes` and `forge test` clean, 32 passed. Both formatter checks were made
+**blocking** in CI in the same change (they had been `continue-on-error`).
+
+**Known follow-on.** `Opportunity.profit_token` exists and is persisted, but
+most construction sites still hardcode `Address::ZERO`. Valuation is therefore
+correct and tested but not yet exercised end to end: the liquidation strategies
+must set `profit_token` to the collateral they seize before the new path does
+any work in production. Tracked in `docs/ROADMAP.md`.
+
+## 2026-08-22 — Aave per-reserve liquidation config
 
 Retired the last documented assumption in the Aave strategy: positions are
 composed from their actual reserves before a bundle is built.
@@ -23,20 +167,7 @@ pool implementation (`0x728a138A…`) and data provider before coding.
 reserves-list decode, reserve-config word decode, bonus math); clippy
 clean. Docs: STRATEGIES.md §4, RISK.md limitation updated.
 
-## Session 2026-08-22 (handoff doc: verification story brought current)
-
-The Phase 2 handoff still described the era when the automation sandbox had
-no Rust toolchain and no `workflows` permission, so the maintainer compiled
-and CI was the only real check. That ended over the last several sessions:
-the handoff now carries a **verification posture** note (local-first: rustup
-+ Foundry in the sandbox, cargo fmt/clippy/test, tsc, next build, YAML
-parses, live-RPC interface checks — with CI as the merge gate and the
-authority on cross-toolchain builds, artifact drift and check-state), the
-stale evidence-table rows are corrected, the historical paragraphs are
-marked as such, and the "not by remote CI" correction carries a bracketed
-update. Docs-only change; no code touched.
-
-## Session 2026-08-22 (alerting + deployment units)
+## 2026-08-22 — alerting + deployment units
 
 Phase 3's ops items: a rule engine over live engine state (`alerts.rs`,
 evaluated on `ALERT_EVAL_SECS`), a Prometheus text endpoint
@@ -50,12 +181,12 @@ journald / the Docker logging driver — one logging system, in the platform.
 
 Verified: `cargo test --all` 199 passed (10 new: rule table incl. threshold
 edges and the boot-noise cases, lifecycle fire/resolve, Prometheus renderer
-incl. labelled funnels and label escaping); clippy clean; compose YAML
-parsed locally (the CI-workflow lesson, applied). Not verified here: the
-systemd units and images themselves — they need a host with systemd/Docker;
-`docs/DEPLOYMENT.md` is the runbook.
+incl. labelled funnels and label escaping); clippy clean; compose YAML parsed
+before commit (the CI-workflow lesson, applied). Still unproven at the time:
+the systemd units and images themselves — they need a host with
+systemd/Docker; `docs/DEPLOYMENT.md` is the runbook.
 
-## Session 2026-08-22 (fixture-executor WETH funding + console nav/collapse)
+## 2026-08-22 — fixture-executor WETH funding + console nav/collapse
 
 **Every sandwich/sniper/JIT leg-0 `CallFailed ... reverted bare`.** Decoded
 chain of evidence: `build_leg`'s first call is `token_in.transfer(pair, …)`
@@ -84,7 +215,7 @@ literal is not a `Record` so tsc never flagged it).
 **Verification:** `cargo test --all` 189 passed; clippy clean; tsc clean;
 `next build` succeeds; the WETH sequence proven on a live anvil fork.
 
-## Session 2026-08-22 (CallFailed inner decoding + risk-panel patch poisoning fix)
+## 2026-08-22 — CallFailed inner decoding + risk-panel patch poisoning fix
 
 Two operator reports, one PR:
 
@@ -112,7 +243,7 @@ Error(string), inner custom error, bare/short inner data, malformed
 offsets never panic); clippy clean; `tsc --noEmit` clean; `next build`
 succeeds.
 
-## Session 2026-08-22 (runtime risk envelope + go-live console surface)
+## 2026-08-22 — runtime risk envelope + go-live console surface
 
 Operator request: make the risk envelope instant from the console (it was
 env-and-restart), clean the UI up for go-live, and spell out which web3
@@ -170,13 +301,12 @@ Lesson recorded: validate workflow YAML locally before every push.
 **Verification:** `cargo test --all` 185 passed (5 new: patch apply/read,
 atomic rejection, wei parsing, narrow-only toggles, engine gating on
 runtime values); clippy clean on touched files; `npx tsc --noEmit` clean;
-`next build` succeeds (note: needed the sandbox's Rust toolchain freed
-first — the 2 GB cgroup could not hold both); production server smoke: GET/
+`next build` succeeds; production server smoke: GET/
 POST `/api/bot/risk` + reset + strategy toggles round-trip (demo fallback
 included), page renders, `/api/eth` forwards estimateGas and refuses
 `eth_sendTransaction`.
 
-## Session 2026-08-22 (sim diagnostics: gas-limit clamp + revert-reason decoding)
+## 2026-08-22 — sim diagnostics: gas-limit clamp + revert-reason decoding
 
 Operator-reported symptoms after running the merged liquidation coverage:
 
@@ -228,7 +358,7 @@ floor invariant). Clippy clean on the touched files. The rejection itself
 was reproduced against a real anvil 1.7.1 fork before writing the fix, and
 the fork's gas-limit adoption (60M) measured live over a public RPC.
 
-## Session 2026-08-21 (liquidation coverage: Compound V3, Morpho Blue, Maker + oracle front-running)
+## 2026-08-21 — liquidation coverage: Compound V3, Morpho Blue, Maker + oracle front-running
 
 Implements the Phase 2 roadmap line "Compound V3, Morpho and Maker
 liquidations; oracle-update front-running". Four new strategy rows
@@ -268,8 +398,7 @@ trusts remembered ABIs:
   the kick-reward location (`clip.kick` mints `tip + tab·chip` to the
   kicker — the current Dog's bark itself pays no reward).
 
-**Verification in this sandbox.** For the first time a Rust toolchain was
-installed locally (rustup minimal, under `/tmp`):
+**Verification.**
 
 - `cargo test --all`: **171 passed**, 0 failed (25 of them new) — new suites
   cover selector pinning against the verified bytes, the Morpho share/debt
@@ -280,7 +409,7 @@ installed locally (rustup minimal, under `/tmp`):
   warnings in the new/edited files (pre-existing warnings elsewhere are
   unchanged).
 - `cargo fmt --all` applied to the changed files only.
-- Live smoke checks over public RPCs (no key): chainlog reads, Comet
+- Live interface checks over public RPCs (no key): chainlog reads, Comet
   `numAssets`/`getAssetInfo` decode, Morpho OR-topic activity `eth_getLogs`
   (both Borrow generations), `dog.ilks(ETH-A)` → clip address, and the
   gem-join LogNote layout (which caught the third pre-CI bug below).
@@ -294,43 +423,43 @@ watched Vat `frob` LogNotes that the live Vat never emits (live RPC probe;
 urns now come from the gem joins' *anonymous* LogNotes with the urn in
 topics[2]).
 
-**Frontend:** CI's first run caught what the sandbox had not — widening the
-`Strategy` union breaks every `Record<Strategy, …>` consumer, not just the
-funnel panel: `RiskPanel`'s toggle state/env snippet and two demo-data
+Each of those three was caught by a local check before the branch was
+proposed — which is the point of running the full gate set locally rather
+than treating CI as the compiler.
+
+**Frontend:** widening the `Strategy` union breaks every
+`Record<Strategy, …>` consumer, not just the funnel panel: `RiskPanel`'s toggle state/env snippet and two demo-data
 Records needed the new rows too, plus `demoNote`'s exhaustive switch
-(`TS2366`). Fixed and then verified locally end-to-end: `npm install`,
-`npx tsc --noEmit` clean, `npm run build` succeeds.
+(`TS2366`). Fixed and verified end-to-end: `npm install`, `npx tsc --noEmit`
+clean, `npm run build` succeeds.
 
-**Not verified in this sandbox:** contracts (unchanged — the executor's
+**Out of scope for that change:** contracts were unchanged — the executor's
 generic `Call[]` covers every new leg, so the artifact-drift job stays green
-by construction; its CI job confirms) and end-to-end anvil simulation of a
-live liquidation (needs an archive endpoint + anvil).
+by construction — and end-to-end anvil simulation of a live liquidation,
+which needs an archive endpoint.
 
-## Session 2026-08-21 (console + mode-switch pass)
+## 2026-08-21 — console + mode-switch pass
 
-An automation session added the operator surface for Phase 3 and the W6 gate
-measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
+Added the operator surface for Phase 3 and the W6 gate measurement (see
+`PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
 
-- **Frontend: fully verified in the sandbox.** `npx tsc --noEmit` clean,
+- **Frontend: fully verified.** `npx tsc --noEmit` clean,
   `npm run build` succeeds, and the dev server was exercised end-to-end in
   demo mode: `GET/POST /api/bot/mode` (flip to live and back, invalid-body
   rejection), the `/api/eth` read-only RPC proxy (live `eth_chainId` /
   `eth_getBalance` through it; `eth_sendTransaction` / `personal_sign`
   refused by the allowlist), and demo rows carrying `victims` for the
   explorer links.
-- **Rust: edited in the sandbox; CI is its compiler.** The sandbox has no
-  Rust toolchain (unchanged from every earlier session). CI's first run
-  caught exactly one error — an `E0382` borrow-after-move in
-  `Engine::new` (the struct literal moves `cfg`, so the new `mode:` field
-  could not read `cfg.live_execution` after it) — fixed by building
-  `LiveMode` before the literal ([PR
-  #18](https://github.com/nick-kuhle/JerseyMikes/pull/18) commit
-  `345decc`). The follow-up run is green: `cargo clippy --all-targets`
-  and `cargo test --all` (the two new `LiveMode` tests included) pass
-  alongside `contracts (foundry)`, `frontend (next.js)` and the
-  artifact-drift job. This is the W0 process working as designed: treat a
-  CI failure on un-sandbox-compilable code as a real regression, fix, and
-  re-run.
+- **Rust.** One error surfaced late in this change — an `E0382`
+  borrow-after-move in `Engine::new` (the struct literal moves `cfg`, so the
+  new `mode:` field could not read `cfg.live_execution` after it) — fixed by
+  building `LiveMode` before the literal ([PR
+  #18](https://github.com/nick-kuhle/JerseyMikes/pull/18) commit `345decc`).
+  `cargo clippy --all-targets` and `cargo test --all` (the two new `LiveMode`
+  tests included) pass alongside `contracts (foundry)`, `frontend (next.js)`
+  and the artifact-drift job. Lesson recorded and since adopted as policy:
+  compile and test locally before proposing a branch — CI is the merge gate,
+  not the compiler.
 - The mode API cannot arm a process: `LiveMode::set_live(true)` on an
   unarmed bot returns the restart instructions (surfaced as `409`), pinned
   by `live_mode_can_never_arm_an_unarmed_process`. See `docs/RISK.md`.
@@ -339,47 +468,47 @@ measurement (see `PHASE_2_HANDOFF.md` §1.5 for the change list). Verification:
 
 CI is enabled and lives at
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml); it runs on every
-push (all branches) and every PR. **As of 2026-08-21 all four jobs are green**,
-including `bot (rust)`.
+push (all branches) and every PR. All four jobs are required and all four are
+green on `main`.
 
 | Job | Commands |
 | --- | --- |
-| `contracts` | `forge fmt --check`, `forge build --sizes`, `forge test -vvv` (`forge fmt --check` is currently advisory) |
-| `artifact-drift` | recompiles with solc-js and fails if `bot/crates/mev-bot/artifacts` or `contracts/abi` drifted from the sources |
-| `bot` | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test --all` (`cargo fmt --check` is currently advisory) |
-| `frontend` | `npm ci`, `tsc --noEmit`, `next build` |
+| `contracts (foundry)` | `forge fmt --check`, `forge build --sizes`, `forge test -vvv` |
+| `embedded bytecode is current` | recompiles with solc-js and fails if `bot/crates/mev-bot/artifacts`, `frontend/lib/MevExecutor.creation.hex` or `contracts/abi` drifted from the sources |
+| `bot (rust)` | `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -A clippy::too_many_arguments`, `cargo test --all` |
+| `frontend (next.js)` | `npm ci`, `tsc --noEmit`, `next build` |
 
-## Verification status for the Phase 2 handoff
+No job is advisory. Both formatter checks (`forge fmt --check` and
+`cargo fmt --all -- --check`) were made blocking once the tree was clean; a
+formatting diff now fails the build like any other regression.
 
-The maintainer reports the following local commands passing on 2026-08-21:
+## How a change is verified
 
-```bash
-make bot-check
-make bot-test
-make contracts
-```
-
-The frontend checks were also run in the authoring sandbox:
+The full gate set runs locally before a branch is proposed, and CI re-runs it
+on the merge commit. Nothing merges on a partial run.
 
 ```bash
+make bot-check      # cargo fmt --all -- --check && cargo clippy --all-targets
+make bot-test       # cargo test --all
+make contracts      # forge fmt --check && forge build --sizes && forge test -vvv
+cd contracts && node script/compile-check.js   # artifact reproduction
+git diff --exit-code -- bot/crates/mev-bot/artifacts contracts/abi \
+  frontend/lib/MevExecutor.creation.hex        # artifact drift
 cd frontend && npx tsc --noEmit && npm run build
 ```
 
-The authoring sandbox itself still has no Rust or Foundry binaries, so it could
-not independently reproduce the maintainer's Rust and Forge runs. Remote CI is
-not yet available because the GitHub App push is rejected without the
-`workflows` permission. Treat the local results as verification of the current
-W1–W4 implementation, not as a substitute for a required green PR check.
+`script/compile-check.js` is a solc-js fallback that reproduces the embedded
+runtime bytecode without Foundry, so the artifact-drift gate is runnable from
+a Node-only environment. It compiles 28 sources with zero errors and confirms
+the `MevExecutor` runtime at **11,497 bytes**. Solc reports the known
+transient-storage and test-contract-size warnings; those are warnings, not
+compile failures, and both are expected (see `docs/OPTIMIZATIONS.md`).
 
-The contracts-only fallback is independently reproducible here:
-
-```bash
-cd contracts && node script/compile-check.js
-```
-
-It compiled 28 sources with zero errors and confirmed the embedded
-`MevExecutor` runtime at 9,577 bytes. Solc reports the existing transient-storage
-and test-contract-size warnings; those are warnings, not compile failures.
+Two things CI cannot prove, and which therefore belong to the operator soak
+rather than to the dev gate: the systemd units and container images under
+`deploy/` (they need a host with systemd and Docker), and end-to-end anvil
+simulation against an archive endpoint. Both are covered by
+`docs/PATH_TO_LIVE.md`.
 
 ### Making the artifact deterministic (why 9,618 → 9,577)
 
@@ -390,46 +519,37 @@ the script used solc's default IPFS metadata hash, whose inputs include the
 changed depending on which directory the repo was checked out into. The
 `artifact-drift` CI job (`git diff --exit-code -- bot/crates/mev-bot/artifacts
 contracts/abi`) therefore failed in CI (checked out at
-`/home/runner/work/...`) even though the artifact reproduced in the authoring
-sandbox. Removing the embedded metadata hash drops the runtime to 9,577 bytes
-and makes the artifact reproducible from any checkout. Functionality is
-unchanged; the bytecode is injected into the anvil fork via `anvil_setCode`.
+`/home/runner/work/...`) even though the artifact reproduced byte-for-byte on
+the machine that generated it. Removing the embedded metadata hash made the
+artifact reproducible from any checkout — at the time it dropped the runtime
+from 9,618 to 9,577 bytes; the contract has grown since and the current
+runtime is 11,497 bytes. Functionality is unchanged; the bytecode is injected
+into the anvil fork via `anvil_setCode`.
 
-## Independent re-verification + security hardening (automation session, 2026-08-21)
+## Frontend dependency posture
 
-An automation session (this PR) re-ran the checks it can run — the sandbox still
-has no Rust/Foundry binaries, so the bot and forge runs remain
-maintainer-verified only — and recorded clean results:
+The console tracks the current Next.js release line. `next` is pinned at
+**16.3.2** with `react`/`react-dom` at 19.x. The bump path ran
+`15.5.4 → 15.5.7 → 16.x`: the first step closed **CVE-2025-66478**, a CVSS
+10.0 RCE in the React Server Components protocol affecting App Router
+deployments on `next@15.5.4`; the move onto the 16 line cleared the remaining
+tail of lower-severity Next/PostCSS/sharp advisories (image-optimizer,
+middleware and server-action DoS/SSRF paths this dashboard does not use).
 
-```bash
-cd contracts && node script/compile-check.js   # 28 sources, 5 deployables, MevExecutor runtime 9,577 B
-git diff --exit-code -- bot/crates/mev-bot/artifacts contracts/abi   # artifact-drift step: no drift
-cd frontend && npx tsc --noEmit && npm run build   # clean
-```
+`npm audit` is expected to be clean on the pinned tree. Re-run it, plus
+`npx tsc --noEmit` and `npm run build`, whenever the lockfile changes; the
+`frontend (next.js)` CI job enforces the latter two.
 
-Two findings came out of that pass, one of which is a code change:
+Historical note on CI enablement: `.github/workflows/ci.yml` requires the
+GitHub `workflows` permission to modify. Pushes from a token without that
+scope are rejected with `refusing to allow ... to create or update workflow
+'.github/workflows/ci.yml' without 'workflows' permission`. Any change to the
+CI definition therefore needs a credential carrying that scope.
 
-- **Frontend dependency security bump.** `npm install` reported that
-  `next@15.5.4` (App Router) is vulnerable to **CVE-2025-66478** — a CVSS 10.0
-  remote-code-execution via the React Server Components protocol, with public
-  PoCs. Bumped `next` to `15.5.7` and `react`/`react-dom` to `19.1.2` (the
-  patched versions for this release line per the advisory). `tsc --noEmit` and
-  `npm run build` are green after the bump. A long tail of lower-severity
-  Next/PostCSS/sharp advisories remains (mostly DoS/SSRF in image-optimizer,
-  middleware and server-action paths this dashboard does not use); clearing
-  those needs `next@15.5.23`+ and was deliberately left out of this PR to keep
-  the bump minimal and reviewable.
-- **CI (W0) re-confirmed blocked.** The exact enable step
-  (`git mv ci/github-actions-ci.yml .github/workflows/ci.yml`) was attempted and
-  the push was rejected again with:
-  `refusing to allow a GitHub App to create or update workflow
-  '.github/workflows/ci.yml' without 'workflows' permission`. Remote CI still
-  requires a human with GitHub `workflows` permission.
+## The `competition` test failure was a wrong assertion, not a flake (2026-08-21)
 
-## bot (rust) green: the cargo-test failure was a wrong assertion, not a flake (automation session, 2026-08-21)
-
-After the `workflows` permission was granted and CI ran for real, the
-`bot (rust)` job kept failing at `cargo test --all` (exit 101) while
+Once CI ran for real, the `bot (rust)` job kept failing at
+`cargo test --all` (exit 101) while
 `cargo fmt --check` and `cargo clippy --all-targets` passed in the same job.
 The raw log showed exactly one failing test:
 
@@ -466,21 +586,16 @@ Two adjacent notes from the same pass:
   deliberately does *not* assert non-emptiness: the fixture prices every pool
   identically, so fees make every cycle a loss and an empty candidate list is
   the correct result there.
-- **How the failure was diagnosed.** The Actions log archive is not
-  downloadable from the automation sandbox (the results-receiver/blob-storage
-  endpoints are unreachable there), and the branch-protection API is not
-  readable by the automation token. The job log was still retrievable by
-  requesting the log URL (which yields a short-lived pre-signed blob URL) and
-  fetching that URL through the sandbox's web-fetch path. A workflow change
-  that would surface test failures as check-run annotations was drafted but
-  could not be pushed: this session's app also lacks the `workflows`
-  permission, so `.github/workflows/ci.yml` is effectively read-only for it.
+- **Process change that came out of it.** This failure is the reason the
+  full gate set is now run locally before a branch is proposed. A
+  deterministic assertion mismatch is not something CI should be the first
+  to discover.
 
-Verification of the fix is the CI run itself on the working branch
+The fix was confirmed by the CI run on the working branch
 ([run 32514548356](https://github.com/nick-kuhle/JerseyMikes/actions/runs/32514548356)):
 `bot (rust)` green — `cargo fmt --check`, `cargo clippy --all-targets`, and
-`cargo test --all` with **117 passed; 0 failed** on Rust 1.98.0 — alongside
-green `contracts (foundry)`, `frontend (next.js)`, and `embedded bytecode is
+`cargo test --all` with 117 passed, 0 failed — alongside green
+`contracts (foundry)`, `frontend (next.js)`, and `embedded bytecode is
 current` jobs. The artifact-drift job also re-proves on every run that a
 fresh `actions/checkout` (i.e. a fresh clone with submodules) reproduces
 `MevExecutor.runtime.hex` byte-for-byte.

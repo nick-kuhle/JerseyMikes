@@ -51,11 +51,28 @@ Defaults are 30 samples/comparisons, 20% error tolerance, and 80% accuracy.
 Restart downtime is visible as an observation gap because the qualification
 window comes from canonical block records in SQLite, not process uptime.
 
-Only `sandwich`, `sandwich_v3`, and `atomic_arb` currently have the engineering
-properties required to become live candidates (atomic settlement into the
-profit token and an executor-enforced retained-profit guard). Every other
-strategy is still reported independently, but remains `INSUFFICIENT SAMPLE`
-with its engineering limitation until that limitation is implemented.
+The rows with the engineering properties required to become live candidates —
+atomic settlement into a **valuable** profit token and an executor-enforced
+retained-profit guard — are `sandwich`, `sandwich_v3`, `atomic_arb`, and the
+four liquidations (`liquidation`, `liquidation_compound`, `liquidation_morpho`,
+`liquidation_maker`).
+
+The liquidations were promoted once non-native profit tokens could be priced.
+A liquidation settles in seized collateral, not ETH; until `valuation.rs`
+existed, the simulator measured native balance delta only, so those bundles
+recorded `net_profit_wei = 0` and could never clear `min_net_profit_wei`. The
+profit token is now valued in native terms at the pinned pre-bundle fork block
+(V3 QuoterV2 across the four canonical fee tiers, then V2 reserves, then fail
+closed with no value and therefore no bid), less `VALUATION_HAIRCUT_BPS`.
+
+`jit`, `sniper` and `oracle_frontrun` remain shadow-only, and pricing does not
+help them: their limitations are settlement- and ordering-shaped rather than
+valuation-shaped. `Strategy::shadow_only_reason` carries the specific reason
+for each, and it is reported on the row.
+
+Being a live candidate is eligibility, not approval. Every row is still
+reported independently and stays `INSUFFICIENT SAMPLE` until its own evidence
+satisfies the six conditions above.
 
 ## Pre-flight order
 

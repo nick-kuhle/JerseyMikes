@@ -121,7 +121,7 @@ flash-loan arbitrage, a full sandwich round trip, and access control.
 
 ```bash
 cd contracts && forge test -vvv
-# no Foundry? a solc-only type-check + artifact regeneration:
+# solc-only type-check + artifact regeneration (no Foundry required):
 node script/compile-check.js
 ```
 
@@ -286,16 +286,33 @@ to measure what is reachable, not to be profitable. See
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
 | [`docs/BASE_SAFETY_FOUNDATION.md`](docs/BASE_SAFETY_FOUNDATION.md) | Base upgrade behavior: raw acceptance, cancellation, gas-at-risk smoke, qualification migration |
 | [`docs/BASE_REVENUE_PATH_WORK_ORDER.md`](docs/BASE_REVENUE_PATH_WORK_ORDER.md) | Successor work order for Flashblocks state semantics, V3/Aerodrome execution, independent qualification and Base smoke |
-| [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies and what the authoring sandbox could not |
+| [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies, the current gate results, and the engineering log |
 
 ## Status
 
-The repository now contains the production relay path, but all execution
-defaults remain off. Current engineering live candidates are V2 sandwich, V3
-sandwich, and atomic arbitrage; each must independently earn a `PASS` from
-continuous canonical fork/relay/on-chain accuracy evidence. Other strategy rows
-remain visible and explicitly ineligible until their documented settlement or
-valuation limitation is removed.
+The repository contains the production relay path, and all execution defaults
+remain off until an operator arms them.
+
+Current live candidates are V2 sandwich, V3 sandwich, atomic arbitrage, and the
+four liquidation rows (Aave, Compound V3, Morpho Blue, Maker). The liquidations
+were promoted once non-native profit tokens could be priced: `valuation.rs`
+values a strategy's profit token in native terms at the pinned pre-bundle fork
+block (Uniswap V3 QuoterV2 across the four canonical fee tiers, falling back to
+V2 reserves, fail-closed to no-bid), so a liquidation paid in a collateral
+token now produces a real `net_profit_wei` instead of zero.
+
+Being a live *candidate* is a necessary condition, not a sufficient one. Each
+row must still independently earn a `PASS` from continuous canonical
+fork/relay/on-chain accuracy evidence (`docs/RISK.md`, "qualification"). JIT
+liquidity, the sniper, and oracle front-running remain explicitly ineligible:
+each has a documented settlement or ordering limitation that no amount of
+runtime evidence removes.
+
+Development is complete through the production gate: the four CI jobs are
+green and blocking, the qualification gate is implemented and enforced, and the
+operator surface is finished. What remains before real money is an **operator**
+exercise — the live-smoke burst and the soak period described in
+[`docs/PATH_TO_LIVE.md`](docs/PATH_TO_LIVE.md) — not further development.
 
 Production operations include separate transaction/reputation signers,
 multi-relay same-UUID retries and cancellation, durable serialized nonce

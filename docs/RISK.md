@@ -106,6 +106,8 @@ Set in the environment; see `.env.example`.
 | `LIVE_SMOKE_MAX_GAS_COST_WEI` | `0` (raw smoke off) | Raw mode only: durable cap on the sum of each attempted smoke payload's `gasLimit × maxFeePerGas`. |
 | `RAW_CANCEL_BUMP_BPS` | `1250` | Raw replacement bump over both original EIP-1559 fee caps (12.5%). |
 | `RAW_CANCEL_MAX_FEE_WEI` | `500 gwei` | Hard `maxFeePerGas` ceiling for cancellation; exceeding it fails closed. |
+| `TOKEN_VALUATION` | `false` (off) | Price non-native profit tokens in native terms so the bundle can be netted against gas. Off means such profits stay uncertified and are never submitted. |
+| `VALUATION_HAIRCUT_BPS` | `200` (2%) | Discount applied to a quoted valuation. Clamped to `10000`. |
 
 The names are wei- or bps-denominated on purpose. `MIN_NET_PROFIT_ETH`,
 `MAX_BASE_FEE_GWEI`, `MAX_DRAWDOWN_ETH`, and `BUILDER_SHARE_BPS` are **not**
@@ -124,6 +126,44 @@ tightening order once there is data:
 3. Turn on `MAX_DRAWDOWN_WEI`.
 4. Drop `BRIBE_BPS` and watch inclusion rate — this is the parameter with the
    most money in it.
+
+### Valuing a profit that is not ETH
+
+A liquidation is paid in seized collateral. The simulator's accounting is a
+balance delta, so before a token could be priced, such a bundle netted to
+**zero** and could never clear `MIN_NET_PROFIT_WEI` — which is why every
+liquidation strategy was shadow-only despite the math being correct and tested.
+
+`valuation.rs` closes that gap, and the way it is written is the risk-relevant
+part:
+
+- **Pinned to the pre-bundle fork block.** The token is priced at the same
+  block the bundle is simulated against, never at `latest`. Pricing at
+  `latest` would let the market move between simulating and valuing, and the
+  resulting number would describe no moment that ever existed.
+- **Route order: Uniswap V3 QuoterV2 across the four canonical fee tiers
+  (100 / 500 / 3,000 / 10,000, best quote wins) → Uniswap V2 `getReserves` →
+  nothing.** QuoterV2 is a real `eth_call` against real pool state, not a
+  reserve approximation.
+- **Fail-closed.** No route means no value, which means no bid. The bot never
+  substitutes an estimate, an oracle price, or a stale cache entry for a quote
+  it could not obtain. A bundle whose profit cannot be priced is reported as
+  uncertified and is not submittable.
+- **Haircut.** `VALUATION_HAIRCUT_BPS` (default 2%) discounts the quote.
+  A quoter prices a trade in isolation and assumes the pool it reads; by the
+  time the bundle lands the pool may be thinner, and someone still has to sell
+  the collateral. Raise it for illiquid collateral.
+- **One unit, then scale.** Each `(token, block)` is priced once for one whole
+  unit and scaled, with results cached — negatives included — and pruned as
+  the fork advances. That bounds the RPC cost of the path.
+- **Off by default.** `TOKEN_VALUATION=false` matches the rest of the risk
+  surface: anything that converts an estimate into a bid is opt-in.
+
+The residual risk this leaves is honest and worth stating: a QuoterV2 quote is
+still a quote, not a fill. It does not model the price impact of the
+liquidation itself competing with other liquidators in the same block, and it
+assumes the collateral can be exited at roughly the quoted depth. The haircut
+is the margin for that, and it is a parameter rather than a proof.
 
 ## Known limitations
 
@@ -147,6 +187,16 @@ tightening order once there is data:
 - **Inclusion probability is a ranking, not a forecast.** `inclusion_p` is
   a logistic of our bribe versus the realised builder payment. It does not
   model other searchers, builder preference, or relay connectivity.
+- **A valuation is a quote, not a fill.** See above: the non-native profit
+  path prices collateral with a block-pinned quoter call and a haircut. It
+  does not model the exit trade, nor other liquidators bidding for the same
+  collateral in the same block.
+- **`Opportunity.profit_token` is not yet set at every construction site.**
+  The field exists and is persisted, and the valuation path that consumes it
+  is implemented and tested, but most sites still write `Address::ZERO`. Until
+  the liquidation strategies populate it, those bundles continue to report as
+  native-only. This is a known open item, tracked in `ROADMAP.md`; it fails in
+  the safe direction (a profit is under-counted, never over-counted).
 
 ## Operational notes
 

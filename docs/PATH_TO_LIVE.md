@@ -3,7 +3,18 @@
 **Audience:** the on-call operator and the engineer sitting next to them.
 **Goal:** fire **one or two real** `eth_sendBundle`s as soon as the box is
 wired, then disarm and start the seven-day soak.
-**Date:** 2026-08-22.
+
+> **This document begins where development ends.** Everything here is an
+> *operator* procedure run against a finished, released build — the four CI
+> jobs green, `mev-bot doctor` clean on the target host, no open code items on
+> the live path. The soak is a measurement period, not a late development
+> phase: it answers "does this correct system make money here, safely, over
+> time", not "is the system finished".
+>
+> If a soak surfaces a code defect, that is a build-phase escape. Stop the
+> soak, ship the fix through CI, and **restart the soak clock at zero** — a
+> qualification verdict is only evidence about the exact build that produced
+> it. Do not patch a running soak.
 
 This is the only page you need in the room. The other docs are companions,
 not prerequisites:
@@ -34,7 +45,8 @@ Default is `LIVE_SMOKE_MAX=0` (off). The binary hard-caps it at **5**.
 Smoke still refuses to send unless **every other gate** is green:
 
 1. live (not replay) lane
-2. engineering live-candidate strategy (`sandwich` / `sandwich_v3` / `atomic_arb`)
+2. engineering live-candidate strategy (`sandwich` / `sandwich_v3` /
+   `atomic_arb` / the four `liquidation*` rows)
 3. risk + inventory (searcher has gas ETH; flash-loan arb needs no executor WETH)
 4. boot arming: `LIVE_EXECUTION=true` **and** the literal `I_UNDERSTAND_LIVE_RISK=yes`
 5. `BROADCAST_ENABLED=true`

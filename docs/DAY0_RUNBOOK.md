@@ -6,6 +6,19 @@ finishes and `GET /api/qualification` shows `PASS`, going live is **three env
 vars, one restart, one console toggle** — zero code changes, zero contract
 redeployments, zero database wipes.
 
+> **Prerequisite: development is done before Day 0 starts.** This runbook is
+> owned by operators and testers, and it assumes a released build: all four CI
+> jobs green on the tagged commit, no open code items on the live path, and
+> the deployment units in `deploy/` ready to install. Engineering does not
+> "finish during the soak" — the whole point of the fixed 7-day window is that
+> every hour of it measures the *same* binary.
+>
+> The clock is unforgiving by design. Any code change to the bot restarts the
+> soak at zero, because qualification evidence is only evidence about the
+> build that produced it. Deciding to ship a fix mid-soak is therefore
+> deciding to spend another seven days, and that trade is the operator's to
+> make deliberately, not to stumble into.
+
 Companions: [`GO_LIVE.md`](GO_LIVE.md) (deploying `MevExecutor`),
 [`SIM_TO_LIVE.md`](SIM_TO_LIVE.md) (what changes between lanes),
 [`DEPLOYMENT.md`](DEPLOYMENT.md) (server hardening, backups),
@@ -99,11 +112,13 @@ the CTO-recommended baselines — tighten from data, not vibes):
 | `INVENTORY_GATE` | `true` (forced on when live anyway) | Verify searcher/executor balances pre-broadcast |
 | `MAX_GAS_PER_BUNDLE` | default `3000000` | Clamped to `[21000, 16777216]` — the upper bound is the EIP-7825 per-tx protocol cap; a tx above it is invalid regardless of the 60M block limit |
 
-Strategy funnel check: `sandwich`, `sandwich_v3`, `atomic_arb` are the
-live-eligible lanes; everything else is shadow-only by design
-(`Strategy::shadow_only_reason`). The UniversalRouter decoding decision
-(`DECODE_UNIVERSAL_ROUTER`) stays `false` until `W6_MEMO.md` is filled in
-from funnel-week data.
+Strategy funnel check: the live-eligible lanes are `sandwich`, `sandwich_v3`,
+`atomic_arb`, and the four liquidation rows (`liquidation`,
+`liquidation_compound`, `liquidation_morpho`, `liquidation_maker`). `jit`,
+`sniper` and `oracle_frontrun` are shadow-only by design
+(`Strategy::shadow_only_reason` names the reason for each). Live-eligible
+means the row *may* earn a `PASS`; it still has to. `DECODE_UNIVERSAL_ROUTER`
+stays `false` — that decision is made and recorded in `W6_MEMO.md`.
 
 ## Phase 3b — optional live-smoke burst (one or two real sends)
 
@@ -164,7 +179,10 @@ Verify daily against the API:
   of matches.
 - `journalctl -u mev-db-backup.service` → snapshots landing every 15 min.
 
-A restart does **not** reset the clock — only losing the database does.
+A restart does **not** reset the clock — the qualification window is computed
+from canonical block records in SQLite, not from process uptime. Two things do
+reset it: losing the database, and **shipping a new bot build**. The second is
+the reason development has to be finished before Day 0.
 
 ## Day 7 — the money switch
 
@@ -196,7 +214,9 @@ Broadcast halts at the next gate check; the shadow lanes keep running.
 
 ## Open decisions (data-gated, do not guess)
 
-- **W6** — `DECODE_UNIVERSAL_ROUTER` stays `false` until `W6_MEMO.md` is
-  answered from funnel-week data (the W6 gap card in the console tracks it).
+- **W6 — decided, no operator action.** `DECODE_UNIVERSAL_ROUTER` stays
+  `false`; the rationale is written up in `W6_MEMO.md`. The console's W6 gap
+  card still renders the reading, so a contradicting observation can reopen
+  it — report one if you see it, but do not flip the flag during a soak.
 - **W4** — `ARB_MAX_CYCLE_LEN` stays `3`; raise to 4–5 only when
   `atomic_arb.candidatesEmitted` is saturated at 3.

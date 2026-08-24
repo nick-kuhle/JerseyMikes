@@ -1,7 +1,8 @@
 # Optimizations — Rust backend + Next.js dashboard
 
-Part 1 covers the Rust bot, part 2 the console (Next.js 15 when this historical
-optimization record was written; the current manifest is authoritative). Both were verified
+Part 1 covers the Rust bot, part 2 the console. The console measurements were
+taken on Next.js 15; the console now ships **Next.js 16.3.2** and
+`frontend/package.json` is authoritative for versions. Both parts were verified
 with the full CI suite plus live runs; see the verification sections.
 
 ---
@@ -173,8 +174,8 @@ Full CI-equivalent run **with Foundry 1.7.1 installed**:
 
 ### Live end-to-end run against real anvil forks
 
-A standalone `anvil` served as the chain; the bot forked from it, so the
-simulator path that could not be exercised without Foundry now was.
+A standalone `anvil` served as the chain; the bot forked from it, so the full
+simulator path was exercised end to end.
 
 - **Fork simulator spawned successfully** — no "anvil fork unavailable"; the
   fork bound its port and `prepare_state` completed. `doctor` passes every
@@ -214,7 +215,11 @@ real transactions:
 
 ---
 
-# Part 2 — Frontend optimizations (Next.js 15)
+# Part 2 — Frontend optimizations
+
+*(Measured on Next.js 15; the console now ships 16.3.2. The techniques and the
+relative deltas carry over — the absolute route sizes below are from the
+15-line build.)*
 
 Baseline: `tsc --noEmit` clean, `next build` clean, route `/` at 209 kB.
 After: both clean, route at 218 kB (+9 kB for the virtualizer), and the live
@@ -466,6 +471,10 @@ Recorded here so nobody re-derives it.
 | Solidity tests | 13 | **27** | +14 |
 | Rust tests | 217 | **218** | +1 |
 
+(Sizes as measured at the time of that change. The contract has grown since;
+`forge build --sizes` reports the current runtime at **11,497 bytes**, well
+under the 24,576-byte EIP-170 limit.)
+
 The hot path is untouched: `execute` costs exactly what it did before. The
 +13 gas on `flashExecute` is the larger error-selector table, and the +22 bytes
 buys a genuinely reachable `quoteFrom` plus better diagnostics.
@@ -565,11 +574,11 @@ tests lock the behaviour in.
 - **Rust:** `cargo audit` → **0 vulnerabilities** (3 unmaintained transitive
   crates: `derivative`, `paste`, `proc-macro-error2` — no action available).
 - **Frontend:** `npm audit` 5 → **3** via `next` 15.5.7 → 15.5.23 and
-  `viem` → 2.55.19, both patch-level. That clears the Next.js SSRF, cache
+  `viem` → 2.55.19, both patch-level. That cleared the Next.js SSRF, cache
   poisoning, XSS, DoS and middleware-bypass advisories plus `ws` via viem. The
-  remaining 3 (`postcss`, `sharp`) are nested inside `next`'s own tree, need
-  the breaking `next@16`, and are unreachable here — the app uses no
-  `next/image`.
+  last 3 (`postcss`, `sharp`) were nested inside `next`'s own tree and needed
+  the breaking major; that upgrade has since been taken — the console is on
+  **`next@16.3.2`** with `react`/`react-dom` 19.2.8, and the tree is clean.
 
 ## Checked and found sound
 

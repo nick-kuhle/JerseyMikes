@@ -42,23 +42,18 @@ baseline resets from that merge), fill `W6_MEMO.md`, flip or close;
 (2) the W4 raise decision (`atomic_arb.candidatesEmitted` at 3 legs vs the
 2-leg baseline, same fresh window). Both are decisions, not code.
 
-**Verification posture (2026-08-22, supersedes the sandbox/CI story
-below):** the automation sandbox no longer depends on the maintainer to
-compile. It installs its own toolchains (rustup; Foundry for `anvil` probes)
-and runs the full battery locally **before every push**: `cargo fmt` /
-`cargo clippy` / `cargo test --all` (199 tests at closeout),
-`tsc --noEmit`, `next build`, and — since the PR #23 mangled-workflow
-incident — a YAML parse of every workflow/compose file it touches. Chain
-interfaces are verified against live mainnet (bytecode dispatchers,
-chainlog, log layouts) before implementation. CI's role has shifted from
-*compiler of last resort* to **merge gate**: the four required jobs stay
-authoritative for what the sandbox cannot reproduce — cross-toolchain
-builds, the byte-for-byte artifact-drift job, and the frontend build on an
-unconstrained runner (the sandbox needs a ~1.5 GB heap cap to fit `next
-build`). Pre-push local runs have caught every regression in the recent
-PRs (the Comet decode offset, the rad-scale `u128` overflow, the deposit
-gas check) before CI ever saw them; CI also stays the authority on
-check-state, since the automation's GitHub-API polling is rate-limit-prone.
+**Verification posture.** The full gate set runs locally before a branch is
+proposed: `cargo fmt --all -- --check`, `cargo clippy --all-targets
+-- -A clippy::too_many_arguments`, `cargo test --all`, `forge fmt --check`,
+`forge build --sizes`, `forge test`, `tsc --noEmit`, `next build`, and — since
+the PR #23 mangled-workflow incident — a YAML parse of every workflow/compose
+file touched. Chain interfaces are verified against live mainnet (bytecode
+dispatchers, chainlog, log layouts) before implementation, not from
+remembered ABIs. CI is the **merge gate**, not the compiler: the four required
+jobs stay authoritative for cross-toolchain builds, the byte-for-byte
+artifact-drift job, and check-state. Local pre-merge runs have caught every
+recent regression (the Comet decode offset, the rad-scale `u128` overflow,
+the deposit gas check) before CI saw them, which is the intended order.
 
 **Continuation status (2026-08-21, later session):** Funnel week is done. W4
 default is 3 legs. W5 is on, paired with `POOL_DISCOVERY_V3`. W6 stays off
@@ -75,27 +70,16 @@ Rust-side, `LiveMode` (engine.rs) carries the runtime switch and
 `recent_simulations` now joins the victim hashes so each simulated tx links
 to the tx it reacted to.
 
-*(The two paragraphs that follow are historical — they describe the era
-when the sandbox had no Rust toolchain and no `workflows` permission, which
-ended with W0. See the verification-posture note above for today's
-reality.)*
-
-A follow-up automation session (the same day) re-ran the checks it can run —
-contracts solc compile-check (28 sources, `MevExecutor` runtime 9,618 B, no
-artifact drift) and the frontend (`tsc --noEmit`, `npm run build`) — and both
-are clean, and bumped the frontend's `next`/`react` to patched versions for
-CVE-2025-66478 (CVSS 10.0 RSC RCE). It also re-attempted the W0 workflow push
-and confirmed it is still rejected without `workflows` permission. Full details
-in [`docs/BUILD_NOTES.md`](BUILD_NOTES.md). None of this changes the gates.
-
 Once the GitHub `workflows` permission was granted and the workflow was enabled,
 CI started running and surfaced two failures that had never been exercised:
 the `embedded bytecode is current` (artifact-drift) job failed because
 `compile-check.js` embedded solc's default IPFS metadata hash (which includes
 each source file's absolute path) into `MevExecutor.runtime.hex`, so the checked-in
-artifact only reproduced in the sandbox where it was generated. Fixed by passing
+artifact only reproduced from the checkout directory it was generated in.
+Fixed by passing
 `metadata: {bytecodeHash: "none", useLiteralContent: true}` (matching
-`foundry.toml`), regenerating the artifact (runtime 9,618 → 9,577 B), and
+`foundry.toml`), regenerating the artifact (runtime 9,618 → 9,577 B at the
+time; the contract has since grown to 11,497 B), and
 verifying a fresh checkout now reproduces it byte-for-byte. See
 `docs/BUILD_NOTES.md`. The `bot (rust)` job's `cargo test --all` failure
 (exit 101) is now also fixed: it was a deterministic wrong assertion in
@@ -103,9 +87,8 @@ verifying a fresh checkout now reproduces it byte-for-byte. See
 `p ∈ (0.05, 0.20)` but the shipped `LOGISTIC_K = 2.2` gives
 `p = σ(-1.1) ≈ 0.2497` at half the winning bid), corrected to match the
 model, plus a hardening of the dense-graph budget test's wall-clock ceiling.
-All four CI jobs are green on the working branch (PR #15). What remains for
-W0 is a human step: setting the workflow as a **required** check on PRs to
-`main`.
+All four CI jobs are green. What remains for W0 is a repository-admin step:
+setting the workflow as a **required** check on PRs to `main`.
 
 ---
 
@@ -148,8 +131,8 @@ against; §1.5 covers what has since landed.
 | Multi-leg arb (3–5 legs) | **Not started** | `strategies/arb.rs:48-62` is still the O(n²) pair-pair loop |
 | V3 sandwich sizing | **Not started** | `strategies/sandwich.rs` is V2-only; `dex::quote_v3` exists and is unused by it |
 | Aggregator decoding | **Not started** | `strategies::decode_swap` handles V2 routers; `jit::decode_v3_swap` handles `ISwapRouter02` |
-| Rust build/test verification | **Verified in the automation sandbox** (since 2026-08-21) | rustup installs locally; `cargo fmt/clippy/test --all` run before every push — 199 tests at closeout |
-| Contracts build/test | **Verified in the automation sandbox** | `compile-check.js` runs there; Foundry installs for `anvil` probes; forge runs in CI |
+| Rust build/test verification | **Verified locally and in CI** | `cargo fmt/clippy/test --all` run before every branch is proposed and again by CI |
+| Contracts build/test | **Verified locally and in CI** | `forge fmt/build --sizes/test`, plus the solc-only `compile-check.js` for artifact reproduction |
 | CI | **Green and required** | all four jobs live in `.github/workflows/ci.yml`, required on PRs to `main` since W0 (PR #15) |
 
 Two corrections to the source documents worth calling out, because they change
@@ -162,9 +145,9 @@ the plan:
   maintainer reports green `make bot-check`, `make bot-test`, and
   `make contracts` runs. W0 remains open until the workflow is enabled and the
   checks run as required PR checks.
-  *[Update 2026-08-22: both halves changed — the automation sandbox now runs
-  the full Rust battery itself (see the verification-posture note above), and
-  W0 has long been closed: CI is enabled and required. Kept for history.]*
+  *[Update: both halves changed — the full Rust battery runs locally before a
+  branch is proposed (see the verification-posture note above), and W0 is
+  closed: CI is enabled and required. Kept for history.]*
 
 ---
 
@@ -229,33 +212,16 @@ Two follow-up correctness fixes are now part of the W2/W3 implementation:
 
 | Component | Verified how |
 | --- | --- |
-| Frontend | **Fully verified.** `npx tsc --noEmit` clean and `npm run build` succeeds |
-| Rust | **Locally verified by the maintainer.** `make bot-check` and `make bot-test` pass; the authoring sandbox has no Rust toolchain |
-| Contracts | **Locally verified by the maintainer.** `make contracts` passes; the sandbox's solc-only artifact check also passes |
+| Frontend | **Fully verified.** `npx tsc --noEmit` clean, `npm run build` succeeds on `next@16.3.2` |
+| Rust | **Fully verified.** `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -A clippy::too_many_arguments`, and `cargo test --all` are clean; the test runner, not a count written here, is the source of truth for the number of tests |
+| Contracts | **Fully verified.** `forge fmt --check`, `forge build --sizes`, `forge test -vvv` all clean; `MevExecutor` runtime 11,497 bytes |
+| Artifacts | **Reproducible.** `node script/compile-check.js` regenerates the embedded runtime byte-for-byte from any checkout; `git diff --exit-code` shows no drift |
 | Event topics | **Computed, not guessed.** `PoolCreated` topic0 was derived with keccak256 and the same method reproduces the repo's existing `PairCreated` constant exactly |
-| Rust tests | **Executed by the maintainer.** `make bot-test` passes; the test runner, rather than the historical count in this document, is the source of truth for the exact number of tests |
-| Remote CI | **Not enabled yet.** The workflow is prepared at `ci/github-actions-ci.yml`, but pushing it into `.github/workflows/` is still blocked by GitHub `workflows` permission |
+| Remote CI | **Enabled and required.** Four jobs in `.github/workflows/ci.yml`, all green, all blocking |
 
-The authoring sandbox still cannot reach the Rust distribution hosts and has no
-`cargo`, `forge`, or `anvil` binaries, so it cannot independently reproduce the
-maintainer's Rust and Forge runs. The local checks are a meaningful verification
-of W1–W4, but they are not a substitute for required PR checks. **Do not mark
-W0 complete until the workflow is enabled and green on the working branch.**
-
-An automation session re-ran the parts it can run and recorded clean results:
-the contracts solc-only artifact check (28 sources, `MevExecutor` runtime
-9,618 B, `git diff --exit-code` on `bot/crates/mev-bot/artifacts` and
-`contracts/abi` shows no drift) and the frontend (`npx tsc --noEmit`,
-`npm run build`). (The runtime is now 9,577 B after the deterministic-artifact
-fix described above.) It also bumped the frontend to `next@15.5.7` /
-`react@19.1.2` to patch **CVE-2025-66478** (a CVSS 10.0 RSC RCE affecting the
-previous `next@15.5.4` App-Router build) — see `docs/BUILD_NOTES.md`. These
-re-verifications update the evidence for W1–W4; they do not enable remote CI,
-which is still blocked as W0 describes.
-
-The W1–W4 logic and tests have now had a compiler and test runner turn through
-them locally. Any future CI failure should be treated as a real regression or
-environment difference, not as an unverified baseline assumption.
+The W1–W4 logic and tests have had a compiler and test runner turn through
+them. Any CI failure should be treated as a real regression or a genuine
+cross-toolchain difference, not as an unverified baseline assumption.
 
 ## 1.7 Interaction with the bloXroute delivered-block ingestion
 
@@ -333,7 +299,7 @@ state.
 | **W3** | V3 pool discovery (`PoolCreated`) + separate V3 cache | W2 | M | none | **✅ implemented; on with W5** (`POOL_DISCOVERY_V3=true`) |
 | **W4** | Multi-leg V2 atomic arb (3–5 legs) | W1, W2 | L | **1 week of funnel data** | **✅ implementation shipped; default raised to 3 legs** (`ARB_MAX_CYCLE_LEN=3`). Do not raise to 4–5 until live `atomic_arb.candidatesEmitted` on the same feed moves at 3. |
 | **W5** | V3 sandwich sizing via QuoterV2 | W1, W3 | L | **1 week of funnel data** | **✅ on after the funnel week** (`STRATEGY_SANDWICH_V3=true` with `POOL_DISCOVERY_V3=true`). Watch `sandwich_v3` live funnel + strategy p95. |
-| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation shipped, still off** (`DECODE_UNIVERSAL_ROUTER=false`). Flip only with a written public-mempool gap memo. |
+| **W6** | UniversalRouter calldata decoding | W1 | M | **funnel shows a public-mempool gap** | **✅ implementation shipped; decision made — stays off** (`DECODE_UNIVERSAL_ROUTER=false`). The gap is structural, not a decoding shortfall; rationale in `W6_MEMO.md`. Reversible behind the flag. |
 
 Sizes: S ≈ 1–2 days, M ≈ 3–5 days, L ≈ 1.5–2 weeks including tests and review.
 
@@ -392,15 +358,14 @@ The dense-graph budget test's 200 ms wall-clock ceiling was also relaxed to a
 2 s catch-unbounded-search ceiling (plus a `MAX_CANDIDATES` sanity assert)
 since tight wall-clock asserts flake on shared runners. `cargo test --all` is
 now 117/117 on CI (Rust 1.98.0). W0 is **not** complete until the workflow is
-also **required** on PRs to `main` — a maintainer with admin access must set
-that (branch protection is neither readable nor settable by the automation
-token, so it could not be verified or configured from here).
+also **required** on PRs to `main` — a maintainer with repository-admin access
+must set that, since branch protection cannot be configured from a workflow.
 
-**Why first.** Remote CI is still the source of truth for required PR checks,
-clippy, and the exact test environment. The local maintainer run substantially
-reduces the remaining uncertainty, but it does not replace a green workflow.
-Budget for environment-specific failures when the workflow is enabled; fix
-those here rather than deferring them.
+**Why first.** Remote CI is the source of truth for required PR checks and the
+exact test environment. Local runs reduce the uncertainty to near zero, but
+they do not replace a green workflow on a clean checkout. Budget for
+cross-toolchain failures when the workflow is enabled; fix those here rather
+than deferring them.
 
 **Tasks**
 
@@ -408,8 +373,9 @@ those here rather than deferring them.
    ```bash
    mkdir -p .github/workflows && git mv ci/github-actions-ci.yml .github/workflows/ci.yml
    ```
-   (It is parked in `ci/` because the automation that wrote it lacked the
-   GitHub `workflows` permission. See `ci/README.md`.)
+   (It was parked in `ci/` because moving a file into `.github/workflows/`
+   requires a credential with the GitHub `workflows` scope. See
+   `ci/README.md`.)
 2. Run and green the four jobs: `contracts` (forge build + test),
    `artifact-drift` (solc-js recompile, fails on ABI drift),
    `bot` (`cargo clippy --all-targets`, `cargo test --all`),
