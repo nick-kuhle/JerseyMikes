@@ -220,3 +220,32 @@ Broadcast halts at the next gate check; the shadow lanes keep running.
   it — report one if you see it, but do not flip the flag during a soak.
 - **W4** — `ARB_MAX_CYCLE_LEN` stays `3`; raise to 4–5 only when
   `atomic_arb.candidatesEmitted` is saturated at 3.
+
+## Running a Base instance (real Base transaction ingest)
+
+The bot is one process per chain. A Base process ingests **real Base
+transactions**: on sequencer chains the chain's own built blocks are the
+delivered-block feed (`CHAIN_BLOCK_INGEST` defaults on for CHAIN_ID=8453),
+and the optional Flashblocks stream carries raw signed preconfirmations when
+a Flashblocks-capable provider is configured.
+
+```bash
+# .env for the Base process (second process alongside the mainnet one)
+CHAIN_ID=8453
+BASE_HTTP_URL=https://<your-base-archive-rpc>
+BASE_WS_URL=wss://<your-base-ws>
+# optional preconfirmation stream (requires a Flashblocks-integrated provider)
+# FLASHBLOCKS_WS_URL=wss://<your-base-flashblocks-endpoint>
+
+# Sniper on Base: simulation needs nothing but the fork; live additionally
+# needs the Base deployment of SniperVault (constructor WETH =
+# 0x4200000000000000000000000000000000000006 — never the mainnet WETH).
+SNIPER_MODE=simulation
+SNIPER_LIVE_ENABLED=false
+```
+
+Run it exactly like the mainnet process (`make bot-run`), and point a second
+console chain entry at its API port. The console's chain switcher re-keys
+every panel, so Ethereum and Base portfolios can never bleed into each other.
+The sniper simulation fixture on Base binds Base WETH automatically from the
+chain profile.

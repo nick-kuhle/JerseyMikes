@@ -713,8 +713,11 @@ impl Engine {
         // a lane that vanishes when it is off is a lane operators cannot
         // reason about. Its own `enabled` switch (`SNIPER_DIRECTIONAL`,
         // default false) is what decides whether it may ever buy.
-        let sniper = Arc::new(crate::sniper::SniperLane::from_env_with_mode(
-            !cfg.live_execution,
+        // The sniper's mode is its own boot decision (SNIPER_MODE /
+        // SNIPER_LIVE_ENABLED), never derived from LIVE_EXECUTION: the two
+        // lanes switch independently by design.
+        let sniper = Arc::new(crate::sniper::SniperLane::from_env_with_boot(
+            cfg.sniper_mode,
         ));
         {
             // Open exposure must survive a restart. Recover positions before
@@ -745,6 +748,22 @@ impl Engine {
             for token in store.sniper_honeypot_tokens().unwrap_or_default() {
                 if let Ok(addr) = token.parse() {
                     sniper.blacklist(addr);
+                }
+            }
+            // The simulation bankroll is durable: a restart resumes the exact
+            // balance the ledger last recorded rather than quietly re-arming
+            // 1 ETH over an operator's tracked session.
+            if sniper.paper_mode() {
+                match store.load_simulation_state() {
+                    Ok(Some((balance, _, _))) => sniper.set_paper_balance(balance),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "sniper",
+                            %error,
+                            "could not load simulation bankroll; starting at 1 ETH"
+                        );
+                    }
                 }
             }
             let params = sniper.params();
@@ -851,8 +870,43 @@ impl Engine {
             sniper_signer,
             store.clone(),
             sniper.clone(),
-            !cfg.live_execution,
         ));
+
+        // Contract-backed simulation: mount the real SniperVault on the local
+        // fork when one exists. Deployment is lazy (first simulation trade or
+        // the wizard's init action), so boot stays fast; without a fork the
+        // lane reports a clear blocker instead of pretending paper trades
+        // were contract-backed.
+        if let Some(fork) = sim.fork.as_ref() {
+            let sniper_params = sniper.params();
+            let one_eth = U256::from(1_000_000_000_000_000_000u128);
+            let sim_daily = if sniper_params.daily_budget_wei.is_zero() {
+                one_eth
+            } else {
+                sniper_params.daily_budget_wei
+            };
+            let fixture = Arc::new(
+                crate::sniper::sim_vault::SimVaultFixture::new(
+                    fork.rpc().clone(),
+                    cfg.chain.weth,
+                    cfg.chain.chain_id,
+                    sim_daily,
+                    sniper_params.total_budget_wei,
+                )
+                .with_shared_lock(fork.sim_lock()),
+            );
+            sniper_execution.set_fixture(fixture);
+            tracing::info!(
+                target: "sniper",
+                weth = ?cfg.chain.weth,
+                "simulation SniperVault fixture attached to the local fork"
+            );
+        } else {
+            tracing::warn!(
+                target: "sniper",
+                "no local fork — contract-backed sniper simulation unavailable (observation-only)"
+            );
+        }
 
         Ok(Self {
             cfg,

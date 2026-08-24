@@ -48,9 +48,11 @@ pub mod calldata;
 pub mod execution;
 pub mod gates;
 pub mod marks;
+pub mod mode;
 pub mod params;
 pub mod portfolio;
 pub mod position;
+pub mod sim_vault;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,9 +65,12 @@ use parking_lot::RwLock;
 pub const INITIAL_PAPER_BALANCE_WEI: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
 pub use gates::{Admission, ExposureSnapshot, HoneypotVerdict, LaunchCandidate, Rejection};
+pub use mode::{SniperMode, SniperModeBoot};
 pub use params::{SniperParams, SniperParamsPatch};
 pub use portfolio::{Mark, Portfolio, PortfolioRow, PortfolioTotals};
-pub use position::{ExitDecision, ExitReason, Position, PositionState};
+pub use position::{
+    ExecutionMode, ExitDecision, ExitReason, Position, PositionState, Settlement, TxStatus,
+};
 
 /// Runtime state for the sniper lane.
 ///
@@ -81,9 +86,12 @@ pub struct SniperLane {
     /// *narrow* what the environment allowed. A bot booted with
     /// `SNIPER_DIRECTIONAL=false` cannot be armed from the dashboard.
     boot_enabled: bool,
-    /// Simulation is an explicit non-live mode, so its paper lane may be
-    /// enabled at runtime without a deployed vault or a live signer.
-    paper_mode: bool,
+    /// The sniper's own execution mode — independent of the atomic engine's
+    /// `/api/mode`. Flipped at runtime through `/api/sniper/mode`.
+    mode: Arc<RwLock<SniperMode>>,
+    /// `SNIPER_LIVE_ENABLED` at boot: capability only. Without it a runtime
+    /// switch to live is refused, fail-closed.
+    live_boot_enabled: bool,
     positions: Arc<RwLock<HashMap<String, Position>>>,
     marks: Arc<RwLock<HashMap<String, Mark>>>,
     symbols: Arc<RwLock<HashMap<Address, String>>>,
@@ -95,17 +103,40 @@ pub struct SniperLane {
 }
 
 impl SniperLane {
+    /// Legacy constructor: a lane shaped like the pre-mode world (live
+    /// domain, boot ceiling taken from `params.enabled`). New call sites
+    /// should use [`Self::with_boot`] with an explicit [`SniperModeBoot`].
     pub fn new(params: SniperParams) -> Self {
         Self::new_with_mode(params, false)
     }
 
+    /// Back-compat constructor: `paper_mode == true` means the lane boots in
+    /// simulation. New call sites should use [`Self::with_boot`].
+    ///
+    /// The legacy shim never grants the new `SNIPER_LIVE_ENABLED` ceiling
+    /// implicitly — a legacy non-paper lane keeps its live behaviour gated by
+    /// `SNIPER_DIRECTIONAL` at boot (`boot_enabled`), and a runtime switch to
+    /// the new live mode still requires the explicit ceiling.
     pub fn new_with_mode(params: SniperParams, paper_mode: bool) -> Self {
+        let boot = SniperModeBoot {
+            mode: if paper_mode {
+                SniperMode::Simulation
+            } else {
+                SniperMode::Live
+            },
+            live_enabled: false,
+        };
+        Self::with_boot(params, boot)
+    }
+
+    pub fn with_boot(params: SniperParams, boot: SniperModeBoot) -> Self {
         let boot_enabled = params.enabled;
         Self {
             params: Arc::new(RwLock::new(params)),
             paper_balance_wei: Arc::new(RwLock::new(INITIAL_PAPER_BALANCE_WEI)),
             boot_enabled,
-            paper_mode,
+            mode: Arc::new(RwLock::new(boot.mode)),
+            live_boot_enabled: boot.live_enabled,
             positions: Arc::new(RwLock::new(HashMap::new())),
             marks: Arc::new(RwLock::new(HashMap::new())),
             symbols: Arc::new(RwLock::new(HashMap::new())),
@@ -117,20 +148,96 @@ impl SniperLane {
     }
 
     pub fn from_env() -> Self {
-        Self::from_env_with_mode(false)
+        Self::from_env_with_boot(SniperModeBoot::default())
     }
 
-    pub fn from_env_with_mode(paper_mode: bool) -> Self {
-        Self::new_with_mode(SniperParams::from_env(), paper_mode)
+    pub fn from_env_with_boot(boot: SniperModeBoot) -> Self {
+        Self::with_boot(SniperParams::from_env(), boot)
     }
 
+    /// The sniper's current execution mode.
+    pub fn mode(&self) -> SniperMode {
+        *self.mode.read()
+    }
+
+    /// True while the lane runs contract-backed simulation against the paper
+    /// bankroll. Kept as the inverse of live mode so existing guards keep
+    /// their meaning.
     pub fn paper_mode(&self) -> bool {
-        self.paper_mode
+        self.mode() == SniperMode::Simulation
+    }
+
+    /// `SNIPER_LIVE_ENABLED` at boot — the ceiling a runtime switch can never
+    /// widen.
+    pub fn live_boot_enabled(&self) -> bool {
+        self.live_boot_enabled
+    }
+
+    /// Every reason a runtime switch to live is currently refused. Empty
+    /// means the switch would succeed. The production vault/key checks use
+    /// what the process knows without an RPC round trip; the allowlist and
+    /// bytecode checks happen at the API layer against the selected chain.
+    pub fn live_switch_blockers(&self, sniper_key_configured: bool) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if !self.live_boot_enabled {
+            blockers.push(
+                "SNIPER_LIVE_ENABLED was false at boot — restart with the live sniper ceiling                  to allow Sniper Live"
+                    .to_string(),
+            );
+        }
+        let params = self.params();
+        if matches!(params.vault_address, None | Some(Address::ZERO)) {
+            blockers.push(
+                "production SniperVault is not configured (SNIPER_VAULT_ADDRESS)".to_string(),
+            );
+        }
+        if !sniper_key_configured {
+            blockers.push("SNIPER_SEARCHER_PRIVATE_KEY is not configured".to_string());
+        }
+        if params.buy_size_wei.is_zero() {
+            blockers.push("buySizeWei is 0 — no live entry size is configured".to_string());
+        }
+        if params.daily_budget_wei.is_zero() {
+            blockers.push("dailyBudgetWei is 0 — no live budget is configured".to_string());
+        }
+        if let Some(reason) = self.halt_reason() {
+            blockers.insert(0, format!("lane halted: {reason}"));
+        }
+        blockers
+    }
+
+    /// Flip the lane's execution mode at runtime.
+    ///
+    /// * `simulation` always succeeds and immediately stops new live entries.
+    ///   Positions already open with `execution_mode = live` stay tagged live
+    ///   and keep receiving live exit management — switching the mode never
+    ///   converts live money into paper or strands live exposure.
+    /// * `live` fails closed unless every boot/config gate is clear
+    ///   ([`Self::live_switch_blockers`]).
+    pub fn set_mode(
+        &self,
+        requested: SniperMode,
+        sniper_key_configured: bool,
+    ) -> Result<SniperMode, Vec<String>> {
+        match requested {
+            SniperMode::Simulation => {
+                *self.mode.write() = SniperMode::Simulation;
+                Ok(SniperMode::Simulation)
+            }
+            SniperMode::Live => {
+                let blockers = self.live_switch_blockers(sniper_key_configured);
+                if !blockers.is_empty() {
+                    return Err(blockers);
+                }
+                *self.mode.write() = SniperMode::Live;
+                Ok(SniperMode::Live)
+            }
+        }
     }
 
     pub fn paper_ready(&self) -> bool {
         let params = self.params();
-        self.paper_mode
+        self.paper_mode()
             && !self.is_halted()
             && params.enabled
             && !params.buy_size_wei.is_zero()
@@ -139,7 +246,7 @@ impl SniperLane {
     }
 
     pub fn effective_armed(&self) -> bool {
-        if self.paper_mode {
+        if self.paper_mode() {
             self.paper_ready()
         } else {
             let params = self.params();
@@ -178,6 +285,11 @@ impl SniperLane {
         *self.paper_balance_wei.write() = INITIAL_PAPER_BALANCE_WEI;
     }
 
+    /// Restore the bankroll from the durable simulation ledger at boot.
+    pub fn set_paper_balance(&self, balance: U256) {
+        *self.paper_balance_wei.write() = balance;
+    }
+
     /// Paper mode can be enabled with a non-zero size/budget but no deployed
     /// vault. A live lane still requires a vault and boot-enabled signer.
     pub fn admit_paper(
@@ -200,6 +312,16 @@ impl SniperLane {
     pub fn patch_params(&self, patch: &SniperParamsPatch) -> Result<SniperParams, Vec<String>> {
         let current = self.params.read().clone();
         let next = current.with_patch(patch)?;
+        // Live entries need the production vault. Simulation never does — it
+        // trades against the local fixture.
+        if !self.paper_mode()
+            && next.enabled
+            && matches!(next.vault_address, None | Some(Address::ZERO))
+        {
+            return Err(vec![
+                "vault address not set (SNIPER_VAULT_ADDRESS)".to_string()
+            ]);
+        }
         // A simulation-only envelope may be enabled without a vault so the
         // paper balance can be exercised. A patch that would enable a funded
         // live envelope still cannot widen a false boot ceiling.
@@ -207,7 +329,7 @@ impl SniperLane {
             && next.vault_address.is_some()
             && !next.buy_size_wei.is_zero()
             && !next.daily_budget_wei.is_zero();
-        if live_intent && !self.boot_enabled && !self.paper_mode {
+        if live_intent && !self.boot_enabled && !self.paper_mode() {
             return Err(vec![
                 "sniper: SNIPER_DIRECTIONAL was false at boot — the live lane cannot be armed at \
                  runtime. Set SNIPER_DIRECTIONAL=true and restart."
@@ -376,13 +498,13 @@ impl SniperLane {
     pub fn effective_arming_blockers(&self) -> Vec<String> {
         let params = self.params();
         let mut blockers = params.arming_blockers();
-        if self.paper_mode {
+        if self.paper_mode() {
             blockers.retain(|blocker| !blocker.contains("SNIPER_VAULT_ADDRESS"));
         }
         if let Some(reason) = self.halt_reason() {
             blockers.insert(0, format!("lane halted: {reason}"));
         }
-        if params.enabled && !self.boot_enabled && !self.paper_mode {
+        if params.enabled && !self.boot_enabled && !self.paper_mode() {
             blockers.push(
                 "SNIPER_DIRECTIONAL was false at boot; runtime arming is refused".to_string(),
             );
@@ -448,6 +570,128 @@ mod tests {
         assert_eq!(lane.paper_balance_wei(), INITIAL_PAPER_BALANCE_WEI);
     }
 
+    fn live_capable_params() -> SniperParams {
+        SniperParams {
+            enabled: true,
+            vault_address: Some(Address::repeat_byte(0xaa)),
+            buy_size_wei: centi(10),
+            daily_budget_wei: eth(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sniper_mode_is_independent_of_the_atomic_engine() {
+        // A process can boot the atomic engine live and still run the sniper
+        // in simulation: the two switches share no state.
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot::default(), // simulation, no live ceiling
+        );
+        assert!(lane.paper_mode());
+        assert_eq!(lane.mode(), SniperMode::Simulation);
+        // And the reverse: live sniper capability with no atomic implication.
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot {
+                mode: SniperMode::Live,
+                live_enabled: true,
+            },
+        );
+        assert_eq!(lane.mode(), SniperMode::Live);
+        assert!(!lane.paper_mode());
+    }
+
+    #[test]
+    fn switching_live_fails_closed_without_the_boot_ceiling() {
+        // A lane booted in simulation with no live ceiling refuses the switch
+        // and stays exactly where it was.
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot {
+                mode: SniperMode::Simulation,
+                live_enabled: false,
+            },
+        );
+        let err = lane.set_mode(SniperMode::Live, true).unwrap_err();
+        assert!(
+            err.iter().any(|b| b.contains("SNIPER_LIVE_ENABLED")),
+            "{err:?}"
+        );
+        assert!(lane.paper_mode(), "a refused switch changes nothing");
+    }
+
+    #[test]
+    fn switching_live_fails_closed_on_missing_vault_or_key() {
+        let mut params = live_capable_params();
+        params.vault_address = None;
+        let lane = SniperLane::with_boot(
+            params,
+            SniperModeBoot {
+                mode: SniperMode::Simulation,
+                live_enabled: true,
+            },
+        );
+        let err = lane.set_mode(SniperMode::Live, true).unwrap_err();
+        assert!(err.iter().any(|b| b.contains("SniperVault")), "{err:?}");
+
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot {
+                mode: SniperMode::Simulation,
+                live_enabled: true,
+            },
+        );
+        let err = lane.set_mode(SniperMode::Live, false).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|b| b.contains("SNIPER_SEARCHER_PRIVATE_KEY")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn switching_live_succeeds_when_every_gate_is_clear() {
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot {
+                mode: SniperMode::Simulation,
+                live_enabled: true,
+            },
+        );
+        assert!(lane.set_mode(SniperMode::Live, true).is_ok());
+        assert_eq!(lane.mode(), SniperMode::Live);
+        // And back down again is always allowed.
+        assert!(lane.set_mode(SniperMode::Simulation, true).is_ok());
+        assert!(lane.paper_mode());
+    }
+
+    #[test]
+    fn live_positions_survive_a_live_to_simulation_switch() {
+        let lane = SniperLane::with_boot(
+            live_capable_params(),
+            SniperModeBoot {
+                mode: SniperMode::Live,
+                live_enabled: true,
+            },
+        );
+        let mut p = open_position("live-1", 1);
+        p.execution_mode = ExecutionMode::Live;
+        p.settlement = Settlement::OnChain;
+        lane.upsert_position(p);
+
+        lane.set_mode(SniperMode::Simulation, true).unwrap();
+
+        let back = lane.position("live-1").unwrap();
+        assert_eq!(
+            back.execution_mode,
+            ExecutionMode::Live,
+            "a mode switch must never convert a live position into paper"
+        );
+        assert_eq!(back.settlement, Settlement::OnChain);
+        assert!(lane.paper_mode(), "but new entries are simulation-only now");
+    }
+
     #[test]
     fn paper_lane_can_enable_a_vault_bound_envelope_without_live_boot() {
         let lane = SniperLane::new_with_mode(SniperParams::default(), true);
@@ -489,6 +733,8 @@ mod tests {
             state: PositionState::Open,
             trigger_tx: None,
             entry_tx: None,
+
+            exit_tx: None,
             entry_cost_wei: centi(10),
             entry_qty: U256::from(1_000u64),
             remaining_qty: U256::from(1_000u64),
@@ -501,6 +747,9 @@ mod tests {
             exit_reason: None,
             entry_verdict: "clean".into(),
             notes: String::new(),
+            execution_mode: ExecutionMode::Live,
+            settlement: Settlement::OnChain,
+            tx_status: TxStatus::Mined,
         }
     }
 
@@ -705,6 +954,8 @@ mod api_contract_tests {
             state: PositionState::Open,
             trigger_tx: None,
             entry_tx: None,
+
+            exit_tx: None,
             entry_cost_wei: eth(1),
             entry_qty: U256::from(1_000u64),
             remaining_qty: U256::from(1_000u64),
@@ -717,6 +968,9 @@ mod api_contract_tests {
             exit_reason: None,
             entry_verdict: "clean".into(),
             notes: String::new(),
+            execution_mode: ExecutionMode::Live,
+            settlement: Settlement::OnChain,
+            tx_status: TxStatus::Mined,
         });
         lane.set_mark("p1", Mark::fresh(eth(2), 0, 0));
         lane

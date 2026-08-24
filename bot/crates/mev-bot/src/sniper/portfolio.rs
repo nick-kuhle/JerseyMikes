@@ -16,7 +16,7 @@ use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 use super::params::BPS;
-use super::position::{Position, PositionState};
+use super::position::{ExecutionMode, Position, PositionState, Settlement, TxStatus};
 
 /// One row in the console's portfolio table.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +52,12 @@ pub struct PortfolioRow {
     pub exit_reason: Option<String>,
     pub entry_verdict: String,
     pub notes: String,
+
+    /// Provenance badges the console renders on every row, so a paper token
+    /// quantity can never be mistaken for a vault or wallet quantity.
+    pub execution_mode: ExecutionMode,
+    pub settlement: Settlement,
+    pub tx_status: TxStatus,
 }
 
 /// Aggregate totals across the lane.
@@ -84,11 +90,24 @@ pub struct PortfolioTotals {
     pub any_mark_stale: bool,
 }
 
+/// Totals split by execution domain. `totals` in [`Portfolio`] is the
+/// labelled combination of these two; nothing is ever merged without saying
+/// so.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TotalsByMode {
+    pub simulation: PortfolioTotals,
+    pub live: PortfolioTotals,
+}
+
 /// The whole payload behind `GET /api/sniper/portfolio`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Portfolio {
     pub totals: PortfolioTotals,
+    /// The same positions, split by execution domain — the numbers behind
+    /// the console's [Simulation] / [Live] ledger switcher.
+    pub totals_by_mode: TotalsByMode,
     pub open: Vec<PortfolioRow>,
     pub recent_closed: Vec<PortfolioRow>,
     /// Reasons the lane cannot currently buy. Empty means armed.
@@ -150,6 +169,8 @@ pub fn summarize(
     let mut open = Vec::new();
     let mut closed = Vec::new();
     let mut t = Totals::default();
+    let mut t_sim = Totals::default();
+    let mut t_live = Totals::default();
 
     for p in positions {
         let mark = marks.get(&p.id).copied().unwrap_or(Mark {
@@ -201,43 +222,22 @@ pub fn summarize(
             exit_reason: p.exit_reason.map(|r| r.as_str().to_string()),
             entry_verdict: p.entry_verdict.clone(),
             notes: p.notes.clone(),
+            execution_mode: p.execution_mode,
+            settlement: p.settlement,
+            tx_status: p.tx_status,
         };
 
-        t.gas = t.gas.saturating_add(p.gas_spent_wei);
-        t.deployed_total = t.deployed_total.saturating_add(p.entry_cost_wei);
-        if now_ms.saturating_sub(p.opened_at_ms) <= 86_400_000 {
-            t.deployed_today = t.deployed_today.saturating_add(p.entry_cost_wei);
-        }
+        let per_mode = if p.execution_mode == ExecutionMode::Simulation {
+            &mut t_sim
+        } else {
+            &mut t_live
+        };
+        accumulate(per_mode, p, net, unrealized, mark_value, fresh, now_ms);
+        accumulate(&mut t, p, net, unrealized, mark_value, fresh, now_ms);
 
         if p.state.is_terminal() {
-            // A closed position's PnL is fully booked.
-            t.realized = t.realized.saturating_add(net);
-            if p.state == PositionState::Closed {
-                if net > 0 {
-                    t.wins += 1;
-                } else if net < 0 {
-                    t.losses += 1;
-                }
-                t.closed += 1;
-            }
             closed.push(row);
         } else {
-            t.open += 1;
-            t.open_cost = t.open_cost.saturating_add(p.entry_cost_wei);
-            t.open_value = t.open_value.saturating_add(mark_value);
-            t.unrealized = t.unrealized.saturating_add(unrealized);
-            // Proceeds already banked on a partially-exited position are
-            // realised even though the position is still live.
-            t.realized = t
-                .realized
-                .saturating_add(to_i128(p.realized_wei).saturating_sub(to_i128(pro_rata(
-                    p.entry_cost_wei,
-                    p.entry_qty.saturating_sub(p.remaining_qty),
-                    p.entry_qty,
-                ))));
-            if !fresh {
-                t.any_stale = true;
-            }
             open.push(row);
         }
     }
@@ -251,35 +251,90 @@ pub fn summarize(
     });
     closed.truncate(recent_closed_limit);
 
-    let decided = t.wins + t.losses;
-    let win_rate_bps = if decided == 0 {
-        0
-    } else {
-        ((t.wins as u64 * BPS as u64) / decided as u64) as u32
-    };
-
     Portfolio {
-        totals: PortfolioTotals {
-            open_positions: t.open,
-            closed_positions: t.closed,
-            open_cost_wei: t.open_cost.to_string(),
-            open_value_wei: t.open_value.to_string(),
-            unrealized_pnl_wei: t.unrealized.to_string(),
-            realized_pnl_wei: t.realized.to_string(),
-            total_pnl_wei: t.realized.saturating_add(t.unrealized).to_string(),
-            gas_spent_wei: t.gas.to_string(),
-            deployed_total_wei: t.deployed_total.to_string(),
-            deployed_today_wei: t.deployed_today.to_string(),
-            wins: t.wins,
-            losses: t.losses,
-            win_rate_bps,
-            any_mark_stale: t.any_stale,
+        totals: to_totals(&t),
+        totals_by_mode: TotalsByMode {
+            simulation: to_totals(&t_sim),
+            live: to_totals(&t_live),
         },
         open,
         recent_closed: closed,
         arming_blockers,
         armed,
         generated_at_ms: now_ms,
+    }
+}
+
+/// Fold one position into an accumulator. Extracted so the combined and
+/// per-mode totals are computed by the exact same code path — a totals
+/// number can never disagree with the rows that produced it.
+fn accumulate(
+    t: &mut Totals,
+    p: &Position,
+    net: i128,
+    unrealized: i128,
+    mark_value: U256,
+    fresh: bool,
+    now_ms: u64,
+) {
+    t.gas = t.gas.saturating_add(p.gas_spent_wei);
+    t.deployed_total = t.deployed_total.saturating_add(p.entry_cost_wei);
+    if now_ms.saturating_sub(p.opened_at_ms) <= 86_400_000 {
+        t.deployed_today = t.deployed_today.saturating_add(p.entry_cost_wei);
+    }
+    if p.state.is_terminal() {
+        // A closed position's PnL is fully booked.
+        t.realized = t.realized.saturating_add(net);
+        if p.state == PositionState::Closed {
+            if net > 0 {
+                t.wins += 1;
+            } else if net < 0 {
+                t.losses += 1;
+            }
+            t.closed += 1;
+        }
+    } else {
+        t.open += 1;
+        t.open_cost = t.open_cost.saturating_add(p.entry_cost_wei);
+        t.open_value = t.open_value.saturating_add(mark_value);
+        t.unrealized = t.unrealized.saturating_add(unrealized);
+        // Proceeds already banked on a partially-exited position are
+        // realised even though the position is still live.
+        t.realized = t
+            .realized
+            .saturating_add(to_i128(p.realized_wei).saturating_sub(to_i128(pro_rata(
+                p.entry_cost_wei,
+                p.entry_qty.saturating_sub(p.remaining_qty),
+                p.entry_qty,
+            ))));
+        if !fresh {
+            t.any_stale = true;
+        }
+    }
+}
+
+fn to_totals(t: &Totals) -> PortfolioTotals {
+    let decided = t.wins + t.losses;
+    let win_rate_bps = if decided == 0 {
+        0
+    } else {
+        ((t.wins as u64 * BPS as u64) / decided as u64) as u32
+    };
+    PortfolioTotals {
+        open_positions: t.open,
+        closed_positions: t.closed,
+        open_cost_wei: t.open_cost.to_string(),
+        open_value_wei: t.open_value.to_string(),
+        unrealized_pnl_wei: t.unrealized.to_string(),
+        realized_pnl_wei: t.realized.to_string(),
+        total_pnl_wei: t.realized.saturating_add(t.unrealized).to_string(),
+        gas_spent_wei: t.gas.to_string(),
+        deployed_total_wei: t.deployed_total.to_string(),
+        deployed_today_wei: t.deployed_today.to_string(),
+        wins: t.wins,
+        losses: t.losses,
+        win_rate_bps,
+        any_mark_stale: t.any_stale,
     }
 }
 
@@ -337,6 +392,8 @@ mod tests {
             state,
             trigger_tx: None,
             entry_tx: None,
+
+            exit_tx: None,
             entry_cost_wei: eth(1),
             entry_qty: U256::from(1_000u64),
             remaining_qty: if state.is_terminal() {
@@ -353,6 +410,9 @@ mod tests {
             exit_reason: None,
             entry_verdict: "clean".into(),
             notes: String::new(),
+            execution_mode: ExecutionMode::Live,
+            settlement: Settlement::OnChain,
+            tx_status: TxStatus::Mined,
         }
     }
 
@@ -564,6 +624,47 @@ mod tests {
         );
         assert_eq!(out.arming_blockers, blockers);
         assert!(!out.armed);
+    }
+
+    #[test]
+    fn simulation_and_live_totals_never_bleed_into_each_other() {
+        let mut sim = p("sim", PositionState::Open);
+        sim.execution_mode = ExecutionMode::Simulation;
+        sim.settlement = Settlement::Paper;
+        let mut live = p("live", PositionState::Open);
+        live.execution_mode = ExecutionMode::Live;
+        live.settlement = Settlement::OnChain;
+        // Newer than `sim`, so the newest-first ordering is deterministic.
+        live.opened_at_ms = 2_000;
+
+        let out = sum(&[sim, live], &marks(&[("sim", eth(2)), ("live", eth(3))]));
+
+        // The combined number is labelled and equals the two parts.
+        assert_eq!(out.totals.open_positions, 2);
+        assert_eq!(out.totals.open_value_wei, eth(5).to_string());
+        // Each ledger only sees its own position.
+        assert_eq!(out.totals_by_mode.simulation.open_positions, 1);
+        assert_eq!(
+            out.totals_by_mode.simulation.open_value_wei,
+            eth(2).to_string()
+        );
+        assert_eq!(out.totals_by_mode.live.open_positions, 1);
+        assert_eq!(out.totals_by_mode.live.open_value_wei, eth(3).to_string());
+        // Rows carry their badges to the UI.
+        assert_eq!(out.open[0].execution_mode, ExecutionMode::Live);
+        assert_eq!(out.open[1].execution_mode, ExecutionMode::Simulation);
+        assert_eq!(out.open[1].settlement, Settlement::Paper);
+    }
+
+    #[test]
+    fn an_all_simulation_portfolio_reports_zero_live_totals() {
+        let mut sim = p("sim", PositionState::Open);
+        sim.execution_mode = ExecutionMode::Simulation;
+        sim.settlement = Settlement::Paper;
+        let out = sum(&[sim], &marks(&[("sim", eth(1))]));
+        assert_eq!(out.totals_by_mode.live.open_positions, 0);
+        assert_eq!(out.totals_by_mode.live.total_pnl_wei, "0");
+        assert_eq!(out.totals_by_mode.simulation.open_positions, 1);
     }
 
     #[test]

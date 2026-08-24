@@ -52,8 +52,11 @@ pub struct AnvilSim {
     forked_at: Mutex<u64>,
     executor: parking_lot::RwLock<Address>,
     searcher: Address,
-    /// Serialises access: one simulation at a time per fork.
-    lock: Mutex<()>,
+    /// Serialises access: one simulation at a time per fork. Shared with the
+    /// sniper simulation fixture so its fixture transactions can never land
+    /// inside a bundle replay's snapshot/revert window (and never race the
+    /// automine-off phase).
+    lock: Arc<Mutex<()>>,
     /// Block-pinned prices for non-native profit tokens. Keyed by
     /// `(token, block)` so a quote can never outlive its block.
     valuation: crate::valuation::ValuationCache,
@@ -349,7 +352,7 @@ impl AnvilSim {
             child: Mutex::new(Some(child)),
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
             valuation: crate::valuation::ValuationCache::new(),
         };
         sim.prepare_state().await?;
@@ -368,7 +371,7 @@ impl AnvilSim {
             child: Mutex::new(None),
             forked_at: Mutex::new(block),
             executor: parking_lot::RwLock::new(executor),
-            lock: Mutex::new(()),
+            lock: Arc::new(Mutex::new(())),
             valuation: crate::valuation::ValuationCache::new(),
         };
         sim.prepare_state().await?;
@@ -377,6 +380,19 @@ impl AnvilSim {
 
     pub fn executor(&self) -> Address {
         *self.executor.read()
+    }
+
+    /// The fork's serialization lock, shared with the sniper simulation
+    /// fixture. A fixture transaction holding this lock cannot interleave
+    /// with a bundle simulation's snapshot/mine/revert cycle, and vice versa.
+    pub fn sim_lock(&self) -> Arc<Mutex<()>> {
+        self.lock.clone()
+    }
+
+    /// The fork's RPC transport. The sniper simulation fixture reuses the
+    /// same anvil process rather than spawning a fork per click.
+    pub fn rpc(&self) -> &RpcClient {
+        &self.rpc
     }
 
     /// Install the executor bytecode, make the searcher the owner and give both

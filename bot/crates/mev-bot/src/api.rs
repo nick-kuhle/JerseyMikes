@@ -54,6 +54,14 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/sniper/sell", post(manual_sniper_sell))
         .route("/api/sniper/trade", post(manual_sniper_trade))
         .route("/api/sniper/paper/reset", post(reset_paper))
+        // The sniper's own mode switch — independent of /api/mode — and the
+        // simulation fixture lifecycle. Both mutate lane state, so both sit
+        // behind the bearer gate.
+        .route("/api/sniper/mode", post(set_sniper_mode))
+        .route(
+            "/api/sniper/sim-fixture/init",
+            post(init_sniper_sim_fixture),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Browsers get no cross-origin access by default. The dashboard reaches
@@ -104,6 +112,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/sniper/params", get(sniper_params))
         .route("/api/sniper/positions", get(sniper_positions))
         .route("/api/sniper/vault", get(sniper_vault))
+        .route("/api/sniper/mode", get(sniper_mode))
+        .route("/api/sniper/sim-fixture", get(sniper_sim_fixture_status))
         .merge(mutating)
         .layer(cors)
         .with_state(state)
@@ -692,6 +702,7 @@ async fn sniper_portfolio(
 async fn sniper_params(State(s): State<ApiState>) -> impl IntoResponse {
     let lane = &s.engine.sniper;
     let params = lane.params();
+    let vaults = sniper_vault_addresses(&s);
     Json(json!({
         "params": params,
         "armed": lane.effective_armed(),
@@ -699,11 +710,57 @@ async fn sniper_params(State(s): State<ApiState>) -> impl IntoResponse {
         "halted": lane.is_halted(),
         "haltReason": lane.halt_reason(),
         "paperMode": lane.paper_mode(),
+        "sniperMode": lane.mode().as_str(),
+        "sniperLiveBootEnabled": lane.live_boot_enabled(),
         "simulationBalanceWei": lane.paper_balance_wei().to_string(),
+        // The two vault addresses are never interchangeable: the simulation
+        // fixture is local-anvil-only, the production vault is on the
+        // selected chain.
+        "simulationVaultAddress": vaults.simulation,
+        "productionVaultAddress": vaults.production,
+        "activeVaultKind": vaults.active_kind,
         "armingBlockers": lane.effective_arming_blockers(),
         "rejections": lane.rejection_counts(),
         "envSnippet": params.env_snippet(),
     }))
+}
+
+/// Resolved vault addresses for the console payloads.
+struct VaultAddresses {
+    simulation: Option<String>,
+    production: Option<String>,
+    active_kind: &'static str,
+}
+
+fn sniper_vault_addresses(s: &ApiState) -> VaultAddresses {
+    let lane = &s.engine.sniper;
+    let params = lane.params();
+    let simulation = s
+        .engine
+        .sniper_execution
+        .fixture()
+        .and_then(|f| f.state())
+        .map(|st| format!("{:?}", st.vault));
+    let production = params
+        .vault_address
+        .filter(|a| !a.is_zero())
+        .map(|a| format!("{a:?}"));
+    let active_kind = if lane.paper_mode() {
+        if simulation.is_some() {
+            "simulation_fixture"
+        } else {
+            "none"
+        }
+    } else if production.is_some() {
+        "production"
+    } else {
+        "none"
+    };
+    VaultAddresses {
+        simulation,
+        production,
+        active_kind,
+    }
 }
 
 /// Positions with their fill history, for the drill-down view.
@@ -772,24 +829,240 @@ async fn set_sniper_params(
 /// operator halting the lane wants to stop buying, not to be trapped in what
 /// they already hold.
 async fn reset_paper(State(s): State<ApiState>) -> Response {
+    // A simulation reset must never operate on a live-armed ledger.
     if !s.engine.sniper.paper_mode() {
         return (
             StatusCode::CONFLICT,
-            Json(json!({"ok": false, "error": "paper funds cannot be reset on a live-armed process"})),
+            Json(json!({"ok": false, "error": "paper funds cannot be reset while the sniper runs in live mode"})),
         )
             .into_response();
     }
     s.engine.sniper.reset_paper();
-    tracing::warn!(target: "sniper", "simulation paper balance reset to 1 ETH");
+    let reset_at = crate::types::now_ms();
+    if let Err(error) = s
+        .engine
+        .store
+        .save_simulation_state(s.engine.sniper.paper_balance_wei(), reset_at)
+    {
+        tracing::error!(target: "sniper", %error, "failed to persist paper balance reset");
+    }
+    tracing::warn!(target: "sniper", "simulation paper balance reset to 1 ETH (history preserved)");
     (
         StatusCode::OK,
         Json(json!({
             "ok": true,
             "paperMode": true,
             "simulationBalanceWei": s.engine.sniper.paper_balance_wei().to_string(),
+            "resetAtMs": reset_at,
         })),
     )
         .into_response()
+}
+
+/// `GET /api/sniper/mode` — the sniper's independent execution mode.
+///
+/// Shape follows the work order: atomic and sniper modes side by side, the
+/// boot ceiling, the live-switch blockers, and the vault addresses kept
+/// strictly apart.
+async fn sniper_mode(State(s): State<ApiState>) -> impl IntoResponse {
+    let lane = &s.engine.sniper;
+    let key_configured = s.engine.cfg.endpoints.sniper_searcher_private_key.is_some();
+    let blockers = lane.live_switch_blockers(key_configured);
+    let vaults = sniper_vault_addresses(&s);
+    let fixture_state = s
+        .engine
+        .sniper_execution
+        .fixture()
+        .as_ref()
+        .and_then(|f| f.state());
+    let active_address = if lane.paper_mode() {
+        vaults.simulation.clone()
+    } else {
+        vaults.production.clone()
+    };
+    Json(json!({
+        "atomicMode": if s.engine.mode.live() { "live" } else { "simulation" },
+        "sniperMode": lane.mode().as_str(),
+        "sniperLiveBootEnabled": lane.live_boot_enabled(),
+        "canSwitchLive": blockers.is_empty(),
+        "blockers": blockers,
+        "simulationVaultAddress": vaults.simulation,
+        "productionVaultAddress": vaults.production,
+        "simulationBalanceWei": lane.paper_balance_wei().to_string(),
+        "simulationChainId": s.engine.cfg.chain.chain_id,
+        "activeVault": {
+            "kind": vaults.active_kind,
+            "address": active_address,
+        },
+        "fixture": {
+            "available": s.engine.sniper_execution.fixture().is_some(),
+            "deployed": fixture_state.is_some(),
+            "searcher": fixture_state.as_ref().map(|st| format!("{:?}", st.searcher)),
+            "owner": fixture_state.as_ref().map(|st| format!("{:?}", st.owner)),
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct SniperModeRequest {
+    /// "simulation" | "live" — the work-order contract.
+    mode: Option<String>,
+}
+
+/// `POST /api/sniper/mode` — flip the sniper's independent mode.
+///
+/// `{"mode":"live"}` fails closed unless the boot ceiling, the production
+/// vault, the dedicated sniper key and the budgets are all in place;
+/// `{"mode":"simulation"}` always succeeds and immediately stops new live
+/// entries. Open live positions stay tagged live and keep receiving live
+/// exit management — they are never converted into paper.
+async fn set_sniper_mode(
+    State(s): State<ApiState>,
+    Json(body): Json<SniperModeRequest>,
+) -> Response {
+    let Some(requested) = body
+        .mode
+        .as_deref()
+        .and_then(crate::sniper::SniperMode::parse)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "mode must be simulation or live",
+            })),
+        )
+            .into_response();
+    };
+    let key_configured = s.engine.cfg.endpoints.sniper_searcher_private_key.is_some();
+    let lane = &s.engine.sniper;
+    let previous = lane.mode();
+    match lane.set_mode(requested, key_configured) {
+        Ok(mode) => {
+            if previous != mode {
+                tracing::warn!(
+                    target: "sniper",
+                    from = %previous,
+                    to = %mode,
+                    "sniper execution mode switched"
+                );
+            }
+            let open_live = if mode == crate::sniper::SniperMode::Simulation {
+                lane.live_positions()
+                    .iter()
+                    .filter(|p| p.execution_mode == crate::sniper::ExecutionMode::Live)
+                    .count()
+            } else {
+                0
+            };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "sniperMode": mode.as_str(),
+                    "atomicMode": if s.engine.mode.live() { "live" } else { "simulation" },
+                    "sniperLiveBootEnabled": lane.live_boot_enabled(),
+                    // Live positions survive the switch to simulation tagged
+                    // live; the operator must flatten them explicitly before
+                    // any migration or handoff.
+                    "openLivePositionsRetained": open_live,
+                    "note": if mode == crate::sniper::SniperMode::Simulation && open_live > 0 {
+                        "live positions remain live data and keep live exit management;                          they are not converted into paper positions"
+                    } else {
+                        ""
+                    },
+                })),
+            )
+                .into_response()
+        }
+        Err(blockers) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "sniperMode": lane.mode().as_str(),
+                "blockers": blockers,
+                "error": "switch to live refused — every gate must clear first",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/sniper/sim-fixture` — fixture status for the wizard.
+async fn sniper_sim_fixture_status(State(s): State<ApiState>) -> Response {
+    let Some(fixture) = s.engine.sniper_execution.fixture() else {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ready": false,
+                "blocker": "simulation unavailable: local fork is not running — the bot is observation-only",
+            })),
+        )
+            .into_response();
+    };
+    if fixture.state().is_none() {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ready": false,
+                "blocker": "fixture not deployed yet — use “Initialize simulation fixture”",
+            })),
+        )
+            .into_response();
+    }
+    match fixture.vault_status().await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(error) => (
+            StatusCode::OK,
+            Json(json!({
+                "ready": false,
+                "blocker": format!("fixture status unreadable: {error}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/sniper/sim-fixture/init` — deploy/verify the local fixture.
+/// Purely local: no real funds, no live signer, no production RPC write.
+async fn init_sniper_sim_fixture(State(s): State<ApiState>) -> Response {
+    let Some(fixture) = s.engine.sniper_execution.fixture() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": "simulation fixture unavailable: local fork is not running",
+                "hint": "start the bot with a reachable HTTP RPC so the anvil fork can spawn",
+            })),
+        )
+            .into_response();
+    };
+    match fixture.ensure_deployed().await {
+        Ok(_) => match fixture.vault_status().await {
+            Ok(status) => (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "message": "Simulation vault ready · local Anvil fixture · no deployment required",
+                    "fixture": status,
+                })),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "ok": false,
+                "error": format!("simulation fixture deployment failed: {error}"),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn halt_sniper(State(s): State<ApiState>, Json(body): Json<HaltBody>) -> impl IntoResponse {

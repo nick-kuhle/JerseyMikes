@@ -1,0 +1,24 @@
+{
+  "WETH": [
+    {
+      "length": 32,
+      "start": 711
+    },
+    {
+      "length": 32,
+      "start": 2486
+    },
+    {
+      "length": 32,
+      "start": 2831
+    },
+    {
+      "length": 32,
+      "start": 4073
+    },
+    {
+      "length": 32,
+      "start": 4418
+    }
+  ]
+}

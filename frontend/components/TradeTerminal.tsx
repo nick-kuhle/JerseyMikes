@@ -18,7 +18,8 @@ import {
   type TradeRoutePreference,
   type TradeSide,
 } from "@/lib/swap";
-import type {SniperPortfolio} from "@/lib/types";
+import type {SniperExecutionMode, SniperPortfolio} from "@/lib/types";
+import {readActiveChain, withChain} from "@/lib/chain";
 
 const PAIR_ABI = [
   {type: "function", name: "token0", stateMutability: "view", inputs: [], outputs: [{type: "address"}]},
@@ -45,13 +46,15 @@ function amountForPercent(balance: bigint, pct: number, buy: boolean): bigint {
   return (balance * BigInt(pct)) / 100n;
 }
 
-export default function TradeTerminal({pf, wallet: walletProp, publicClient, activeChainSlug, currentChainId, initialTarget}: {
+export default function TradeTerminal({pf, wallet: walletProp, publicClient, activeChainSlug, currentChainId, initialTarget, sniperMode}: {
   pf: SniperPortfolio;
   wallet: WalletState;
   publicClient: Pick<PublicClient, "readContract" | "waitForTransactionReceipt">;
   activeChainSlug: string;
   currentChainId: number;
   initialTarget: Target;
+  /** The sniper's own mode — decides whether this terminal simulates or trades. */
+  sniperMode?: SniperExecutionMode;
 }) {
   // `walletProp` is passed from SniperPanel so this terminal shares the same
   // EIP-6963 connection and provider event subscriptions.
@@ -71,6 +74,10 @@ export default function TradeTerminal({pf, wallet: walletProp, publicClient, act
   const feeConfig = useMemo(() => platformFeeConfig(), []);
   const router = V2_ROUTER_BY_CHAIN[activeChainSlug] || V2_ROUTER_BY_CHAIN.ethereum;
   const weth = WETH_BY_CHAIN[activeChainSlug] || WETH_BY_CHAIN.ethereum;
+  // Work order E: the terminal honors the independent sniper mode. Simulation
+  // routes trades through the bot's local fixture; only Live signs on-chain
+  // swaps with the connected wallet.
+  const isSimulation = (sniperMode ?? "simulation") === "simulation";
   const aggregatorLinks = details ? getAggregatorLinks(details.token, currentChainId, activeChainSlug) : null;
 
   const resolveToken = useCallback(async (raw: string, target?: Target) => {
@@ -149,7 +156,53 @@ export default function TradeTerminal({pf, wallet: walletProp, publicClient, act
     try { setAmount(side === "buy" ? formatEther(value) : formatUnits(value, details?.decimals ?? 18)); } catch { setAmount("0"); }
   };
 
+  /**
+   * Simulation path: the trade intent goes to the bot, which executes the
+   * bounded SniperVault calldata against the local Anvil fixture and settles
+   * against the paper ledger. No wallet signature, no real explorer link —
+   * the response carries the fixture tx/event identifier instead.
+   */
+  const executeSimulated = async () => {
+    if (!details || !details.pair || amountIn <= 0n || quote <= 0n) {
+      setNotice({tone: "bad", text: "Resolve a liquid V2 pair and a non-zero amount first."}); return;
+    }
+    setTradeBusy(true); setNotice(null);
+    try {
+      if (side === "buy") {
+        const res = await fetch(withChain("/api/bot/sniper/trade", readActiveChain()), {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({side: "buy", token: details.token, pair: details.pair, amountWei: amountIn.toString()}),
+        });
+        const body = (await res.json()) as {ok?: boolean; error?: string; position?: {id?: string; notes?: string; entryTx?: string | null}};
+        if (!res.ok || !body.ok) throw new Error(body.error || "simulation buy refused");
+        const id = body.position?.entryTx ? `fixture tx ${body.position.entryTx}` : `position ${body.position?.id ?? "?"}`;
+        setNotice({tone: "good", text: `SIMULATION entry executed · ${id}. Local simulated transaction — no explorer link. ${body.position?.notes ?? ""}`});
+      } else {
+        const position = (pf.open ?? []).find((p) => p.token.toLowerCase() === details.token.toLowerCase());
+        if (!position) throw new Error("no open position for this token — nothing to sell in simulation");
+        const res = await fetch(withChain("/api/bot/sniper/trade", readActiveChain()), {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({side: "sell", positionId: position.id, sellFractionBps: 10_000}),
+        });
+        const body = (await res.json()) as {ok?: boolean; error?: string; txHash?: string};
+        if (!res.ok || !body.ok) throw new Error(body.error || "simulation sell refused");
+        setNotice({tone: "good", text: `SIMULATION exit executed · local id ${body.txHash ?? "?"}. No explorer link — paper settlement only.`});
+      }
+      setAmount("");
+    } catch (error) {
+      setNotice({tone: "bad", text: `Simulated trade failed: ${errorText(error)}`});
+    } finally {
+      setTradeBusy(false);
+    }
+  };
+
   const execute = async () => {
+    if (isSimulation) {
+      await executeSimulated();
+      return;
+    }
     if (!details || !wallet.address || !wallet.eip1193 || !details.pair || amountIn <= 0n || quote <= 0n) {
       setNotice({tone: "bad", text: "Connect a wallet and resolve a liquid V2 pair before trading."}); return;
     }
@@ -157,7 +210,9 @@ export default function TradeTerminal({pf, wallet: walletProp, publicClient, act
       setNotice({tone: "bad", text: `Switch the wallet to the active console chain (${activeChainSlug}) before signing.`}); return;
     }
     if (route === "mev_safe") {
-      setNotice({tone: "warn", text: "Browser wallet execution cannot guarantee private ordering. Configure a private bot/relay route before using MEV-Safe."});
+      // MEV-Safe stays unavailable until a private relay path is actually
+      // implemented and verified — never silently degraded to a public swap.
+      setNotice({tone: "warn", text: "MEV-Safe is unavailable: no private relay path is implemented for this terminal yet."});
       return;
     }
     if (!feeReady) { setNotice({tone: "bad", text: "Treasury is configured but PLATFORM_FEE_ROUTER_ADDRESS is not configured; trade blocked to prevent fee bypass."}); return; }
@@ -215,14 +270,23 @@ export default function TradeTerminal({pf, wallet: walletProp, publicClient, act
         </div>
         <div style={{padding: 12, display: "grid", alignContent: "start", gap: 10}}>
           <div style={{fontWeight: 700, color: "var(--cyan)"}}>⚡ Quick Trade Console</div>
+          {/* Mode banner: SIMULATION never spends wallet funds; LIVE identifies
+              the signer/source of every trade. */}
+          <div style={{fontSize: 10, padding: "6px 8px", borderRadius: 4, border: `1px solid ${isSimulation ? "var(--cyan)" : "rgba(255,92,92,0.5)"}`, background: isSimulation ? "rgba(34,211,238,0.07)" : "rgba(255,92,92,0.07)", color: isSimulation ? "var(--cyan)" : "#ff8c8c"}}>
+            {isSimulation ? (
+              <><strong>SIMULATION</strong> · trades run the SniperVault calldata on the bot&apos;s local Anvil fixture and settle against the paper bankroll. No real explorer links, no wallet signature, no treasury transfer.</>
+            ) : (
+              <><strong>LIVE</strong> · {activeChainSlug === "base" ? "Base" : "Ethereum"} · signer: connected wallet (direct wallet swap){feeConfig.feeRecipient ? " · 1% fee via atomic fee router" : " · fee disabled by configuration"}</>
+            )}
+          </div>
           <div style={{display: "flex", gap: 6}}>{(["buy", "sell"] as TradeSide[]).map((value) => <button key={value} onClick={() => {setSide(value); setAmount("");}} style={{...buttonStyle, flex: 1, color: side === value ? "#05240f" : "var(--text)", background: side === value ? "var(--cyan)" : "var(--panel-2)"}}>{value.toUpperCase()}</button>)}</div>
           <label style={labelStyle}>{side === "buy" ? "Amount (ETH)" : `Amount (${details?.symbol || "token"})`}<input value={amount} onChange={(event) => setAmount(event.target.value)} placeholder={side === "buy" ? "0.050" : "0.0"} inputMode="decimal" style={fieldStyle} /></label>
           <div style={{display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 5}}>{[25, 50, 75].map((pct) => <button key={pct} style={chipStyle} onClick={() => setPreset(pct)}>{pct}%</button>)}<button style={{...chipStyle, color: "var(--amber)", borderColor: "var(--amber)"}} onClick={() => setPreset(100)}>MAX</button></div>
           <div className="muted" style={{fontSize: 10}}>Max {side === "buy" ? `reserves ${formatEther(GAS_RESERVE)} ETH gas` : `reads exact ${details?.symbol || "token"} balance`}</div>
           <label style={labelStyle}>Slippage tolerance<select value={slippage} onChange={(event) => setSlippage(event.target.value)} style={fieldStyle}><option value="0.5">0.5%</option><option value="1.0">1.0%</option><option value="3.0">3.0%</option></select></label>
           <label style={labelStyle}>Routing preference<div style={{display: "grid", gap: 5}}>{([["fastest", "⚡ Fastest"], ["mev_safe", "🛡️ MEV-Safe"], ["best_price", "💰 Best Price"]] as [TradeRoutePreference,string][]).map(([value, text]) => <button key={value} onClick={() => setRoute(value)} style={{...buttonStyle, textAlign: "left", color: route === value ? "var(--cyan)" : "var(--text)", borderColor: route === value ? "var(--cyan)" : "var(--line)"}}>{text}</button>)}</div></label>
-          <div style={{background: "var(--panel-2)", padding: 9, borderRadius: 4, border: "1px solid var(--line)", fontSize: 11, display: "grid", gap: 4}}><div>Estimated output <strong>{quote ? (side === "buy" ? formatUnits(quote, details?.decimals ?? 18) : `${formatEther(quote)} ETH`) : "—"}</strong></div><div>Minimum after slippage <strong>{minOut ? (side === "buy" ? formatUnits(minOut, details?.decimals ?? 18) : `${formatEther(minOut)} ETH`) : "—"}</strong></div><div style={{color: feeConfigured ? "var(--amber)" : "var(--muted)"}}>Platform fee {feeConfigured ? "1.00%" : "0% · treasury not configured"} {fee ? `(${side === "buy" ? formatEther(fee) : formatUnits(fee, details?.decimals ?? 18)} ${side === "buy" ? "ETH" : details?.symbol || "token"})` : ""}</div></div>
-          <button onClick={() => void execute()} disabled={tradeBusy || !details || !wallet.address || wallet.chainId !== currentChainId || !feeReady} style={{...executeButton, opacity: tradeBusy || !details || !wallet.address || wallet.chainId !== currentChainId || !feeReady ? 0.55 : 1}}>{tradeBusy ? "confirming…" : !wallet.address ? "connect wallet to trade" : wallet.chainId !== currentChainId ? `switch wallet to ${activeChainSlug}` : !feeReady ? "fee router not configured" : `execute ${side} · ${route.replace("_", " ")}`}</button>
+          <div style={{background: "var(--panel-2)", padding: 9, borderRadius: 4, border: "1px solid var(--line)", fontSize: 11, display: "grid", gap: 4}}><div>{isSimulation && <span style={{color: "var(--cyan)", fontWeight: 700}}>SIMULATION · </span>}Estimated output <strong>{quote ? (side === "buy" ? formatUnits(quote, details?.decimals ?? 18) : `${formatEther(quote)} ETH`) : "—"}</strong></div><div>Minimum after slippage <strong>{minOut ? (side === "buy" ? formatUnits(minOut, details?.decimals ?? 18) : `${formatEther(minOut)} ETH`) : "—"}</strong></div><div style={{color: feeConfigured && !isSimulation ? "var(--amber)" : "var(--muted)"}}>{isSimulation ? `Platform fee ${feeConfigured ? "modeled in paper accounting (no treasury transfer)" : "0% · treasury not configured"}` : <>Platform fee {feeConfigured ? "1.00%" : "0% · treasury not configured"}</>} {fee && !isSimulation ? `(${side === "buy" ? formatEther(fee) : formatUnits(fee, details?.decimals ?? 18)} ${side === "buy" ? "ETH" : details?.symbol || "token"})` : ""}</div></div>
+          <button onClick={() => void execute()} disabled={isSimulation ? tradeBusy || !details || !details.pair : tradeBusy || !details || !wallet.address || wallet.chainId !== currentChainId || !feeReady} style={{...executeButton, opacity: (isSimulation ? tradeBusy || !details || !details.pair : tradeBusy || !details || !wallet.address || wallet.chainId !== currentChainId || !feeReady) ? 0.55 : 1}}>{tradeBusy ? "confirming…" : isSimulation ? `simulate ${side} on local fixture` : !wallet.address ? "connect wallet to trade" : wallet.chainId !== currentChainId ? `switch wallet to ${activeChainSlug}` : !feeReady ? "fee router not configured" : `execute ${side} · ${route.replace("_", " ")}`}</button>
           {notice && <div style={{fontSize: 10, color: notice.tone === "good" ? "var(--green)" : notice.tone === "bad" ? "var(--red)" : "var(--amber)"}} role="status">{notice.text}</div>}
           {aggregatorLinks && <div className="muted" style={{fontSize: 10}}>Research links: <a href={aggregatorLinks.oneInch} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>1inch</a> · <a href={aggregatorLinks.uniswap} target="_blank" rel="noreferrer" style={{color: "var(--cyan)"}}>Uniswap</a></div>}
         </div>

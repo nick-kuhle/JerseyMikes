@@ -464,6 +464,7 @@ mod tests {
                 oracle_frontrun: false,
                 sniper: true,
             },
+            sniper_mode: crate::sniper::SniperModeBoot::default(),
             sim: crate::config::SimConfig {
                 anvil_bin: "anvil".into(),
                 anvil_port: 8548,

@@ -47,6 +47,32 @@ pub fn compute_mark_value(
     Some((remaining_qty * weth_reserve) / token_reserve)
 }
 
+/// Read a pair's reserves. Shared by marking and by exit sizing: a sell's
+/// optimistic swap output must be the constant-product output for the input,
+/// never the spot mark (which ignores price impact and fails the pair's K
+/// invariant).
+pub async fn pair_reserves(
+    rpc: &RpcClient,
+    pair: Address,
+    head_block: u64,
+) -> Option<(U256, U256)> {
+    let call_data = IUniswapV2Pair::getReservesCall {}.abi_encode();
+    let bytes = rpc.eth_call(pair, call_data, head_block).await.ok()?;
+    let decoded = IUniswapV2Pair::getReservesCall::abi_decode_returns(&bytes, true).ok()?;
+    Some((U256::from(decoded.reserve0), U256::from(decoded.reserve1)))
+}
+
+/// The UniswapV2 constant-product output (0.3% fee) for `amount_in` against
+/// `(reserve_in, reserve_out)` — the exact amount a swap leg may request as
+/// its optimistic output without tripping the K invariant.
+pub fn v2_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
+    if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+        return U256::ZERO;
+    }
+    let in_with_fee = amount_in * U256::from(997u64);
+    (in_with_fee * reserve_out) / (reserve_in * U256::from(1000u64) + in_with_fee)
+}
+
 /// Query reserves for a position's pair and update its mark in the lane.
 ///
 /// On RPC read failure: does NOT set a new fresh mark. Stale-mark policy kicks in
@@ -60,32 +86,17 @@ pub async fn update_position_mark(
     head_block: u64,
     now_ms: u64,
 ) -> Option<Mark> {
-    let call_data = IUniswapV2Pair::getReservesCall {}.abi_encode();
-    let res = rpc.eth_call(position.pair, call_data, head_block).await;
-
-    match res {
-        Ok(bytes) => {
-            let Ok(decoded) = IUniswapV2Pair::getReservesCall::abi_decode_returns(&bytes, true)
-            else {
-                return None;
-            };
-            let reserve0 = U256::from(decoded.reserve0);
-            let reserve1 = U256::from(decoded.reserve1);
-
-            let value_wei = compute_mark_value(
-                weth,
-                position.token,
-                reserve0,
-                reserve1,
-                position.remaining_qty,
-            )?;
-
-            let mark = Mark::fresh(value_wei, head_block, now_ms);
-            lane.set_mark(&position.id, mark);
-            Some(mark)
-        }
-        Err(_) => None,
-    }
+    let (reserve0, reserve1) = pair_reserves(rpc, position.pair, head_block).await?;
+    let value_wei = compute_mark_value(
+        weth,
+        position.token,
+        reserve0,
+        reserve1,
+        position.remaining_qty,
+    )?;
+    let mark = Mark::fresh(value_wei, head_block, now_ms);
+    lane.set_mark(&position.id, mark);
+    Some(mark)
 }
 
 #[cfg(test)]

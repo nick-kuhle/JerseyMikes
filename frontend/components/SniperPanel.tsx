@@ -32,6 +32,7 @@ import {
 } from "viem";
 import {base, mainnet} from "viem/chains";
 import type {
+  SniperModeResponse,
   SniperParams,
   SniperParamsPatch,
   SniperParamsResponse,
@@ -146,9 +147,17 @@ function SniperPanel() {
   const [pf, setPf] = useState<SniperPortfolio | null>(null);
   const [cfg, setCfg] = useState<SniperParamsResponse | null>(null);
   const [vault, setVault] = useState<SniperVaultStatus | null>(null);
+  /** The sniper's own independent mode payload (never the atomic mode). */
+  const [modeInfo, setModeInfo] = useState<SniperModeResponse | null>(null);
   const [demo, setDemo] = useState(false);
   const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "gates">("portfolio");
   const [portfolioSubTab, setPortfolioSubTab] = useState<"all" | "open" | "wallet" | "closed">("all");
+  /** Two-ledger portfolio view: simulation / live / labelled combination. */
+  const [ledgerView, setLedgerView] = useState<"simulation" | "live" | "all">("simulation");
+  /** Mode-switch confirmation dialogs. */
+  const [modeDialog, setModeDialog] = useState<"none" | "confirm-live" | "confirm-sim">("none");
+  const [modeBusy, setModeBusy] = useState(false);
+  const [modeNote, setModeNote] = useState<string | null>(null);
 
   // Wallet and chain state
   const wallet = useWallet();
@@ -227,10 +236,11 @@ function SniperPanel() {
   const load = useCallback(async () => {
     const chain = readActiveChain();
     try {
-      const [pRes, cRes, vRes] = await Promise.all([
+      const [pRes, cRes, vRes, mRes] = await Promise.all([
         fetch(withChain("/api/bot/sniper/portfolio", chain), {cache: "no-store"}),
         fetch(withChain("/api/bot/sniper/params", chain), {cache: "no-store"}),
         fetch(withChain("/api/bot/sniper/vault", chain), {cache: "no-store"}),
+        fetch(withChain("/api/bot/sniper/mode", chain), {cache: "no-store"}),
       ]);
       if (pRes.ok && cRes.ok) {
         const p = (await pRes.json()) as SniperPortfolio & {demo?: boolean};
@@ -244,10 +254,41 @@ function SniperPanel() {
         }
       }
       if (vRes.ok) setVault((await vRes.json()) as SniperVaultStatus & {demo?: boolean});
+      if (mRes.ok) setModeInfo((await mRes.json()) as SniperModeResponse & {demo?: boolean});
     } catch {
       /* maintain existing data on transient fetch error */
     }
   }, [populateFormFromConfig]);
+
+  /**
+   * Flip the sniper's independent execution mode. The atomic engine's mode is
+   * never touched by this control.
+   */
+  const handleSetSniperMode = useCallback(async (target: "simulation" | "live") => {
+    setModeBusy(true);
+    setModeNote(null);
+    const chain = readActiveChain();
+    try {
+      const res = await fetch(withChain("/api/bot/sniper/mode", chain), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({mode: target}),
+      });
+      const body = (await res.json()) as {ok?: boolean; error?: string; blockers?: string[]; note?: string};
+      if (!res.ok || body.ok === false) {
+        const blockers = body.blockers?.length ? body.blockers.join(" · ") : "";
+        setModeNote(blockers || body.error || `switch refused (HTTP ${res.status})`);
+        return;
+      }
+      setModeDialog("none");
+      setModeNote(null);
+      await load();
+    } catch (error) {
+      setModeNote((error instanceof Error ? error.message : String(error)).split("\n")[0]);
+    } finally {
+      setModeBusy(false);
+    }
+  }, [load]);
 
   // Initial load and periodic polling
   useEffect(() => {
@@ -346,6 +387,8 @@ function SniperPanel() {
       inBot: boolean;
       inWallet: boolean;
       walletBalance?: string;
+      /** Which ledger owns the bot side: simulation paper or live vault. */
+      executionMode?: "simulation" | "live";
     }>();
     for (const pos of pf?.open ?? []) {
       holdings.set(pos.token.toLowerCase(), {
@@ -360,6 +403,7 @@ function SniperPanel() {
         markStale: pos.markStale,
         inBot: true,
         inWallet: false,
+        executionMode: pos.executionMode ?? "live",
       });
     }
     for (const token of walletTokens) {
@@ -384,6 +428,36 @@ function SniperPanel() {
     }
     return [...holdings.values()];
   }, [pf?.open, walletTokens]);
+
+  /**
+   * Two-ledger filtering. Simulation rows and live rows are never added
+   * together; "All" renders them as separate, labelled sections downstream.
+   */
+  const matchesLedger = useCallback(
+    (executionMode: "simulation" | "live" | undefined): boolean => {
+      const mode = executionMode ?? "live";
+      if (ledgerView === "all") return true;
+      return mode === ledgerView;
+    },
+    [ledgerView],
+  );
+
+  const filteredOpen = useMemo(
+    () => (pf?.open ?? []).filter((row) => matchesLedger(row.executionMode)),
+    [pf?.open, matchesLedger],
+  );
+  const filteredClosed = useMemo(
+    () => (pf?.recentClosed ?? []).filter((row) => matchesLedger(row.executionMode)),
+    [pf?.recentClosed, matchesLedger],
+  );
+  const filteredHoldings = useMemo(
+    () =>
+      unifiedHoldings.filter((h) => {
+        if (h.inWallet && !h.inBot) return ledgerView !== "simulation"; // wallet rows are never simulation
+        return matchesLedger(h.executionMode);
+      }),
+    [unifiedHoldings, ledgerView, matchesLedger],
+  );
 
   // Patch parameters API call
   const handleSaveParams = async (overridePatch?: Partial<SniperParamsPatch>) => {
@@ -617,32 +691,19 @@ function SniperPanel() {
             </button>
           </div>
 
-          {/* SIM / LIVE Mode Badge */}
-          <div style={{display: "flex", alignItems: "center", gap: 6}}>
-            <span
-              className="badge"
-              style={{
-                background: isArmed ? "rgba(34,197,94,0.15)" : "rgba(107,124,147,0.15)",
-                color: isArmed ? "var(--green)" : "var(--muted)",
-                borderColor: isArmed ? "var(--green)" : "var(--line)",
-                padding: "4px 8px",
-                fontSize: 11,
-                fontWeight: 600,
-              }}
-              title={
-                isArmed
-                  ? "Armed for real trades through SniperVault"
-                  : "Shadow / Simulation mode: launches monitored without broadcast"
-              }
-            >
-              {isArmed ? "LIVE TRADING ARMED" : "SIMULATION (SHADOW MODE)"}
+          {/* SNIPER MODE — an independent, clickable execution-mode control.
+              It is deliberately NOT the atomic MEV engine's mode switch, and
+              it is a real control (buttons), not a status badge. */}
+          <SniperModeControl
+            modeInfo={modeInfo}
+            armed={isArmed}
+            onOpenDialog={setModeDialog}
+          />
+          {demo && (
+            <span className="badge" style={{color: "var(--amber)"}}>
+              DEMO DATA
             </span>
-            {demo && (
-              <span className="badge" style={{color: "var(--amber)"}}>
-                DEMO DATA
-              </span>
-            )}
-          </div>
+          )}
 
           {/* Emergency Halt / Resume Button */}
           <button
@@ -682,13 +743,20 @@ function SniperPanel() {
         </div>
       </div>
 
-      {(cfg.paperMode || !cfg.armed) && (
+      {(cfg.sniperMode ?? (cfg.paperMode ? "simulation" : "live")) === "simulation" && (
         <div className="panel" style={{padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", borderColor: "rgba(34,211,238,0.45)", background: "rgba(34,211,238,0.05)"}}>
-          <div style={{display: "flex", alignItems: "center", gap: 8, fontSize: 11}}>
+          <div style={{display: "flex", alignItems: "center", gap: 8, fontSize: 11, flexWrap: "wrap"}}>
             <span className="badge" style={{color: "var(--cyan)", borderColor: "var(--cyan)"}}>SIMULATION WALLET</span>
             <span className="muted">virtual balance</span>
-            <strong style={{color: "var(--cyan)", fontVariantNumeric: "tabular-nums"}}>{ethFromWei(cfg.simulationBalanceWei ?? "1000000000000000000", 4)} Ξ</strong>
+            <strong style={{color: "var(--cyan)", fontVariantNumeric: "tabular-nums"}}>
+              {ethFromWei(modeInfo?.simulationBalanceWei ?? cfg.simulationBalanceWei ?? "1000000000000000000", 4)} Ξ
+            </strong>
             <span className="muted">paper only · no RPC funds</span>
+            {modeInfo?.simulationVaultAddress && (
+              <span className="muted">
+                Simulation vault · local Anvil only: <code>{shortHash(modeInfo.simulationVaultAddress, 6)}</code>
+              </span>
+            )}
           </div>
           <button onClick={() => void handleResetPaper()} disabled={isSaving} style={{...chipButtonStyle, color: "var(--cyan)", borderColor: "var(--cyan)"}}>↻ reset 1 ETH paper funds</button>
         </div>
@@ -868,6 +936,42 @@ function SniperPanel() {
           ──────────────────────────────────────────────────────────────────────── */}
       {tab === "portfolio" && (
         <div className="panel" style={{padding: 14, display: "grid", gap: 12}}>
+          {/* Two-ledger portfolio switcher: simulation paper and live vault
+              rows are never merged into one unlabeled number. */}
+          <div style={{display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap"}}>
+            <span className="muted" style={{fontSize: 10, letterSpacing: "0.05em"}}>PORTFOLIO VIEW</span>
+            {([
+              ["simulation", "Simulation"],
+              ["live", "Live"],
+              ["all", "All (separate sections)"],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                onClick={() => setLedgerView(value)}
+                aria-pressed={ledgerView === value}
+                style={{
+                  padding: "3px 10px",
+                  fontSize: 11,
+                  borderRadius: 3,
+                  background: ledgerView === value ? "rgba(34,211,238,0.15)" : "transparent",
+                  color: ledgerView === value ? "var(--cyan)" : "var(--muted)",
+                  border: `1px solid ${ledgerView === value ? "var(--cyan)" : "var(--line)"}`,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                {label}
+              </button>
+            ))}
+            {ledgerView !== "all" && pf?.totalsByMode && (
+              <span className="muted" style={{fontSize: 10}}>
+                {ledgerView === "simulation"
+                  ? `sim totals: ${weiToEth(pf.totalsByMode.simulation.totalPnlWei, 4)} Ξ across ${pf.totalsByMode.simulation.openPositions + pf.totalsByMode.simulation.closedPositions} positions`
+                  : `live totals: ${weiToEth(pf.totalsByMode.live.totalPnlWei, 4)} Ξ across ${pf.totalsByMode.live.openPositions + pf.totalsByMode.live.closedPositions} positions`}
+              </span>
+            )}
+          </div>
+
           {/* Portfolio View Switcher */}
           <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8}}>
             <div style={{display: "flex", gap: 6}}>
@@ -883,7 +987,7 @@ function SniperPanel() {
                   cursor: "pointer",
                 }}
               >
-                All Holdings ({unifiedHoldings.length})
+                All Holdings ({filteredHoldings.length})
               </button>
               <button
                 onClick={() => setPortfolioSubTab("open")}
@@ -897,7 +1001,7 @@ function SniperPanel() {
                   cursor: "pointer",
                 }}
               >
-                Active Positions ({pf.open.length})
+                Active Positions ({filteredOpen.length})
               </button>
               <button
                 onClick={() => setPortfolioSubTab("wallet")}
@@ -925,7 +1029,7 @@ function SniperPanel() {
                   cursor: "pointer",
                 }}
               >
-                Closed History ({pf.recentClosed.length})
+                Closed History ({filteredClosed.length})
               </button>
             </div>
 
@@ -964,18 +1068,36 @@ function SniperPanel() {
           {/* Unified Holdings Table */}
           {portfolioSubTab === "all" && (
             <div style={{overflowX: "auto"}}>
-              {unifiedHoldings.length === 0 ? (
+              {filteredHoldings.length === 0 ? (
                 <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>No bot positions or connected-wallet token balances yet.</div>
               ) : (
                 <table className="grid" style={{width: "100%", fontSize: 12}}>
                   <thead><tr><th>TOKEN</th><th>SOURCE</th><th style={{textAlign: "right"}}>ENTRY</th><th style={{textAlign: "right"}}>MARK</th><th style={{textAlign: "right"}}>UNREALIZED PNL</th><th style={{textAlign: "right"}}>WALLET BALANCE</th><th>ACTION</th></tr></thead>
-                  <tbody>{unifiedHoldings.map((holding) => {
+                  <tbody>{filteredHoldings.map((holding) => {
                     const positive = BigInt(holding.unrealizedPnlWei || "0") > 0n;
                     const negative = BigInt(holding.unrealizedPnlWei || "0") < 0n;
                     const links = getAggregatorLinks(holding.token, currentChainId, activeChainSlug);
                     return <tr key={holding.token}>
                       <td><strong>{holding.symbol}</strong><div className="muted" style={{fontSize: 10}}>{shortHash(holding.token, 6)}</div></td>
-                      <td><span className="badge" style={{fontSize: 9, color: holding.inBot ? "var(--green)" : "var(--cyan)"}}>{holding.inBot && holding.inWallet ? "bot + wallet" : holding.inBot ? "sniper position" : "wallet"}</span></td>
+                      <td>
+                        <div style={{display: "flex", gap: 3, flexWrap: "wrap"}}>
+                          {holding.inBot && (
+                            <span
+                              className="badge"
+                              style={{
+                                fontSize: 9,
+                                color: holding.executionMode === "simulation" ? "var(--cyan)" : "var(--green)",
+                                borderColor: holding.executionMode === "simulation" ? "var(--cyan)" : "var(--green)",
+                              }}
+                            >
+                              {holding.executionMode === "simulation" ? "SIMULATION" : "LIVE VAULT"}
+                            </span>
+                          )}
+                          {holding.inWallet && (
+                            <span className="badge" style={{fontSize: 9, color: "var(--muted)"}}>CONNECTED WALLET</span>
+                          )}
+                        </div>
+                      </td>
                       <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.entryCostWei, 4)} Ξ` : "—"}</td>
                       <td style={{textAlign: "right"}}>{holding.inBot ? `${weiToEth(holding.markValueWei, 4)} Ξ` : "—"}</td>
                       <td style={{textAlign: "right", color: positive ? "var(--green)" : negative ? "var(--red)" : "var(--muted)"}}>{holding.inBot ? `${signedEth(holding.unrealizedPnlWei, 4)} Ξ (${bpsFormatted(holding.netPnlBps)})` : "—"}</td>
@@ -991,7 +1113,7 @@ function SniperPanel() {
           {/* Active Open Positions Table */}
           {portfolioSubTab === "open" && (
             <div>
-              {pf.open.length === 0 ? (
+              {filteredOpen.length === 0 ? (
                 <div className="muted" style={{padding: "24px 0", textAlign: "center", fontSize: 12}}>
                   No active open positions currently held.
                   <br />
@@ -1014,7 +1136,7 @@ function SniperPanel() {
                       </tr>
                     </thead>
                     <tbody>
-                      {pf.open.map((pos) => {
+                      {filteredOpen.map((pos) => {
                         const aggLinks = getAggregatorLinks(pos.token, currentChainId, activeChainSlug);
                         const isPos = BigInt(pos.unrealizedPnlWei || "0") > 0n;
                         const isNeg = BigInt(pos.unrealizedPnlWei || "0") < 0n;
@@ -1031,6 +1153,18 @@ function SniperPanel() {
                                   }}
                                 />
                                 <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
+                                <span
+                                  className="badge"
+                                  style={{
+                                    fontSize: 8,
+                                    color: pos.executionMode === "simulation" ? "var(--cyan)" : "var(--green)",
+                                    borderColor: pos.executionMode === "simulation" ? "var(--cyan)" : "var(--green)",
+                                  }}
+                                  title={pos.executionMode === "simulation" ? "Simulation position — local Anvil fixture, paper settlement" : "Live position — production SniperVault, on-chain settlement"}
+                                >
+                                  {pos.executionMode === "simulation" ? "SIMULATION" : "LIVE VAULT"}
+                                </span>
+                                {pos.executionMode !== "simulation" && (
                                 <a
                                   href={addressUrl(currentChainId, pos.token) || undefined}
                                   target="_blank"
@@ -1041,6 +1175,7 @@ function SniperPanel() {
                                 >
                                   ↗
                                 </a>
+                                )}
                               </div>
                               <div className="muted" style={{fontSize: 10}}>
                                 {shortHash(pos.token, 6)}
@@ -1313,7 +1448,7 @@ function SniperPanel() {
           {/* Closed Positions History */}
           {portfolioSubTab === "closed" && (
             <div style={{overflowX: "auto"}}>
-              {pf.recentClosed.length === 0 ? (
+              {filteredClosed.length === 0 ? (
                 <div className="muted" style={{padding: 20, textAlign: "center", fontSize: 11}}>
                   No closed positions yet.
                 </div>
@@ -1330,7 +1465,7 @@ function SniperPanel() {
                     </tr>
                   </thead>
                   <tbody>
-                    {pf.recentClosed.map((pos) => (
+                    {filteredClosed.map((pos) => (
                       <tr key={pos.id}>
                         <td>
                           <strong>{pos.symbol || shortHash(pos.token, 4)}</strong>
@@ -1813,6 +1948,7 @@ function SniperPanel() {
           activeChainSlug={activeChainSlug}
           currentChainId={currentChainId}
           initialTarget={swapTarget}
+          sniperMode={modeInfo?.sniperMode ?? cfg?.sniperMode ?? (cfg?.paperMode ? "simulation" : "live")}
         />
       )}
 
@@ -1882,6 +2018,161 @@ function SniperPanel() {
           </div>
         </div>
       )}
+
+      {/* Sniper mode confirmation dialogs */}
+      {modeDialog !== "none" && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={modeDialog === "confirm-live" ? "Switch sniper to live" : "Switch sniper to simulation"}
+          onClick={() => (modeBusy ? undefined : setModeDialog("none"))}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.65)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="panel"
+            style={{maxWidth: 560, width: "92vw", padding: 16}}
+          >
+            {modeDialog === "confirm-live" ? (
+              <div style={{display: "grid", gap: 10}}>
+                <div style={{fontWeight: 700, color: "#ff5c5c"}}>Switch Sniper to LIVE</div>
+                <p className="muted" style={{margin: 0, fontSize: 12, lineHeight: 1.6}}>
+                  Sniper Live submits real trades through the configured bot signer and
+                  SniperVault. This control does <b>not</b> change the atomic MEV engine mode. A
+                  successful buy can lose the full amount — the sniper has no profit-or-revert
+                  guard, only bounded-loss budgets.
+                </p>
+                <div style={{fontSize: 11, display: "grid", gap: 4, background: "#040608", border: "1px solid #1b2532", borderRadius: 4, padding: "8px 10px"}}>
+                  <div><span className="muted">Chain:</span> {activeChainSlug} (id {currentChainId})</div>
+                  <div><span className="muted">Production vault:</span> {modeInfo?.productionVaultAddress ?? cfg?.productionVaultAddress ?? cfg?.params.vaultAddress ?? "not configured"}</div>
+                  <div><span className="muted">Connected owner wallet:</span> {wallet.address ?? "not connected"}</div>
+                  <div><span className="muted">Bot searcher (SNIPER_SEARCHER_ADDRESS):</span> {modeInfo?.fixture?.searcher ?? "see /api/bot/config"}</div>
+                  <div><span className="muted">Daily budget:</span> {ethFromWei(cfg?.params.dailyBudgetWei ?? "0", 4)} Ξ · <span className="muted">Total:</span> {cfg?.params.totalBudgetWei === "0" ? "unlimited" : `${ethFromWei(cfg?.params.totalBudgetWei ?? "0", 4)} Ξ`}</div>
+                  <div><span className="muted">Buy size:</span> {ethFromWei(cfg?.params.buySizeWei ?? "0", 4)} Ξ</div>
+                </div>
+                {(!modeInfo?.canSwitchLive) && modeInfo && (
+                  <div style={{fontSize: 11, color: "var(--red)"}}>
+                    {modeInfo.blockers.map((b) => (
+                      <div key={b}>✗ {b}</div>
+                    ))}
+                  </div>
+                )}
+                {modeNote && <div style={{fontSize: 11, color: "var(--red)"}} role="alert">{modeNote}</div>}
+                <div style={{display: "flex", gap: 8}}>
+                  <button
+                    onClick={() => void handleSetSniperMode("live")}
+                    disabled={modeBusy || !modeInfo?.canSwitchLive}
+                    style={{...chipButtonStyle, borderColor: "#ff5c5c", color: "#ff5c5c", padding: "6px 12px", fontSize: 12}}
+                  >
+                    {modeBusy ? "switching…" : "go live"}
+                  </button>
+                  <button onClick={() => setModeDialog("none")} disabled={modeBusy} style={{...chipButtonStyle, padding: "6px 12px", fontSize: 12}}>
+                    cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div style={{display: "grid", gap: 10}}>
+                <div style={{fontWeight: 700, color: "var(--cyan)"}}>Switch Sniper to SIMULATION</div>
+                <p className="muted" style={{margin: 0, fontSize: 12, lineHeight: 1.6}}>
+                  New entries run contract-backed trades on the local Anvil fixture and cannot
+                  spend real funds. Live positions and receipts <b>remain live data</b> — they
+                  keep live exit management and are never converted into paper positions. Flatten
+                  them explicitly before any migration or handoff.
+                </p>
+                {modeNote && <div style={{fontSize: 11, color: "var(--red)"}} role="alert">{modeNote}</div>}
+                <div style={{display: "flex", gap: 8}}>
+                  <button
+                    onClick={() => void handleSetSniperMode("simulation")}
+                    disabled={modeBusy}
+                    style={{...chipButtonStyle, borderColor: "var(--cyan)", color: "var(--cyan)", padding: "6px 12px", fontSize: 12}}
+                  >
+                    {modeBusy ? "switching…" : "pause to simulation"}
+                  </button>
+                  <button onClick={() => setModeDialog("none")} disabled={modeBusy} style={{...chipButtonStyle, padding: "6px 12px", fontSize: 12}}>
+                    cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The sniper's independent SIMULATION/LIVE control.
+ *
+ * Rendered as an actual segmented control (two buttons with `aria-pressed`),
+ * never a passive badge. The atomic MEV engine's mode is shown only as
+ * context underneath — flipping this control never changes it.
+ */
+function SniperModeControl({
+  modeInfo,
+  armed,
+  onOpenDialog,
+}: {
+  modeInfo: SniperModeResponse | null;
+  armed: boolean;
+  onOpenDialog: (dialog: "none" | "confirm-live" | "confirm-sim") => void;
+}) {
+  const sniperMode: "simulation" | "live" =
+    modeInfo?.sniperMode ?? (armed ? "live" : "simulation");
+  const atomicMode = modeInfo?.atomicMode;
+
+  const seg = (value: "simulation" | "live", label: string, tone: string): React.ReactNode => {
+    const active = sniperMode === value;
+    return (
+      <button
+        onClick={() => {
+          if (value === sniperMode) return;
+          onOpenDialog(value === "live" ? "confirm-live" : "confirm-sim");
+        }}
+        aria-pressed={active}
+        title={
+          value === "live"
+            ? "Sniper Live submits real trades through the configured vault and bot signer"
+            : "Sniper Simulation runs contract-backed trades on a local fork and cannot spend real funds"
+        }
+        style={{
+          padding: "4px 10px",
+          fontSize: 11,
+          fontWeight: 700,
+          background: active ? (value === "live" ? "rgba(255,92,92,0.18)" : "rgba(34,211,238,0.15)") : "transparent",
+          color: active ? tone : "var(--muted)",
+          border: `1px solid ${active ? tone : "var(--line)"}`,
+          borderRadius: value === "simulation" ? "4px 0 0 4px" : "0 4px 4px 0",
+          cursor: "pointer",
+          fontFamily: "inherit",
+        }}
+      >
+        {label}
+      </button>
+    );
+  };
+
+  return (
+    <div style={{display: "flex", flexDirection: "column", gap: 2}}>
+      <div style={{display: "flex", alignItems: "center", gap: 6}}>
+        <span className="muted" style={{fontSize: 10, letterSpacing: "0.05em"}}>SNIPER MODE</span>
+        <div role="group" aria-label="Sniper execution mode" style={{display: "inline-flex"}}>
+          {seg("simulation", "SIMULATION", "var(--cyan)")}
+          {seg("live", "LIVE", "#ff5c5c")}
+        </div>
+      </div>
+      <span className="muted" style={{fontSize: 10}}>
+        ATOMIC MEV: {atomicMode ? atomicMode.toUpperCase() : "—"} · this control does not change it
+      </span>
     </div>
   );
 }
