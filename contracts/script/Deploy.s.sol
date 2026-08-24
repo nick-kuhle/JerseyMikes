@@ -14,11 +14,13 @@ import {MevExecutor} from "../src/MevExecutor.sol";
 contract Deploy is Script {
     // Balancer V2 vault and WETH9, identical addresses on most EVM chains that host Balancer.
     address constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
-    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant MAINNET_WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant BASE_WETH = 0x4200000000000000000000000000000000000006;
 
     function run() external returns (MevExecutor executor) {
         address vault = vm.envOr("BALANCER_VAULT", BALANCER_VAULT);
-        address weth = vm.envOr("WETH_ADDRESS", WETH);
+        address defaultWeth = block.chainid == 8453 ? BASE_WETH : MAINNET_WETH;
+        address weth = vm.envOr("WETH_ADDRESS", defaultWeth);
 
         uint256 pk = vm.envOr("DEPLOYER_PRIVATE_KEY", uint256(0));
         if (pk != 0) vm.startBroadcast(pk);

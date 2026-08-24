@@ -623,6 +623,7 @@ export function demoEvent(i: number): FeedEvent {
 
 let demoSniperState = {
   enabled: false,
+  simulationBalanceWei: "1000000000000000000",
   buySizeWei: "0",
   minLiquidityWei: "2000000000000000000",
   maxPriceImpactBps: 300,
@@ -656,12 +657,20 @@ export function setDemoSniperHalted(halted: boolean, reason: string | null = nul
   return demoSniperParams();
 }
 
+export function resetDemoSniperFunds() {
+  demoSniperState.simulationBalanceWei = "1000000000000000000";
+  return demoSniperParams();
+}
+
 /**
  * Demo sniper params.
  */
 export function demoSniperParams() {
   const params = {
     enabled: demoSniperState.enabled,
+    paperMode: true,
+    simulationBalanceWei: demoSniperState.simulationBalanceWei,
+    vaultAddress: null as string | null,
     buySizeWei: demoSniperState.buySizeWei,
     minLiquidityWei: demoSniperState.minLiquidityWei,
     maxPriceImpactBps: demoSniperState.maxPriceImpactBps,
@@ -712,6 +721,8 @@ export function demoSniperParams() {
 
   return {
     params,
+    paperMode: true,
+    simulationBalanceWei: demoSniperState.simulationBalanceWei,
     armed: isArmed,
     bootEnabled: true,
     halted: demoSniperState.halted,

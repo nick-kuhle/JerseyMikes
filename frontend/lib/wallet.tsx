@@ -13,6 +13,7 @@
  * and reacts to `accountsChanged` / `chainChanged` from the wallet.
  */
 
+import {readActiveChain, withChain} from "./chain";
 import {
   createContext,
   useCallback,
@@ -88,7 +89,7 @@ const STORAGE_KEY = "jm.wallet.uuid";
 
 /* ── Store ────────────────────────────────────────────────────────────────── */
 
-interface WalletState {
+export interface WalletState {
   /** Every wallet that announced itself (EIP-6963) + legacy `window.ethereum`. */
   providers: WalletProviderInfo[];
   address: string | null;
@@ -184,7 +185,7 @@ export function WalletProvider({children}: {children: ReactNode}) {
       return;
     }
     try {
-      const r = await fetch("/api/eth", {
+      const r = await fetch(withChain("/api/eth", readActiveChain()), {
         method: "POST",
         headers: {"content-type": "application/json"},
         body: JSON.stringify({jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [who, "latest"]}),

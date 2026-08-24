@@ -79,8 +79,23 @@ pub fn evaluate(
     writes: &AsyncStore,
     now_ms: u64,
 ) -> QualificationStatus {
-    let required_ms = cfg
-        .qualification_hours
+    evaluate_with_required_hours(cfg, store, writes, now_ms, cfg.qualification_hours)
+}
+
+/// Evaluate using an operator-selected soak threshold. The threshold is a
+/// runtime control, not a bypass: all continuity, persistence, sample,
+/// independent-comparison, and accuracy gates still run against the selected
+/// window. Lowering it only changes how much history is required; it cannot
+/// manufacture evidence.
+pub fn evaluate_with_required_hours(
+    cfg: &Config,
+    store: &Store,
+    writes: &AsyncStore,
+    now_ms: u64,
+    required_hours: u64,
+) -> QualificationStatus {
+    let required_hours = required_hours.max(1);
+    let required_ms = required_hours
         .saturating_mul(60)
         .saturating_mul(60)
         .saturating_mul(1_000);
@@ -97,10 +112,9 @@ pub fn evaluate(
         .unwrap_or(0);
 
     let mut global_reasons = Vec::new();
-    if coverage.first_seen_ms.is_none() || elapsed_hours < cfg.qualification_hours {
+    if coverage.first_seen_ms.is_none() || elapsed_hours < required_hours {
         global_reasons.push(format!(
-            "canonical shadow observations span {elapsed_hours}h; {}h required",
-            cfg.qualification_hours
+            "canonical shadow observations span {elapsed_hours}h; {required_hours}h required"
         ));
     }
     if coverage.maximum_gap_ms > allowed_gap_ms {
@@ -150,7 +164,7 @@ pub fn evaluate(
         pass,
         started_at_ms: coverage.first_seen_ms.unwrap_or(now_ms),
         elapsed_hours,
-        required_hours: cfg.qualification_hours,
+        required_hours,
         observation_count: coverage.observations,
         maximum_observation_gap_secs: coverage.maximum_gap_ms / 1_000,
         allowed_observation_gap_secs: cfg.qualification_max_gap_secs,

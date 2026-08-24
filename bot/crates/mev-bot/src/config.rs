@@ -719,14 +719,23 @@ pub struct Endpoints {
     /// otherwise print a live key.
     #[serde(skip_serializing, default)]
     pub flashbots_signer_key: Option<String>,
-    /// Funded EOA key that signs the bundle transactions themselves. This is
-    /// deliberately distinct from the unfunded Flashbots reputation key.
+    /// Funded EOA key that signs atomic-engine bundles and raw transactions.
+    /// This is deliberately distinct from the unfunded Flashbots reputation key.
     #[serde(skip_serializing, default)]
     pub searcher_private_key: Option<String>,
+    /// Optional, independently funded key for the directional SniperVault
+    /// lane. It is never used by MevExecutor or the raw cancellation lane.
+    #[serde(skip_serializing, default)]
+    pub sniper_searcher_private_key: Option<String>,
     /// Executor contract address, if deployed.
     pub executor: Option<Address>,
-    /// Address the simulated searcher trades from.
+    /// Address the atomic engine signs from.
     pub searcher_address: Address,
+    /// Address the directional lane signs from. Defaults to the atomic
+    /// searcher address when no dedicated key is configured, preserving the
+    /// simulation-only legacy behaviour; live sniper execution requires the
+    /// dedicated key in `Config::validate`.
+    pub sniper_searcher_address: Address,
 }
 
 /// Hand-written so the signer key is redacted.
@@ -756,8 +765,16 @@ impl std::fmt::Debug for Endpoints {
                 "searcher_private_key",
                 &self.searcher_private_key.as_ref().map(|_| "<redacted>"),
             )
+            .field(
+                "sniper_searcher_private_key",
+                &self
+                    .sniper_searcher_private_key
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("executor", &self.executor)
             .field("searcher_address", &self.searcher_address)
+            .field("sniper_searcher_address", &self.sniper_searcher_address)
             .finish()
     }
 }
@@ -1016,10 +1033,25 @@ pub fn validate_ignored_aliases(found: &[IgnoredEnvAlias]) -> Result<()> {
 impl Config {
     /// Load configuration from the process environment (after `.env` is applied).
     pub fn from_env() -> Result<Self> {
-        let http_url = env_opt("ETH_HTTP_URL")
-            .context("ETH_HTTP_URL is required (an archive-capable RPC endpoint)")?;
-
         let chain_id = env_u64("CHAIN_ID", 1);
+        // Keep the legacy `ETH_*` names for one-process deployments while
+        // allowing an operator to keep Ethereum and Base bindings in the same
+        // environment. The selected chain always wins; a missing selected
+        // binding is a hard startup error rather than silently using the other
+        // chain's RPC (which would contaminate state and qualification data).
+        let (http_url, ws_url) = if chain_id == 8453 {
+            (
+                env_opt("BASE_HTTP_URL").or_else(|| env_opt("ETH_HTTP_URL")),
+                env_opt("BASE_WS_URL").or_else(|| env_opt("ETH_WS_URL")),
+            )
+        } else {
+            (env_opt("ETH_HTTP_URL"), env_opt("ETH_WS_URL"))
+        };
+        let http_url = http_url.context(if chain_id == 8453 {
+            "BASE_HTTP_URL is required for chain 8453 (an archive-capable RPC endpoint)"
+        } else {
+            "ETH_HTTP_URL is required (an archive-capable RPC endpoint)"
+        })?;
 
         // ── Chain address registry: built-in profile + env overrides ──
         // Env wins field-by-field, so a chain without a built-in profile is
@@ -1117,6 +1149,37 @@ impl Config {
             }
         }
 
+        // The directional lane may use a separate funded EOA. Falling back to
+        // the atomic searcher address keeps shadow-mode and existing single-key
+        // deployments compatible, but a live sniper lane is rejected unless a
+        // dedicated private key is present (see `validate`).
+        let sniper_searcher_private_key = env_opt("SNIPER_SEARCHER_PRIVATE_KEY");
+        let sniper_signer = match sniper_searcher_private_key.as_deref() {
+            Some(key) => Some(
+                crate::signer::Signer::from_hex(key)
+                    .context("SNIPER_SEARCHER_PRIVATE_KEY is not a valid secp256k1 private key")?,
+            ),
+            None => None,
+        };
+        let configured_sniper_address = env_opt("SNIPER_SEARCHER_ADDRESS")
+            .map(|raw| {
+                raw.parse::<Address>().with_context(|| {
+                    format!("SNIPER_SEARCHER_ADDRESS is not a valid EVM address: {raw:?}")
+                })
+            })
+            .transpose()?;
+        if let (Some(signer), Some(configured)) = (&sniper_signer, configured_sniper_address) {
+            if signer.address() != configured {
+                anyhow::bail!(
+                    "SNIPER_SEARCHER_ADDRESS ({configured:?}) does not match the address derived from SNIPER_SEARCHER_PRIVATE_KEY ({:?})",
+                    signer.address()
+                );
+            }
+        }
+        let sniper_searcher_address = configured_sniper_address
+            .or_else(|| sniper_signer.as_ref().map(crate::signer::Signer::address))
+            .unwrap_or(searcher_address);
+
         let relay_url = env_or("FLASHBOTS_RELAY_URL", "https://relay.flashbots.net");
         let bundle_relay_urls = {
             let configured = env_list("BUNDLE_RELAY_URLS");
@@ -1150,7 +1213,7 @@ impl Config {
             addresses,
             endpoints: Endpoints {
                 http_url,
-                ws_url: env_opt("ETH_WS_URL"),
+                ws_url,
                 // Mainnet-shaped feeds default ON for mainnet and OFF for
                 // sequencer chains: a Base instance must not silently
                 // ingest mainnet MEV-Share hints or relay data — cross-chain
@@ -1193,8 +1256,10 @@ impl Config {
                 mev_blocker_ws: env_opt("MEV_BLOCKER_WS"),
                 flashbots_signer_key: env_opt("FLASHBOTS_SIGNER_KEY"),
                 searcher_private_key,
+                sniper_searcher_private_key,
                 executor: env_opt("EXECUTOR_ADDRESS").and_then(|v| v.parse().ok()),
                 searcher_address,
+                sniper_searcher_address,
             },
             risk: RiskConfig {
                 // Liberal defaults: record anything at all that is net positive.
@@ -1418,6 +1483,26 @@ impl Config {
             if self.endpoints.executor.is_none() {
                 anyhow::bail!("live execution was armed without EXECUTOR_ADDRESS");
             }
+        }
+        // A non-zero, enabled directional lane is its own live money path.
+        // Requiring a dedicated key prevents a configuration that appears
+        // armed in the console while sharing the atomic key or having no
+        // signer at all. Shadow mode remains usable with zero size/budget.
+        let sniper_live_intent = self.live_execution
+            && env_bool("SNIPER_DIRECTIONAL", false)
+            && !env_u256("SNIPER_BUY_SIZE_WEI", 0).is_zero()
+            && !env_u256("SNIPER_DAILY_BUDGET_WEI", 0).is_zero();
+        if sniper_live_intent && self.endpoints.sniper_searcher_private_key.is_none() {
+            anyhow::bail!(
+                "SNIPER_DIRECTIONAL is enabled with a non-zero buy size and budget but SNIPER_SEARCHER_PRIVATE_KEY is unset; configure a dedicated sniper key"
+            );
+        }
+        if sniper_live_intent
+            && self.endpoints.sniper_searcher_address == self.endpoints.searcher_address
+        {
+            anyhow::bail!(
+                "SNIPER_SEARCHER_PRIVATE_KEY derives the same address as SEARCHER_PRIVATE_KEY; use separate keys for the atomic and directional nonce/risk domains"
+            );
         }
         Ok(())
     }
@@ -1701,8 +1786,10 @@ mod tests {
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
             searcher_private_key: None,
+            sniper_searcher_private_key: None,
             executor: None,
             searcher_address: Address::ZERO,
+            sniper_searcher_address: Address::ZERO,
         };
         let rendered = format!("{e:?}");
         assert!(
@@ -1728,8 +1815,10 @@ mod tests {
             mev_blocker_ws: None,
             flashbots_signer_key: Some("0xdeadbeefsupersecretkeymaterial".into()),
             searcher_private_key: None,
+            sniper_searcher_private_key: None,
             executor: None,
             searcher_address: Address::ZERO,
+            sniper_searcher_address: Address::ZERO,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("supersecret"), "signer key leaked: {json}");

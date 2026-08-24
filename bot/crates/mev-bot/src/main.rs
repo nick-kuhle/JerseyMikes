@@ -244,6 +244,21 @@ async fn doctor(cfg: Arc<Config>) -> Result<()> {
         }
         None => println!("· searcher key       built-in public simulation key (cannot broadcast)"),
     }
+    match &cfg.endpoints.sniper_searcher_private_key {
+        Some(key) => match mev_bot::signer::Signer::from_hex(key) {
+            Ok(s) if s.address() == cfg.endpoints.searcher_address => println!(
+                "✗ sniper key         derives the same address as SEARCHER_PRIVATE_KEY — split the nonce/risk domains before arming"
+            ),
+            Ok(s) => println!(
+                "✓ sniper key         configured; derived address {:?}",
+                s.address()
+            ),
+            Err(e) => println!("✗ sniper key         invalid SNIPER_SEARCHER_PRIVATE_KEY: {e}"),
+        },
+        None => println!(
+            "· sniper key         not configured (required only for a non-zero enabled directional lane)"
+        ),
+    }
     println!(
         "· broadcast gate     {} (qualification {}h / {} actual matches)",
         if cfg.broadcast_enabled {

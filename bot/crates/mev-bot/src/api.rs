@@ -43,6 +43,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/mode", post(set_mode))
         .route("/api/risk", post(set_risk))
         .route("/api/risk/reset", post(reset_risk))
+        .route("/api/qualification", post(set_qualification))
         // The sniper lane's mutating surface. Grouped with the other mutating
         // routes so it inherits the same bearer-token gate: `sniper/params`
         // can commit real capital, and `sniper/halt` can stop it.
@@ -51,6 +52,8 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/sniper/resume", post(resume_sniper))
         .route("/api/sniper/buy", post(manual_sniper_buy))
         .route("/api/sniper/sell", post(manual_sniper_sell))
+        .route("/api/sniper/trade", post(manual_sniper_trade))
+        .route("/api/sniper/paper/reset", post(reset_paper))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Browsers get no cross-origin access by default. The dashboard reaches
@@ -89,6 +92,7 @@ pub fn router(engine: Arc<Engine>) -> Router {
         .route("/api/actual-mev", get(actual_mev))
         .route("/api/executions", get(executions))
         .route("/api/qualification", get(qualification))
+        .route("/api/preflight", get(preflight))
         .route("/api/reorgs", get(reorgs))
         .route("/api/stream", get(stream))
         .route("/api/mode", get(mode))
@@ -242,6 +246,8 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
         // The bot's signer EOA — prefills the go-live panel's setSearcher
         // step and the executor-allowlist check.
         "searcher": format!("{:?}", e.cfg.endpoints.searcher_address),
+        "sniperSearcher": format!("{:?}", e.cfg.endpoints.sniper_searcher_address),
+        "sniperSearcherKeyConfigured": e.cfg.endpoints.sniper_searcher_private_key.is_some(),
         "liveExecution": e.mode.live(),
         "liveArmed": e.mode.armed(),
         "broadcastEnabled": e.cfg.broadcast_enabled,
@@ -257,6 +263,8 @@ async fn config(State(s): State<ApiState>) -> impl IntoResponse {
             "relays": e.cfg.endpoints.relay_data_urls.len(),
             "sequencerFeed": e.cfg.endpoints.sequencer_feed.is_some(),
             "externalMempools": e.cfg.endpoints.extra_mempool_ws.len(),
+            "flashblocks": e.cfg.endpoints.flashblocks_ws.is_some(),
+            "chainBlockIngest": e.cfg.chain_block_ingest,
         },
         "bloxrouteRelay": {
             "url": e.cfg.endpoints.bloxroute_relay_url,
@@ -374,6 +382,102 @@ async fn qualification(State(s): State<ApiState>) -> impl IntoResponse {
         "broadcastEnabled": s.engine.cfg.broadcast_enabled,
         "runtimeLive": s.engine.mode.live(),
         "armed": s.engine.mode.armed(),
+        "operatorSoakHours": s.engine.qualification_hours(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QualificationPatch {
+    required_hours: u64,
+}
+
+/// Update the operator-selected soak threshold. This is intentionally a
+/// control-plane write: the value changes the evidence window, never the
+/// evidence itself, and the normal per-strategy qualification gates remain
+/// mandatory.
+async fn set_qualification(
+    State(s): State<ApiState>,
+    Json(patch): Json<QualificationPatch>,
+) -> Response {
+    match s.engine.set_qualification_hours(patch.required_hours) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "operatorSoakHours": s.engine.qualification_hours(),
+                "status": s.engine.qualification_status(),
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error})),
+        )
+            .into_response(),
+    }
+}
+
+/// Live go-live checks. This endpoint reports reachability and configuration,
+/// never secrets. Relay URLs are probed server-side because builder RPCs are
+/// not reachable from a browser-hosted console and many reject browser CORS.
+async fn preflight(State(s): State<ApiState>) -> impl IntoResponse {
+    let e = &s.engine;
+    let (rpc_ok, rpc_chain_id) = match e.http.call_raw("eth_chainId", json!([])).await {
+        Ok(value) => {
+            let chain_id = value
+                .as_str()
+                .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok());
+            (chain_id == Some(e.cfg.chain.chain_id), chain_id)
+        }
+        Err(_) => (false, None),
+    };
+
+    let relay_required = e.cfg.submission_mode == crate::config::SubmissionMode::Bundle;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok();
+    let relay_checks = if let Some(client) = client {
+        let checks =
+            futures_util::future::join_all(e.cfg.endpoints.bundle_relay_urls.iter().cloned().map(
+                |url| {
+                    let client = client.clone();
+                    async move {
+                        let ok = client
+                            .get(&url)
+                            .send()
+                            .await
+                            .map(|response| response.status().as_u16() < 500)
+                            .unwrap_or(false);
+                        json!({"url": url, "reachable": ok})
+                    }
+                },
+            ))
+            .await;
+        checks
+    } else {
+        Vec::new()
+    };
+    let relay_ok = !relay_required
+        || relay_checks
+            .iter()
+            .any(|row| row.get("reachable").and_then(serde_json::Value::as_bool) == Some(true));
+    let qualification = e.qualification_status();
+    Json(json!({
+        "rpc": rpc_ok,
+        "rpcChainId": rpc_chain_id,
+        "expectedChainId": e.cfg.chain.chain_id,
+        "relayRequired": relay_required,
+        "relay": relay_ok,
+        "relayChecks": relay_checks,
+        "wsConfigured": e.cfg.endpoints.ws_url.is_some(),
+        "sequencerFeedConfigured": e.cfg.endpoints.sequencer_feed.is_some(),
+        "flashblocksConfigured": e.cfg.endpoints.flashblocks_ws.is_some(),
+        "chainBlockIngest": e.cfg.chain_block_ingest,
+        "qualification": qualification,
+        "liveArmed": e.mode.armed(),
+        "broadcastEnabled": e.cfg.broadcast_enabled,
     }))
 }
 
@@ -590,11 +694,13 @@ async fn sniper_params(State(s): State<ApiState>) -> impl IntoResponse {
     let params = lane.params();
     Json(json!({
         "params": params,
-        "armed": params.is_armed() && !lane.is_halted() && lane.boot_enabled(),
+        "armed": lane.effective_armed(),
         "bootEnabled": lane.boot_enabled(),
         "halted": lane.is_halted(),
         "haltReason": lane.halt_reason(),
-        "armingBlockers": params.arming_blockers(),
+        "paperMode": lane.paper_mode(),
+        "simulationBalanceWei": lane.paper_balance_wei().to_string(),
+        "armingBlockers": lane.effective_arming_blockers(),
         "rejections": lane.rejection_counts(),
         "envSnippet": params.env_snippet(),
     }))
@@ -630,7 +736,7 @@ async fn set_sniper_params(
     let lane = &s.engine.sniper;
     match lane.patch_params(&patch) {
         Ok(effective) => {
-            if effective.is_armed() {
+            if lane.effective_armed() {
                 tracing::warn!(
                     target: "sniper",
                     buy_size_wei = %effective.buy_size_wei,
@@ -645,8 +751,10 @@ async fn set_sniper_params(
                 Json(json!({
                     "ok": true,
                     "params": effective,
-                    "armed": effective.is_armed() && !lane.is_halted(),
-                    "armingBlockers": effective.arming_blockers(),
+                    "armed": lane.effective_armed(),
+                    "paperMode": lane.paper_mode(),
+                    "simulationBalanceWei": lane.paper_balance_wei().to_string(),
+                    "armingBlockers": lane.effective_arming_blockers(),
                     "envSnippet": effective.env_snippet(),
                 })),
             )
@@ -663,6 +771,27 @@ async fn set_sniper_params(
 /// Stop opening new positions. Existing positions keep being managed — an
 /// operator halting the lane wants to stop buying, not to be trapped in what
 /// they already hold.
+async fn reset_paper(State(s): State<ApiState>) -> Response {
+    if !s.engine.sniper.paper_mode() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "paper funds cannot be reset on a live-armed process"})),
+        )
+            .into_response();
+    }
+    s.engine.sniper.reset_paper();
+    tracing::warn!(target: "sniper", "simulation paper balance reset to 1 ETH");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "paperMode": true,
+            "simulationBalanceWei": s.engine.sniper.paper_balance_wei().to_string(),
+        })),
+    )
+        .into_response()
+}
+
 async fn halt_sniper(State(s): State<ApiState>, Json(body): Json<HaltBody>) -> impl IntoResponse {
     let reason = body
         .reason
@@ -678,13 +807,12 @@ async fn resume_sniper(State(s): State<ApiState>) -> impl IntoResponse {
     let was = lane.halt_reason();
     lane.resume();
     tracing::warn!(target: "sniper", previous = ?was, "sniper lane resumed");
-    let params = lane.params();
     Json(json!({
         "ok": true,
         "halted": false,
         "previousReason": was,
-        "armed": params.is_armed() && lane.boot_enabled(),
-        "armingBlockers": params.arming_blockers(),
+        "armed": lane.effective_armed(),
+        "armingBlockers": lane.effective_arming_blockers(),
     }))
 }
 
@@ -855,6 +983,134 @@ async fn sniper_vault(State(s): State<ApiState>) -> impl IntoResponse {
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualTradePayload {
+    side: String,
+    token: Option<String>,
+    pair: Option<String>,
+    amount_wei: Option<String>,
+    position_id: Option<String>,
+    sell_fraction_bps: Option<u32>,
+}
+
+/// Strict bot-signer terminal endpoint. It intentionally accepts a normalized
+/// trade intent rather than arbitrary calldata; the bot chooses the bounded
+/// SniperVault path and validates the V2 pair/position before signing.
+async fn manual_sniper_trade(
+    State(s): State<ApiState>,
+    Json(p): Json<ManualTradePayload>,
+) -> Response {
+    let head = s.engine.ctx.head();
+    match p.side.to_ascii_lowercase().as_str() {
+        "buy" => {
+            let (Some(token), Some(pair), Some(amount_wei)) = (p.token, p.pair, p.amount_wei)
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "buy requires token, pair and amountWei"})),
+                )
+                    .into_response();
+            };
+            let Ok(token) = token.parse::<Address>() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "invalid token address"})),
+                )
+                    .into_response();
+            };
+            let Ok(pair) = pair.parse::<Address>() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "invalid pair address"})),
+                )
+                    .into_response();
+            };
+            let Ok(amount) = amount_wei.parse::<U256>() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "amountWei must be decimal wei"})),
+                )
+                    .into_response();
+            };
+            match s
+                .engine
+                .sniper_execution
+                .process_manual_buy(
+                    token,
+                    pair,
+                    s.engine.cfg.chain.weth,
+                    amount,
+                    s.engine.cfg.chain.chain_id,
+                    head.number,
+                    head.base_fee_per_gas,
+                    crate::types::now_ms(),
+                )
+                .await
+            {
+                Ok(Some(position)) => (
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "position": position})),
+                )
+                    .into_response(),
+                Ok(None) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({"ok": false, "error": "admission rejected manual buy"})),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": error.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        "sell" => {
+            let Some(id) = p.position_id else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": "sell requires positionId"})),
+                )
+                    .into_response();
+            };
+            match s
+                .engine
+                .sniper_execution
+                .process_manual_sell(
+                    &id,
+                    p.sell_fraction_bps.unwrap_or(10_000),
+                    s.engine.cfg.chain.weth,
+                    head.number,
+                    head.base_fee_per_gas,
+                    crate::types::now_ms(),
+                )
+                .await
+            {
+                Ok(Some((position, tx_hash))) => (
+                    StatusCode::OK,
+                    Json(json!({"ok": true, "position": position, "txHash": tx_hash})),
+                )
+                    .into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"ok": false, "error": "position not found or not live"})),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": error.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "side must be buy or sell"})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualBuyPayload {
@@ -885,17 +1141,46 @@ async fn manual_sniper_buy(
         .pair
         .and_then(|addr| addr.parse().ok())
         .unwrap_or(Address::ZERO);
-    let head = s.engine.ctx.head().number;
+    if pair == Address::ZERO || size_wei.is_zero() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "manual buy requires a non-zero pair and sizeWei"})),
+        )
+            .into_response();
+    }
+    let head = s.engine.ctx.head();
     let now = crate::types::now_ms();
-    let pos = s.engine.sniper.manual_buy(
-        token,
-        pair,
-        size_wei,
-        s.engine.cfg.chain.chain_id,
-        head,
-        now,
-    );
-    (StatusCode::OK, Json(json!({"ok": true, "position": pos}))).into_response()
+    match s
+        .engine
+        .sniper_execution
+        .process_manual_buy(
+            token,
+            pair,
+            s.engine.cfg.chain.weth,
+            size_wei,
+            s.engine.cfg.chain.chain_id,
+            head.number,
+            head.base_fee_per_gas,
+            now,
+        )
+        .await
+    {
+        Ok(Some(position)) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "position": position, "manualProbeBypass": true})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::CONFLICT,
+            Json(json!({"ok": false, "error": "token is already claimed or the admission gates rejected it"})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -909,16 +1194,34 @@ async fn manual_sniper_sell(
     State(s): State<ApiState>,
     Json(p): Json<ManualSellPayload>,
 ) -> impl IntoResponse {
-    let fraction = p.sell_fraction_bps.unwrap_or(10_000);
-    match s.engine.sniper.manual_sell(&p.id, fraction) {
-        Some(decision) => (
+    let fraction = p.sell_fraction_bps.unwrap_or(10_000).min(10_000);
+    let head = s.engine.ctx.head();
+    match s
+        .engine
+        .sniper_execution
+        .process_manual_sell(
+            &p.id,
+            fraction,
+            s.engine.cfg.chain.weth,
+            head.number,
+            head.base_fee_per_gas,
+            crate::types::now_ms(),
+        )
+        .await
+    {
+        Ok(Some((position, tx_hash))) => (
             StatusCode::OK,
-            Json(json!({"ok": true, "decision": decision})),
+            Json(json!({"ok": true, "position": position, "txHash": tx_hash})),
         )
             .into_response(),
-        None => (
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "error": "position not found or not live"})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": error.to_string()})),
         )
             .into_response(),
     }

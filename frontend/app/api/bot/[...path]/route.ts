@@ -115,11 +115,57 @@ function demoFor(path: string, search: URLSearchParams): unknown {
       const blockNumber = search.get("blockNumber");
       return demoRelayTxs(blockNumber ? Number(blockNumber) : undefined, limit);
     }
+    case "preflight":
+      return {
+        rpc: false,
+        rpcChainId: null,
+        expectedChainId: 1,
+        relayRequired: true,
+        relay: false,
+        relayChecks: [],
+        wsConfigured: false,
+        sequencerFeedConfigured: false,
+        flashblocksConfigured: false,
+        chainBlockIngest: false,
+        qualification: null,
+        liveArmed: false,
+        broadcastEnabled: false,
+      };
+    case "qualification":
+      return {
+        status: {
+          pass: false,
+          startedAtMs: Date.now(),
+          elapsedHours: 0,
+          requiredHours: 168,
+          observationCount: 0,
+          maximumObservationGapSecs: 0,
+          allowedObservationGapSecs: 120,
+          liveCandidateSimulations: 0,
+          relayCrossChecks: 0,
+          highConfidenceActualMatches: 0,
+          minimumSamples: 30,
+          minimumRelayComparisons: 30,
+          minimumActualMatches: 30,
+          maximumErrorBps: 2000,
+          minimumAccuracyBps: 8000,
+          persistenceDropped: 0,
+          comparisonBackend: "relay",
+          reasons: ["demo data has no canonical qualification evidence"],
+          strategies: [],
+        },
+        broadcastEnabled: false,
+        runtimeLive: demoLive,
+        armed: true,
+        operatorSoakHours: 168,
+      };
     case "config":
       return {
         chainId: 1,
         executor: demoStatus().executor,
         searcher: "0x00000000000000000000000000000000000f0000",
+        sniperSearcher: "0x00000000000000000000000000000000000f0001",
+        sniperSearcherKeyConfigured: false,
         liveExecution: demoLive,
         liveArmed: true,
         // Mirrors `Strategy::live_candidate()` / `shadow_only_reason()` in the
@@ -253,7 +299,7 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
   // panel unchanged. There is deliberately NO demo fallback that "applies" a
   // sniper patch — pretending to arm a lane that commits real capital is the
   // one place a convincing demo would be actively dangerous.
-  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume", "sniper/buy", "sniper/sell"];
+  const SNIPER_MUTATIONS = ["sniper/params", "sniper/halt", "sniper/resume", "sniper/buy", "sniper/sell", "sniper/trade", "sniper/paper/reset"];
   if (SNIPER_MUTATIONS.includes(route)) {
     let body: unknown = {};
     try {
@@ -279,20 +325,12 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
         headers: {"content-type": "application/json", "x-data-source": "bot"},
       });
     } catch {
-      // In demo mode / fallback when bot is offline:
-      const {updateDemoSniperParams, setDemoSniperHalted, demoSniperParams} = await import("@/lib/demo");
-      if (route === "sniper/halt") {
-        const h = body as {reason?: string};
-        setDemoSniperHalted(true, h.reason || "halted from console");
-        return jsonResponse({ok: true, halted: true, reason: h.reason || "halted from console", demo: true}, true);
-      }
-      if (route === "sniper/resume") {
-        setDemoSniperHalted(false, null);
-        return jsonResponse({ok: true, halted: false, demo: true}, true);
-      }
-      if (route === "sniper/params") {
-        const patch = body as Record<string, unknown>;
-        updateDemoSniperParams(patch);
+      // Resetting an in-memory paper bankroll is the one harmless demo
+      // mutation. Capital-control writes fail closed whenever the selected
+      // bot cannot be reached.
+      if (route === "sniper/paper/reset" && DEMO_MUTATIONS) {
+        const {resetDemoSniperFunds, demoSniperParams} = await import("@/lib/demo");
+        resetDemoSniperFunds();
         const res = demoSniperParams();
         return jsonResponse({ok: true, ...res, demo: true}, true);
       }
@@ -304,6 +342,39 @@ export async function POST(req: NextRequest, {params}: {params: Promise<{path: s
         }),
         {status: 503, headers: {"content-type": "application/json", "x-data-source": "bot"}},
       );
+    }
+  }
+
+  if (route === "qualification") {
+    let body: unknown = {};
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(JSON.stringify({ok: false, error: "invalid JSON body", demo: false}), {
+        status: 400,
+        headers: {"content-type": "application/json"},
+      });
+    }
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const upstream = await fetch(botUpstreamUrl("/api/qualification", chainSlug), {
+        method: "POST",
+        signal: controller.signal,
+        headers: {"content-type": "application/json", ...botAuthHeaders(chainSlug)},
+        body: JSON.stringify(body),
+      });
+      clearTimeout(timer);
+      const data = (await upstream.json().catch(() => ({error: `bot returned HTTP ${upstream.status}`}))) as Record<string, unknown>;
+      return new Response(JSON.stringify({...data, ok: upstream.ok, demo: false}), {
+        status: upstream.status,
+        headers: {"content-type": "application/json", "x-data-source": "bot"},
+      });
+    } catch {
+      return new Response(JSON.stringify({ok: false, error: "bot control plane unreachable", demo: false}), {
+        status: 503,
+        headers: {"content-type": "application/json", "x-data-source": "bot"},
+      });
     }
   }
 

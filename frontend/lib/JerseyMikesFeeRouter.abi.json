@@ -1,0 +1,366 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "feeRecipient_",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidRecipient",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "InvalidRouter",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotOwner",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "Reentrancy",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "RouterNotAllowed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes",
+        "name": "returndata",
+        "type": "bytes"
+      }
+    ],
+    "name": "SwapFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "TransferFailed",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "received",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "expected",
+        "type": "uint256"
+      }
+    ],
+    "name": "UnexpectedInputAmount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ValueMismatch",
+    "type": "error"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "previousOwner",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "newOwner",
+        "type": "address"
+      }
+    ],
+    "name": "OwnerChanged",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "allowed",
+        "type": "bool"
+      }
+    ],
+    "name": "RouterSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "to",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "Swept",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "trader",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "grossAmountIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "feeAmount",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "netAmountIn",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "minAmountOut",
+        "type": "uint256"
+      }
+    ],
+    "name": "TradeExecuted",
+    "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "BPS",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "PLATFORM_FEE_BPS",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "name": "allowedRouters",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amountIn",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "minAmountOut",
+        "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "internalType": "bytes",
+        "name": "swapCalldata",
+        "type": "bytes"
+      }
+    ],
+    "name": "executeSwapWithFee",
+    "outputs": [
+      {
+        "internalType": "bytes",
+        "name": "result",
+        "type": "bytes"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "feeRecipient",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "owner",
+    "outputs": [
+      {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "newOwner",
+        "type": "address"
+      }
+    ],
+    "name": "setOwner",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "router",
+        "type": "address"
+      },
+      {
+        "internalType": "bool",
+        "name": "allowed",
+        "type": "bool"
+      }
+    ],
+    "name": "setRouter",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "to",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "sweep",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "stateMutability": "payable",
+    "type": "receive"
+  }
+]

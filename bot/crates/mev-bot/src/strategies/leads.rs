@@ -191,6 +191,7 @@ pub fn ratio_bps(collateral_scaled: U256, lltv_wad: Option<U256>, debt: U256) ->
 
 /// Common tail for every liquidation-flavoured opportunity so the protocol
 /// modules only differ in their call list.
+#[allow(clippy::too_many_arguments)]
 pub fn liquidation_opportunity(
     strategy: Strategy,
     calls: Vec<Call>,

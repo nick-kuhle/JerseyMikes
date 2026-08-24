@@ -681,6 +681,17 @@ mod tests {
     }
 
     #[test]
+    fn json_patch_uses_the_camel_case_api_contract() {
+        let patch: SniperParamsPatch = serde_json::from_str(
+            r#"{"buySizeWei":"1000000000000000","dailyBudgetWei":"2000000000000000","takeProfitBps":2500}"#,
+        )
+        .unwrap();
+        assert_eq!(patch.buy_size_wei.as_deref(), Some("1000000000000000"));
+        assert_eq!(patch.daily_budget_wei.as_deref(), Some("2000000000000000"));
+        assert_eq!(patch.take_profit_bps, Some(2500));
+    }
+
+    #[test]
     fn patch_can_arm_the_lane_in_one_call() {
         let armed = SniperParams::default()
             .with_patch(&SniperParamsPatch {

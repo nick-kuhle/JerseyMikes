@@ -17,6 +17,8 @@ import {ago, shortHash, signedEth, weiToEth} from "@/lib/format";
 import {addressUrl, txUrl} from "@/lib/explorer";
 import {useWallet} from "@/lib/wallet";
 import {getAggregatorLinks, ERC20_ABI} from "@/lib/swap";
+import SniperVaultWizard from "./SniperVaultWizard";
+import TradeTerminal from "./TradeTerminal";
 import {
   createPublicClient,
   createWalletClient,
@@ -35,6 +37,7 @@ import type {
   SniperParamsResponse,
   SniperPortfolio,
   SniperPortfolioRow,
+  SniperVaultStatus,
 } from "@/lib/types";
 
 const EXIT_LABEL: Record<string, string> = {
@@ -142,6 +145,7 @@ const PRESETS = {
 function SniperPanel() {
   const [pf, setPf] = useState<SniperPortfolio | null>(null);
   const [cfg, setCfg] = useState<SniperParamsResponse | null>(null);
+  const [vault, setVault] = useState<SniperVaultStatus | null>(null);
   const [demo, setDemo] = useState(false);
   const [tab, setTab] = useState<"portfolio" | "parameters" | "swap" | "gates">("portfolio");
   const [portfolioSubTab, setPortfolioSubTab] = useState<"open" | "wallet" | "closed">("open");
@@ -188,6 +192,12 @@ function SniperPanel() {
   const [customTokenInput, setCustomTokenInput] = useState("");
   const [walletTokens, setWalletTokens] = useState<Array<{address: string; symbol: string; balance: string; decimals: number}>>([]);
   const [isScanningWallet, setIsScanningWallet] = useState(false);
+  // Manual controls require both addresses because an operator must identify
+  // the exact V2 pair. The bot validates the pair against the configured WETH
+  // and still enforces the SniperVault budget/slippage guards.
+  const [manualBuyToken, setManualBuyToken] = useState("");
+  const [manualBuyPair, setManualBuyPair] = useState("");
+  const [manualBuySizeEth, setManualBuySizeEth] = useState("0.05");
 
   // Sync form with fetched config
   const populateFormFromConfig = useCallback((params: SniperParams) => {
@@ -213,9 +223,10 @@ function SniperPanel() {
   const load = useCallback(async () => {
     const chain = readActiveChain();
     try {
-      const [pRes, cRes] = await Promise.all([
+      const [pRes, cRes, vRes] = await Promise.all([
         fetch(withChain("/api/bot/sniper/portfolio", chain), {cache: "no-store"}),
         fetch(withChain("/api/bot/sniper/params", chain), {cache: "no-store"}),
+        fetch(withChain("/api/bot/sniper/vault", chain), {cache: "no-store"}),
       ]);
       if (pRes.ok && cRes.ok) {
         const p = (await pRes.json()) as SniperPortfolio & {demo?: boolean};
@@ -224,6 +235,7 @@ function SniperPanel() {
         setCfg(c);
         setDemo(Boolean(p.demo || c.demo));
       }
+      if (vRes.ok) setVault((await vRes.json()) as SniperVaultStatus & {demo?: boolean});
     } catch {
       /* maintain existing data on transient fetch error */
     }
@@ -323,23 +335,23 @@ function SniperPanel() {
     const chain = readActiveChain();
 
     const patch: SniperParamsPatch = {
-      buy_size_wei: overridePatch?.buy_size_wei ?? weiFromEth(formBuySizeEth),
-      daily_budget_wei: overridePatch?.daily_budget_wei ?? weiFromEth(formDailyBudgetEth),
-      total_budget_wei: overridePatch?.total_budget_wei ?? (formTotalBudgetEth === "0" ? "0" : weiFromEth(formTotalBudgetEth)),
-      take_profit_bps: overridePatch?.take_profit_bps ?? Math.round(parseFloat(formTakeProfitPct || "100") * 100),
-      take_profit_abs_wei: overridePatch?.take_profit_abs_wei ?? (formTakeProfitAbsEth === "0" ? "0" : weiFromEth(formTakeProfitAbsEth)),
-      sell_fraction_bps: overridePatch?.sell_fraction_bps ?? Math.round(parseFloat(formSellFractionPct || "100") * 100),
-      stop_loss_bps: overridePatch?.stop_loss_bps ?? Math.round(parseFloat(formStopLossPct || "0") * 100),
-      trailing_stop_bps: overridePatch?.trailing_stop_bps ?? Math.round(parseFloat(formTrailingStopPct || "0") * 100),
-      max_hold_secs: overridePatch?.max_hold_secs ?? Math.round(parseFloat(formMaxHoldMins || "0") * 60),
-      max_concurrent_positions: overridePatch?.max_concurrent_positions ?? parseInt(formMaxPositions || "1", 10),
-      min_liquidity_wei: overridePatch?.min_liquidity_wei ?? weiFromEth(formMinLiquidityEth),
-      max_price_impact_bps: overridePatch?.max_price_impact_bps ?? Math.round(parseFloat(formMaxPriceImpactPct || "3") * 100),
-      max_buy_tax_bps: overridePatch?.max_buy_tax_bps ?? Math.round(parseFloat(formMaxBuyTaxPct || "5") * 100),
-      max_sell_tax_bps: overridePatch?.max_sell_tax_bps ?? Math.round(parseFloat(formMaxSellTaxPct || "5") * 100),
-      min_hold_blocks: overridePatch?.min_hold_blocks ?? parseInt(formMinHoldBlocks || "1", 10),
-      require_honeypot_pass: overridePatch?.require_honeypot_pass ?? formRequireHoneypot,
-      require_lp_locked: overridePatch?.require_lp_locked ?? formRequireLpLocked,
+      buySizeWei: overridePatch?.buySizeWei ?? weiFromEth(formBuySizeEth),
+      dailyBudgetWei: overridePatch?.dailyBudgetWei ?? weiFromEth(formDailyBudgetEth),
+      totalBudgetWei: overridePatch?.totalBudgetWei ?? (formTotalBudgetEth === "0" ? "0" : weiFromEth(formTotalBudgetEth)),
+      takeProfitBps: overridePatch?.takeProfitBps ?? Math.round(parseFloat(formTakeProfitPct || "100") * 100),
+      takeProfitAbsWei: overridePatch?.takeProfitAbsWei ?? (formTakeProfitAbsEth === "0" ? "0" : weiFromEth(formTakeProfitAbsEth)),
+      sellFractionBps: overridePatch?.sellFractionBps ?? Math.round(parseFloat(formSellFractionPct || "100") * 100),
+      stopLossBps: overridePatch?.stopLossBps ?? Math.round(parseFloat(formStopLossPct || "0") * 100),
+      trailingStopBps: overridePatch?.trailingStopBps ?? Math.round(parseFloat(formTrailingStopPct || "0") * 100),
+      maxHoldSecs: overridePatch?.maxHoldSecs ?? Math.round(parseFloat(formMaxHoldMins || "0") * 60),
+      maxConcurrentPositions: overridePatch?.maxConcurrentPositions ?? parseInt(formMaxPositions || "1", 10),
+      minLiquidityWei: overridePatch?.minLiquidityWei ?? weiFromEth(formMinLiquidityEth),
+      maxPriceImpactBps: overridePatch?.maxPriceImpactBps ?? Math.round(parseFloat(formMaxPriceImpactPct || "3") * 100),
+      maxBuyTaxBps: overridePatch?.maxBuyTaxBps ?? Math.round(parseFloat(formMaxBuyTaxPct || "5") * 100),
+      maxSellTaxBps: overridePatch?.maxSellTaxBps ?? Math.round(parseFloat(formMaxSellTaxPct || "5") * 100),
+      minHoldBlocks: overridePatch?.minHoldBlocks ?? parseInt(formMinHoldBlocks || "1", 10),
+      requireHoneypotPass: overridePatch?.requireHoneypotPass ?? formRequireHoneypot,
+      requireLpLocked: overridePatch?.requireLpLocked ?? formRequireLpLocked,
       enabled: overridePatch?.enabled ?? cfg?.params.enabled,
     };
 
@@ -398,6 +410,73 @@ function SniperPanel() {
       setFeedback({type: "error", msg: `Error: ${(err as Error).message}`});
     } finally {
       setIsHalting(false);
+    }
+  };
+
+  const handleManualBuy = async () => {
+    if (!isAddress(manualBuyToken) || !isAddress(manualBuyPair)) {
+      setFeedback({type: "error", msg: "Manual buy needs a valid token address and V2 pair address."});
+      return;
+    }
+    const sizeWei = weiFromEth(manualBuySizeEth);
+    if (sizeWei === "0") {
+      setFeedback({type: "error", msg: "Manual buy size must be greater than zero."});
+      return;
+    }
+    if (!window.confirm("Submit this manual buy? This explicitly bypasses the automatic launch probe; the on-chain vault budget and slippage guards still apply.")) return;
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/buy", readActiveChain()), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({token: manualBuyToken, pair: manualBuyPair, sizeWei}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; manualProbeBypass?: boolean};
+      if (!response.ok || !data.ok) throw new Error(data.error || "manual buy rejected");
+      setFeedback({type: "success", msg: "Manual buy submitted through SniperVault. The action bypassed the automatic launch probe by operator request."});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Manual buy failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleManualSell = async (id: string, fractionBps: number) => {
+    if (!window.confirm(`Submit a ${fractionBps === 5000 ? "50%" : "100%"} manual exit for this position?`)) return;
+    setIsSaving(true);
+    setFeedback(null);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/sell", readActiveChain()), {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({id, sellFractionBps: fractionBps}),
+      });
+      const data = (await response.json()) as {ok?: boolean; error?: string; txHash?: string};
+      if (!response.ok || !data.ok) throw new Error(data.error || "manual exit rejected");
+      setFeedback({type: "success", msg: `Manual ${fractionBps === 5000 ? "50%" : "100%"} exit submitted${data.txHash ? ` (${shortHash(data.txHash, 5)})` : ""}.`});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Manual exit failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleResetPaper = async () => {
+    if (!window.confirm("Reset the virtual simulation bankroll to 1 ETH? This does not touch an on-chain balance.")) return;
+    setIsSaving(true);
+    try {
+      const response = await fetch(withChain("/api/bot/sniper/paper/reset", readActiveChain()), {method: "POST", headers: {"content-type": "application/json"}});
+      const data = (await response.json()) as {ok?: boolean; error?: string; simulationBalanceWei?: string};
+      if (!response.ok || !data.ok) throw new Error(data.error || "paper funds reset rejected");
+      setFeedback({type: "success", msg: "Virtual simulation bankroll reset to 1 ETH."});
+      await load();
+    } catch (error) {
+      setFeedback({type: "error", msg: `Paper funds reset failed: ${(error as Error).message}`});
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -543,6 +622,18 @@ function SniperPanel() {
         </div>
       </div>
 
+      {(cfg.paperMode || !cfg.armed) && (
+        <div className="panel" style={{padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", borderColor: "rgba(34,211,238,0.45)", background: "rgba(34,211,238,0.05)"}}>
+          <div style={{display: "flex", alignItems: "center", gap: 8, fontSize: 11}}>
+            <span className="badge" style={{color: "var(--cyan)", borderColor: "var(--cyan)"}}>SIMULATION WALLET</span>
+            <span className="muted">virtual balance</span>
+            <strong style={{color: "var(--cyan)", fontVariantNumeric: "tabular-nums"}}>{ethFromWei(cfg.simulationBalanceWei ?? "1000000000000000000", 4)} Ξ</strong>
+            <span className="muted">paper only · no RPC funds</span>
+          </div>
+          <button onClick={() => void handleResetPaper()} disabled={isSaving} style={{...chipButtonStyle, color: "var(--cyan)", borderColor: "var(--cyan)"}}>↻ reset 1 ETH paper funds</button>
+        </div>
+      )}
+
       {/* ── Status Alerts & Feedback Banner ── */}
       {feedback && (
         <div
@@ -583,6 +674,9 @@ function SniperPanel() {
           </button>
         </div>
       )}
+
+      {/* ── SniperVault onboarding ── */}
+      <SniperVaultWizard params={cfg.params} onBound={() => void load()} />
 
       {/* ── Hard Blockers or Warnings Banner ── */}
       {(hardBlockers.length > 0 || isHalted || warnings.length > 0) && (
@@ -666,12 +760,27 @@ function SniperPanel() {
         />
       </div>
 
+      {/* ── On-chain vault status ── */}
+      <div className="panel" style={{padding: "10px 14px", display: "grid", gap: 7, borderColor: vault?.configured ? "rgba(34,197,94,0.45)" : "var(--line)"}}>
+        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap"}}>
+          <strong style={{fontSize: 11}}>SniperVault status · {activeChainSlug === "base" ? "Base" : "Ethereum"}</strong>
+          <span className="badge" style={{color: vault?.configured ? "var(--green)" : "var(--amber)", borderColor: vault?.configured ? "var(--green)" : "var(--amber)"}}>{vault?.configured ? "ON-CHAIN CONFIGURED" : "NOT CONFIGURED"}</span>
+        </div>
+        <div style={{display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", fontSize: 11}}>
+          <span className="muted">address <code>{vault?.address ? shortHash(vault.address, 7) : "—"}</code></span>
+          <span className="muted">spendable <strong>{vault?.spendableRemainingWei ? `${ethFromWei(vault.spendableRemainingWei, 4)} Ξ` : "—"}</strong></span>
+          <span className="muted">daily cap <strong>{vault?.dailyBudgetWei ? `${ethFromWei(vault.dailyBudgetWei, 4)} Ξ` : "—"}</strong></span>
+          <span className="muted">window reset <strong>{vault?.windowResetTimeSecs ? new Date(vault.windowResetTimeSecs * 1000).toLocaleString() : "—"}</strong></span>
+          {vault?.demo && <span className="badge" style={{color: "var(--amber)"}}>DEMO DATA</span>}
+        </div>
+      </div>
+
       {/* ── Sub-Navigation Tabs ── */}
       <div style={{display: "flex", gap: 8, borderBottom: "1px solid var(--line)", paddingBottom: 6}}>
         {[
           {id: "portfolio", label: `📊 Mini Portfolio (${pf.open.length} Active)`},
           {id: "parameters", label: "⚙️ Strategy & Investment Parameters"},
-          {id: "swap", label: "⚡ Instant Sell & DEX Aggregators"},
+          {id: "swap", label: "📈 Trade / Charts"},
           {id: "gates", label: "🛡️ Gate Logs & Honeypots"},
         ].map((t) => (
           <button
@@ -763,6 +872,19 @@ function SniperPanel() {
                 {isScanningWallet ? "Scanning..." : "↻ Refresh Wallet Balances"}
               </button>
             )}
+          </div>
+
+          {/* Explicit manual buy control. This is separate from the automatic
+              launch detector and is intentionally gated by a confirmation. */}
+          <div style={{display: "grid", gap: 7, padding: "9px 10px", border: "1px solid var(--amber)", borderRadius: 4, background: "rgba(245,181,68,0.06)"}}>
+            <div style={{fontSize: 11, fontWeight: 700, color: "var(--amber)"}}>Manual limit buy · operator override</div>
+            <div className="muted" style={{fontSize: 10}}>Provide the exact Uniswap V2-compatible pair. The bot verifies the pair contains configured WETH and submits through SniperVault; this does not run the automatic honeypot probe.</div>
+            <div style={{display: "flex", gap: 6, flexWrap: "wrap"}}>
+              <input value={manualBuyToken} onChange={(e) => setManualBuyToken(e.target.value)} placeholder="token 0x…" style={{...inputStyle, flex: "1 1 220px", width: 0}} />
+              <input value={manualBuyPair} onChange={(e) => setManualBuyPair(e.target.value)} placeholder="V2 pair 0x…" style={{...inputStyle, flex: "1 1 220px", width: 0}} />
+              <input value={manualBuySizeEth} onChange={(e) => setManualBuySizeEth(e.target.value)} placeholder="ETH size" inputMode="decimal" style={{...inputStyle, flex: "0 0 100px", width: 100}} />
+              <button onClick={() => void handleManualBuy()} disabled={isSaving || !isArmed} style={{...chipButtonStyle, color: "var(--amber)", borderColor: "var(--amber)", padding: "6px 10px"}}>{isArmed ? "submit manual buy" : "lane not armed"}</button>
+            </div>
           </div>
 
           {/* Active Open Positions Table */}
@@ -875,6 +997,22 @@ function SniperPanel() {
                                   }}
                                 >
                                   ⚡ SELL / SWAP
+                                </button>
+                                <button
+                                  onClick={() => void handleManualSell(pos.id, 5000)}
+                                  disabled={isSaving}
+                                  style={{...chipButtonStyle, padding: "3px 6px", color: "var(--amber)", borderColor: "var(--amber)"}}
+                                  title="Sell 50% through the bot's SniperVault"
+                                >
+                                  50% EXIT
+                                </button>
+                                <button
+                                  onClick={() => void handleManualSell(pos.id, 10000)}
+                                  disabled={isSaving}
+                                  style={{...chipButtonStyle, padding: "3px 6px", color: "var(--red)", borderColor: "var(--red)"}}
+                                  title="Sell 100% through the bot's SniperVault"
+                                >
+                                  100% EXIT
                                 </button>
                                 <a
                                   href={aggLinks.oneInch}
@@ -1564,218 +1702,17 @@ function SniperPanel() {
       )}
 
       {/* ────────────────────────────────────────────────────────────────────────
-          TAB 3: INSTANT SELL & DEX AGGREGATOR SWAPPING HUB
+          TAB 3: TRADE / CHARTS TERMINAL
           ──────────────────────────────────────────────────────────────────────── */}
       {tab === "swap" && (
-        <div className="panel" style={{padding: 16, display: "grid", gap: 14}}>
-          <div className="panel-head" style={{padding: "0 0 8px 0"}}>
-            <span>⚡ Instant Token Sell & DEX Aggregator Hub</span>
-            <span className="muted" style={{fontSize: 11}}>
-              Route via 1inch, Uniswap, KyberSwap or direct in-wallet execution
-            </span>
-          </div>
-
-          <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16}}>
-            {/* Left: Position / Token Selection */}
-            <div style={{display: "grid", gap: 10}}>
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Select Token from Active Positions:</strong>
-                </label>
-                <select
-                  style={inputStyle}
-                  value={swapTarget?.token || ""}
-                  onChange={(e) => {
-                    const match = pf.open.find((p) => p.token.toLowerCase() === e.target.value.toLowerCase());
-                    if (match) {
-                      setSwapTarget({
-                        token: match.token,
-                        symbol: match.symbol || "TOKEN",
-                        pair: match.pair,
-                        qty: match.remainingQty,
-                        markEth: weiToEth(match.markValueWei, 4),
-                      });
-                    } else if (e.target.value) {
-                      setSwapTarget({token: e.target.value, symbol: "CUSTOM"});
-                    } else {
-                      setSwapTarget(null);
-                    }
-                  }}
-                >
-                  <option value="">-- Choose active position or enter address --</option>
-                  {pf.open.map((p) => (
-                    <option key={p.id} value={p.token}>
-                      {p.symbol || "Token"} ({shortHash(p.token, 4)}) — Mark: {weiToEth(p.markValueWei, 3)} ETH
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Or Enter Any Token Contract Address:</strong>
-                </label>
-                <input
-                  type="text"
-                  value={swapTarget?.token || ""}
-                  onChange={(e) =>
-                    setSwapTarget({
-                      token: e.target.value,
-                      symbol: "CUSTOM",
-                    })
-                  }
-                  placeholder="0x..."
-                  style={inputStyle}
-                />
-              </div>
-
-              {/* Sell Quantity Fraction */}
-              <div>
-                <label style={{display: "block", fontSize: 11, marginBottom: 4}}>
-                  <strong>Sell Amount (% of Holdings):</strong>
-                </label>
-                <div style={{display: "flex", gap: 6}}>
-                  {[25, 50, 75, 100].map((f) => (
-                    <button
-                      key={f}
-                      onClick={() => setSwapFraction(f)}
-                      style={{
-                        flex: 1,
-                        padding: "6px",
-                        fontSize: 11,
-                        fontWeight: swapFraction === f ? 700 : 500,
-                        background: swapFraction === f ? "var(--cyan)" : "var(--panel-2)",
-                        color: swapFraction === f ? "#05240f" : "var(--text)",
-                        border: "1px solid",
-                        borderColor: swapFraction === f ? "var(--cyan)" : "var(--line)",
-                        borderRadius: 3,
-                        cursor: "pointer",
-                      }}
-                    >
-                      {f}%
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Right: Aggregator Links & Launchpad */}
-            <div style={{display: "grid", gap: 10}}>
-              {swapTarget && isAddress(swapTarget.token) ? (
-                (() => {
-                  const links = getAggregatorLinks(swapTarget.token, currentChainId, activeChainSlug);
-                  return (
-                    <div style={{background: "var(--panel-2)", padding: 12, borderRadius: 6, border: "1px solid var(--line)"}}>
-                      <div style={{fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--cyan)"}}>
-                        DEX Aggregator Execution for {swapTarget.symbol || "Token"}:
-                      </div>
-
-                      <div style={{display: "grid", gap: 8}}>
-                        <a
-                          href={links.oneInch}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "rgba(34, 211, 238, 0.12)",
-                            border: "1px solid var(--cyan)",
-                            borderRadius: 4,
-                            color: "var(--cyan)",
-                            textDecoration: "none",
-                            fontWeight: 700,
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>🦄 1inch DEX Aggregator (Optimal Route)</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.uniswap}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--text)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>🦄 Uniswap / Aerodrome Direct Swap</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.kyberswap}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--text)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>⚡ KyberSwap Meta-Aggregator</span>
-                          <span>Open ↗</span>
-                        </a>
-
-                        <a
-                          href={links.dexscreener}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            padding: "8px 12px",
-                            background: "var(--panel)",
-                            border: "1px solid var(--line)",
-                            borderRadius: 4,
-                            color: "var(--amber)",
-                            textDecoration: "none",
-                            fontSize: 12,
-                          }}
-                        >
-                          <span>📈 DexScreener Live Pool & Chart</span>
-                          <span>View ↗</span>
-                        </a>
-                      </div>
-                    </div>
-                  );
-                })()
-              ) : (
-                <div
-                  style={{
-                    padding: 24,
-                    textAlign: "center",
-                    color: "var(--muted)",
-                    border: "1px dashed var(--line)",
-                    borderRadius: 6,
-                    fontSize: 11,
-                  }}
-                >
-                  Select a token from your positions or enter an address on the left to generate aggregator swap links.
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <TradeTerminal
+          pf={pf}
+          wallet={wallet}
+          publicClient={publicClient}
+          activeChainSlug={activeChainSlug}
+          currentChainId={currentChainId}
+          initialTarget={swapTarget}
+        />
       )}
 
       {/* ────────────────────────────────────────────────────────────────────────

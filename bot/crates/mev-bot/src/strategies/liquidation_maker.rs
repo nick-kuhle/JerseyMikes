@@ -190,6 +190,7 @@ pub mod maker {
 /// Off-chain mirror of `Dog.bark`'s auction sizing, so the bundle knows the
 /// exact lot/tab it creates. Returns `(dink, dart, tab)` or `None` when the
 /// urn is safe / the dog is out of room.
+#[allow(clippy::too_many_arguments)]
 pub fn auction_math(
     ink: U256,
     art: U256,

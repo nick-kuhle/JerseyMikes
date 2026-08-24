@@ -112,8 +112,21 @@ promoted to a full exit, so a dust remainder cannot loop forever.
 ## 3. Configuration
 
 All keys are `SNIPER_*`, so the lane's entire configuration greps out of an
-`.env` in one line. Every one is also runtime-patchable via
-`POST /api/sniper/params`.
+`.env` in one line. Every runtime-safe parameter is patchable via
+`POST /api/sniper/params`; keys and contract addresses still need durable
+configuration and a restart where noted.
+
+The lane has an independent signer domain:
+
+```bash
+SNIPER_SEARCHER_PRIVATE_KEY=<dedicated-funded-key>
+SNIPER_SEARCHER_ADDRESS=<address-derived-from-that-key>
+```
+
+The address is checked against the key at boot. The bot never serializes the
+private key, and a non-zero enabled lane refuses to start without it. The
+atomic `SEARCHER_PRIVATE_KEY` and the Flashbots reputation key remain separate.
+
 
 ### Arming — the three switches that ship at zero
 
@@ -190,6 +203,39 @@ SNIPER_MAX_HOLD_SECS=1800
 SNIPER_MIN_LIQUIDITY_WEI=2000000000000000000
 SNIPER_MAX_PRICE_IMPACT_BPS=300
 ```
+
+### Paper simulation
+
+A process that is not boot-armed for live execution owns an isolated virtual
+balance initialized to **1 ETH**. It is not the searcher's RPC balance and it
+cannot be sent on chain. When the directional parameters have a non-zero size
+and daily budget, passing candidates reserve paper funds, create `Open`
+positions and are marked from the same pool reserves used by the live lane.
+Take-profit, stop-loss, max-hold and manual exits credit the simulated WETH
+proceeds back to the paper balance and append a `[SIMULATION]` fill. The Sniper
+panel exposes the balance and an authenticated reset-to-1-ETH action.
+
+### Trade terminal
+
+The Sniper panel's **Trade / Charts** tab resolves an ERC-20 against the
+selected chain's configured V2 factory, embeds a DexScreener chart with a
+DexTools fallback link, and exposes direct wallet Buy/Sell controls. `MAX`
+reserves 0.005 ETH for gas on buys and reads the exact ERC-20 balance on sells.
+Slippage and route preferences are shown before signing. Browser execution
+cannot guarantee private ordering; the MEV-Safe label is therefore explicit
+about that limitation rather than implying that a public wallet transaction
+is private.
+
+### Optional platform fee wrapper
+
+The manual terminal has fee calculation and calldata support for
+`JerseyMikesFeeRouter`, a separate contract with an immutable treasury, an
+owner-managed router allowlist, and an atomic 100 bps fee. It is intentionally
+off until `PLATFORM_FEE_RECIPIENT` and a deployed
+`NEXT_PUBLIC_PLATFORM_FEE_ROUTER_ADDRESS` are configured. This avoids silently
+charging to an unknown treasury or bypassing the fee with an unwrapped direct
+router call. The wrapper is not used by the automated atomic or directional
+lanes.
 
 ---
 
@@ -334,8 +380,8 @@ The four critical blocking items have all been implemented, tested, and wired:
    - Deterministic tag generation via `make_tag(position_id, fill_index)`.
    - Covered with ABI unit tests decoding generated calldata against `SniperVault`.
 
-2. **Vault Deployment & Config (`contracts/script/SniperVault.s.sol` & `params.rs`).**
-   - Implemented Forge deployment script `DeploySniperVault`.
+2. **Vault Deployment & Config (`contracts/script/DeploySniperVault.s.sol` & `params.rs`).**
+   - Implemented Forge deployment script `DeploySniperVault` for Ethereum and Base.
    - Added `SNIPER_VAULT_ADDRESS` configuration, validation, and arming blockers.
    - Added `GET /api/sniper/vault` endpoint reporting spendable remaining balance and window reset time.
 
@@ -384,13 +430,17 @@ The four critical blocking items have all been implemented, tested, and wired:
 
 1. Read this document and [`RISK.md`](RISK.md).
 2. Deploy and fund `SniperVault` with a **separate key** from the
-   `MevExecutor` searcher. *(Blocked on item 3 above.)*
+   `MevExecutor` searcher. Allowlist `SNIPER_SEARCHER_ADDRESS` and verify the
+   on-chain WETH binding before setting a non-zero budget.
 3. Start in shadow: leave `SNIPER_DIRECTIONAL=false` and watch the Gates tab.
    If the rejection counters are all `liquidity_thin`, your `minLiquidityWei`
    is wrong for the chain — find that out for free.
-4. Arm with a budget you are willing to lose entirely. Not a budget you expect
+4. Use the wizard's explicit manual controls only after verifying the exact V2
+   pair. Manual buys disclose that they bypass the automatic launch probe but
+   still use the vault's on-chain budget and slippage guards.
+5. Arm with a budget you are willing to lose entirely. Not a budget you expect
    to lose; one you are willing to.
-5. Tighten from measurement, never from hope.
+6. Tighten from measurement, never from hope.
 
 The drawdown stop, the halt endpoint and the vault's owner-only budget are
 three independent ways to stop this lane. Know all three before arming it.
