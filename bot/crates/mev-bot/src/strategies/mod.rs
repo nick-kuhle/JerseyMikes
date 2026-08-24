@@ -1085,13 +1085,13 @@ mod tests {
 
     /// The real Aerodrome `PoolCreated` for the WETH/`0x9c05…e9f6` volatile
     /// pool `0xb64ce58ed12a84ba00dc4dd58d28771b9308597d`, emitted by Base
-    /// block 50,390,210 (tx index 205, log index 589). Cross-checked live
-    /// 2026-08-24: `factory.getPool(t0, t1, false)` returns the pool,
-    /// `pool.stable()` is false, `factory.getFee(pool, false)` is 30.
+    /// block 50,390,210 (0x300e4c2). Cross-checked live 2026-08-24:
+    /// `factory.getPool(t0, t1, false)` returns the pool, `pool.stable()` is
+    /// false, `factory.getFee(pool, false)` is 30.
     fn aero_pool_created_log() -> serde_json::Value {
         serde_json::json!({
             "address": "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
-            "blockNumber": "0x300e942",
+            "blockNumber": "0x300e4c2",
             "topics": [
                 crate::dex::AERO_POOL_CREATED_TOPIC,
                 "0x0000000000000000000000004200000000000000000000000000000000000006",
