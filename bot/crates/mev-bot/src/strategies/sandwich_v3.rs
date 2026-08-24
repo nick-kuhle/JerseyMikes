@@ -113,6 +113,9 @@ impl StrategyImpl for SandwichV3Strategy {
     }
 
     async fn on_pending(&self, ctx: &StrategyCtx, tx: &PendingTx) -> Vec<Opportunity> {
+        if tx.source.backrun_only() {
+            return Vec::new();
+        }
         let weth = ctx.cfg.chain.weth;
         let Some(intent) = decode_v3_swap(tx) else {
             return Vec::new();

@@ -99,8 +99,13 @@ pub enum TxSource {
     PublicMempool,
     /// Flashbots MEV-Share SSE (hints only — calldata is usually redacted).
     MevShare,
-    /// L2 sequencer feed / preconfirmation.
+    /// L2 sequencer feed / preconfirmation. Ordered by the sequencer; the
+    /// searcher cannot place a transaction in front of it.
     Sequencer,
+    /// Base Flashblocks / sub-block preconfirmation. Same back-run-only
+    /// constraint as [`TxSource::Sequencer`]; kept distinct so ingest can
+    /// tag the feed without collapsing it onto ordinary pending semantics.
+    Flashblock,
     /// Third-party mempool stream (bloXroute, Blocknative, ...).
     ExternalStream,
     /// MEV Blocker's searcher feed: *unsigned* pending transactions from
@@ -122,6 +127,7 @@ impl TxSource {
             TxSource::PublicMempool => "public_mempool",
             TxSource::MevShare => "mev_share",
             TxSource::Sequencer => "sequencer",
+            TxSource::Flashblock => "flashblock",
             TxSource::ExternalStream => "external_stream",
             TxSource::MevBlocker => "mev_blocker",
             TxSource::RelayDelivered => "bloxroute_relay",
@@ -138,7 +144,10 @@ impl TxSource {
     /// front of it — a sandwich needs the victim's signed bytes to replay the
     /// victim leg, and those do not exist here.
     pub fn backrun_only(&self) -> bool {
-        matches!(self, TxSource::MevBlocker | TxSource::MevShare)
+        matches!(
+            self,
+            TxSource::MevBlocker | TxSource::MevShare | TxSource::Sequencer | TxSource::Flashblock
+        )
     }
 }
 
@@ -670,6 +679,18 @@ mod tests {
         assert_eq!(Strategy::all().len(), 10);
         assert_eq!(Strategy::SandwichV3.as_str(), "sandwich_v3");
         assert!(Strategy::all().contains(&Strategy::SandwichV3));
+    }
+
+    #[test]
+    fn sequencer_and_flashblock_are_backrun_only() {
+        assert!(TxSource::Sequencer.backrun_only());
+        assert!(TxSource::Flashblock.backrun_only());
+        assert!(TxSource::MevShare.backrun_only());
+        assert!(TxSource::MevBlocker.backrun_only());
+        assert!(!TxSource::PublicMempool.backrun_only());
+        assert!(!TxSource::ExternalStream.backrun_only());
+        assert!(!TxSource::RelayDelivered.backrun_only());
+        assert_eq!(TxSource::Flashblock.as_str(), "flashblock");
     }
 
     #[test]

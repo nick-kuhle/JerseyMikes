@@ -34,6 +34,8 @@ export interface StrategyQualification {
   verdict: "PASS" | "FAIL" | "INSUFFICIENT SAMPLE";
   forkSamples: number;
   relayComparisons: number;
+  /** Backend-neutral alias of `relayComparisons` (WS-R). */
+  independentComparisons?: number;
   actualComparisons: number;
   relayWithinTolerance: number;
   actualWithinTolerance: number;

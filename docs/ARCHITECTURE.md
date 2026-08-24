@@ -68,6 +68,7 @@ the victim replay was not faithful.
 | `contracts/script/compile-check.js` | solc-js compile check; also emits the ABI + runtime bytecode the bot embeds |
 | `bot/crates/mev-bot/src/rpc.rs` | JSON-RPC client, WS subscriptions, SSE reader |
 | `bot/crates/mev-bot/src/dex.rs` | Constant-product math, optimal sandwich/arb sizing, V3 quoter |
+| `bot/crates/mev-bot/src/dex/edge.rs` | Directed venue edges: V2 adapter + QuoterV2 quote book (never a V2 approximation of V3) |
 | `bot/crates/mev-bot/src/strategies/` | The strategy rows (sandwich ×2, JIT, arb, liquidations ×4, oracle front-run, sniper) plus the shared near-miss `leads.rs` registry |
 | `bot/crates/mev-bot/src/sim/` | anvil fork backend + relay `eth_callBundle` backend |
 | `bot/crates/mev-bot/src/signer.rs`, `rlp.rs` | EIP-1559 signing and a 60-line RLP encoder |
@@ -146,9 +147,12 @@ What is actually chain-aware in the code (added with Base, all env-overridable):
 Base is a **sequencer chain**: no public mempool (front-run strategies are
 off in `.env.example.base`), no relay market, and `BRIBE_BPS=0`. The current
 Base process is a measurement instrument, not a certified revenue lane:
-`atomic_arb` prices only the V2 graph, Base registers one V2 venue, V3 discovery
-does not feed that graph, and a pending dependency cannot yet be represented as
-a preconfirmed-state raw backrun. It must remain shadow-only until
+`atomic_arb` prices the V2 graph by default. `DEX_UNIV3_ARB=true` adds
+QuoterV2-quoted V3 edges from the existing V3 cache (never a V2
+approximation). Base still registers one V2 venue, and a pending
+dependency cannot yet be represented as a preconfirmed-state raw backrun.
+Victimless sequencer qualification now has a dedicated `state_comparisons`
+population (disjoint from `actual_mev_matches`). It must remain shadow-only until
 [`BASE_REVENUE_PATH_WORK_ORDER.md`](BASE_REVENUE_PATH_WORK_ORDER.md) is done.
 The console still multiplexes both instances behind `CHAINS`. Lending-protocol
 deployments exist on Base but are deliberately unregistered (phase 2,

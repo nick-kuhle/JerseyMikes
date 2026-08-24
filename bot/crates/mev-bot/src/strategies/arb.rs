@@ -1,10 +1,11 @@
-//! Atomic (cyclic) arbitrage across constant-product venues.
+//! Atomic (cyclic) arbitrage across venues.
 //!
 //! On every new block the bot refreshes its pool cache and looks for a
-//! WETH → token → WETH cycle whose two legs sit on different venues. The input
-//! size is solved exactly with a ternary search over the integer AMM curve, and
-//! the capital comes from a zero-fee Balancer flash loan, so the strategy needs
-//! no inventory at all.
+//! WETH-anchored cycle. The historical V2 search (`graph::search`) is always
+//! run and is byte-identical to the pre-graph enumerator at `max_len = 2`.
+//! `DEX_UNIV3_ARB=true` additionally probes QuoterV2 for a small V3 book and
+//! searches the mixed graph; V2-only cycles from that pass are dropped so they
+//! are not double-counted. Capital comes from a zero-fee Balancer flash loan.
 //!
 //! It also runs on pending transactions: a large swap creates the imbalance we
 //! want to back-run, so the same search is repeated against the *post-victim*
@@ -14,8 +15,9 @@ use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 
+use crate::dex::edge::{self, PricedCycle, PricedEdge, QuoteBook};
 use crate::dex::graph::{self, CycleCandidate, DirectedEdge};
-use crate::dex::{self, V2Pool, Venue};
+use crate::dex::{self, V2Pool, V3Pool, Venue};
 use crate::strategies::sandwich::build_leg;
 use crate::strategies::{decode_router, StrategyCtx, StrategyImpl};
 use crate::types::{now_ms, BlockHead, Call, Opportunity, PendingTx, Strategy};
@@ -64,6 +66,11 @@ impl StrategyImpl for AtomicArbStrategy {
                 out.push(opp);
             }
         }
+        // Mixed-venue (V3↔V2 / V3↔V3) search is opt-in so a default mainnet
+        // boot stays byte-identical to the historical V2 enumerator.
+        if ctx.cfg.dex_univ3_arb {
+            out.extend(v3_cross_opportunities(ctx, head).await);
+        }
         out
     }
 
@@ -97,7 +104,8 @@ impl StrategyImpl for AtomicArbStrategy {
             .map(|(v, _)| *v)
             .collect();
         if venues.len() < 2 {
-            // Single-venue chains have no cross-venue arb to back-run.
+            // Single-venue chains have no V2↔V2 back-run. V3 cross-venue
+            // candidates are emitted on the block tick (`DEX_UNIV3_ARB`).
             return Vec::new();
         }
         let Some(victim_pair) = ctx
@@ -264,6 +272,143 @@ fn try_cycle(
     })
 }
 
+/// Hard ceiling on V3 pools admitted into one mixed-venue search.
+const MAX_V3_POOLS: usize = 4;
+/// QuoterV2 `eth_call`s spent building the V3 quote book for one block.
+/// Four probe sizes × two directions × two pools, or two sizes across four.
+const V3_QUOTE_BUDGET: u32 = 16;
+
+/// Prefer WETH-quoted, actionable-fee V3 pools. Cap is a hard budget, not a hint.
+fn select_v3_pools(pools: &[V3Pool], weth: Address) -> Vec<V3Pool> {
+    let mut weth_quoted: Vec<V3Pool> = pools
+        .iter()
+        .copied()
+        .filter(|p| V3Pool::is_actionable_fee(p.fee) && (p.token0 == weth || p.token1 == weth))
+        .collect();
+    weth_quoted.sort_by_key(|p| (p.fee, p.address));
+    weth_quoted.truncate(MAX_V3_POOLS);
+    weth_quoted
+}
+
+/// Probe QuoterV2 at the discrete book sizes and search the mixed graph.
+///
+/// V2-only cycles are dropped: `on_block` already emitted those from
+/// [`graph::search`]. A book miss is `None` (never an interpolated V2 quote).
+async fn v3_cross_opportunities(ctx: &StrategyCtx, head: &BlockHead) -> Vec<Opportunity> {
+    let (Some(quoter), Some(router)) = (
+        ctx.cfg.addresses.univ3_quoter_v2,
+        ctx.cfg.addresses.univ3_swap_router_02,
+    ) else {
+        return Vec::new();
+    };
+    let weth = ctx.cfg.chain.weth;
+    let v3_pools = select_v3_pools(&ctx.pools_v3.all(), weth);
+    if v3_pools.is_empty() {
+        return Vec::new();
+    }
+    let sizes = edge::probe_sizes(ctx.max_position());
+    if sizes.is_empty() {
+        return Vec::new();
+    }
+
+    let hops: Vec<(V3Pool, Address, Address)> = v3_pools
+        .iter()
+        .flat_map(|p| [(*p, p.token0, p.token1), (*p, p.token1, p.token0)])
+        .collect();
+    let mut books: Vec<QuoteBook> = vec![QuoteBook::new(); hops.len()];
+    let mut quotes_left = V3_QUOTE_BUDGET;
+    let block_tag = ctx.block_tag(head.number);
+
+    // Interleave sizes across hops so the budget covers the graph instead
+    // of exhausting on the first pool's four-point book.
+    for &size in &sizes {
+        if quotes_left == 0 {
+            break;
+        }
+        for (i, (pool, token_in, token_out)) in hops.iter().enumerate() {
+            if quotes_left == 0 {
+                break;
+            }
+            quotes_left = quotes_left.saturating_sub(1);
+            match dex::quote_v3(
+                &ctx.rpc, quoter, *token_in, *token_out, pool.fee, size, &block_tag,
+            )
+            .await
+            {
+                Ok(out) if !out.is_zero() => books[i].insert(size, out),
+                _ => {}
+            }
+        }
+    }
+
+    let mut edges: Vec<PricedEdge> = Vec::new();
+    for p in &ctx.pools.all() {
+        edges.extend(PricedEdge::from_v2(p));
+    }
+    for ((pool, token_in, token_out), book) in hops.into_iter().zip(books) {
+        if let Some(e) = PricedEdge::v3(pool, token_in, token_out, router, book) {
+            edges.push(e);
+        }
+    }
+    if !edges.iter().any(|e| e.is_v3()) {
+        return Vec::new();
+    }
+
+    let found = edge::search_priced(
+        &edges,
+        weth,
+        ctx.max_position(),
+        ctx.cfg.arb_max_cycle_len,
+        ctx.cfg.arb_enumeration_budget,
+    );
+    found
+        .into_iter()
+        .filter(|c| c.uses_v3(&edges))
+        .filter_map(|c| build_priced_opportunity(ctx, &c, &edges, head))
+        .collect()
+}
+
+/// Turn a sized mixed-venue cycle into an `Opportunity`.
+fn build_priced_opportunity(
+    ctx: &StrategyCtx,
+    candidate: &PricedCycle,
+    edges: &[PricedEdge],
+    head: &BlockHead,
+) -> Option<Opportunity> {
+    let legs = candidate.legs();
+    let gas_units = candidate
+        .edges
+        .iter()
+        .filter_map(|&i| edges.get(i).map(|e| e.gas))
+        .sum::<u64>()
+        .max(graph::gas_estimate(legs));
+    let gas_cost = estimated_gas_cost(gas_units, head.base_fee_per_gas, ctx.cfg.priority_fee_wei);
+    if candidate.gross_profit <= gas_cost {
+        return None;
+    }
+    let calls = candidate.build_calls(edges, ctx.executor)?;
+    Some(Opportunity {
+        id: uuid::Uuid::new_v4().to_string(),
+        strategy: Strategy::AtomicArb,
+        victim_hashes: Vec::new(),
+        front_calls: calls,
+        back_calls: Vec::new(),
+        flash_tokens: vec![candidate.anchor],
+        flash_amounts: vec![candidate.amount_in],
+        profit_token: candidate.anchor,
+        expected_profit_wei: candidate.gross_profit.saturating_sub(gas_cost),
+        notional_wei: candidate.amount_in,
+        target_block: head.number + ctx.cfg.sim.target_block_offset,
+        created_at_ms: now_ms(),
+        notes: format!(
+            "arb {legs}-leg [{}] in {} gross {} (v3)",
+            candidate.route_label(edges),
+            candidate.amount_in,
+            candidate.gross_profit
+        ),
+    })
+}
+
 /// Balancer flash-loan repayment happens inside the executor, but the pool must
 /// be approved to pull the mid token when the venue is a router-based one.
 pub fn approve_call(token: Address, spender: Address) -> Call {
@@ -377,5 +522,123 @@ mod tests {
         assert!(!two.is_empty());
         assert!(five.len() >= two.len());
         assert_eq!(five[0].gross_profit, two[0].gross_profit);
+    }
+
+    fn v3_meta(addr: u8, fee: u32) -> V3Pool {
+        V3Pool {
+            address: Address::with_last_byte(addr),
+            token0: known::WETH,
+            token1: known::USDC,
+            fee,
+            tick_spacing: 60,
+            block: 1,
+        }
+    }
+
+    #[test]
+    fn select_v3_pools_keeps_weth_actionable_and_caps() {
+        let pools = vec![
+            v3_meta(1, 3_000),
+            v3_meta(2, 100), // 1 bp — not actionable
+            V3Pool {
+                address: Address::with_last_byte(3),
+                token0: known::USDC,
+                token1: known::USDT,
+                fee: 500,
+                tick_spacing: 10,
+                block: 1,
+            },
+            v3_meta(4, 500),
+            v3_meta(5, 10_000),
+            v3_meta(6, 500),
+            v3_meta(7, 3_000),
+        ];
+        let got = select_v3_pools(&pools, known::WETH);
+        assert!(got.iter().all(|p| V3Pool::is_actionable_fee(p.fee)));
+        assert!(got
+            .iter()
+            .all(|p| p.token0 == known::WETH || p.token1 == known::WETH));
+        assert_eq!(got.len(), MAX_V3_POOLS);
+        assert!(got[0].fee <= got[got.len() - 1].fee);
+    }
+
+    #[test]
+    fn mixed_search_drops_v2_only_cycles() {
+        // Same two V2 pools the historical search prices, plus an empty V3
+        // book that never becomes an edge. The V3 path must not re-emit the
+        // V2 cycle — that would double-count against graph::search.
+        let a = pool(Venue::UniV2, 1_000e18 as u128, 2_200_000e6 as u128);
+        let b = pool(Venue::SushiV2, 1_000e18 as u128, 2_000_000e6 as u128);
+        let mut edges = PricedEdge::from_v2(&a);
+        edges.extend(PricedEdge::from_v2(&b));
+        let found = edge::search_priced(
+            &edges,
+            known::WETH,
+            U256::from(10u128.pow(21)),
+            2,
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            !found.is_empty(),
+            "V2 cycle still exists on the priced graph"
+        );
+        assert!(
+            found.iter().all(|c| !c.uses_v3(&edges)),
+            "without a V3 book every cycle is V2-only and must be filtered"
+        );
+    }
+
+    #[test]
+    fn a_quoted_v3_book_plus_v2_produces_a_v3_cycle() {
+        let v2 = pool(Venue::UniV2, 1_000e18 as u128, 1_800_000e6 as u128);
+        let size = U256::from(10u128.pow(19));
+        let v2_out = v2.amount_out(known::WETH, size).unwrap();
+        let generous = v2_out + v2_out / U256::from(20u64);
+        let mut book = QuoteBook::new();
+        book.insert(size, generous);
+        let mut back = QuoteBook::new();
+        back.insert(generous, size / U256::from(2u64));
+
+        let mut edges = PricedEdge::from_v2(&v2);
+        edges.push(
+            PricedEdge::v3(
+                v3_meta(9, 500),
+                known::WETH,
+                known::USDC,
+                known::UNIV3_SWAP_ROUTER_02,
+                book,
+            )
+            .unwrap(),
+        );
+        edges.push(
+            PricedEdge::v3(
+                v3_meta(9, 500),
+                known::USDC,
+                known::WETH,
+                known::UNIV3_SWAP_ROUTER_02,
+                back,
+            )
+            .unwrap(),
+        );
+
+        let found = edge::search_priced(
+            &edges,
+            known::WETH,
+            size,
+            2,
+            std::time::Duration::from_secs(1),
+        );
+        let cross = found
+            .iter()
+            .find(|c| c.uses_v3(&edges))
+            .expect("V3↔V2 cycle survives the uses_v3 filter");
+        assert_eq!(cross.amount_in, size);
+        assert!(cross.gross_profit > U256::ZERO);
+        let calls = cross
+            .build_calls(&edges, Address::with_last_byte(0xee))
+            .expect("executable");
+        assert!(calls
+            .iter()
+            .any(|c| c.target == known::UNIV3_SWAP_ROUTER_02));
     }
 }
