@@ -316,6 +316,77 @@ function SniperPanel() {
     }
   }, [wallet.address, tab, scanWalletBalances]);
 
+  // Merge bot positions and wallet token balances into a unified list
+  const unifiedHoldings = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        token: string;
+        symbol: string;
+        pair?: string;
+        venue?: string;
+        state?: string;
+        entryCostWei: string;
+        markValueWei: string;
+        unrealizedPnlWei: string;
+        netPnlBps: number;
+        ageSecs: number;
+        openedAtMs: number;
+        markStale: boolean;
+        inBot: boolean;
+        inWallet: boolean;
+        walletBalance?: string;
+      }
+    >();
+
+    // Add bot open positions
+    (pf?.open || []).forEach((pos) => {
+      map.set(pos.token.toLowerCase(), {
+        token: pos.token,
+        symbol: pos.symbol || shortHash(pos.token, 4),
+        pair: pos.pair,
+        venue: pos.venue,
+        state: pos.state,
+        entryCostWei: pos.entryCostWei,
+        markValueWei: pos.markValueWei,
+        unrealizedPnlWei: pos.unrealizedPnlWei,
+        netPnlBps: pos.netPnlBps,
+        ageSecs: pos.ageSecs,
+        openedAtMs: pos.openedAtMs,
+        markStale: pos.markStale,
+        inBot: true,
+        inWallet: false,
+      });
+    });
+
+    // Add/merge wallet holdings
+    walletTokens.forEach((wt) => {
+      const key = wt.address.toLowerCase();
+      const existing = map.get(key);
+      if (existing) {
+        existing.inWallet = true;
+        existing.walletBalance = wt.balance;
+      } else {
+        map.set(key, {
+          token: wt.address,
+          symbol: wt.symbol,
+          entryCostWei: "0",
+          markValueWei: "0",
+          unrealizedPnlWei: "0",
+          netPnlBps: 0,
+          ageSecs: 0,
+          openedAtMs: Date.now(),
+          markStale: false,
+          inBot: false,
+          inWallet: true,
+          walletBalance: wt.balance,
+        });
+      }
+    });
+
+    return Array.from(map.values());
+  }, [pf?.open, walletTokens]);
+
   // Patch parameters API call (Sends exact camelCase payload)
   const handleSaveParams = async (overridePatch?: Partial<SniperParamsPatch>) => {
     setIsSaving(true);
@@ -440,77 +511,6 @@ function SniperPanel() {
   const blockers = pf.armingBlockers ?? [];
   const hardBlockers = blockers.filter((b) => !b.startsWith("WARNING"));
   const warnings = blockers.filter((b) => b.startsWith("WARNING"));
-
-  // Merge bot positions and wallet token balances into a unified list
-  const unifiedHoldings = useMemo(() => {
-    const map = new Map<
-      string,
-      {
-        token: string;
-        symbol: string;
-        pair?: string;
-        venue?: string;
-        state?: string;
-        entryCostWei: string;
-        markValueWei: string;
-        unrealizedPnlWei: string;
-        netPnlBps: number;
-        ageSecs: number;
-        openedAtMs: number;
-        markStale: boolean;
-        inBot: boolean;
-        inWallet: boolean;
-        walletBalance?: string;
-      }
-    >();
-
-    // Add bot open positions
-    pf.open.forEach((pos) => {
-      map.set(pos.token.toLowerCase(), {
-        token: pos.token,
-        symbol: pos.symbol || shortHash(pos.token, 4),
-        pair: pos.pair,
-        venue: pos.venue,
-        state: pos.state,
-        entryCostWei: pos.entryCostWei,
-        markValueWei: pos.markValueWei,
-        unrealizedPnlWei: pos.unrealizedPnlWei,
-        netPnlBps: pos.netPnlBps,
-        ageSecs: pos.ageSecs,
-        openedAtMs: pos.openedAtMs,
-        markStale: pos.markStale,
-        inBot: true,
-        inWallet: false,
-      });
-    });
-
-    // Add/merge wallet holdings
-    walletTokens.forEach((wt) => {
-      const key = wt.address.toLowerCase();
-      const existing = map.get(key);
-      if (existing) {
-        existing.inWallet = true;
-        existing.walletBalance = wt.balance;
-      } else {
-        map.set(key, {
-          token: wt.address,
-          symbol: wt.symbol,
-          entryCostWei: "0",
-          markValueWei: "0",
-          unrealizedPnlWei: "0",
-          netPnlBps: 0,
-          ageSecs: 0,
-          openedAtMs: Date.now(),
-          markStale: false,
-          inBot: false,
-          inWallet: true,
-          walletBalance: wt.balance,
-        });
-      }
-    });
-
-    return Array.from(map.values());
-  }, [pf.open, walletTokens]);
 
   return (
     <div style={{display: "grid", gap: 12}}>
