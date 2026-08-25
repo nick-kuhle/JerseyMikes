@@ -1047,6 +1047,7 @@ impl Engine {
             sniper_signer,
             store.clone(),
             sniper.clone(),
+            cfg.addresses,
         ));
 
         // Contract-backed simulation: mount the real SniperVault on the local
@@ -1811,6 +1812,7 @@ impl Engine {
                                 token,
                                 pair,
                                 venue: crate::dex::Venue::UniV2,
+                                pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
                                 weth_reserve: U256::from(10_000_000_000_000_000_000u128),
                                 token_reserve: U256::from(1_000_000_000_000_000_000u128),
                                 verdict: crate::sniper::HoneypotVerdict::Clean {

@@ -111,6 +111,12 @@ pub struct LaunchCandidate {
     /// quote math and the LP-lock probe all dispatch on it, and a candidate
     /// that cannot prove where it came from must not be tradable.
     pub venue: crate::dex::Venue,
+    /// The pool's own fee in bps, **when the venue prices off a per-pool
+    /// fee** (Aerodrome: read from `factory.getFee` at fetch time). `None`
+    /// on venues whose fee is a protocol constant (UniV2/SushiV2 30 bps,
+    /// hardcoded in the quote formula) and makes Aerodrome candidates
+    /// unquotable — discovery must never omit it.
+    pub pool_fee_bps: Option<u32>,
     /// WETH-side reserve of the pool at the state we would buy against.
     pub weth_reserve: U256,
     /// Token-side reserve.
@@ -479,6 +485,7 @@ mod tests {
             token: Address::with_last_byte(1),
             pair: Address::with_last_byte(2),
             venue: crate::dex::Venue::UniV2,
+            pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
             weth_reserve: eth(10),
             token_reserve: U256::from(1_000_000u64),
             verdict: HoneypotVerdict::Clean {
