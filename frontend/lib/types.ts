@@ -87,7 +87,69 @@ export interface StrategyQualification {
 
 export interface StatusResponse {
   chain: {id: number; name: string};
-  head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number};
+  head: {number: number; hash: string; baseFeeWei: string; gasUsed: number; timestamp: number;
+    /** Work order 0.3: age of the newest known block in ms, from its own
+     *  timestamp — the canonical-data-plane staleness reading. */
+    ageMs?: number};
+  /**
+   * Work order 0.3: the one-word data-plane verdict.
+   *
+   * The bot only ever reports the three live/degraded variants; `demo` is
+   * injected client-side by the console's proxy when the API is unreachable
+   * and generated fixtures are being rendered, so a missing bot (`demo`)
+   * can never be confused with a broken feed (`degraded` /
+   * `live_canonical_only`).
+   */
+  dataMode?: "live_preconfirmation" | "live_canonical_only" | "degraded" | "demo";
+  /** Work order 0.3: health of the primary JSON-RPC endpoint. */
+  upstream?: {
+    calls: number;
+    requests: number;
+    ok: number;
+    errors: number;
+    /** errors / (ok + errors) in basis points; 0 before the first request. */
+    errorRateBps: number;
+    /** HTTP 429 + provider rate-limit JSON-RPC errors. */
+    rateLimited: number;
+    avgLatencyMs: number;
+    lastOkMs: number;
+    lastErrorMs: number;
+  };
+  /** Work order 0.3: preconfirmation-feed health (Flashblocks). Stable
+   *  shape: `configured: false` on chains without a feed; otherwise every
+   *  raw counter plus derived connection state. */
+  flashblocks?: {
+    configured: boolean;
+    connectionState?: "connected" | "stalled" | "down";
+    lastFrameAgeMs?: number | null;
+    framesTotal?: number;
+    framesMalformed?: number;
+    blocksSeen?: number;
+    txsTotal?: number;
+    txsDuplicate?: number;
+    txsMalformed?: number;
+    txsDeposit?: number;
+    stateGaps?: number;
+    reconnects?: number;
+    lastFrameMs?: number;
+    lastBlockNumber?: number;
+    lastIndex?: number;
+    lastSealedLeadMs?: number;
+    sealedMatches?: number;
+    sealedMismatches?: number;
+    /** matches / (matches + mismatches) in bps; null until the first sealed
+     *  block has been graded — 0 would read as "every block mismatched". */
+    sealedMatchRateBps?: number | null;
+  };
+  /** Work order 0.3: chain-native full-block fetch coverage. */
+  chainBlocks?: {
+    configured: boolean;
+    blocksFetched?: number;
+    fetchesFailed?: number;
+    fetchSuccessRateBps?: number;
+    txsSeen?: number;
+    lastFetchMs?: number;
+  };
   mode: "simulation" | "live";
   /**
    * Boot-time arming: `LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`
@@ -169,6 +231,14 @@ export interface StatusResponse {
      * live signal.
      */
     funnelReplay?: Partial<Record<Strategy, FunnelCounters>>;
+    /**
+     * Work order 0.3: live candidates attributed to the data-plane source
+     * they rode in on (`chainBlock`, `flashblocks`, `sequencerFeed`,
+     * `publicMempool`). Deliberately disjoint from either strategy lane: a
+     * Base chain-block wave must not dilute the mainnet relay/mempool
+     * ratios, and vice versa.
+     */
+    sourceFunnels?: Record<string, {candidates: number; gatedByRisk: number; simulated: number}>;
   };
   simBackends: {anvilFork: boolean; relayCallBundle: boolean};
   inventory?: {

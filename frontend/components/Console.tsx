@@ -14,6 +14,7 @@ import Phase1Panel from "./Phase1Panel";
 import ModeSwitch from "./ModeSwitch";
 import ChainSwitcher from "./ChainSwitcher";
 import Section from "./Section";
+import DataPlanePanel from "./DataPlanePanel";
 import WalletButton from "./WalletButton";
 import type {
   ActualMevResponse,
@@ -53,6 +54,21 @@ const CHAIN_ID_LABEL: Record<number, string> = {
 };
 const labelFor = (id: number | null | undefined) =>
   id == null ? "an unknown chain" : CHAIN_ID_LABEL[id] ?? `chain ${id}`;
+
+/** Registry slug → the chain id that slug promises (work order 0.3). When
+ *  the CHAINS env maps `base` to a URL that answers for Ethereum, the
+ *  *console registry* is wrong — neither the bot nor the wallet is at
+ *  fault — and the banner below says exactly that. Kept in sync with the
+ *  switcher's LABELS map in `frontend/lib/chains.ts`. */
+const SLUG_EXPECTED_CHAIN: Record<string, number> = {
+  ethereum: 1,
+  mainnet: 1,
+  base: 8453,
+  arbitrum: 42161,
+  optimism: 10,
+  polygon: 137,
+  bsc: 56,
+};
 
 const FEED_MAX = 400;
 const POLL_MS = 4000;
@@ -145,6 +161,18 @@ export default function Console() {
     wallet.chainId !== null &&
     chainId !== undefined &&
     wallet.chainId !== chainId;
+  // Amber banner when the console registry itself lies: the switcher says
+  // "Base" but the mapped URL answered for Ethereum (work order 0.3). Needs
+  // the bot's real answer, so it is suppressed under demo fixtures.
+  const registryMismatch =
+    !demo &&
+    chainSlug != null &&
+    SLUG_EXPECTED_CHAIN[chainSlug] !== undefined &&
+    chainId !== undefined &&
+    SLUG_EXPECTED_CHAIN[chainSlug] !== chainId;
+  // Work order 0.3: the data-plane verdict, shown verbatim in the header so
+  // a sick plane is visible without opening the panel.
+  const dataMode = status?.dataMode ?? (demo ? "demo" : undefined);
 
   // Tab title: prefix the active chain so a screenshot or a browser tab
   // strip reads "Base · JerseyMikes …" (WS-H4). Runs client-side only.
@@ -191,6 +219,44 @@ export default function Console() {
           </span>
         )}
 
+        {!demo && dataMode && (
+          <span
+            className="badge"
+            style={{
+              color:
+                dataMode === "live_preconfirmation"
+                  ? "#35d07f"
+                  : dataMode === "live_canonical_only"
+                    ? "#22d3ee"
+                    : "#f5b544",
+            }}
+            title={
+              dataMode === "live_preconfirmation"
+                ? "canonical head fresh + preconfirmation feed live"
+                : dataMode === "live_canonical_only"
+                  ? "canonical head fresh; no preconfirmation frames (normal outside Base)"
+                  : "canonical head is stale — nothing on this console is live"
+            }
+          >
+            <span
+              className="dot"
+              style={{
+                background:
+                  dataMode === "live_preconfirmation"
+                    ? "#35d07f"
+                    : dataMode === "live_canonical_only"
+                      ? "#22d3ee"
+                      : "#f5b544",
+              }}
+            />
+            {dataMode === "live_preconfirmation"
+              ? "preconf live"
+              : dataMode === "live_canonical_only"
+                ? "canonical only"
+                : "data degraded"}
+          </span>
+        )}
+
         <span className={connected ? "badge live" : "badge"} style={{color: connected ? "#35d07f" : "#6b7c93"}}>
           <span className="dot" style={{background: connected ? "#35d07f" : "#6b7c93"}} /> feed
         </span>
@@ -234,6 +300,29 @@ export default function Console() {
         </div>
       )}
 
+      {/* wrong console registry (work order 0.3): the slug promises one
+          chain, the mapped bot URL answered for another. Nothing the bot or
+          the wallet can fix — the CHAINS env entry is wrong. */}
+      {registryMismatch && (
+        <div
+          role="status"
+          style={{
+            border: "1px solid var(--amber)",
+            background: "rgba(245, 181, 68, 0.08)",
+            color: "var(--amber)",
+            padding: "6px 10px",
+            borderRadius: 4,
+            fontSize: 11,
+            marginBottom: 8,
+          }}
+        >
+          console registry maps <strong>{chainSlug}</strong> to{" "}
+          <strong>{labelFor(SLUG_EXPECTED_CHAIN[chainSlug!])}</strong>, but that bot URL answered for{" "}
+          <strong>{status?.chain.name ?? labelFor(chainId)}</strong> (chain id {chainId}). The CHAINS
+          env entry is pointed at the wrong bot — fix the registry, not the bot.
+        </div>
+      )}
+
       {/* jump nav — the page is long; this keeps every section one click away */}
       <nav
         style={{
@@ -254,6 +343,7 @@ export default function Console() {
           jump
         </span>
         {[
+          ["data-plane", "Data plane"],
           ["pnl", "P/L"],
           ["activity", "Activity"],
           ["history", "Transactions"],
@@ -325,6 +415,17 @@ export default function Console() {
           sub={`${(status?.stats.relayTxsSeen ?? 0).toLocaleString()} delivered txs`}
         />
       </section>
+
+      {/* data-plane diagnostics (work order 0.3): the one screen that
+          separates a missing bot, a wrong registry, a broken upstream RPC,
+          a quiet preconfirmation feed and a genuinely calm chain. */}
+      <Section
+        id="data-plane"
+        title="data plane"
+        subtitle="upstream RPC · canonical head · preconfirmation feed · candidates by source"
+      >
+        <DataPlanePanel status={status} now={Date.now()} />
+      </Section>
 
       {/* equity + strategies */}
       <section

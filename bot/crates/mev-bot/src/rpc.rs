@@ -24,6 +24,59 @@ pub struct RpcClient {
     id: std::sync::Arc<AtomicU64>,
     /// Extra headers (used for the Flashbots signature header).
     headers: Vec<(String, String)>,
+    /// Data-plane health counters (work order 0.3), shared by every clone.
+    stats: std::sync::Arc<RpcStats>,
+}
+
+/// Per-endpoint data-plane health counters (work order 0.3). All plain
+/// atomics: the console reads them on every status tick and a slow panel
+/// must never put pressure on the hot path.
+#[derive(Default, Debug)]
+pub struct RpcStats {
+    /// JSON-RPC method calls issued (batch elements count individually).
+    pub calls: AtomicU64,
+    /// HTTP round trips attempted.
+    pub requests: AtomicU64,
+    /// Round trips that produced a usable protocol response.
+    pub ok: AtomicU64,
+    /// Round trips that failed for any reason (transport, HTTP, protocol).
+    pub errors: AtomicU64,
+    /// Rejections for load-shedding: HTTP 429 or a provider rate-limit
+    /// JSON-RPC error (public Base endpoints emit -32016 "over rate limit").
+    pub rate_limited: AtomicU64,
+    /// Sum of successful round-trip latencies in ms (divide by `ok`).
+    pub total_latency_ms: AtomicU64,
+    /// Wall clock of the last successful round trip (unix ms); 0 = never.
+    pub last_ok_ms: AtomicU64,
+    /// Wall clock of the last failed round trip (unix ms); 0 = never.
+    pub last_error_ms: AtomicU64,
+}
+
+impl RpcStats {
+    pub fn snapshot(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ok = self.ok.load(Relaxed);
+        let errors = self.errors.load(Relaxed);
+        let total = ok + errors;
+        serde_json::json!({
+            "calls": self.calls.load(Relaxed),
+            "requests": self.requests.load(Relaxed),
+            "ok": ok,
+            "errors": errors,
+            "errorRateBps": errors
+                .saturating_mul(10_000)
+                .checked_div(total)
+                .unwrap_or(0),
+            "rateLimited": self.rate_limited.load(Relaxed),
+            "avgLatencyMs": self
+                .total_latency_ms
+                .load(Relaxed)
+                .checked_div(ok)
+                .unwrap_or(0),
+            "lastOkMs": self.last_ok_ms.load(Relaxed),
+            "lastErrorMs": self.last_error_ms.load(Relaxed),
+        })
+    }
 }
 
 impl RpcClient {
@@ -37,7 +90,40 @@ impl RpcClient {
             url: url.into(),
             id: std::sync::Arc::new(AtomicU64::new(1)),
             headers: Vec::new(),
+            stats: std::sync::Arc::new(RpcStats::default()),
         })
+    }
+
+    /// The shared data-plane health counters for this endpoint.
+    pub fn stats(&self) -> &RpcStats {
+        &self.stats
+    }
+
+    fn record_request(&self, methods: u64) {
+        self.stats.calls.fetch_add(methods, Ordering::Relaxed);
+        self.stats.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_round_trip(&self, elapsed: std::time::Duration, ok: bool) {
+        if ok {
+            self.stats.ok.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .total_latency_ms
+                .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+            self.stats
+                .last_ok_ms
+                .store(crate::types::now_ms(), Ordering::Relaxed);
+        } else {
+            self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .last_error_ms
+                .store(crate::types::now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// HTTP 429 or provider `-32016 "over rate limit"`.
+    fn note_rate_limited(&self) {
+        self.stats.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn url(&self) -> &str {
@@ -168,18 +254,26 @@ impl RpcClient {
         });
         let text = serde_json::to_string(&body)?;
         let header = signer.flashbots_header(text.as_bytes());
-        let resp = self
-            .http
-            .post(&self.url)
-            .header("content-type", "application/json")
-            .header("X-Flashbots-Signature", header)
-            .body(text)
-            .send()
-            .await?;
-        Self::decode(resp).await
+        self.record_request(1);
+        let started = std::time::Instant::now();
+        let result = async {
+            let resp = self
+                .http
+                .post(&self.url)
+                .header("content-type", "application/json")
+                .header("X-Flashbots-Signature", header)
+                .body(text)
+                .send()
+                .await?;
+            self.decode(resp).await
+        }
+        .await;
+        self.record_round_trip(started.elapsed(), result.is_ok());
+        result
     }
 
     async fn send(&self, body: Value) -> Result<Value> {
+        self.record_request(1);
         let mut req = self
             .http
             .post(&self.url)
@@ -187,19 +281,34 @@ impl RpcClient {
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
         }
-        let resp = req.json(&body).send().await?;
-        Self::decode(resp).await
+        let started = std::time::Instant::now();
+        let result = async {
+            let resp = req.json(&body).send().await?;
+            self.decode(resp).await
+        }
+        .await;
+        self.record_round_trip(started.elapsed(), result.is_ok());
+        result
     }
 
-    async fn decode(resp: reqwest::Response) -> Result<Value> {
+    async fn decode(&self, resp: reqwest::Response) -> Result<Value> {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                self.note_rate_limited();
+            }
             bail!("rpc http {status}: {}", truncate(&text, 512));
         }
         let v: Value = serde_json::from_str(&text)
             .with_context(|| format!("rpc returned non-json: {}", truncate(&text, 512)))?;
         if let Some(err) = v.get("error") {
+            // Public endpoints signal load-shedding as a JSON-RPC error too
+            // (e.g. -32016 "over rate limit"), not only as HTTP 429.
+            let msg = err["message"].as_str().unwrap_or_default();
+            if err["code"].as_i64() == Some(-32016) || msg.contains("rate limit") {
+                self.note_rate_limited();
+            }
             bail!("rpc error: {err}");
         }
         v.get("result")
@@ -213,6 +322,7 @@ impl RpcClient {
         if calls.is_empty() {
             return Ok(Vec::new());
         }
+        self.record_request(calls.len() as u64);
         let mut payload = Vec::with_capacity(calls.len());
         let mut ids = Vec::with_capacity(calls.len());
         for (method, params) in calls {
@@ -227,7 +337,22 @@ impl RpcClient {
         for (k, v) in &self.headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        let started = std::time::Instant::now();
+        let result = self.batch_inner(req, payload, ids).await;
+        self.record_round_trip(started.elapsed(), result.is_ok());
+        result
+    }
+
+    async fn batch_inner(
+        &self,
+        req: reqwest::RequestBuilder,
+        payload: Vec<Value>,
+        ids: Vec<u64>,
+    ) -> Result<Vec<Result<Value>>> {
         let resp = req.json(&Value::Array(payload)).send().await?;
+        if resp.status().as_u16() == 429 {
+            self.note_rate_limited();
+        }
         let text = resp.text().await?;
         let parsed: Value = serde_json::from_str(&text)
             .with_context(|| format!("batch returned non-json: {}", truncate(&text, 512)))?;
@@ -243,6 +368,11 @@ impl RpcClient {
             match entry {
                 Some(e) => {
                     if let Some(err) = e.get("error") {
+                        // Batch elements can be individually rate-limited.
+                        let msg = err["message"].as_str().unwrap_or_default();
+                        if err["code"].as_i64() == Some(-32016) || msg.contains("rate limit") {
+                            self.note_rate_limited();
+                        }
                         out.push(Err(anyhow!("rpc error: {err}")));
                     } else {
                         out.push(Ok(e.get("result").cloned().unwrap_or(Value::Null)));
@@ -422,9 +552,150 @@ async fn run_sse(client: &reqwest::Client, url: &str, tx: &mpsc::Sender<String>)
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{json, Value};
+
     #[test]
     fn truncate_is_utf8_safe_for_ascii() {
         assert_eq!(super::truncate("hello", 10), "hello");
         assert_eq!(super::truncate("hello", 2), "he…");
+    }
+
+    /// A one-shot JSON-RPC stub answering `respond(body)` with a canned
+    /// response (or raw HTTP status).
+    async fn mock_server(
+        respond: impl Fn(&Value) -> (u16, Value) + Send + Sync + 'static,
+    ) -> String {
+        // axum handlers must be Clone: the responder is shared across
+        // requests behind an Arc rather than moved into one closure.
+        let respond = std::sync::Arc::new(respond);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                move |axum::extract::Json(req): axum::extract::Json<Value>| {
+                    let respond = respond.clone();
+                    async move {
+                        let (status, body) = respond(&req);
+                        (
+                            axum::http::StatusCode::from_u16(status).expect("status code"),
+                            axum::Json(body),
+                        )
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn rpc_stats_count_ok_errors_and_rate_limits_honestly() {
+        use super::RpcClient;
+        // 1. Success path: ok + latency land, no errors.
+        let url = mock_server(|req| {
+            (
+                200,
+                json!({"jsonrpc": "2.0", "id": req["id"], "result": "0x2105"}),
+            )
+        })
+        .await;
+        let rpc = RpcClient::new(url).unwrap();
+        let out: String = rpc.call("eth_chainId", json!([])).await.unwrap();
+        assert_eq!(out, "0x2105");
+        assert_eq!(
+            rpc.stats().calls.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(rpc.stats().ok.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            rpc.stats()
+                .errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(
+            rpc.stats()
+                .last_ok_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+
+        // 2. HTTP 429 → errors + rateLimited, never counted as ok.
+        let url =
+            mock_server(|_| (429, json!({"error": "max project request rate exceeded"}))).await;
+        let rpc = RpcClient::new(url).unwrap();
+        assert!(rpc.call::<String>("eth_chainId", json!([])).await.is_err());
+        assert_eq!(
+            rpc.stats()
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            rpc.stats()
+                .errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(rpc.stats().ok.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // 3. Provider JSON-RPC rate-limit error (-32016) → also load-shedding.
+        let url = mock_server(|req| {
+            (
+                200,
+                json!({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "error": {"code": -32016, "message": "over rate limit"}
+                }),
+            )
+        })
+        .await;
+        let rpc = RpcClient::new(url).unwrap();
+        assert!(rpc.call::<String>("eth_chainId", json!([])).await.is_err());
+        assert_eq!(
+            rpc.stats()
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            rpc.stats()
+                .errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // 4. Batch counts each method as a call on one round trip.
+        let url = mock_server(|req| {
+            let arr = req.as_array().unwrap();
+            let out: Vec<Value> = arr
+                .iter()
+                .map(|one| json!({"jsonrpc": "2.0", "id": one["id"], "result": "0x1"}))
+                .collect();
+            (200, Value::Array(out))
+        })
+        .await;
+        let rpc = RpcClient::new(url).unwrap();
+        let res = rpc
+            .batch(&[
+                ("eth_chainId".to_string(), json!([])),
+                ("eth_blockNumber".to_string(), json!([])),
+            ])
+            .await
+            .unwrap();
+        assert!(res.iter().all(|r| r.is_ok()));
+        assert_eq!(
+            rpc.stats().calls.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            rpc.stats()
+                .requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }

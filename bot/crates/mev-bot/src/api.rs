@@ -180,7 +180,23 @@ async fn health() -> impl IntoResponse {
 async fn status(State(s): State<ApiState>) -> impl IntoResponse {
     let e = &s.engine;
     let head = e.ctx.head();
+    let now_ms = crate::types::now_ms();
+    // How stale the newest block we know about is, from its own timestamp:
+    // the single number that answers "is the canonical data plane alive?"
+    let head_age_ms = now_ms.saturating_sub(head.timestamp.saturating_mul(1_000));
+    let preconfirmed_frame_age_ms = e.flashblocks.as_ref().and_then(|f| {
+        let last = f.last_frame_ms.load(std::sync::atomic::Ordering::Relaxed);
+        (last > 0).then(|| now_ms.saturating_sub(last))
+    });
     Json(json!({
+        // Work order 0.3: the one-word data-plane verdict. The bot only ever
+        // reports the live/degraded variants; `demo` is injected by the
+        // console's proxy when this API is unreachable.
+        "dataMode": crate::engine::classify_data_mode(
+            e.cfg.chain.block_time_ms,
+            Some(head_age_ms),
+            preconfirmed_frame_age_ms,
+        ),
         "chain": {
             "id": e.cfg.chain.chain_id,
             "name": e.cfg.chain.name,
@@ -191,6 +207,24 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
             "baseFeeWei": head.base_fee_per_gas.to_string(),
             "gasUsed": head.gas_used,
             "timestamp": head.timestamp,
+            "ageMs": head_age_ms,
+        },
+        // Upstream reachability + latency + load-shedding for the primary
+        // JSON-RPC endpoint (work order 0.3).
+        "upstream": e.http.stats().snapshot(),
+        // Preconfirmation-feed health, or {"configured": false} on chains
+        // without one — never silently absent.
+        "flashblocks": flashblocks_json(e, now_ms),
+        // Chain-native full-block fetch coverage, or {"configured": false}.
+        "chainBlocks": match &e.chain_blocks {
+            Some(s) => {
+                let mut snap = s.snapshot();
+                snap.as_object_mut()
+                    .expect("chain-block snapshot is an object")
+                    .insert("configured".into(), json!(true));
+                snap
+            }
+            None => json!({"configured": false}),
         },
         "mode": if e.mode.live() { "live" } else { "simulation" },
         // Boot-time arming (`LIVE_EXECUTION=true` + `I_UNDERSTAND_LIVE_RISK=yes`).
@@ -233,6 +267,52 @@ async fn status(State(s): State<ApiState>) -> impl IntoResponse {
         },
         "latency": e.latency.snapshot(),
     }))
+}
+
+/// Preconfirmation-feed health for `/api/status` (work order 0.3). Stable
+/// shape: `configured: false` on chains without a feed, otherwise every raw
+/// counter plus the derived view an operator actually triages on —
+/// connection state, frame age, and the sealed-block match rate.
+fn flashblocks_json(e: &Engine, now_ms: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(f) = &e.flashblocks else {
+        return json!({"configured": false});
+    };
+    let last_frame = f.last_frame_ms.load(Relaxed);
+    let last_frame_age_ms = (last_frame > 0).then(|| now_ms.saturating_sub(last_frame));
+    // Sub-blocks seal at ~200 ms: two seconds without a frame is a stall,
+    // ten is a down feed (reconnects will already be climbing in the raw
+    // counters, which stay visible here — nothing is hidden behind the word).
+    let connection_state = match last_frame_age_ms {
+        Some(age) if age < 2_000 => "connected",
+        Some(age) if age < 10_000 => "stalled",
+        _ => "down",
+    };
+    let matches = f.sealed_matches.load(Relaxed);
+    let mismatches = f.sealed_mismatches.load(Relaxed);
+    let graded = matches + mismatches;
+    let mut snap = f.snapshot();
+    let obj = snap
+        .as_object_mut()
+        .expect("flashblock snapshot is an object");
+    obj.insert("configured".into(), json!(true));
+    obj.insert("connectionState".into(), json!(connection_state));
+    obj.insert(
+        "lastFrameAgeMs".into(),
+        last_frame_age_ms
+            .map(|age| json!(age))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    // null until the first sealed block has been graded: 0 bps would read as
+    // "every block mismatched", which is a very different verdict.
+    obj.insert(
+        "sealedMatchRateBps".into(),
+        match matches.saturating_mul(10_000).checked_div(graded) {
+            Some(rate) => json!(rate),
+            None => serde_json::Value::Null,
+        },
+    );
+    snap
 }
 
 fn live_smoke(e: &Engine) -> serde_json::Value {

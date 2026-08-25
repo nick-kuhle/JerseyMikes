@@ -157,6 +157,10 @@ pub struct Engine {
     /// Feed counters for `/api/status`, populated when a Flashblocks feed is
     /// configured. `run` hands this exact handle to the ingest spawn.
     pub flashblocks: Option<Arc<crate::flashblocks::FlashblockStats>>,
+    /// Fetch-coverage counters for the chain-native full-block poller (work
+    /// order 0.3), populated when `chain_block_ingest` is on. Same hand-off
+    /// pattern as `flashblocks`.
+    pub chain_blocks: Option<Arc<crate::ingest::ChainBlockStats>>,
     /// Arb candidates awaiting their canonical re-quote (WS-R independent
     /// `state_comparisons` population). Captured at emission, settled when
     /// the source state's block seals. Bounded; overflow drops the new
@@ -284,6 +288,12 @@ pub struct Stats {
     /// WS-R: arb samples dropped without writing (missed seal, unquotable
     /// venue, RPC failure, or a full backlog — evidence is never fabricated).
     pub state_comparisons_dropped: std::sync::atomic::AtomicU64,
+    /// Per-source funnel counters for this chain's data plane (work order
+    /// 0.3). Deliberately disjoint from the live/replay funnels: on mainnet
+    /// the live lane means relay + public-mempool flow, and counting Base
+    /// chain-block / Flashblocks / sequencer-feed candidates into those
+    /// ratios would contaminate both chains' measurements.
+    source_funnels: parking_lot::Mutex<std::collections::BTreeMap<&'static str, SourceFunnel>>,
     /// Delivered blocks skipped because the replay worker was still busy.
     /// Replay is post-mortem analysis, so dropping the block is preferable to
     /// letting a backlog build behind the live path.
@@ -340,6 +350,90 @@ impl FunnelLane {
             | TxSource::Flashblock
             | TxSource::ExternalStream => FunnelLane::Live,
         }
+    }
+}
+
+/// Per-data-source funnel counters for one chain's data plane (work order
+/// 0.3): how far candidates from each upstream feed actually get. Three
+/// stages only — this is an operator triage aid ("is the preconfirmation
+/// feed producing candidates at all?"), not the per-strategy conversion
+/// funnel, which stays in [`FunnelCounters`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourceFunnel {
+    /// Candidates attributed to this source at emission time.
+    pub candidates: u64,
+    /// Of those, rejected by the risk or inventory gates.
+    pub gated_by_risk: u64,
+    /// Of those, that produced a simulation outcome (succeeded or reverted).
+    pub simulated: u64,
+}
+
+/// Attribute an opportunity to the data-plane source it rode in on (work
+/// order 0.3). Attribution is by shape, exactly as documented:
+///
+/// - **flashblocks**: pinned to a preconfirmed state — the candidate could
+///   not exist without the preconfirmation feed.
+/// - **chainBlock**: no victim transaction — a block-cadence strategy
+///   (atomic arb, liquidation and oracle watches) driven by the canonical
+///   head.
+/// - **sequencerFeed** / **publicMempool**: a victim-ful candidate is only
+///   as live as the feed the victim arrived on; which one applies is a
+///   deployment fact, handed in by the caller from config rather than
+///   guessed per transaction.
+///
+/// These labels are never mixed with the mainnet relay/mempool ratios: they
+/// live in their own map so a Base chain-block wave cannot dilute the
+/// per-strategy funnel, and vice versa.
+pub fn candidate_source(opp: &Opportunity, sequencer_feed_configured: bool) -> &'static str {
+    if opp.provenance.source_state.is_some() {
+        return "flashblocks";
+    }
+    if opp.victim_hashes.is_empty() {
+        return "chainBlock";
+    }
+    if sequencer_feed_configured {
+        "sequencerFeed"
+    } else {
+        "publicMempool"
+    }
+}
+
+/// The `/api/status` `dataMode` verdict (work order 0.3):
+///
+/// - **live_preconfirmation**: canonical head fresh *and* a fresh
+///   preconfirmation frame — the full Base data plane is up.
+/// - **live_canonical_only**: head fresh, no fresh preconfirmations. The
+///   normal state on mainnet (no feed is configured there) and the honest
+///   verdict on a sequencer chain whose preconfirmation feed has gone quiet
+///   while blocks still seal.
+/// - **degraded**: the canonical head itself is stale — upstream RPC or
+///   ingestion is broken; nothing the console shows can be trusted as live.
+/// - **demo** is never emitted by the bot. It is injected by the console's
+///   proxy when the bot API is unreachable and generated fixtures are being
+///   rendered — a missing bot reads as `demo`, a broken feed as `degraded`
+///   or `live_canonical_only`, and the two can never be confused.
+///
+/// `canonical_head_age_ms` / `preconfirmed_frame_age_ms` are `None` when the
+/// respective stream has never produced an observation, which is never
+/// "fresh".
+pub fn classify_data_mode(
+    block_time_ms: u64,
+    canonical_head_age_ms: Option<u64>,
+    preconfirmed_frame_age_ms: Option<u64>,
+) -> &'static str {
+    // Three missed slots plus two seconds of poll/jitter slack.
+    let head_fresh = canonical_head_age_ms
+        .map(|age| age < block_time_ms.saturating_mul(3).saturating_add(2_000))
+        .unwrap_or(false);
+    // Sub-blocks seal at ~200 ms; two seconds without a frame means the
+    // preconfirmation stream is not feeding.
+    let pin_fresh = preconfirmed_frame_age_ms
+        .map(|age| age < 2_000)
+        .unwrap_or(false);
+    match (head_fresh, pin_fresh) {
+        (true, true) => "live_preconfirmation",
+        (true, false) => "live_canonical_only",
+        (false, _) => "degraded",
     }
 }
 
@@ -439,6 +533,31 @@ impl Stats {
         });
     }
 
+    /// Bump a per-source data-plane funnel counter (work order 0.3). Live
+    /// lane only — the replay path re-scores already-mined transactions and
+    /// would double-count every source.
+    pub fn record_source(&self, source: &'static str, f: impl FnOnce(&mut SourceFunnel)) {
+        f(self.source_funnels.lock().entry(source).or_default());
+    }
+
+    /// Serialise the per-source data-plane funnels as `{source: counters}`.
+    pub fn source_funnels_json(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.source_funnels
+            .lock()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    (*k).to_string(),
+                    serde_json::json!({
+                        "candidates": v.candidates,
+                        "gatedByRisk": v.gated_by_risk,
+                        "simulated": v.simulated,
+                    }),
+                )
+            })
+            .collect()
+    }
+
     /// Serialise one funnel lane as `{strategy: counters}`.
     pub fn funnel_json(map: &FunnelMap) -> serde_json::Map<String, serde_json::Value> {
         map.iter()
@@ -487,6 +606,10 @@ impl Stats {
             // transactions is counted separately so it cannot inflate this.
             "funnel": funnel,
             "funnelReplay": funnel_replay,
+            // Work order 0.3: the data-plane attribution of live candidates —
+            // which upstream feed produced them and how far they got. Never
+            // folded into either per-strategy lane.
+            "sourceFunnels": self.source_funnels_json(),
         })
     }
 }
@@ -572,6 +695,23 @@ impl Engine {
                 "transaction signer {:?} does not match configured searcher {:?}",
                 transaction_signer.address(),
                 cfg.endpoints.searcher_address
+            );
+        }
+
+        // Wrong-chain RPC must fail at boot, loudly: simulating "on Base"
+        // against a mainnet endpoint would make every byte of evidence a
+        // lie (work order 0.3 wrong-chain detection).
+        {
+            let observed = http
+                .call_raw("eth_chainId", serde_json::json!([]))
+                .await
+                .map_err(|e| anyhow::anyhow!("eth_chainId failed at boot: {e:#}"))?;
+            let observed = crate::types::parse_u64(&observed);
+            anyhow::ensure!(
+                observed == cfg.chain.chain_id,
+                "RPC chain id {observed} != configured chain id {} — refusing \
+                 to boot against the wrong chain",
+                cfg.chain.chain_id,
             );
         }
 
@@ -951,6 +1091,10 @@ impl Engine {
             .is_some()
             .then(crate::flashblocks::FlashblockStats::default)
             .map(Arc::new);
+        let chain_blocks_stats = cfg
+            .chain_block_ingest
+            .then(crate::ingest::ChainBlockStats::default)
+            .map(Arc::new);
 
         Ok(Self {
             cfg,
@@ -989,6 +1133,7 @@ impl Engine {
             last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
             preconfirmed: Arc::new(crate::flashblocks::PreconfirmedTracker::new()),
             flashblocks: flashblocks_stats,
+            chain_blocks: chain_blocks_stats,
             state_comparisons: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             state_comparison_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -1147,7 +1292,11 @@ impl Engine {
         if let Some(rx) = self.replay_rx.lock().take() {
             self.spawn_replay_worker(rx);
         }
-        let mut ingest = Ingest::start(self.cfg.clone(), self.flashblocks.clone());
+        let mut ingest = Ingest::start(
+            self.cfg.clone(),
+            self.flashblocks.clone(),
+            self.chain_blocks.clone(),
+        );
         tracing::info!(target: "engine", "ingest started: {}", self.cfg.summary());
 
         while let Some(ev) = ingest.rx.recv().await {
@@ -1852,10 +2001,21 @@ impl Engine {
                 }
             }
         }
+        // Work order 0.3: attribute the candidate to its data-plane source.
+        // Live lane only — the replay path re-emits the same transactions
+        // post-mortem and would double-count every source.
+        let source = (lane == FunnelLane::Live)
+            .then(|| candidate_source(&opp, self.cfg.endpoints.sequencer_feed.is_some()));
+        if let Some(source) = source {
+            self.stats.record_source(source, |f| f.candidates += 1);
+        }
         if let Err(reject) = self.risk.check(&opp, base_fee) {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
+            if let Some(source) = source {
+                self.stats.record_source(source, |f| f.gated_by_risk += 1);
+            }
             if let Some(suppressed) = RISK_REJECT_LOG.allow() {
                 tracing::debug!(
                     target: "engine",
@@ -1873,6 +2033,9 @@ impl Engine {
             Stats::bump(&self.stats.rejected);
             self.stats
                 .record_funnel(lane, kind, |f| f.gated_by_risk += 1);
+            if let Some(source) = source {
+                self.stats.record_source(source, |f| f.gated_by_risk += 1);
+            }
             if let Some(suppressed) = INVENTORY_REJECT_LOG.allow() {
                 tracing::debug!(
                     target: "engine",
@@ -1967,6 +2130,9 @@ impl Engine {
         };
 
         Stats::bump(&self.stats.simulations);
+        if let Some(source) = source {
+            self.stats.record_source(source, |f| f.simulated += 1);
+        }
         self.latency
             .observe(Stage::Simulation, outcome.primary.sim_latency_ms);
         if seen_at_ms > 0 {
@@ -2827,5 +2993,150 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap["funnel"]["sandwich"]["candidatesEmitted"], 8 * 500);
         assert_eq!(snap["funnelReplay"]["atomic_arb"]["submittable"], 8 * 500);
+    }
+
+    // --- work order 0.3: data-plane diagnostics --------------------------
+
+    fn source_probe_opp(victims: usize, pinned: bool) -> Opportunity {
+        Opportunity {
+            id: "x".into(),
+            strategy: Strategy::AtomicArb,
+            victim_hashes: (0..victims)
+                .map(|i| alloy_primitives::B256::from([i as u8 + 1; 32]))
+                .collect(),
+            front_calls: vec![crate::types::Call::new(Address::ZERO, vec![1])],
+            back_calls: vec![],
+            flash_tokens: vec![],
+            flash_amounts: vec![],
+            profit_token: Address::ZERO,
+            expected_profit_wei: U256::from(1u8),
+            notional_wei: U256::from(1u8),
+            target_block: 1,
+            created_at_ms: now_ms(),
+            notes: String::new(),
+            provenance: if pinned {
+                crate::types::Provenance {
+                    source_state: Some(crate::types::PreconfirmedState {
+                        feed: "flashblocks".into(),
+                        block_number: 1,
+                        flashblock_index: 0,
+                        state_id: alloy_primitives::B256::from([7; 32]),
+                        payload_id: "p".into(),
+                        prev_frame_id: None,
+                        parent_hash: None,
+                        observed_at_ms: now_ms(),
+                        ordered: true,
+                    }),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_pinned_candidate_is_attributed_to_flashblocks_no_matter_what() {
+        // The pin is proof the preconfirmation feed produced the candidate;
+        // victims or not, that fact wins.
+        assert_eq!(
+            candidate_source(&source_probe_opp(1, true), false),
+            "flashblocks"
+        );
+        assert_eq!(
+            candidate_source(&source_probe_opp(0, true), false),
+            "flashblocks"
+        );
+        assert_eq!(
+            candidate_source(&source_probe_opp(2, true), true),
+            "flashblocks"
+        );
+    }
+
+    #[test]
+    fn unpinned_candidates_follow_the_feed_that_carried_them() {
+        // Block-cadence work rides the canonical head.
+        assert_eq!(
+            candidate_source(&source_probe_opp(0, false), false),
+            "chainBlock"
+        );
+        assert_eq!(
+            candidate_source(&source_probe_opp(0, false), true),
+            "chainBlock"
+        );
+        // Victim-ful flow is as live as the feed the victim arrived on.
+        assert_eq!(
+            candidate_source(&source_probe_opp(1, false), true),
+            "sequencerFeed"
+        );
+        assert_eq!(
+            candidate_source(&source_probe_opp(1, false), false),
+            "publicMempool"
+        );
+    }
+
+    #[test]
+    fn data_mode_never_confuses_a_missing_feed_with_a_broken_one() {
+        // Base block cadence: fresh threshold is 3 * 2000 + 2000 = 8000 ms.
+        const BASE: u64 = 2_000;
+        const MAINNET: u64 = 12_000;
+        assert_eq!(
+            classify_data_mode(BASE, Some(1_000), Some(300)),
+            "live_preconfirmation"
+        );
+        // A quiet preconfirmation feed with healthy blocks is canonical-only:
+        // the normal state on mainnet, and "feed broken" evidence on Base.
+        assert_eq!(
+            classify_data_mode(BASE, Some(1_000), Some(2_500)),
+            "live_canonical_only"
+        );
+        assert_eq!(
+            classify_data_mode(BASE, Some(1_000), None),
+            "live_canonical_only"
+        );
+        assert_eq!(
+            classify_data_mode(MAINNET, Some(5_000), None),
+            "live_canonical_only"
+        );
+        // A stale head degrades no matter how fresh the frames are — the
+        // canonical anchor is what every verdict is measured against.
+        assert_eq!(classify_data_mode(BASE, Some(8_500), Some(300)), "degraded");
+        assert_eq!(classify_data_mode(BASE, None, Some(300)), "degraded");
+        assert_eq!(classify_data_mode(BASE, None, None), "degraded");
+        // Boundaries are strict: exactly at the threshold is already stale.
+        assert_eq!(
+            classify_data_mode(BASE, Some(7_999), Some(1_999)),
+            "live_preconfirmation"
+        );
+        assert_eq!(classify_data_mode(BASE, Some(8_000), None), "degraded");
+        assert_eq!(
+            classify_data_mode(BASE, Some(1_000), Some(2_000)),
+            "live_canonical_only"
+        );
+    }
+
+    #[test]
+    fn source_funnels_never_leak_into_the_strategy_lanes() {
+        // The whole point of the separate map: a Base chain-block wave must
+        // not move a single per-strategy counter, in either lane.
+        let s = Stats::default();
+        s.record_source("chainBlock", |f| f.candidates += 3);
+        s.record_source("chainBlock", |f| f.gated_by_risk += 1);
+        s.record_source("flashblocks", |f| f.candidates += 2);
+        s.record_source("flashblocks", |f| f.simulated += 1);
+
+        let snap = s.snapshot();
+        let src = &snap["sourceFunnels"];
+        assert_eq!(src["chainBlock"]["candidates"], 3);
+        assert_eq!(src["chainBlock"]["gatedByRisk"], 1);
+        assert_eq!(src["chainBlock"]["simulated"], 0);
+        assert_eq!(src["flashblocks"]["candidates"], 2);
+        assert_eq!(src["flashblocks"]["simulated"], 1);
+        assert!(snap["funnel"].as_object().unwrap().is_empty());
+        assert!(snap["funnelReplay"].as_object().unwrap().is_empty());
+
+        // And an untouched map still serialises (dashboard before any flow).
+        let empty = Stats::default().snapshot();
+        assert!(empty["sourceFunnels"].as_object().unwrap().is_empty());
     }
 }

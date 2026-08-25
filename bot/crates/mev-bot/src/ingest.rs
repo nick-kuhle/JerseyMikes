@@ -80,10 +80,12 @@ impl Ingest {
     /// Wire up every configured source. `stats_slot` lets the caller (the
     /// engine) hand in the `FlashblockStats` handle it already published for
     /// `/api/status`, so the counters the operator watches are the ones the
-    /// parser actually increments.
+    /// parser actually increments. `chain_blocks` is the same hand-off for
+    /// the chain-native full-block poller's fetch-coverage counters.
     pub fn start(
         cfg: Arc<Config>,
         stats_slot: Option<Arc<crate::flashblocks::FlashblockStats>>,
+        chain_blocks: Option<Arc<ChainBlockStats>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(8192);
         let http = RpcClient::new(cfg.endpoints.http_url.clone()).expect("http rpc");
@@ -138,7 +140,12 @@ impl Ingest {
         // blocks are the delivered blocks. Defaulted on for them (see
         // Config::chain_block_ingest).
         if cfg.chain_block_ingest {
-            spawn_chain_blocks(http.clone(), cfg.chain.block_time_ms, tx.clone());
+            spawn_chain_blocks(
+                http.clone(),
+                cfg.chain.block_time_ms,
+                tx.clone(),
+                chain_blocks,
+            );
         }
 
         Self { rx, flashblocks }
@@ -770,11 +777,50 @@ pub async fn fetch_raw_tx(http: &RpcClient, hash: B256) -> Option<Vec<u8>> {
 /// what feeds the `Sequencer` qualification backend's included-block
 /// evidence.
 ///
+/// Fetch-coverage counters for the chain-native full-block poller (work
+/// order 0.3). A public sequencer RPC rate-limits `eth_getBlockByNumber`
+/// aggressively, and without these counters a feed quietly returning half
+/// its blocks was indistinguishable from a calm chain in every other panel.
+/// All plain atomics, shared by every clone of the handle.
+#[derive(Default, Debug)]
+pub struct ChainBlockStats {
+    /// Full-block bodies successfully fetched and forwarded to the engine.
+    pub blocks_fetched: std::sync::atomic::AtomicU64,
+    /// Full-block fetches that failed (typically provider rate limits).
+    pub fetches_failed: std::sync::atomic::AtomicU64,
+    /// Transactions carried by the fetched blocks.
+    pub txs_seen: std::sync::atomic::AtomicU64,
+    /// Wall clock of the last successful body fetch (unix ms); 0 = never.
+    pub last_fetch_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ChainBlockStats {
+    pub fn snapshot(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ok = self.blocks_fetched.load(Relaxed);
+        let failed = self.fetches_failed.load(Relaxed);
+        let total = ok + failed;
+        json!({
+            "blocksFetched": ok,
+            "fetchesFailed": failed,
+            // 0 before the first attempt, never a synthetic 100%.
+            "fetchSuccessRateBps": ok.saturating_mul(10_000).checked_div(total).unwrap_or(0),
+            "txsSeen": self.txs_seen.load(Relaxed),
+            "lastFetchMs": self.last_fetch_ms.load(Relaxed),
+        })
+    }
+}
+
 /// Polling rather than a `newHeads` subscription: sequencer-chain WS
 /// endpoints are not uniform (and often absent on free tiers), while one
 /// `eth_getBlockByNumber` per block is a negligible RPC cost. Missed blocks
 /// (a blip) are caught up by the range walk below.
-fn spawn_chain_blocks(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<IngestEvent>) {
+fn spawn_chain_blocks(
+    http: RpcClient,
+    block_time_ms: u64,
+    tx: mpsc::Sender<IngestEvent>,
+    stats: Option<Arc<ChainBlockStats>>,
+) {
     tokio::spawn(async move {
         let mut last = 0u64;
         let interval = (block_time_ms / 2).max(250);
@@ -797,6 +843,10 @@ fn spawn_chain_blocks(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<Inge
                             )
                             .await;
                         let Ok(v) = result else {
+                            if let Some(s) = &stats {
+                                s.fetches_failed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             // Silent `continue` is how a rate-limited provider
                             // hides itself: log (throttled) and move on.
                             static ERR_LOG: std::sync::atomic::AtomicU64 =
@@ -835,6 +885,12 @@ fn spawn_chain_blocks(http: RpcClient, block_time_ms: u64, tx: mpsc::Sender<Inge
                                 .unwrap_or(0),
                         };
                         let txs = txs_from_block(&v);
+                        if let Some(s) = &stats {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            s.blocks_fetched.fetch_add(1, Relaxed);
+                            s.txs_seen.fetch_add(txs.len() as u64, Relaxed);
+                            s.last_fetch_ms.store(now_ms(), Relaxed);
+                        }
                         if tx
                             .send(IngestEvent::RelayBlock { block, txs })
                             .await
