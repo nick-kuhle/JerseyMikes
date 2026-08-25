@@ -357,6 +357,7 @@ mod tests {
                     target_block: 1,
                     created_at_ms: now,
                     notes: String::new(),
+                    provenance: Default::default(),
                 })
                 .unwrap();
             store

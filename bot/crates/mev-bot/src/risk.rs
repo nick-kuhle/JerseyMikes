@@ -498,6 +498,8 @@ mod tests {
             pool_discovery_v3: false,
             decode_universal_router: false,
             dex_univ3_arb: false,
+            dex_aerodrome_arb: false,
+            dex_aerodrome_stable: false,
             arb_max_cycle_len: 2,
             relay_tx_ingest: false,
             relay_tx_concurrency: 4,
@@ -519,6 +521,7 @@ mod tests {
             qualification_min_accuracy_bps: 8_000,
             qualification_max_gap_secs: 120,
             finality_depth: 12,
+            preconfirmed_ttl_ms: 1_000,
             submission_retry_ms: 250,
             submission_max_attempts: 2,
             live_smoke_max: 0,
@@ -541,6 +544,7 @@ mod tests {
             target_block: 1,
             created_at_ms: now_ms(),
             notes: String::new(),
+            provenance: Default::default(),
         }
     }
 

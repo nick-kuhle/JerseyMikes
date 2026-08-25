@@ -19,6 +19,65 @@ pub struct MinedAt {
     pub base_fee_per_gas: U256,
 }
 
+/// Identity of the preconfirmed sequencer state a transaction arrived
+/// with — the Flashblocks-era replacement for "the mempool".
+///
+/// Base seals a preconfirmed sub-block every ~200 ms; each frame carries an
+/// incremental diff of ordered, signed transactions plus a block-hash-shaped
+/// identity for the resulting preconfirmed state. That identity is what a
+/// quote, a simulation, and eventually a send must agree on — a candidate
+/// priced against one frame and simulated against another is an invented
+/// arbitrage, so the identity travels with every transaction the frame
+/// produced.
+///
+/// Wire-format facts this type encodes (Base Flashblocks, verified against a
+/// live capture 2026-08-24; see `tests/fixtures/flashblocks/README.md`):
+///
+/// - `state_id` is the frame's `diff.block_hash`: unique per frame, changes
+///   as transactions are appended, and is deliberately *not* the sealed
+///   canonical block hash;
+/// - `(block_number, flashblock_index)` restarts at `(N+1, 0)` per block;
+/// - `prev_frame_id` chains frames as `"<block_number>-<index>"` and is the
+///   sequence/reorg signal the ingest layer watches for gaps;
+/// - the ordering of a preconfirmed frame is final — this state can only be
+///   back-run, never front-run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreconfirmedState {
+    /// Provider/feed label, so counters and dedupe never merge two feeds.
+    pub feed: String,
+    /// Canonical block this state builds towards.
+    pub block_number: u64,
+    /// Frame index inside the block (0 is rollover/system-only).
+    pub flashblock_index: u64,
+    /// Immutable identity of this exact preconfirmed state (`diff.block_hash`).
+    pub state_id: B256,
+    /// Payload id grouping every frame of one block build.
+    pub payload_id: String,
+    /// Chain link to the previous frame, when the feed supplies one
+    /// (`metadata.prev_flashblock_id`, `"<block>-<index>"`).
+    pub prev_frame_id: Option<String>,
+    /// Parent block hash when the feed supplies one (index-0 `base` object).
+    pub parent_hash: Option<B256>,
+    /// Local observation time (ms); lead time is measured against it.
+    pub observed_at_ms: u64,
+    /// Whether the transaction order in this state is preconfirmed by the
+    /// sequencer. Always true for the Flashblocks feed; carried explicitly so
+    /// a future "pending hint" feed cannot silently claim ordering.
+    pub ordered: bool,
+}
+
+impl PreconfirmedState {
+    /// A frame `(block_number, index)` that builds on `self` within the same
+    /// block — the only descendant relation the recheck path accepts: the
+    /// pinned state's transactions are a prefix of the descendant's.
+    pub fn is_descendant_of(&self, earlier: &PreconfirmedState) -> bool {
+        self.feed == earlier.feed
+            && self.block_number == earlier.block_number
+            && self.flashblock_index >= earlier.flashblock_index
+            && self.payload_id == earlier.payload_id
+    }
+}
+
 /// A transaction observed in the public mempool or in a private orderflow stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingTx {
@@ -40,6 +99,12 @@ pub struct PendingTx {
     /// live flow, which is evaluated against the current head.
     #[serde(default)]
     pub mined_at: Option<MinedAt>,
+    /// Preconfirmed-state identity this transaction was observed in. Present
+    /// on sequencer preconfirmation feeds (Flashblocks); `None` for ordinary
+    /// pending flow. This is *provenance*, not a `victim_hashes` dependency:
+    /// nothing here needs to be re-broadcast by the searcher.
+    #[serde(default)]
+    pub preconfirmed: Option<PreconfirmedState>,
     pub seen_at_ms: u64,
 }
 
@@ -352,6 +417,75 @@ pub struct Opportunity {
     pub created_at_ms: u64,
     /// Human readable trail of how the opportunity was found.
     pub notes: String,
+    /// State / route provenance for preconfirmation-pinned candidates and
+    /// independent qualification samples. `Default` = canonical mempool
+    /// provenance (no pin, foreign payload required when there are victims).
+    pub provenance: Provenance,
+}
+
+/// One ordered hop of a priced route, in a form the state-comparison
+/// producer can re-quote against canonical state without trusting a label
+/// string (work order 3.1). `fee_bps` is captured because the re-quote must
+/// bill the exact fee the prediction billed, not whatever is current later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteHop {
+    pub venue: crate::dex::Venue,
+    pub pool: Address,
+    pub token_in: Address,
+    pub fee_bps: u32,
+}
+
+/// Where an [`Opportunity`] was derived from and what its execution needs
+/// (work order 2.4 and 3.1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Preconfirmed-state pin for flashblock-derived candidates: identity of
+    /// the exact state the economics were measured against. `None` for
+    /// canonical-state candidates (block tick, public mempool).
+    pub source_state: Option<PreconfirmedState>,
+    /// Wall-clock TTL of a pinned candidate in milliseconds. The pin is dead
+    /// at `created_at_ms + ttl_ms` even if the tracker still accepts the
+    /// state (a stale frame cannot finance a send).
+    pub ttl_ms: Option<u64>,
+    /// Whether the payload must contain a foreign transaction (victim
+    /// bytes). Mempool sandwiches/back-runs need the victim in the bundle;
+    /// a preconfirmed-state back-run does not — the victim is already in
+    /// the state — and raw transport can only deliver our own transactions.
+    pub requires_foreign_payload: bool,
+    /// Stable ordered route label for qualification identity
+    /// (`venue:pool -> venue:pool`), matching
+    /// [`crate::dex::edge::PricedCycle::route_label`].
+    pub route: String,
+    /// Direction of the route relative to the anchor (`"forward"` today;
+    /// carried so the qualification row is never ambiguous).
+    pub direction: String,
+    /// Ordered route hops as priced — the exact identity the state
+    /// comparison producer re-quotes at the canonical block. Empty for
+    /// candidates that never passed through the priced router (or old rows
+    /// predating the field).
+    #[serde(default)]
+    pub route_hops: Vec<RouteHop>,
+    /// Gross profit of the sized route measured at the source state, before
+    /// gas — the predicted side of an independent state comparison (3.1).
+    /// Zero for candidates that never priced a route (victim strategies).
+    pub predicted_gross_wei: U256,
+}
+
+impl Default for Provenance {
+    /// Canonical mempool provenance: no pin, and victim-hashed candidates
+    /// keep their historical requirement that the victim's bytes ride in the
+    /// payload. Flashblock-derived back-runs override both explicitly.
+    fn default() -> Self {
+        Self {
+            source_state: None,
+            ttl_ms: None,
+            requires_foreign_payload: true,
+            route: String::new(),
+            direction: String::new(),
+            route_hops: Vec::new(),
+            predicted_gross_wei: U256::ZERO,
+        }
+    }
 }
 
 /// Result of simulating an [`Opportunity`].
@@ -394,6 +528,10 @@ pub enum SimBackend {
     RelayCallBundle,
     /// `eth_call` with state overrides against the primary RPC.
     EthCall,
+    /// `eth_simulateV1` at the provider's `"pending"` (preconfirmed) state
+    /// with the executor fixture injected via state overrides — the only
+    /// honest proof for a sub-block opportunity (work order 2.4).
+    EthSimulateV1,
 }
 
 impl SimBackend {
@@ -402,6 +540,7 @@ impl SimBackend {
             SimBackend::AnvilFork => "anvil_fork",
             SimBackend::RelayCallBundle => "relay_call_bundle",
             SimBackend::EthCall => "eth_call",
+            SimBackend::EthSimulateV1 => "eth_simulate_v1",
         }
     }
 }
@@ -451,7 +590,9 @@ pub enum FeedEvent {
         functions: Vec<String>,
         seen_at_ms: u64,
     },
-    Opportunity(Opportunity),
+    /// Boxed: `Opportunity` (with its provenance) dwarfs the other variants;
+    /// serde renders the box transparently so the wire shape never changed.
+    Opportunity(Box<Opportunity>),
     Alert {
         rule: String,
         severity: String,
@@ -644,6 +785,7 @@ mod tests {
             raw: None,
             source: TxSource::PublicMempool,
             mined_at,
+            preconfirmed: None,
             seen_at_ms: 0,
         }
     }

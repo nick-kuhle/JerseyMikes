@@ -89,10 +89,19 @@ pub mod known {
     /// non-zero `getProtocolFeesCollector()`, and Base WETH getter verified
     /// live 2026-08-23.
     pub const BASE_BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
-    /// Aerodrome router — registered for the phase-2 integration; unused by
-    /// any v1 strategy (its Solidly-style math is out of scope, see the
-    /// Base work order §7).
+    /// Aerodrome router — verified live 2026-08-24: `defaultFactory()` getter
+    /// returns the pool factory below; the address matches Aerodrome's
+    /// official Base deployment registry.
     pub const BASE_AERODROME_ROUTER: Address = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
+    /// Aerodrome pool factory — verified live 2026-08-24 two ways:
+    /// `router.defaultFactory()` returns it, and `getPool(WETH, USDC, false)`
+    /// resolves the canonical WETH/USDC volatile pool.
+    pub const BASE_AERODROME_FACTORY: Address =
+        address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+    /// Canonical Aerodrome WETH/USDC volatile pool — verified live
+    /// 2026-08-24 via `factory.getPool(WETH, USDC, false)`; 30 bps fee.
+    pub const BASE_AERO_WETH_USDC_VOLATILE: Address =
+        address!("cDAC0d6c6C59727a65F871236188350531885C43");
 
     /// Collateral tokens whose feeds the oracle front-runner maps leads to.
     pub fn collateral_universe() -> [Address; 3] {
@@ -134,6 +143,10 @@ pub mod known {
         /// Registry-only (no v1 strategy reads it); recorded so a future
         /// Aerodrome integration finds the router without re-verifying.
         pub aerodrome_router: Option<Address>,
+        /// Aerodrome pool factory. Backed by `router.defaultFactory()` on
+        /// Base; per-pool fees come from `factory.getFee(pool, stable)` and
+        /// discovery from its `PoolCreated` events.
+        pub aerodrome_factory: Option<Address>,
         // Lending protocols (None ⇒ that liquidation strategy is
         // unavailable on this chain and is skipped at construction)
         pub aave_v3_pool: Option<Address>,
@@ -204,6 +217,7 @@ pub mod known {
             sushi_factory: Some(SUSHI_FACTORY),
             balancer_vault: Some(BALANCER_VAULT),
             aerodrome_router: None,
+            aerodrome_factory: None,
             aave_v3_pool: Some(AAVE_V3_POOL),
             aave_v3_oracle: Some(AAVE_V3_ORACLE),
             aave_v3_data_provider: Some(AAVE_V3_DATA_PROVIDER),
@@ -249,6 +263,7 @@ pub mod known {
             sushi_factory: None,
             balancer_vault: Some(BASE_BALANCER_VAULT),
             aerodrome_router: Some(BASE_AERODROME_ROUTER),
+            aerodrome_factory: Some(BASE_AERODROME_FACTORY),
             aave_v3_pool: None,
             aave_v3_oracle: None,
             aave_v3_data_provider: None,
@@ -332,6 +347,9 @@ pub mod known {
         }
         if let Some(v) = override_addr("AERODROME_ROUTER_ADDRESS") {
             a.aerodrome_router = Some(v);
+        }
+        if let Some(v) = override_addr("AERODROME_FACTORY_ADDRESS") {
+            a.aerodrome_factory = Some(v);
         }
         if let Some(v) = override_addr("AAVE_V3_POOL_ADDRESS") {
             a.aave_v3_pool = Some(v);
@@ -541,6 +559,21 @@ pub struct Config {
     /// `DEX_UNIV3_ARB=true` to measure the surface. Quotes come from
     /// QuoterV2 (never a V2 approximation of concentrated liquidity).
     pub dex_univ3_arb: bool,
+    /// Include Aerodrome **volatile** pools in the atomic-arb graph. Per-pool
+    /// fee from `factory.getFee(pool, false)`; exact fee-off-input integer
+    /// math; execution through the Aerodrome router's `Route[]` calldata.
+    /// Off by default everywhere; the Base shadow plan enables it (`work
+    /// order WS-P3`). Stable pools are never included — see
+    /// `dex_aerodrome_stable`.
+    pub dex_aerodrome_arb: bool,
+    /// Reserved dark flag for Aerodrome **stable** pools (work order P4).
+    /// Stable-pool quotes require the contract-equivalent iterative
+    /// invariant with fuzz parity and bounded convergence; until that lands,
+    /// stable pools refuse to quote (`AeroPool::amount_out` returns `None`)
+    /// no matter what this says. This flag currently guards nothing — it
+    /// exists so the operator surface and the work-order numbering stay in
+    /// 1:1 correspondence.
+    pub dex_aerodrome_stable: bool,
     /// Longest cycle the atomic-arb search will consider, in legs.
     ///
     /// Default is 3 (the first post-funnel-week raise). 2 reproduces the
@@ -634,6 +667,14 @@ pub struct Config {
     pub qualification_max_gap_secs: u64,
     /// Canonical confirmations required before execution outcomes become final.
     pub finality_depth: u64,
+    /// Wall-clock TTL (milliseconds) stamped on a preconfirmation-pinned
+    /// candidate. After `created_at_ms + ttl` the candidate is dead even if
+    /// the feed has not visibly superseded the state — with a Base block of
+    /// 2 000 ms and ~200 ms flashblock frames, a quote derived from a frame
+    /// older than this is about a state nobody can submit against anymore.
+    /// Fail-closed toward shorter. Rechecked before simulation, before nonce
+    /// reservation and immediately before send (work order 2.4).
+    pub preconfirmed_ttl_ms: u64,
     /// Delay between same-UUID relay replacement attempts.
     pub submission_retry_ms: u64,
     /// Maximum relay submission attempts per bundle.
@@ -1082,6 +1123,7 @@ impl Config {
                 sushi_factory: None,
                 balancer_vault: None,
                 aerodrome_router: None,
+                aerodrome_factory: None,
                 aave_v3_pool: None,
                 aave_v3_oracle: None,
                 aave_v3_data_provider: None,
@@ -1392,6 +1434,10 @@ impl Config {
             pool_discovery_v3: env_bool("POOL_DISCOVERY_V3", true),
             decode_universal_router: env_bool("DECODE_UNIVERSAL_ROUTER", false),
             dex_univ3_arb: env_bool("DEX_UNIV3_ARB", false),
+            dex_aerodrome_arb: env_bool("DEX_AERODROME_ARB", false),
+            // Stable pools stay refused regardless; the flag is reserved and
+            // deliberately inert until work order P4 lands the iterative math.
+            dex_aerodrome_stable: env_bool("DEX_AERODROME_STABLE", false),
             // Clamped to the enumerator's hard ceiling: config cannot talk the
             // search into an unbounded walk.
             arb_max_cycle_len: (env_u64("ARB_MAX_CYCLE_LEN", 3) as usize)
@@ -1451,6 +1497,7 @@ impl Config {
                 .clamp(1, 10_000),
             qualification_max_gap_secs: env_u64("QUALIFICATION_MAX_GAP_SECS", 120).max(15),
             finality_depth: env_u64("FINALITY_DEPTH", 12).max(1),
+            preconfirmed_ttl_ms: env_u64("PRECONFIRMED_TTL_MS", 1_000).clamp(100, 5_000),
             submission_retry_ms: env_u64("SUBMISSION_RETRY_MS", 250).max(50),
             submission_max_attempts: env_u64("SUBMISSION_MAX_ATTEMPTS", 2).clamp(1, 5),
             live_smoke_max: env_u64("LIVE_SMOKE_MAX", 0).min(LIVE_SMOKE_MAX_CAP),
@@ -2044,6 +2091,7 @@ mod tests {
             sushi_factory: None,
             balancer_vault: None,
             aerodrome_router: None,
+            aerodrome_factory: None,
             aave_v3_pool: None,
             aave_v3_oracle: None,
             aave_v3_data_provider: None,

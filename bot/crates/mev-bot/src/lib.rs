@@ -25,6 +25,7 @@ pub mod competition;
 pub mod config;
 pub mod dex;
 pub mod engine;
+pub mod flashblocks;
 pub mod ingest;
 pub mod inventory;
 pub mod latency;
@@ -40,6 +41,7 @@ pub mod sim;
 /// atomic profit-or-revert engine above — see `sniper/mod.rs` and
 /// `docs/SNIPER.md` for why.
 pub mod sniper;
+pub mod state_comparisons;
 pub mod store;
 pub mod strategies;
 pub mod submission;

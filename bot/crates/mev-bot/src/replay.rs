@@ -292,6 +292,7 @@ mod tests {
             raw: None,
             source: TxSource::RelayDelivered,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         };
         store.record_relay_block_tx(&block, &tx, 0).unwrap();
@@ -312,6 +313,7 @@ mod tests {
                 target_block: 100,
                 created_at_ms: now_ms(),
                 notes: String::new(),
+                provenance: Default::default(),
             })
             .unwrap();
         store
@@ -350,6 +352,7 @@ mod tests {
                 target_block: 100,
                 created_at_ms: now_ms(),
                 notes: String::new(),
+                provenance: Default::default(),
             })
             .unwrap();
         store

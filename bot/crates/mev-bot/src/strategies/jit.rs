@@ -190,6 +190,7 @@ impl StrategyImpl for JitStrategy {
                 p.amount_in,
                 expected_fee
             ),
+            provenance: Default::default(),
         }]
     }
 }
@@ -515,6 +516,7 @@ mod tests {
             raw: None,
             source: TxSource::PublicMempool,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         }
     }

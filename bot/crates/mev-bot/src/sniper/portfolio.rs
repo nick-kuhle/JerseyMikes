@@ -243,12 +243,8 @@ pub fn summarize(
     }
 
     // Newest first in both tables.
-    open.sort_by(|a, b| b.opened_at_ms.cmp(&a.opened_at_ms));
-    closed.sort_by(|a, b| {
-        b.closed_at_ms
-            .unwrap_or(b.opened_at_ms)
-            .cmp(&a.closed_at_ms.unwrap_or(a.opened_at_ms))
-    });
+    open.sort_by_key(|a| std::cmp::Reverse(a.opened_at_ms));
+    closed.sort_by_key(|a| std::cmp::Reverse(a.closed_at_ms.unwrap_or(a.opened_at_ms)));
     closed.truncate(recent_closed_limit);
 
     Portfolio {

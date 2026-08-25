@@ -306,6 +306,7 @@ mod tests {
             target_block: 100,
             created_at_ms: 0,
             notes: String::new(),
+            provenance: Default::default(),
         }
     }
 

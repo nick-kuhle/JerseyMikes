@@ -212,6 +212,7 @@ impl StrategyImpl for SandwichV3Strategy {
                 sizing.gross_profit,
                 sizing.quotes_used
             ),
+            provenance: Default::default(),
         }]
     }
 }

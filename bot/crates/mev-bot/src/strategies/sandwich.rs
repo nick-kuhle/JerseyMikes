@@ -135,7 +135,8 @@ impl StrategyImpl for SandwichStrategy {
                     sizing.back_out,
                     sizing.gross_profit
                 ),
-            });
+            provenance: Default::default(),
+        });
         }
         out
     }

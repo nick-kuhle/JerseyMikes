@@ -467,6 +467,7 @@ mod tests {
             raw: None,
             source: TxSource::PublicMempool,
             mined_at: None,
+            preconfirmed: None,
             seen_at_ms: now_ms(),
         }
     }

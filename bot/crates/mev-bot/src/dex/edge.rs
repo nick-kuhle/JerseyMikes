@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::SolCall;
 
-use crate::dex::{self, graph, V2Pool, V3Pool, Venue};
+use crate::dex::{self, graph, AeroPool, V2Pool, V3Pool, Venue};
 use crate::types::Call;
 
 /// Capability flags a downstream searcher can filter on.
@@ -88,9 +88,30 @@ enum EdgeKind {
         router: Address,
         quotes: QuoteBook,
     },
+    AeroVolatile {
+        pool: AeroPool,
+        router: Address,
+        factory: Address,
+    },
 }
 
 impl PricedEdge {
+    /// Machine-readable hop identity for the WS-R state-comparison producer:
+    /// venue, pool, direction token and the exact fee the prediction billed.
+    pub fn route_hop(&self) -> crate::types::RouteHop {
+        let fee_bps = match &self.kind {
+            EdgeKind::V2 { pool } => pool.fee_bps,
+            EdgeKind::V3 { pool, .. } => pool.fee,
+            EdgeKind::AeroVolatile { pool, .. } => pool.fee_bps,
+        };
+        crate::types::RouteHop {
+            venue: self.venue,
+            pool: self.pool,
+            token_in: self.token_in,
+            fee_bps,
+        }
+    }
+
     /// Both directions of a V2 pool. Dust sides are dropped.
     pub fn from_v2(pool: &V2Pool) -> Vec<Self> {
         let mut out = Vec::with_capacity(2);
@@ -112,6 +133,38 @@ impl PricedEdge {
                     concentrated: false,
                 },
                 kind: EdgeKind::V2 { pool: *pool },
+            });
+        }
+        out
+    }
+
+    /// Both directions of an Aerodrome **volatile** pool. Dust sides and
+    /// stable pools are dropped — stable is a separate capability flag and a
+    /// separately-gated work item, never silently priced by volatile math.
+    pub fn from_aero(pool: &AeroPool, router: Address, factory: Address) -> Vec<Self> {
+        let mut out = Vec::with_capacity(2);
+        if pool.stable || pool.reserve0.is_zero() || pool.reserve1.is_zero() {
+            return out;
+        }
+        for (token_in, token_out) in [(pool.token0, pool.token1), (pool.token1, pool.token0)] {
+            out.push(Self {
+                pool: pool.address,
+                venue: Venue::AeroVolatile,
+                token_in,
+                token_out,
+                block: pool.block,
+                state_id: None,
+                gas: 170_000,
+                caps: EdgeCaps {
+                    volatile: true,
+                    stable: false,
+                    concentrated: false,
+                },
+                kind: EdgeKind::AeroVolatile {
+                    pool: *pool,
+                    router,
+                    factory,
+                },
             });
         }
         out
@@ -173,13 +226,15 @@ impl PricedEdge {
                 }
             }
             EdgeKind::V3 { quotes, .. } => quotes.get(amount_in),
+            EdgeKind::AeroVolatile { pool, .. } => pool.amount_out(self.token_in, amount_in),
         }
     }
 
-    /// Discrete sizes this edge can be evaluated at. Empty for V2 (any size).
+    /// Discrete sizes this edge can be evaluated at. Empty for closed-form
+    /// venues (V2, Aerodrome volatile) — any size is quotable.
     pub fn discrete_sizes(&self) -> Vec<U256> {
         match &self.kind {
-            EdgeKind::V2 { .. } => Vec::new(),
+            EdgeKind::V2 { .. } | EdgeKind::AeroVolatile { .. } => Vec::new(),
             EdgeKind::V3 { quotes, .. } => quotes.sizes().collect(),
         }
     }
@@ -194,6 +249,16 @@ impl PricedEdge {
                 self.token_in,
                 self.token_out,
                 pool.fee,
+                amount_in,
+                recipient,
+            )),
+            EdgeKind::AeroVolatile {
+                router, factory, ..
+            } => Some(build_aero_leg(
+                *router,
+                *factory,
+                self.token_in,
+                self.token_out,
                 amount_in,
                 recipient,
             )),
@@ -272,6 +337,46 @@ pub fn build_v3_router_leg(
     ]
 }
 
+/// Approve the Aerodrome router then one `swapExactTokensForTokens` hop over
+/// a single `Route { from, to, stable: false, factory }`. The volatile
+/// `stable: false` flag is what tells the router which invariant the pool
+/// runs — a stable route here would price wrong.
+pub fn build_aero_leg(
+    router: Address,
+    factory: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    recipient: Address,
+) -> Vec<Call> {
+    vec![
+        Call::new(
+            token_in,
+            dex::IERC20::approveCall {
+                spender: router,
+                amount: amount_in,
+            }
+            .abi_encode(),
+        ),
+        Call::new(
+            router,
+            dex::IAerodromeRouter::swapExactTokensForTokensCall {
+                amountIn: amount_in,
+                amountOutMin: U256::ZERO,
+                routes: vec![dex::IAerodromeRouter::Route {
+                    from: token_in,
+                    to: token_out,
+                    stable: false,
+                    factory,
+                }],
+                to: recipient,
+                deadline: U256::MAX,
+            }
+            .abi_encode(),
+        ),
+    ]
+}
+
 /// A sized cycle over [`PricedEdge`]s. Indices refer to the slice the
 /// search was given.
 #[derive(Clone, Debug)]
@@ -291,6 +396,16 @@ impl PricedCycle {
         self.edges
             .iter()
             .any(|&i| edges.get(i).is_some_and(|e| e.is_v3()))
+    }
+
+    /// True when any leg is a non-V2 venue (V3 QuoterV2 book, Aerodrome
+    /// volatile, ...). The mixed-graph search emits only these: all-V2 cycles
+    /// were already emitted by the byte-pinned [`graph::search`] pass, and
+    /// re-emitting them here would double-count the funnel.
+    pub fn uses_non_v2(&self, edges: &[PricedEdge]) -> bool {
+        self.edges
+            .iter()
+            .any(|&i| edges.get(i).is_some_and(|e| !e.is_v2()))
     }
 
     pub fn route_label(&self, edges: &[PricedEdge]) -> String {
@@ -465,10 +580,12 @@ fn size_cycle(
         .iter()
         .any(|&i| edges.get(i).is_some_and(|e| !e.discrete_sizes().is_empty()));
     if !has_discrete {
-        // All closed-form (V2): same ternary as graph::optimal_cycle_in.
+        // All closed-form (V2 / Aerodrome volatile): same ternary as
+        // graph::optimal_cycle_in.
         let first = edges.get(*cycle.first()?)?;
         let hi = match &first.kind {
             EdgeKind::V2 { pool } => max_in.min(pool.reserves_for(first.token_in)?.0),
+            EdgeKind::AeroVolatile { pool, .. } => max_in.min(pool.reserves_for(first.token_in)?.0),
             EdgeKind::V3 { .. } => max_in,
         };
         if hi.is_zero() {
@@ -685,6 +802,108 @@ mod tests {
                 .iter()
                 .any(|c| c.target == known::UNIV3_SWAP_ROUTER_02),
             "V3 leg must hit SwapRouter02"
+        );
+    }
+
+    fn aero_pool(addr: u8, r0: u128, r1: u128, stable: bool) -> AeroPool {
+        AeroPool {
+            address: Address::with_last_byte(addr),
+            token0: crate::config::known::WETH,
+            token1: crate::config::known::USDC,
+            reserve0: U256::from(r0),
+            reserve1: U256::from(r1),
+            fee_bps: 30,
+            stable,
+            block: 1,
+        }
+    }
+
+    #[test]
+    fn aero_adapter_emits_two_volatile_directions_and_skips_stable_and_dust() {
+        let router = Address::with_last_byte(0x99);
+        let factory = Address::with_last_byte(0x88);
+        let volatile = aero_pool(1, 1_000, 1_000, false);
+        let edges = PricedEdge::from_aero(&volatile, router, factory);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.venue == Venue::AeroVolatile));
+        assert!(edges
+            .iter()
+            .all(|e| e.caps.volatile && !e.caps.concentrated));
+        assert!(
+            PricedEdge::from_aero(&aero_pool(2, 1_000, 1_000, true), router, factory).is_empty()
+        );
+        assert!(PricedEdge::from_aero(&aero_pool(3, 0, 0, false), router, factory).is_empty());
+    }
+
+    #[test]
+    fn aero_quote_tracks_the_volatile_formula_not_univ2() {
+        let router = Address::with_last_byte(0x99);
+        let factory = Address::with_last_byte(0x88);
+        let p = aero_pool(1, 2_000_000, 2_000_000, false);
+        let edges = PricedEdge::from_aero(&p, router, factory);
+        let weth_in = edges.iter().find(|e| e.token_in == p.token0).unwrap();
+        let x = U256::from(1_000u64);
+        assert_eq!(
+            weth_in.quote(x),
+            Some(dex::aero_volatile_amount_out(x, p.reserve0, p.reserve1, 30))
+        );
+        assert_eq!(weth_in.quote(U256::ZERO), None);
+    }
+
+    #[test]
+    fn a_v2_pool_and_a_diverged_aero_pool_produce_a_cross_venue_cycle() {
+        let v2 = pool(Venue::UniV2, 1, 1_000e18 as u128, 2_200_000e6 as u128);
+        let aero = aero_pool(2, 1_000e18 as u128, 1_800_000e6 as u128, false);
+        let mut edges = PricedEdge::from_v2(&v2);
+        edges.extend(PricedEdge::from_aero(
+            &aero,
+            Address::with_last_byte(0x99),
+            Address::with_last_byte(0x88),
+        ));
+        let found = search_priced(
+            &edges,
+            known::WETH,
+            U256::from(10u128.pow(20)),
+            2,
+            Duration::from_secs(1),
+        );
+        let best = found.first().expect("a V2↔Aero cycle exists");
+        assert_eq!(best.legs(), 2);
+        assert!(best.gross_profit > U256::ZERO);
+        let calls = best
+            .build_calls(&edges, Address::with_last_byte(0xee))
+            .expect("executable");
+        // The Aero leg targets the Aerodrome router.
+        assert!(calls
+            .iter()
+            .any(|c| c.target == Address::with_last_byte(0x99)));
+        // And its swap call routes with stable: false.
+        let swap = calls
+            .iter()
+            .find(|c| c.target == Address::with_last_byte(0x99))
+            .unwrap();
+        assert_eq!(
+            &swap.data[..4],
+            &dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR
+        );
+    }
+
+    #[test]
+    fn aero_leg_is_approve_then_router_swap_exact_tokens() {
+        let calls = build_aero_leg(
+            known::BASE_AERODROME_ROUTER,
+            known::BASE_AERODROME_FACTORY,
+            known::WETH,
+            known::USDC,
+            U256::from(1_000u64),
+            Address::with_last_byte(9),
+        );
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].target, known::WETH);
+        assert_eq!(calls[1].target, known::BASE_AERODROME_ROUTER);
+        assert_eq!(
+            &calls[1].data[..4],
+            &dex::IAerodromeRouter::swapExactTokensForTokensCall::SELECTOR
         );
     }
 
