@@ -11,11 +11,12 @@
 
 use alloy_primitives::{Address, U256};
 use alloy_sol_types::{sol, SolCall};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::rpc::RpcClient;
+use crate::types::RouteHop;
 
 /// Router calldata decoders (V2, UniversalRouter).
 pub mod calldata;
@@ -829,6 +830,57 @@ pub async fn quote_v3(
 /// 500 → 5, 3000 → 30, 10000 → 100.
 pub fn v3_fee_to_bps(fee: u32) -> u32 {
     fee / 100
+}
+
+/// Build the [`RouteHop`] identity for one hop through a V2 pool.
+pub fn hop_for_v2(pool: &V2Pool, token_in: Address) -> RouteHop {
+    RouteHop {
+        venue: pool.venue,
+        pool: pool.address,
+        token_in,
+        fee_bps: pool.fee_bps,
+    }
+}
+
+/// Build the [`RouteHop`] identity for one hop through an Aerodrome volatile
+/// pool.
+pub fn hop_for_aero(pool: &AeroPool, token_in: Address) -> RouteHop {
+    RouteHop {
+        venue: Venue::AeroVolatile,
+        pool: pool.address,
+        token_in,
+        fee_bps: pool.fee_bps,
+    }
+}
+
+/// The pool fetch + re-quote the WS-R state-comparison producer runs at the
+/// canonical sealed block for one hop. V3's QuoterV2 path is deliberately
+/// not re-quoted here: its quotes were captured off-chain at sizing time and
+/// cannot be re-derived from 3 static calls.
+pub async fn requote_hop(
+    rpc: &RpcClient,
+    hop: &RouteHop,
+    anchor_factory: Option<Address>,
+    amount_in: U256,
+    target_block: u64,
+) -> Result<Option<U256>> {
+    match hop.venue {
+        Venue::AeroVolatile => {
+            let pool = fetch_aero_pool(
+                rpc,
+                anchor_factory.context("aerodrome hop without factory")?,
+                hop.pool,
+                target_block,
+            )
+            .await?;
+            Ok(pool.amount_out(hop.token_in, amount_in))
+        }
+        Venue::UniV3 => Ok(None),
+        _ => {
+            let pool = fetch_v2_pool(rpc, hop.pool, hop.venue, hop.fee_bps, target_block).await?;
+            Ok(pool.amount_out(hop.token_in, amount_in))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -149,6 +149,11 @@ fn pinned_backrun(state: &mev_bot::types::PreconfirmedState, cfg: &Config) -> Op
             requires_foreign_payload: false,
             route: candidate.route_label(&edges),
             direction: "forward".into(),
+            route_hops: candidate
+                .edges
+                .iter()
+                .map(|&i| edges[i].route_hop())
+                .collect(),
             predicted_gross_wei: candidate.gross_profit,
         },
     }

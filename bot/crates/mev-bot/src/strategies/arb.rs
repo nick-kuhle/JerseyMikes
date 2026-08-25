@@ -381,6 +381,7 @@ fn build_cycle_opportunity(
     let mut calls: Vec<Call> = Vec::new();
     let mut amount = candidate.amount_in;
     let mut route: Vec<String> = Vec::with_capacity(legs);
+    let mut hops: Vec<crate::types::RouteHop> = Vec::with_capacity(legs);
     for &e in &candidate.cycle.edges {
         let edge = edges.get(e)?;
         let pool = pools.get(edge.pool)?;
@@ -392,6 +393,7 @@ fn build_cycle_opportunity(
             ctx.executor,
         ));
         route.push(format!("{}:{:?}", pool.venue.as_str(), pool.address));
+        hops.push(crate::dex::hop_for_v2(pool, edge.token_in));
         amount = pool.amount_out(edge.token_in, amount)?;
     }
 
@@ -417,6 +419,7 @@ fn build_cycle_opportunity(
         provenance: crate::types::Provenance {
             route: route.join(" -> "),
             direction: "forward".into(),
+            route_hops: hops,
             predicted_gross_wei: candidate.gross_profit,
             ..Default::default()
         },
@@ -480,6 +483,10 @@ fn try_cycle(
                 b.address
             ),
             direction: "forward".into(),
+            route_hops: vec![
+                crate::dex::hop_for_v2(a, ctx.cfg.chain.weth),
+                crate::dex::hop_for_v2(b, mid),
+            ],
             predicted_gross_wei: gross,
             ..Default::default()
         },

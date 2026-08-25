@@ -423,6 +423,18 @@ pub struct Opportunity {
     pub provenance: Provenance,
 }
 
+/// One ordered hop of a priced route, in a form the state-comparison
+/// producer can re-quote against canonical state without trusting a label
+/// string (work order 3.1). `fee_bps` is captured because the re-quote must
+/// bill the exact fee the prediction billed, not whatever is current later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteHop {
+    pub venue: crate::dex::Venue,
+    pub pool: Address,
+    pub token_in: Address,
+    pub fee_bps: u32,
+}
+
 /// Where an [`Opportunity`] was derived from and what its execution needs
 /// (work order 2.4 and 3.1).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -447,6 +459,12 @@ pub struct Provenance {
     /// Direction of the route relative to the anchor (`"forward"` today;
     /// carried so the qualification row is never ambiguous).
     pub direction: String,
+    /// Ordered route hops as priced — the exact identity the state
+    /// comparison producer re-quotes at the canonical block. Empty for
+    /// candidates that never passed through the priced router (or old rows
+    /// predating the field).
+    #[serde(default)]
+    pub route_hops: Vec<RouteHop>,
     /// Gross profit of the sized route measured at the source state, before
     /// gas — the predicted side of an independent state comparison (3.1).
     /// Zero for candidates that never priced a route (victim strategies).
@@ -464,6 +482,7 @@ impl Default for Provenance {
             requires_foreign_payload: true,
             route: String::new(),
             direction: String::new(),
+            route_hops: Vec::new(),
             predicted_gross_wei: U256::ZERO,
         }
     }

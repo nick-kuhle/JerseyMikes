@@ -41,6 +41,7 @@ pub mod sim;
 /// atomic profit-or-revert engine above — see `sniper/mod.rs` and
 /// `docs/SNIPER.md` for why.
 pub mod sniper;
+pub mod state_comparisons;
 pub mod store;
 pub mod strategies;
 pub mod submission;

@@ -157,6 +157,18 @@ pub struct Engine {
     /// Feed counters for `/api/status`, populated when a Flashblocks feed is
     /// configured. `run` hands this exact handle to the ingest spawn.
     pub flashblocks: Option<Arc<crate::flashblocks::FlashblockStats>>,
+    /// Arb candidates awaiting their canonical re-quote (WS-R independent
+    /// `state_comparisons` population). Captured at emission, settled when
+    /// the source state's block seals. Bounded; overflow drops the new
+    /// sample, never queued work.
+    state_comparisons: Arc<
+        parking_lot::Mutex<
+            std::collections::VecDeque<crate::state_comparisons::PendingStateComparison>,
+        >,
+    >,
+    /// Reentrancy guard for the settle task (same shape as
+    /// `own_reconciliation_running`).
+    state_comparison_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A delivered block waiting to be scored: the block and its transactions.
@@ -266,6 +278,12 @@ pub struct Stats {
     /// invisible, hidden inside an unbounded task queue.
     pub evaluations_shed: std::sync::atomic::AtomicU64,
     pub reorgs_seen: std::sync::atomic::AtomicU64,
+    /// WS-R: arb samples re-quoted at their canonical seal and written to
+    /// `state_comparisons` (independent qualification population).
+    pub state_comparisons_settled: std::sync::atomic::AtomicU64,
+    /// WS-R: arb samples dropped without writing (missed seal, unquotable
+    /// venue, RPC failure, or a full backlog — evidence is never fabricated).
+    pub state_comparisons_dropped: std::sync::atomic::AtomicU64,
     /// Delivered blocks skipped because the replay worker was still busy.
     /// Replay is post-mortem analysis, so dropping the block is preferable to
     /// letting a backlog build behind the live path.
@@ -462,6 +480,8 @@ impl Stats {
             "evaluationsShed": self.evaluations_shed.load(Relaxed),
             "replayBlocksDropped": self.replay_blocks_dropped.load(Relaxed),
             "reorgsSeen": self.reorgs_seen.load(Relaxed),
+            "stateComparisonsSettled": self.state_comparisons_settled.load(Relaxed),
+            "stateComparisonsDropped": self.state_comparisons_dropped.load(Relaxed),
             "startedAtMs": self.started_at_ms.load(Relaxed),
             // Live flow only. Post-mortem scoring of already-mined relay
             // transactions is counted separately so it cannot inflate this.
@@ -969,6 +989,8 @@ impl Engine {
             last_inventory_block: std::sync::atomic::AtomicU64::new(NEVER),
             preconfirmed: Arc::new(crate::flashblocks::PreconfirmedTracker::new()),
             flashblocks: flashblocks_stats,
+            state_comparisons: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+            state_comparison_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1423,6 +1445,47 @@ impl Engine {
         }
         *self.last_head.lock() = Some(head.clone());
 
+        // WS-R: settle arb samples whose seal has landed — the canonical
+        // re-quote runs against this head so one reorged head never leaves
+        // phantom predictions in the qualification population. RPC-light
+        // (three calls per hop) and non-overlapping by the guard flag.
+        if !self
+            .state_comparison_running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let engine = self.clone();
+            let head = head.clone();
+            tokio::spawn(async move {
+                let mut taken = {
+                    let mut guard = engine.state_comparisons.lock();
+                    std::mem::take(&mut *guard)
+                };
+                let outcome = crate::state_comparisons::settle(
+                    &mut taken,
+                    &head,
+                    &engine.http,
+                    engine.cfg.addresses.aerodrome_factory,
+                    &engine.writes,
+                )
+                .await;
+                {
+                    let mut guard = engine.state_comparisons.lock();
+                    for item in taken {
+                        guard.push_back(item);
+                    }
+                }
+                for _ in 0..outcome.settled {
+                    Stats::bump(&engine.stats.state_comparisons_settled);
+                }
+                for _ in 0..outcome.dropped {
+                    Stats::bump(&engine.stats.state_comparisons_dropped);
+                }
+                engine
+                    .state_comparison_running
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
+
         // Receipt polling and finality reconciliation can fan out over many
         // submitted hashes. It must never delay pool refresh or block-cadence
         // strategies, so it runs as an independent async task.
@@ -1777,6 +1840,18 @@ impl Engine {
         // for a replay. Gating a historical bundle on today's gas price, in
         // either direction, invents a result.
         let risk_started = std::time::Instant::now();
+        // WS-R: capture every live-lane priced arb candidate for the
+        // independent `state_comparisons` population *before* any gate can
+        // discard it — the measured divergence at the canonical seal is
+        // evidence about the feed, not about this candidate's tradability.
+        if lane == FunnelLane::Live {
+            if let Some(sample) = crate::state_comparisons::capture(&opp, &self.ctx.head()) {
+                let mut guard = self.state_comparisons.lock();
+                if !crate::state_comparisons::push(&mut guard, sample) {
+                    Stats::bump(&self.stats.state_comparisons_dropped);
+                }
+            }
+        }
         if let Err(reject) = self.risk.check(&opp, base_fee) {
             Stats::bump(&self.stats.rejected);
             self.stats

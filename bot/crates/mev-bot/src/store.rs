@@ -597,6 +597,40 @@ impl Store {
     }
 }
 
+/// One `state_comparisons` row as read back by tests (WS-R assertions).
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub struct StateComparisonRow {
+    pub sample_id: String,
+    pub opportunity_id: String,
+    pub source_state_id: String,
+    pub canonical_block: u64,
+    pub route: String,
+    pub amount_in: String,
+    pub direction: String,
+    pub predicted_wei: i128,
+    pub realized_wei: i128,
+    pub canonical: bool,
+}
+
+/// A queued `state_comparisons` insert (the WS-R independent producer's
+/// row). Kept as a struct because the insert carries more fields than a
+/// positional tuple can name honestly.
+#[derive(Clone, Debug)]
+pub struct StateComparisonSample {
+    pub sample_id: String,
+    pub opportunity_id: String,
+    pub strategy: String,
+    pub source_state_id: String,
+    pub canonical_block: u64,
+    pub canonical_hash: String,
+    pub route: String,
+    pub amount_in: String,
+    pub direction: String,
+    pub predicted_wei: i128,
+    pub realized_wei: i128,
+}
+
 /// One deferred append-only write.
 ///
 /// The hot path produces these and drops them on a channel; the writer task
@@ -607,6 +641,7 @@ pub enum WriteOp {
     Simulation(Box<SimulationResult>),
     Bundle(Box<BundleRecord>),
     Block(Box<crate::types::BlockHead>),
+    StateComparison(Box<StateComparisonSample>),
 }
 
 impl WriteOp {
@@ -616,8 +651,40 @@ impl WriteOp {
             WriteOp::Simulation(s) => write_simulation(conn, s),
             WriteOp::Bundle(b) => write_bundle(conn, b),
             WriteOp::Block(h) => write_block(conn, h),
+            WriteOp::StateComparison(s) => write_state_comparison(conn, s),
         }
     }
+}
+
+/// The `state_comparisons` insert shared by the batched writer and the
+/// synchronous [`Store::record_state_comparison`] used by tests. Returns
+/// whether the row was newly written (`INSERT OR IGNORE` dedupes replayed
+/// duplicates).
+fn write_state_comparison(conn: &Connection, s: &StateComparisonSample) -> Result<()> {
+    let error_bps = relative_error_bps(s.predicted_wei, s.realized_wei);
+    conn.execute(
+        "INSERT OR IGNORE INTO state_comparisons
+         (id, opportunity_id, strategy, source_state_id, canonical_block,
+          canonical_hash, route, amount_in, direction,
+          predicted_wei, realized_wei, error_bps, canonical, created_at_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)",
+        params![
+            s.sample_id,
+            s.opportunity_id,
+            s.strategy,
+            s.source_state_id,
+            s.canonical_block as i64,
+            s.canonical_hash,
+            s.route,
+            s.amount_in,
+            s.direction,
+            s.predicted_wei.to_string(),
+            s.realized_wei.to_string(),
+            error_bps as i64,
+            now_ms() as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Asynchronous, batching front end to [`Store`].
@@ -773,6 +840,39 @@ impl AsyncStore {
 
     pub fn record_block(&self, head: &crate::types::BlockHead) {
         self.send(WriteOp::Block(Box::new(head.clone())));
+    }
+
+    /// Queue a `state_comparisons` row from the WS-R independent producer.
+    /// The 12-field identity is spelled out in the argument list rather
+    /// than hidden in a struct so call sites cannot silently reorder it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_state_comparison(
+        &self,
+        sample_id: String,
+        opportunity_id: String,
+        strategy: &str,
+        source_state_id: String,
+        canonical_block: u64,
+        canonical_hash: String,
+        route: String,
+        amount_in: String,
+        direction: String,
+        predicted_wei: i128,
+        realized_wei: i128,
+    ) {
+        self.send(WriteOp::StateComparison(Box::new(StateComparisonSample {
+            sample_id,
+            opportunity_id,
+            strategy: strategy.to_string(),
+            source_state_id,
+            canonical_block,
+            canonical_hash,
+            route,
+            amount_in,
+            direction,
+            predicted_wei,
+            realized_wei,
+        })));
     }
 
     /// Writes discarded because the queue was full.
@@ -1570,30 +1670,65 @@ impl Store {
         predicted_wei: i128,
         realized_wei: i128,
     ) -> Result<bool> {
-        let error_bps = relative_error_bps(predicted_wei, realized_wei);
-        let changed = self.conn.lock().execute(
-            "INSERT OR IGNORE INTO state_comparisons
-             (id, opportunity_id, strategy, source_state_id, canonical_block,
-              canonical_hash, route, amount_in, direction,
-              predicted_wei, realized_wei, error_bps, canonical, created_at_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,?13)",
-            params![
-                sample_id,
-                opportunity_id,
-                strategy,
-                source_state_id,
-                canonical_block as i64,
-                canonical_hash,
-                route,
-                amount_in,
-                direction,
-                predicted_wei.to_string(),
-                realized_wei.to_string(),
-                error_bps as i64,
-                now_ms() as i64,
-            ],
+        // Delegate to the shared insert so the batched writer and this
+        // synchronous path can never drift apart; `conn.changes()` then
+        // reports 1 (inserted) or 0 (ignored duplicate) for the statement.
+        let conn = self.conn.lock();
+        write_state_comparison(
+            &conn,
+            &StateComparisonSample {
+                sample_id: sample_id.to_string(),
+                opportunity_id: opportunity_id.to_string(),
+                strategy: strategy.to_string(),
+                source_state_id: source_state_id.to_string(),
+                canonical_block,
+                canonical_hash: canonical_hash.to_string(),
+                route: route.to_string(),
+                amount_in: amount_in.to_string(),
+                direction: direction.to_string(),
+                predicted_wei,
+                realized_wei,
+            },
         )?;
-        Ok(changed == 1)
+        Ok(conn.changes() == 1)
+    }
+
+    /// Read-back helper for producer tests: identity + measured columns of
+    /// every `state_comparisons` row for a strategy, insertion-ordered.
+    #[cfg(test)]
+    pub fn recorded_state_comparisons_for_test(
+        &self,
+        strategy: &str,
+    ) -> Result<Vec<StateComparisonRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, opportunity_id, source_state_id, canonical_block,
+                    route, amount_in, direction, predicted_wei, realized_wei, canonical
+             FROM state_comparisons WHERE strategy = ?1 ORDER BY created_at_ms, rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![strategy], |r| {
+                Ok(StateComparisonRow {
+                    sample_id: r.get(0)?,
+                    opportunity_id: r.get(1)?,
+                    source_state_id: r.get(2)?,
+                    canonical_block: r.get::<_, i64>(3)? as u64,
+                    route: r.get(4)?,
+                    amount_in: r.get(5)?,
+                    direction: r.get(6)?,
+                    predicted_wei: r
+                        .get::<_, String>(7)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    realized_wei: r
+                        .get::<_, String>(8)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    canonical: r.get::<_, i64>(9)? == 1,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn record_actual_mev_match(&self, matched: &ActualMevMatch) -> Result<()> {

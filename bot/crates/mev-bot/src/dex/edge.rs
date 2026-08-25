@@ -96,6 +96,22 @@ enum EdgeKind {
 }
 
 impl PricedEdge {
+    /// Machine-readable hop identity for the WS-R state-comparison producer:
+    /// venue, pool, direction token and the exact fee the prediction billed.
+    pub fn route_hop(&self) -> crate::types::RouteHop {
+        let fee_bps = match &self.kind {
+            EdgeKind::V2 { pool } => pool.fee_bps,
+            EdgeKind::V3 { pool, .. } => pool.fee,
+            EdgeKind::AeroVolatile { pool, .. } => pool.fee_bps,
+        };
+        crate::types::RouteHop {
+            venue: self.venue,
+            pool: self.pool,
+            token_in: self.token_in,
+            fee_bps,
+        }
+    }
+
     /// Both directions of a V2 pool. Dust sides are dropped.
     pub fn from_v2(pool: &V2Pool) -> Vec<Self> {
         let mut out = Vec::with_capacity(2);
