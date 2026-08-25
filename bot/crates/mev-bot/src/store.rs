@@ -481,6 +481,34 @@ impl Store {
                 probed_at_ms    INTEGER NOT NULL,
                 detail          TEXT NOT NULL DEFAULT ''
             );
+
+            -- Launch observations (work order 4.1): one row per decoded
+            -- pool-creation log, with full source and state provenance —
+            -- venue, emitting block, transaction hash, log index, the
+            -- discovery source, and the reserve snapshot actually read at
+            -- scan time (NULL when unread, never zero). `gate_result` is
+            -- the shadow admission outcome ("admitted" or a rejection
+            -- code); canonical observations are gated only for the shadow
+            -- record and never enter from it. `canonical` flips to 0 when
+            -- a re-org discards the block; rows are never rewritten.
+            CREATE TABLE IF NOT EXISTS sniper_launches (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                token         TEXT NOT NULL,
+                pair          TEXT NOT NULL,
+                venue         TEXT NOT NULL,
+                block_number  INTEGER NOT NULL,
+                tx_hash       TEXT NOT NULL,
+                log_index     INTEGER NOT NULL,
+                source        TEXT NOT NULL,
+                weth_reserve  TEXT,
+                token_reserve TEXT,
+                gate_result   TEXT NOT NULL DEFAULT '',
+                canonical     INTEGER NOT NULL DEFAULT 1,
+                created_at_ms INTEGER NOT NULL,
+                UNIQUE (pair, block_number, log_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sniper_launches_block
+                ON sniper_launches (block_number, canonical);
             "#,
         )?;
         // Additive columns for databases created before Phase 1. SQLite has no
@@ -997,6 +1025,11 @@ impl Store {
         )?;
         conn.execute(
             "UPDATE execution_outcomes SET canonical = 0
+             WHERE block_number >= ?1 AND block_number <= ?2 AND canonical = 1",
+            params![from_block as i64, to_block as i64],
+        )?;
+        conn.execute(
+            "UPDATE sniper_launches SET canonical = 0
              WHERE block_number >= ?1 AND block_number <= ?2 AND canonical = 1",
             params![from_block as i64, to_block as i64],
         )?;
@@ -2921,6 +2954,93 @@ impl Store {
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
+
+    /// Persist one launch observation (work order 4.1). The natural key is
+    /// (pair, block_number, log_index): a replayed or overlapping scan that
+    /// re-reads the same log inserts nothing. Reserves are the snapshot
+    /// read at scan time — `None` stays NULL, never zero. Returns whether
+    /// the row was newly written, so the caller gates each launch exactly
+    /// once for the shadow record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_sniper_launch(
+        &self,
+        token: &str,
+        pair: &str,
+        venue: &str,
+        block_number: u64,
+        tx_hash: &str,
+        log_index: u64,
+        source: &str,
+        weth_reserve: Option<U256>,
+        token_reserve: Option<U256>,
+        gate_result: &str,
+    ) -> Result<bool> {
+        let written = self.conn.lock().execute(
+            "INSERT OR IGNORE INTO sniper_launches
+             (token, pair, venue, block_number, tx_hash, log_index, source,
+              weth_reserve, token_reserve, gate_result, canonical, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11)",
+            params![
+                token,
+                pair,
+                venue,
+                block_number as i64,
+                tx_hash,
+                log_index as i64,
+                source,
+                weth_reserve.map(|v| v.to_string()),
+                token_reserve.map(|v| v.to_string()),
+                gate_result,
+                now_ms() as i64,
+            ],
+        )?;
+        Ok(written > 0)
+    }
+
+    /// Whether this exact log has already been observed. The discovery
+    /// pass checks before shadow-gating so a replayed log is never counted
+    /// twice in the gate funnel.
+    pub fn sniper_launch_exists(
+        &self,
+        pair: &str,
+        block_number: u64,
+        log_index: u64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM sniper_launches
+             WHERE pair = ?1 AND block_number = ?2 AND log_index = ?3 LIMIT 1",
+        )?;
+        Ok(stmt.exists(params![pair, block_number as i64, log_index as i64])?)
+    }
+
+    /// Launch observations, newest block first. `canonical = false` rows
+    /// belong to a discarded fork and are marked, not hidden.
+    pub fn recent_sniper_launches(&self, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT token, pair, venue, block_number, tx_hash, log_index, source,
+                    weth_reserve, token_reserve, gate_result, canonical, created_at_ms
+             FROM sniper_launches ORDER BY block_number DESC, log_index DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(serde_json::json!({
+                "token": row.get::<_, String>(0)?,
+                "pair": row.get::<_, String>(1)?,
+                "venue": row.get::<_, String>(2)?,
+                "blockNumber": row.get::<_, i64>(3)?,
+                "txHash": row.get::<_, String>(4)?,
+                "logIndex": row.get::<_, i64>(5)?,
+                "source": row.get::<_, String>(6)?,
+                "wethReserve": row.get::<_, Option<String>>(7)?,
+                "tokenReserve": row.get::<_, Option<String>>(8)?,
+                "gateResult": row.get::<_, String>(9)?,
+                "canonical": row.get::<_, i64>(10)? != 0,
+                "createdAtMs": row.get::<_, i64>(11)?,
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
 }
 
 fn parse_address(raw: &str) -> alloy_primitives::Address {
@@ -3916,5 +4036,115 @@ mod tests {
         let counts = s.sniper_verdict_counts().unwrap();
         assert_eq!(counts.get("clean"), None);
         assert_eq!(counts.get("honeypot"), Some(&1));
+    }
+
+    #[test]
+    fn sniper_launches_dedupe_by_natural_key_and_round_trip_provenance() {
+        let s = Store::open_in_memory().unwrap();
+        for _ in 0..3 {
+            // A replayed/overlapping scan re-reading the same log inserts
+            // nothing — the natural key is (pair, block_number, log_index).
+            s.record_sniper_launch(
+                "0x9630ececf6db99c2fbee57415c9002dcee8a32ad",
+                "0xc175960f630044a5a74627b78d39d202d4ee9e97",
+                "univ2",
+                50_423_761,
+                "0x716f3985a730f4946f7a5b1ade6576bf3224605c0ecafe93b9267567ad8a5a68",
+                0x108,
+                "canonical_log",
+                Some(U256::from(10_000_000_000_000_000_000u128)),
+                Some(U256::from(1_000_000_000_000_000_000u128)),
+                "verdict_unknown",
+            )
+            .unwrap();
+        }
+        let rows = s.recent_sniper_launches(10).unwrap();
+        assert_eq!(rows.len(), 1, "natural key must dedupe replays");
+        let row = &rows[0];
+        assert_eq!(row["token"], "0x9630ececf6db99c2fbee57415c9002dcee8a32ad");
+        assert_eq!(row["venue"], "univ2");
+        assert_eq!(row["blockNumber"], 50_423_761);
+        assert_eq!(row["logIndex"], 0x108);
+        assert_eq!(row["source"], "canonical_log");
+        assert_eq!(row["gateResult"], "verdict_unknown");
+        assert_eq!(row["wethReserve"], "10000000000000000000");
+        assert_eq!(row["tokenReserve"], "1000000000000000000");
+        assert_eq!(row["canonical"], true);
+
+        // Same pool, different log: a new observation. Reserves not read at
+        // scan time stay NULL — zero would be a claim nobody made.
+        let written = s
+            .record_sniper_launch(
+                "0x9630ececf6db99c2fbee57415c9002dcee8a32ad",
+                "0xc175960f630044a5a74627b78d39d202d4ee9e97",
+                "univ2",
+                50_423_762,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                3,
+                "canonical_log",
+                None,
+                None,
+                "state_unreadable",
+            )
+            .unwrap();
+        assert!(written);
+        let rows = s.recent_sniper_launches(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["wethReserve"], serde_json::Value::Null);
+        assert_eq!(rows[0]["gateResult"], "state_unreadable");
+    }
+
+    #[test]
+    fn a_reorg_marks_launch_observations_non_canonical() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_sniper_launch(
+            "0x9630ececf6db99c2fbee57415c9002dcee8a32ad",
+            "0xc175960f630044a5a74627b78d39d202d4ee9e97",
+            "univ2",
+            50_423_761,
+            "0x716f3985a730f4946f7a5b1ade6576bf3224605c0ecafe93b9267567ad8a5a68",
+            0x108,
+            "canonical_log",
+            None,
+            None,
+            "not_armed",
+        )
+        .unwrap();
+        s.record_sniper_launch(
+            "0xda3dc35fa2a848b642e75169812ae6aca5645450",
+            "0xfed0f301d4d2c91558cc60b791163d952b04960c",
+            "univ3",
+            50_424_058,
+            "0x765e8dceb389ee64a6cf182cf280e27c77b976bd20dae4c24d7fce3282b89e6b",
+            0x8d,
+            "canonical_log",
+            None,
+            None,
+            "observation_only",
+        )
+        .unwrap();
+
+        s.record_reorg(50_423_761, 50_423_800, "0xold", "0xnew")
+            .unwrap();
+        let rows = s.recent_sniper_launches(10).unwrap();
+        let by_block: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r["blockNumber"].as_i64().unwrap(),
+                    r["canonical"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_block.get(&50_423_761),
+            Some(&false),
+            "blocks inside the discarded fork flip to non-canonical"
+        );
+        assert_eq!(
+            by_block.get(&50_424_058),
+            Some(&true),
+            "blocks past the fork keep canonical provenance"
+        );
     }
 }

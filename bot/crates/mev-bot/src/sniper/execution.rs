@@ -32,12 +32,154 @@ use crate::rpc::RpcClient;
 use crate::signer::{Eip1559Tx, Signer};
 use crate::store::Store;
 
+/// Work order 4.2: venue-exact entry calldata. A venue with no adapter
+/// (UniV3 today) or no registry addresses is an error — the caller turns
+/// that into an abandoned position with the reason in its notes, never a
+/// trade on approximated calldata.
+#[allow(clippy::too_many_arguments)]
+fn build_entry_for(
+    addresses: &crate::config::known::ChainAddresses,
+    venue: crate::dex::Venue,
+    vault: Address,
+    pair: Address,
+    weth: Address,
+    token: Address,
+    is_weth_token0: bool,
+    size_wei: U256,
+    expected_tokens_out: U256,
+    impact_bps: u32,
+    head_block: u64,
+    grace: u64,
+    max_base_fee: U256,
+    tag: alloy_primitives::B256,
+) -> Result<Vec<u8>> {
+    Ok(match venue {
+        crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 => {
+            calldata::build_entry(
+                vault,
+                pair,
+                weth,
+                token,
+                is_weth_token0,
+                size_wei,
+                expected_tokens_out,
+                impact_bps,
+                head_block,
+                grace,
+                max_base_fee,
+                tag,
+            )
+            .2
+        }
+        crate::dex::Venue::AeroVolatile => {
+            let router = addresses
+                .aerodrome_router
+                .ok_or_else(|| anyhow::anyhow!("chain registry has no Aerodrome router"))?;
+            let factory = addresses
+                .aerodrome_factory
+                .ok_or_else(|| anyhow::anyhow!("chain registry has no Aerodrome factory"))?;
+            calldata::build_entry_aero(
+                vault,
+                router,
+                factory,
+                weth,
+                token,
+                size_wei,
+                expected_tokens_out,
+                impact_bps,
+                head_block,
+                grace,
+                max_base_fee,
+                tag,
+            )
+            .2
+        }
+        crate::dex::Venue::UniV3 => {
+            anyhow::bail!(
+                "UniV3 sniper entries have no execution adapter — refusing to fabricate calldata"
+            )
+        }
+    })
+}
+
+/// Work order 4.2: venue-exact exit calldata, same contract as
+/// [`build_entry_for`].
+#[allow(clippy::too_many_arguments)]
+fn build_exit_for(
+    addresses: &crate::config::known::ChainAddresses,
+    venue: crate::dex::Venue,
+    vault: Address,
+    pair: Address,
+    weth: Address,
+    token: Address,
+    is_weth_token0: bool,
+    token_amount: U256,
+    expected_weth_out: U256,
+    slippage_bps: u32,
+    head_block: u64,
+    grace: u64,
+    max_base_fee: U256,
+    tag: alloy_primitives::B256,
+) -> Result<Vec<u8>> {
+    Ok(match venue {
+        crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 => {
+            calldata::build_exit(
+                vault,
+                pair,
+                weth,
+                token,
+                is_weth_token0,
+                token_amount,
+                expected_weth_out,
+                slippage_bps,
+                head_block,
+                grace,
+                max_base_fee,
+                tag,
+            )
+            .2
+        }
+        crate::dex::Venue::AeroVolatile => {
+            let router = addresses
+                .aerodrome_router
+                .ok_or_else(|| anyhow::anyhow!("chain registry has no Aerodrome router"))?;
+            let factory = addresses
+                .aerodrome_factory
+                .ok_or_else(|| anyhow::anyhow!("chain registry has no Aerodrome factory"))?;
+            calldata::build_exit_aero(
+                vault,
+                router,
+                factory,
+                weth,
+                token,
+                token_amount,
+                expected_weth_out,
+                slippage_bps,
+                head_block,
+                grace,
+                max_base_fee,
+                tag,
+            )
+            .2
+        }
+        crate::dex::Venue::UniV3 => {
+            anyhow::bail!(
+                "UniV3 sniper exits have no execution adapter — refusing to fabricate calldata"
+            )
+        }
+    })
+}
+
 #[derive(Clone)]
 pub struct SniperExecution {
     pub rpc: RpcClient,
     pub signer: Option<Signer>,
     pub store: Arc<Store>,
     pub lane: Arc<SniperLane>,
+    /// Chain registry addresses the venue adapters dispatch on (Aerodrome
+    /// router/factory today). Snapshot at boot; overrides still come from
+    /// the same validated registry every other component reads.
+    addresses: crate::config::known::ChainAddresses,
     /// The local SniperVault simulation fixture, present only while a fork
     /// backend is available. Simulation entries refuse to run without it
     /// rather than pretending a paper trade was contract-backed.
@@ -50,12 +192,14 @@ impl SniperExecution {
         signer: Option<Signer>,
         store: Arc<Store>,
         lane: Arc<SniperLane>,
+        addresses: crate::config::known::ChainAddresses,
     ) -> Self {
         Self {
             rpc,
             signer,
             store,
             lane,
+            addresses,
             fixture: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
@@ -63,6 +207,48 @@ impl SniperExecution {
     /// Attach the simulation fixture once the engine's fork is up.
     pub fn set_fixture(&self, fixture: Arc<SimVaultFixture>) {
         *self.fixture.write() = Some(fixture);
+    }
+
+    /// Expected WETH out for selling `qty` of a position's token into its
+    /// WETH pool, quoted with the execution venue's own fee model — the
+    /// number the optimistic amount and the vault's slippage floor derive
+    /// from (work order 4.2). `U256::ZERO` means "could not quote", which
+    /// callers degrade to the spot mark exactly as they already do for an
+    /// unreadable reserve set.
+    async fn expected_exit_out(
+        &self,
+        venue: crate::dex::Venue,
+        pair: Address,
+        weth: Address,
+        token: Address,
+        qty: U256,
+        head_block: u64,
+    ) -> U256 {
+        let Some((r0, r1)) = marks::pair_reserves(&self.rpc, pair, head_block).await else {
+            return U256::ZERO;
+        };
+        let (weth_r, token_r) = if weth < token { (r0, r1) } else { (r1, r0) };
+        match venue {
+            crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 => {
+                marks::v2_amount_out(qty, token_r, weth_r)
+            }
+            crate::dex::Venue::AeroVolatile => {
+                // Aerodrome's fee is per-pool, read live at quote time so a
+                // fee that changed since discovery cannot be baked into a
+                // slippage floor that no longer exists (volatile only —
+                // stable pools refuse to quote upstream).
+                let Some(factory) = self.addresses.aerodrome_factory else {
+                    return U256::ZERO;
+                };
+                crate::dex::aero_fee_bps(&self.rpc, factory, pair, false, head_block)
+                    .await
+                    .map(|fee| crate::dex::aero_volatile_amount_out(qty, token_r, weth_r, fee))
+                    .unwrap_or(U256::ZERO)
+            }
+            // No adapter, no quote. The calldata builder refuses UniV3
+            // before anything signs, so this zero can never settle a trade.
+            crate::dex::Venue::UniV3 => U256::ZERO,
+        }
     }
 
     pub fn fixture(&self) -> Option<Arc<SimVaultFixture>> {
@@ -116,10 +302,30 @@ impl SniperExecution {
             self.lane.blacklist(candidate.token);
         }
 
+        // Work order 4.3: the LP-lock requirement is a real gate, not a
+        // label. When the operator demands a locked LP and the candidate
+        // arrived without a verdict, reach for one now — but only on venues
+        // where the probe means something (V2-style pools; UniV3 liquidity
+        // is NFT positions and stays unprobed, which the gate reads as
+        // not-locked — fail-closed, never a silent pass).
+        let params = self.lane.params();
+        let probed;
+        let candidate = if params.require_lp_locked
+            && candidate.lp_locked.is_none()
+            && super::gates::lp_lock_probe_supported(candidate.venue)
+        {
+            probed = {
+                let mut c = candidate.clone();
+                c.lp_locked = super::gates::probe_lp_locked(&self.rpc, c.pair).await;
+                c
+            };
+            &probed
+        } else {
+            candidate
+        };
         // Admit candidate through the normal gates. Simulation uses the same
         // gates but substitutes an internal non-zero vault marker, because no
         // production deployment is needed for a contract-backed local trade.
-        let params = self.lane.params();
         let admission = if self.paper_mode()
             && params.enabled
             && !params.buy_size_wei.is_zero()
@@ -148,12 +354,30 @@ impl SniperExecution {
             return Ok(None);
         }
 
-        let expected_tokens_out = (size_wei * token_reserve * U256::from(997))
-            / (weth_reserve * U256::from(1000) + size_wei * U256::from(997));
-
-        if expected_tokens_out.is_zero() {
+        // Venue-exact quote (work order 4.2): the fee the execution will
+        // actually be billed is the one the prediction uses. A venue without
+        // an exact quote here (UniV3 — reserves are not its pricing input)
+        // refuses rather than buying on an invented number.
+        let expected_tokens_out = match candidate.venue {
+            crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 => {
+                let out = (size_wei * token_reserve * U256::from(997))
+                    / (weth_reserve * U256::from(1000) + size_wei * U256::from(997));
+                (!out.is_zero()).then_some(out)
+            }
+            crate::dex::Venue::AeroVolatile => candidate.pool_fee_bps.and_then(|fee_bps| {
+                let out = crate::dex::aero_volatile_amount_out(
+                    size_wei,
+                    weth_reserve,
+                    token_reserve,
+                    fee_bps,
+                );
+                (!out.is_zero()).then_some(out)
+            }),
+            crate::dex::Venue::UniV3 => None,
+        };
+        let Some(expected_tokens_out) = expected_tokens_out else {
             return Ok(None);
-        }
+        };
 
         let pos_id = uuid::Uuid::new_v4().to_string();
         let simulation = self.paper_mode();
@@ -163,7 +387,11 @@ impl SniperExecution {
             chain_id,
             token: candidate.token,
             pair: candidate.pair,
-            venue: "univ2".into(),
+            // The entry's venue is the position's venue forever: exits quote
+            // and build against the same venue's exact model (work order
+            // 4.2). Pre-venue rows in the store predate this string only by
+            // never existing on this chain.
+            venue: candidate.venue.as_str().into(),
             state: PositionState::Pending,
             trigger_tx: None,
             entry_tx: None,
@@ -240,7 +468,11 @@ impl SniperExecution {
         }
 
         let tag = calldata::make_tag(&pos_id, 0);
-        let (_, _guard, calldata) = calldata::build_entry(
+        // Work order 4.2 dispatch: venue-exact calldata or an abandoned,
+        // fully persisted position. Never a trade on approximated calldata.
+        let calldata = match build_entry_for(
+            &self.addresses,
+            candidate.venue,
             vault_addr,
             candidate.pair,
             weth,
@@ -253,7 +485,19 @@ impl SniperExecution {
             2,
             U256::ZERO,
             tag,
-        );
+        ) {
+            Ok(c) => c,
+            Err(error) => {
+                position.state = PositionState::Abandoned;
+                position.tx_status = TxStatus::Abandoned;
+                position.notes = format!("execution adapter refused the entry: {error}");
+                self.store
+                    .upsert_sniper_position(&position)
+                    .map_err(|e| anyhow::anyhow!("persisting refused entry: {e}"))?;
+                self.lane.upsert_position(position.clone());
+                return Ok(Some(position));
+            }
+        };
 
         let signer = self.signer.as_ref().unwrap();
 
@@ -338,7 +582,7 @@ impl SniperExecution {
     async fn simulated_entry(
         &self,
         position: &mut Position,
-        _candidate: &LaunchCandidate,
+        candidate: &LaunchCandidate,
         weth: Address,
         size_wei: U256,
         expected_tokens_out: U256,
@@ -348,6 +592,24 @@ impl SniperExecution {
         head_block: u64,
         _now_ms: u64,
     ) -> Result<Option<Position>> {
+        // The simulation fixture is a UniV2-shaped mock pair. Running an
+        // Aerodrome/UniV3 candidate through it would measure the wrong
+        // venue — abandon honestly rather than report an invented fill
+        // (work order 4.2; live fork round-trips for the Aero adapters run
+        // in the env-gated integration test instead).
+        if candidate.venue != crate::dex::Venue::UniV2 {
+            self.lane.credit_paper(size_wei);
+            self.persist_paper_balance();
+            position.state = PositionState::Abandoned;
+            position.tx_status = TxStatus::Abandoned;
+            position.notes = format!(
+                "simulation fixture is UniV2-shaped; {} entries are not simulated",
+                candidate.venue.as_str()
+            );
+            self.store.upsert_sniper_position(position)?;
+            self.lane.upsert_position(position.clone());
+            return Ok(Some(position.clone()));
+        }
         let Some(fixture) = self.fixture() else {
             position.state = PositionState::Abandoned;
             position.tx_status = TxStatus::Abandoned;
@@ -859,6 +1121,8 @@ impl SniperExecution {
         let candidate = LaunchCandidate {
             token,
             pair,
+            venue: crate::dex::Venue::UniV2,
+            pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
             weth_reserve,
             token_reserve,
             verdict: super::gates::HoneypotVerdict::Clean {
@@ -950,20 +1214,42 @@ impl SniperExecution {
             anyhow::bail!("SNIPER_VAULT_ADDRESS is not configured")
         }
         let is_weth_token0 = weth < position.token;
-        let (_, _, calldata) = calldata::build_exit(
+        // Positions written before venues existed are UniV2 by construction;
+        // anything newer quotes with its own venue's fee model (work order
+        // 4.2). UniV2 keeps the historical spot mark as its optimistic
+        // amount, byte-identical to before this dispatch existed.
+        let venue =
+            crate::dex::Venue::from_label(&position.venue).unwrap_or(crate::dex::Venue::UniV2);
+        let expected_out = if venue == crate::dex::Venue::AeroVolatile {
+            self.expected_exit_out(
+                venue,
+                position.pair,
+                weth,
+                position.token,
+                decision.qty,
+                head_block,
+            )
+            .await
+        } else {
+            mark.value_wei
+        };
+        let calldata = build_exit_for(
+            &self.addresses,
+            venue,
             vault_addr,
             position.pair,
             weth,
             position.token,
             is_weth_token0,
             decision.qty,
-            mark.value_wei,
+            expected_out,
             params.max_price_impact_bps,
             head_block,
             2,
             U256::ZERO,
             calldata::make_tag(&position.id, now_ms as u32),
-        );
+        )
+        .map_err(|error| anyhow::anyhow!("execution adapter refused the manual exit: {error}"))?;
 
         // Persist the intent before signing/broadcasting. The durable row is
         // the recovery anchor if the process dies after sendRawTransaction.
@@ -1272,7 +1558,26 @@ impl SniperExecution {
             // and a pair's K invariant rejects it. Fall back to the mark only
             // when reserves cannot be read (the vault's minWethOut still
             // guards the realised proceeds either way).
-            let expected_weth =
+            let venue =
+                crate::dex::Venue::from_label(&position.venue).unwrap_or(crate::dex::Venue::UniV2);
+            let expected_weth = if venue == crate::dex::Venue::AeroVolatile {
+                // Same intent, the venue's own fee model (work order 4.2).
+                let out = self
+                    .expected_exit_out(
+                        venue,
+                        position.pair,
+                        weth,
+                        position.token,
+                        decision.qty,
+                        head_block,
+                    )
+                    .await;
+                if out.is_zero() {
+                    mark_val
+                } else {
+                    out
+                }
+            } else {
                 match marks::pair_reserves(&self.rpc, position.pair, head_block).await {
                     Some((r0, r1)) => {
                         let (weth_r, token_r) = if is_weth_token0 { (r0, r1) } else { (r1, r0) };
@@ -1284,8 +1589,14 @@ impl SniperExecution {
                         }
                     }
                     None => mark_val,
-                };
-            let (_, _, calldata) = calldata::build_exit(
+                }
+            };
+            // Venue-exact calldata or no exit this block: an adapter that
+            // cannot build must never fall back to approximated calldata
+            // with real funds on the line.
+            let calldata = match build_exit_for(
+                &self.addresses,
+                venue,
                 vault_addr,
                 position.pair,
                 weth,
@@ -1298,7 +1609,19 @@ impl SniperExecution {
                 2,
                 U256::ZERO,
                 tag,
-            );
+            ) {
+                Ok(c) => c,
+                Err(error) => {
+                    tracing::error!(
+                        target: "sniper",
+                        id = %position.id,
+                        %error,
+                        "execution adapter refused the block exit; skipping this block"
+                    );
+                    let _ = mark_opt;
+                    continue;
+                }
+            };
 
             // Exit management is independent of the entry switch. A halt or
             // disabled master switch stops new buys, but must not strand funds
@@ -1549,7 +1872,13 @@ mod tests {
             super::super::SniperModeBoot::default(),
         ));
 
-        let exec = SniperExecution::new(rpc, None, store, lane.clone());
+        let exec = SniperExecution::new(
+            rpc,
+            None,
+            store,
+            lane.clone(),
+            *crate::config::known::ethereum(),
+        );
         assert!(exec.signer.is_none());
         // Default boot is simulation: the paper ledger is reachable.
         assert!(exec.paper_mode());
@@ -1568,6 +1897,7 @@ mod tests {
             None,
             Arc::new(Store::open_in_memory().unwrap()),
             live_lane,
+            *crate::config::known::ethereum(),
         );
         assert!(!exec_live.paper_mode());
     }

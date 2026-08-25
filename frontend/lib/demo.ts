@@ -66,7 +66,26 @@ export function demoStatus(): StatusResponse {
       baseFeeWei: "8320000000",
       gasUsed: 16_942_113,
       timestamp: Math.floor(Date.now() / 1000),
+      ageMs: 3_400,
     },
+    // `demo` is the honest verdict here: this payload is generated fixture
+    // data because the bot API could not be reached (work order 0.3). The
+    // sub-plane fixtures below stay plausible-looking but are always
+    // identified by this word, never by a live-looking dataMode.
+    dataMode: "demo",
+    upstream: {
+      calls: 24_860,
+      requests: 12_940,
+      ok: 12_812,
+      errors: 128,
+      errorRateBps: 99,
+      rateLimited: 3,
+      avgLatencyMs: 118,
+      lastOkMs: Date.now() - 4_000,
+      lastErrorMs: Date.now() - 90_000,
+    },
+    flashblocks: {configured: false},
+    chainBlocks: {configured: false},
     mode: "simulation",
     strategies: STRATEGIES,
     risk: {
@@ -91,6 +110,10 @@ export function demoStatus(): StatusResponse {
       startedAtMs: Date.now() - 1000 * 60 * 84,
       funnel: demoFunnel(),
       funnelReplay: demoFunnelReplay(),
+      sourceFunnels: {
+        publicMempool: {candidates: 1_180, gatedByRisk: 1_040, simulated: 132},
+        chainBlock: {candidates: 104, gatedByRisk: 96, simulated: 7},
+      },
     },
     simBackends: {anvilFork: true, relayCallBundle: true},
     inventory: {

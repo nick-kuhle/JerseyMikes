@@ -181,6 +181,19 @@ impl Venue {
             Venue::AeroVolatile => "aerodrome",
         }
     }
+
+    /// Inverse of [`Venue::as_str`] for labels persisted on rows (positions
+    /// carry their venue as a string). Unknown labels return `None` — the
+    /// caller must refuse to dispatch on a venue it cannot identify.
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "univ2" => Some(Venue::UniV2),
+            "sushiv2" => Some(Venue::SushiV2),
+            "univ3" => Some(Venue::UniV3),
+            "aerodrome" => Some(Venue::AeroVolatile),
+            _ => None,
+        }
+    }
 }
 
 /// Snapshot of an Aerodrome pool. Only `stable = false` pools are priced;

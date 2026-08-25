@@ -47,6 +47,7 @@
 pub mod calldata;
 pub mod execution;
 pub mod gates;
+pub mod launch_feed;
 pub mod marks;
 pub mod mode;
 pub mod params;
@@ -713,6 +714,8 @@ mod tests {
         LaunchCandidate {
             token: Address::with_last_byte(1),
             pair: Address::with_last_byte(2),
+            venue: crate::dex::Venue::UniV2,
+            pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
             weth_reserve: eth(10),
             token_reserve: U256::from(1_000_000u64),
             verdict: HoneypotVerdict::Clean {

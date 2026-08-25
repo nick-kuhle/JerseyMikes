@@ -855,7 +855,7 @@ pub async fn try_scan_aero_pool_created(
 /// Map the emitting factory address to its venue, using the chain's
 /// registry (`factories`) rather than a hardcoded table — a chain whose
 /// V2 factory differs from mainnet's must still decode its own logs.
-fn venue_from_factory(
+pub fn venue_from_factory(
     factory: &serde_json::Value,
     factories: &[(crate::dex::Venue, Address)],
 ) -> Option<crate::dex::Venue> {
