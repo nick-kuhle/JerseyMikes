@@ -181,7 +181,7 @@ one already approved.
 | `SNIPER_MIN_LIQUIDITY_WEI` | `2 ETH` | Reject pools thinner than this. |
 | `SNIPER_MAX_PRICE_IMPACT_BPS` | `300` | Reject if the (budget-clamped) size moves the pool more than this. |
 | `SNIPER_MIN_HOLD_BLOCKS` | `1` | Suppress price-based exits until the position is this old, so our own entry impact does not trip the stop. |
-| `SNIPER_REQUIRE_LP_LOCKED` | `false` | Require burned/locked LP. **Not yet enforced** — see below. |
+| `SNIPER_REQUIRE_LP_LOCKED` | `false` | Require burned/locked LP (W4.3: `probe_lp_locked` reads totalSupply + 0x0/dead balances, ≥95% burned → locked; supported for UniV2/SushiV2/AeroVolatile, UniV3 fails closed). |
 
 A honeypot is rejected **even with `requireHoneypotPass` off**. That switch
 only governs what happens to an *unmeasurable* token.
@@ -397,7 +397,7 @@ real capital is the one place a convincing demo would be dangerous.
 
 ## 7. Persistence and restart
 
-Three tables, no foreign keys into the rest of the schema:
+Four tables, no foreign keys into the rest of the schema:
 
 - `sniper_positions` — one row per position, written **before** the entry is
   submitted, not after it confirms.
@@ -406,6 +406,12 @@ Three tables, no foreign keys into the rest of the schema:
 - `sniper_token_verdicts` — honeypot verdicts, so a token is probed once and
   remembered. Doubles as the evidence population for the (non-blocking)
   directional qualification track.
+- `sniper_launches` (W4.1) — canonical launch observations with full
+  provenance: token, pair, venue, block, tx_hash, log_index, source
+  (`canonical_log`), weth/token reserves (NULL when unread), gate_result
+  shadow (`admitted` or rejection code, `observation_only` for V3,
+  `state_unreadable`), canonical flag flipped to 0 on reorg, unique on
+  `(pair, block_number, log_index)` for exactly-once dedupe.
 
 At boot the engine hydrates every live position **before** anything can open a
 new one, so the concurrency and budget gates see the true picture on the first
@@ -424,11 +430,12 @@ we are holding, we must not open anything on top of it.
 | `sniper::portfolio` | 16 | Realised/unrealised split, staleness, win rate, JSON string invariants |
 | `sniper` (lane) | 15 | Boot ceiling, halting, concurrency, hydration, rejection counting |
 | `sniper` (API contract) | 7 | JSON field names, camelCase, wei-as-string, patch deserialisation |
-| `store` (sniper) | 7 | Round-trip fidelity, upsert idempotence, live-only hydration |
+| `store` (sniper) | 9 | Round-trip fidelity, upsert idempotence, live-only hydration, `sniper_launches` dedupe + provenance |
+| `sniper::launch_feed` | 6 | Real Base PairCreated/PoolCreated fixtures, cross-family rejection, WETH filter, scan_window bounds |
 | `SniperVault.t.sol` | 31 | Guards, budgets, access control, honeypot backstop, 2 fuzz invariants |
 
-**Total: 134 tests specific to this lane.** Full suite: 388 Rust, 63 Solidity,
-all green.
+**Total: ~142 tests specific to this lane.** Full suite: 474 Rust, 63 Solidity,
+all green (W4.1 + W4.2 + W4.3 included).
 
 Invariants worth calling out, each pinned by a named test:
 
@@ -477,26 +484,65 @@ The four critical blocking items have all been implemented, tested, and wired:
 
 ## What remains
 
-### Non-blocking — known gaps
+### Recently completed (Base work order W4)
 
-5. **`SNIPER_REQUIRE_LP_LOCKED` is not enforced.** The parameter, the gate and
-   the tests exist; `lp_locked` is always `None` because no LP-lock detector is
-   written. With the flag on, the gate correctly fails closed and rejects
-   everything — accurate, but useless. Left off by default.
-6. **Directional qualification track is not built.** The sniper cannot earn a
+5. **`SNIPER_REQUIRE_LP_LOCKED` is now enforced (W4.3).** `gates::probe_lp_locked`
+   reads `totalSupply` + `balanceOf(0x0 / dead)` on the pair; ≥95% burned →
+   locked. `lp_lock_probe_supported` true for UniV2/SushiV2/AeroVolatile,
+   false for UniV3 (fail-closed). Wired into `process_launch` when
+   `require_lp_locked && lp_locked None && supported`. `LaunchCandidate.venue`
+   carried everywhere, rejection code `lp_not_locked` counted.
+6. **Aerodrome volatile execution adapters (W4.2).** `calldata::build_entry_aero`
+   / `build_exit_aero` encode exact-allowance approve + 
+   `swapExactTokensForTokensSupportingFeeOnTransferTokens` with Route
+   `{from,to,stable:false,factory}`, amountOutMin mirrors vault guard floor,
+   deadline `u64::MAX` with rationale. `pool_fee_bps` on LaunchCandidate,
+   venue-exact expected-out dispatch (UniV3→None refuses), `build_entry_for` /
+   `build_exit_for` free fns + `expected_exit_out` re-reads reserves+getFee at
+   quote time. Position.venue from candidate, manual/block exit dispatch,
+   sim entries for non-UniV2 venues abandon honestly. Fork round-trip
+   `tests/sniper_aero_fork.rs` passed live against Base block 50424093.
+7. **Canonical launch discovery (W4.1).** `sniper/launch_feed.rs` watches the
+   chain's registered factories for pool-creation events with full provenance:
+   UniV2/SushiV2 `PairCreated`, Aerodrome `PoolCreated` (volatile only, stable
+   dropped never relabelled), UniswapV3 `PoolCreated` (observation only, no
+   execution adapter). `scan_launch_events` does 3× `eth_getLogs` max, only for
+   factories the chain has. `None` = RPC fail → cursor not advanced. Real Base
+   fixtures: V2 block 50424273 (0x30169d1), Aero 50423380 (0x3016654), V3
+   50424058 (0x30168fa). `scan_window` with `CURSOR_NEVER` sentinel, backfill
+   16, max range 64, fail-closed. Engine `on_block` gated on
+   `boot_enabled() && launch_factories_registered()`, off hot path, guarded
+   against overlap. `observe_launch` exactly-once dedupe via
+   `sniper_launch_exists`, reserve verification (`other_token`, stable drop),
+   shadow gating with `Unknown` verdict (fail-closed, counted as
+   `verdict_unknown`), V3 `observation_only`, `state_unreadable`. `store.rs`
+   `sniper_launches` table: `(pair, block_number, log_index)` unique, reserves
+   NULL when unread, `gate_result` shadow, `canonical` flip on reorg, index on
+   block. GO_LIVE selectors extended with Aero `0xb7e0d4c0`/`0x5a47ddc3`,
+   venue-aware `aero_get_pool` resolution when `tx.to==aerodrome_router`
+   (mainnet router None → byte-identical).
+8. **Data-plane health (W0.3).** `RpcStats` counters, `ChainBlockStats`,
+   `SourceFunnel` + `candidate_source` (pin→flashblocks, victimless→chainBlock,
+   victimful→sequencerFeed|publicMempool) + `classify_data_mode`, status
+   `dataMode/head.ageMs/upstream/flashblocks{configured,connectionState,lastFrameAgeMs,sealedMatchRateBps}/chainBlocks`
+   + sourceFunnels, frontend DataPlanePanel triage.
+
+### Remaining gaps
+
+9. **Directional qualification track is not built.** The sniper cannot earn a
    `PASS` from the existing gate (that gate certifies fork/relay/chain accuracy
    on atomic profit-or-revert bundles, which this lane is not). Arming is
-   currently governed by the budget gates alone. `sniper_token_verdicts` is
-   already accumulating the evidence a directional track would need
-   (honeypot-detector precision/recall, paper entry/exit reconciliation).
-7. **Base.** The lane is chain-agnostic and `chain_id` is carried on every
-   position, but Base registers one V2 venue and the launch detector only
-   scans V2 `PairCreated`. Aerodrome pool creation is not detected, so on Base
-   the lane will see very few launches.
-8. **Sell-side re-probing** is modelled (`evaluate_exit` takes a
-   `sell_honeypot` flag and is tested) but nothing periodically re-runs the
-   probe on open positions to set it.
-9. **Multi-hop and V3 launches** are out of scope; WETH-quoted V2 pairs only.
+   currently governed by the budget gates alone. `sniper_token_verdicts` and
+   `sniper_launches` are accumulating the evidence a directional track would need.
+10. **Sell-side re-probing** is modelled (`evaluate_exit` takes a
+    `sell_honeypot` flag and is tested) but nothing periodically re-runs the
+    probe on open positions to set it.
+11. **UniV3 execution adapters are deliberately refused, not built.** V3
+    `PoolCreated` is persisted as observation only; no `build_entry_v3` exists.
+    Reason: concentrated-liquidity quoting requires tick math and QuoterV2 that
+    is not yet pinned to the preconfirmed state identity. The observation ledger
+    exists so a future adapter can be measured before it trades.
+12. **Multi-hop launches** are out of scope; WETH-quoted pairs only.
 
 ### Not planned
 

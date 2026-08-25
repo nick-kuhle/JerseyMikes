@@ -292,6 +292,8 @@ to measure what is reachable, not to be profitable. See
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | systemd + Docker Compose units, `/api/metrics`, the alert rules and their knobs |
 | [`docs/BASE_SAFETY_FOUNDATION.md`](docs/BASE_SAFETY_FOUNDATION.md) | Base upgrade behavior: raw acceptance, cancellation, gas-at-risk smoke, qualification migration |
 | [`docs/BASE_REVENUE_PATH_WORK_ORDER.md`](docs/BASE_REVENUE_PATH_WORK_ORDER.md) | Successor work order for Flashblocks state semantics, V3/Aerodrome execution, independent qualification and Base smoke |
+| [`docs/BASE_TIMING_FEE_RESEARCH.md`](docs/BASE_TIMING_FEE_RESEARCH.md) | §3.2 timing & fee research: p50/p95/p99 per stage, RpcStats, SourceFunnel, why adaptive fee deferred |
+| [`docs/BASE_SOAK_SMOKE.md`](docs/BASE_SOAK_SMOKE.md) | §3.3 soak & controlled smoke: why blocked, how to run 168h soak, what is ready |
 | [`docs/BUILD_NOTES.md`](docs/BUILD_NOTES.md) | What CI verifies, the current gate results, and the engineering log |
 
 ## Status
@@ -315,7 +317,17 @@ blocks, and sell a configurable fraction once it reaches a configurable profit
 target (percentage or absolute ETH). It is isolated from the atomic engine at
 every level — its own contract (`SniperVault`, budget-capped spend instead of
 profit-or-revert), its own `SNIPER_*` risk envelope, its own arming switch, its
-own halt, its own tables, and its own console panel with a mini portfolio.
+own halt, its own tables (`sniper_positions`, `sniper_fills`,
+`sniper_token_verdicts`, `sniper_launches`), and its own console panel with a
+mini portfolio.
+
+Base support (W4): canonical launch discovery watches V2/V3/Aerodrome
+`PoolCreated` with full provenance (`sniper_launches` table, real Base fixtures,
+scan_window with cursor, shadow gating), Aerodrome volatile execution adapters
+with venue-exact dispatch and fork-tested round-trip, LP-lock gate
+(`probe_lp_locked` ≥95% burned), data-plane health diagnostics (RpcStats,
+ChainBlockStats, SourceFunnel, dataMode), and GO_LIVE extension with Aero
+selectors `0xb7e0d4c0`/`0x5a47ddc3` (mainnet byte-identical).
 
 `MevExecutor`'s runtime bytecode is unchanged (11,497 bytes), so nothing about
 the certified atomic path moved.
