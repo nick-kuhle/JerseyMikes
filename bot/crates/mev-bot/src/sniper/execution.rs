@@ -116,10 +116,30 @@ impl SniperExecution {
             self.lane.blacklist(candidate.token);
         }
 
+        // Work order 4.3: the LP-lock requirement is a real gate, not a
+        // label. When the operator demands a locked LP and the candidate
+        // arrived without a verdict, reach for one now — but only on venues
+        // where the probe means something (V2-style pools; UniV3 liquidity
+        // is NFT positions and stays unprobed, which the gate reads as
+        // not-locked — fail-closed, never a silent pass).
+        let params = self.lane.params();
+        let probed;
+        let candidate = if params.require_lp_locked
+            && candidate.lp_locked.is_none()
+            && super::gates::lp_lock_probe_supported(candidate.venue)
+        {
+            probed = {
+                let mut c = candidate.clone();
+                c.lp_locked = super::gates::probe_lp_locked(&self.rpc, c.pair).await;
+                c
+            };
+            &probed
+        } else {
+            candidate
+        };
         // Admit candidate through the normal gates. Simulation uses the same
         // gates but substitutes an internal non-zero vault marker, because no
         // production deployment is needed for a contract-backed local trade.
-        let params = self.lane.params();
         let admission = if self.paper_mode()
             && params.enabled
             && !params.buy_size_wei.is_zero()
@@ -859,6 +879,7 @@ impl SniperExecution {
         let candidate = LaunchCandidate {
             token,
             pair,
+            venue: crate::dex::Venue::UniV2,
             weth_reserve,
             token_reserve,
             verdict: super::gates::HoneypotVerdict::Clean {

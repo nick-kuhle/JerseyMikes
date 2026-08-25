@@ -96,9 +96,13 @@ pub struct SniperParams {
     /// same-block round trip being mistaken for a directional position and
     /// gives the launch time to establish a price.
     pub min_hold_blocks: u64,
-    /// Require the pool's LP tokens to be burned or time-locked. Enforcement
-    /// is best-effort (see `gates::lp_locked`); when the check cannot reach a
-    /// verdict the gate fails **closed** if this is true.
+    /// Require the pool's LP tokens to be burned (work order 4.3). Real
+    /// enforcement via `gates::probe_lp_locked`: on V2-style venues (UniV2,
+    /// SushiV2, Aerodrome volatile — where the pool *is* the LP token) at
+    /// least 95% of LP supply must sit in the canonical burn addresses.
+    /// Candidates on venues the probe cannot answer for (UniV3, NFT
+    /// positions) and probes that fail to run read as **not locked** — the
+    /// gate fails closed, never passes silently.
     pub require_lp_locked: bool,
 }
 

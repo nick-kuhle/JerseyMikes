@@ -1881,6 +1881,13 @@ function SniperPanel() {
                 />
                 <label htmlFor="reqLp" style={{fontSize: 11, cursor: "pointer"}}>
                   Require LP Burned / Locked
+                  <span
+                    className="muted"
+                    style={{display: "block", fontSize: 9, marginTop: 1, cursor: "pointer"}}
+                  >
+                    on-chain probe: ≥95% of V2-style LP supply (incl. Aerodrome volatile) in burn
+                    addresses; unprobable venues (UniV3) and failed probes read as not-locked
+                  </span>
                 </label>
               </div>
             </div>

@@ -9,9 +9,19 @@
 //! have runs before anything that costs an RPC or a simulation.
 
 use alloy_primitives::{Address, U256};
+use alloy_sol_types::{sol, SolCall};
 use serde::{Deserialize, Serialize};
 
 use super::params::{SniperParams, BPS};
+
+sol! {
+    /// Just the ERC20 reads the LP-lock probe needs. The pair *is* the LP
+    /// token on every V2-style venue (UniV2, SushiV2, Aerodrome volatile).
+    interface ILpToken {
+        function totalSupply() external view returns (uint256);
+        function balanceOf(address account) external view returns (uint256);
+    }
+}
 
 /// The honeypot round trip's verdict for a token.
 ///
@@ -97,12 +107,18 @@ impl HoneypotVerdict {
 pub struct LaunchCandidate {
     pub token: Address,
     pub pair: Address,
+    /// The launch venue. Provenance, not decoration: calldata builders,
+    /// quote math and the LP-lock probe all dispatch on it, and a candidate
+    /// that cannot prove where it came from must not be tradable.
+    pub venue: crate::dex::Venue,
     /// WETH-side reserve of the pool at the state we would buy against.
     pub weth_reserve: U256,
     /// Token-side reserve.
     pub token_reserve: U256,
     pub verdict: HoneypotVerdict,
     /// Whether the LP position is burned / locked, if known.
+    /// `None` means unprobed or unprobable — and the gate fails closed on it
+    /// when the operator requires a verdict (work order 4.3).
     pub lp_locked: Option<bool>,
     /// True if the token has already been rejected once.
     pub blacklisted: bool,
@@ -342,6 +358,98 @@ pub fn price_impact_bps(size: U256, reserve_in: U256) -> u32 {
         .to::<u32>()
 }
 
+// --- LP-lock probe (work order 4.3) -----------------------------------------
+
+/// Share of LP supply that must sit in burn addresses for the position to
+/// count as locked. 95% deliberately tolerates the tiny deployer/test mints
+/// common on real launches while still meaning "the deployer cannot rug the
+/// pool's liquidity". A rug that keeps 4.9% of the LP cannot drain the pool.
+const LOCKED_MIN_BPS: u64 = 9_500;
+
+/// Canonical burn destinations. `0x0` is the classic burn; `0x…dEaD` is the
+/// address modern launch tooling burns to. Both are unspendable — no known
+/// private key can exist for either.
+const BURN_ADDRESSES: [Address; 2] = [
+    Address::ZERO,
+    Address::new([
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0xde, 0xad,
+    ]),
+];
+
+/// Whether the LP-lock probe has a meaning on this venue.
+///
+/// V2-style venues (UniV2, SushiV2, Aerodrome volatile) make the pool itself
+/// the LP token, so a burned-supply check works. UniV3 liquidity lives in
+/// non-fungible positions: there is no LP-token supply to inspect and a
+/// `totalSupply` probe would answer a question nobody asked. Unsupported
+/// does **not** mean "pass" — it means the probe cannot run, and the gate
+/// fails closed on `None` when the operator requires the check.
+pub fn lp_lock_probe_supported(venue: crate::dex::Venue) -> bool {
+    matches!(
+        venue,
+        crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 | crate::dex::Venue::AeroVolatile
+    )
+}
+
+/// Probe a V2-style pool's burn share at the latest state.
+///
+/// `Some(true)` — at least [`LOCKED_MIN_BPS`] of LP supply is burned.
+/// `Some(false)` — measurably less than that (a rug-able pool).
+/// `None` — the probe could not be completed (RPC failure, short response,
+/// zero supply): no verdict exists, and the admission gate treats `None` as
+/// "not locked" when the check is required. Fail-closed by construction.
+pub async fn probe_lp_locked(rpc: &crate::rpc::RpcClient, pair: Address) -> Option<bool> {
+    let call = |data: Vec<u8>| {
+        (
+            "eth_call".to_string(),
+            serde_json::json!([
+                {"to": format!("{pair:?}"), "data": format!("0x{}", hex::encode(data))},
+                "latest"
+            ]),
+        )
+    };
+    let calls = vec![
+        call(ILpToken::totalSupplyCall {}.abi_encode()),
+        call(
+            ILpToken::balanceOfCall {
+                account: BURN_ADDRESSES[0],
+            }
+            .abi_encode(),
+        ),
+        call(
+            ILpToken::balanceOfCall {
+                account: BURN_ADDRESSES[1],
+            }
+            .abi_encode(),
+        ),
+    ];
+    let res = rpc.batch(&calls).await.ok()?;
+    let word = |i: usize| -> Option<U256> {
+        let s = res.get(i)?.as_ref().ok()?.as_str()?;
+        let raw = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
+        if raw.len() != 32 {
+            return None;
+        }
+        Some(U256::from_be_slice(&raw))
+    };
+    let total = word(0)?;
+    let burned = word(1)?.saturating_add(word(2)?);
+    if total.is_zero() {
+        // A pool with no LP supply has no LP to lock — and no liquidity, so
+        // the liquidity gate would reject it anyway. Answer honestly: the
+        // lock property is unprovable on an empty pool.
+        return None;
+    }
+    Some(
+        burned
+            .saturating_mul(U256::from(BPS))
+            .checked_div(total)
+            .map(|share| share >= U256::from(LOCKED_MIN_BPS))
+            .unwrap_or(false),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +478,7 @@ mod tests {
         LaunchCandidate {
             token: Address::with_last_byte(1),
             pair: Address::with_last_byte(2),
+            venue: crate::dex::Venue::UniV2,
             weth_reserve: eth(10),
             token_reserve: U256::from(1_000_000u64),
             verdict: HoneypotVerdict::Clean {
@@ -651,5 +760,110 @@ mod tests {
         };
         assert_eq!(lucky.implied_tax_bps(), Some(0));
         assert_eq!(HoneypotVerdict::Unknown.implied_tax_bps(), None);
+    }
+
+    // --- LP-lock probe (work order 4.3) --------------------------------------
+
+    /// A batched eth_call stub: answers `totalSupply`/`balanceOf` for the
+    /// pair with the supplied values, by decoding the probe's selectors.
+    async fn mock_pair(supply: u128, zero_balance: u128, dead_balance: u128) -> String {
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(
+                move |axum::extract::Json(req): axum::extract::Json<serde_json::Value>| async move {
+                    let word = |v: u128| format!("0x{v:064x}");
+                    let answer = |data: &str| {
+                        if let Some(rest) = data.strip_prefix("0x18160ddd") {
+                            let _ = rest;
+                            word(supply)
+                        } else if let Some(arg) = data.strip_prefix("0x70a08231") {
+                            // balanceOf: the address is the last 40 nibbles.
+                            if arg.ends_with("dead") || arg.ends_with("dEaD") {
+                                word(dead_balance)
+                            } else {
+                                word(zero_balance)
+                            }
+                        } else {
+                            panic!("unexpected probe call: {data}");
+                        }
+                    };
+                    let arr = req.as_array().expect("batch request");
+                    let out: Vec<serde_json::Value> = arr
+                        .iter()
+                        .map(|one| {
+                            let data = one["params"][0]["data"].as_str().unwrap();
+                            serde_json::json!({"jsonrpc": "2.0", "id": one["id"], "result": answer(data)})
+                        })
+                        .collect();
+                    axum::Json(serde_json::Value::Array(out))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_fully_burned_lp_supply_probes_locked() {
+        let url = mock_pair(1_000_000, 0, 1_000_000).await;
+        let rpc = crate::rpc::RpcClient::new(url).unwrap();
+        assert_eq!(
+            probe_lp_locked(&rpc, Address::repeat_byte(7)).await,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_95_percent_burn_boundary_counts_as_locked() {
+        // Exactly 9,500 bps burned across the two burn addresses.
+        let url = mock_pair(1_000_000, 400_000, 550_000).await;
+        let rpc = crate::rpc::RpcClient::new(url).unwrap();
+        assert_eq!(
+            probe_lp_locked(&rpc, Address::repeat_byte(7)).await,
+            Some(true)
+        );
+        // One wei less burned and the pool is honestly rug-able.
+        let url = mock_pair(1_000_000, 400_000, 549_999).await;
+        let rpc = crate::rpc::RpcClient::new(url).unwrap();
+        assert_eq!(
+            probe_lp_locked(&rpc, Address::repeat_byte(7)).await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployer_held_lp_supply_probes_not_locked() {
+        let url = mock_pair(1_000_000, 0, 0).await;
+        let rpc = crate::rpc::RpcClient::new(url).unwrap();
+        assert_eq!(
+            probe_lp_locked(&rpc, Address::repeat_byte(7)).await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_is_no_verdict_never_a_pass() {
+        // Nothing listening on the port at all: the transport itself fails.
+        let rpc = crate::rpc::RpcClient::new("http://127.0.0.1:1").unwrap();
+        assert_eq!(probe_lp_locked(&rpc, Address::repeat_byte(7)).await, None);
+    }
+
+    #[tokio::test]
+    async fn an_empty_pool_has_no_lock_verdict() {
+        let url = mock_pair(0, 0, 0).await;
+        let rpc = crate::rpc::RpcClient::new(url).unwrap();
+        assert_eq!(probe_lp_locked(&rpc, Address::repeat_byte(7)).await, None);
+    }
+
+    #[test]
+    fn v3_positions_are_outside_the_probes_reach() {
+        assert!(lp_lock_probe_supported(crate::dex::Venue::UniV2));
+        assert!(lp_lock_probe_supported(crate::dex::Venue::SushiV2));
+        assert!(lp_lock_probe_supported(crate::dex::Venue::AeroVolatile));
+        assert!(!lp_lock_probe_supported(crate::dex::Venue::UniV3));
     }
 }

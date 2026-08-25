@@ -713,6 +713,7 @@ mod tests {
         LaunchCandidate {
             token: Address::with_last_byte(1),
             pair: Address::with_last_byte(2),
+            venue: crate::dex::Venue::UniV2,
             weth_reserve: eth(10),
             token_reserve: U256::from(1_000_000u64),
             verdict: HoneypotVerdict::Clean {

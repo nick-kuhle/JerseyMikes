@@ -1810,6 +1810,7 @@ impl Engine {
                             let candidate = crate::sniper::LaunchCandidate {
                                 token,
                                 pair,
+                                venue: crate::dex::Venue::UniV2,
                                 weth_reserve: U256::from(10_000_000_000_000_000_000u128),
                                 token_reserve: U256::from(1_000_000_000_000_000_000u128),
                                 verdict: crate::sniper::HoneypotVerdict::Clean {
