@@ -47,6 +47,7 @@
 pub mod calldata;
 pub mod execution;
 pub mod gates;
+pub mod launch_feed;
 pub mod marks;
 pub mod mode;
 pub mod params;

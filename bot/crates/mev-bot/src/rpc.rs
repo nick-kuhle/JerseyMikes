@@ -698,4 +698,63 @@ mod tests {
             1
         );
     }
+
+    #[tokio::test]
+    async fn the_snapshot_is_the_console_health_contract() {
+        use super::RpcClient;
+        // One healthy endpoint: two single calls, both succeed.
+        let ok_url = mock_server(|req| {
+            (
+                200,
+                json!({"jsonrpc": "2.0", "id": req["id"], "result": "0x1"}),
+            )
+        })
+        .await;
+        let rpc = RpcClient::new(ok_url).unwrap();
+        rpc.call::<String>("eth_blockNumber", json!([]))
+            .await
+            .unwrap();
+        rpc.call::<String>("eth_chainId", json!([])).await.unwrap();
+
+        let before_err_ms = crate::types::now_ms();
+        // An endpoint that always load-sheds: every call is an error, and
+        // exactly the classified one.
+        let limited_url = mock_server(|req| {
+            (
+                429,
+                json!({"jsonrpc": "2.0", "id": req["id"],
+                       "error": {"code": -32016, "message": "over rate limit"}}),
+            )
+        })
+        .await;
+        let limited = RpcClient::new(limited_url).unwrap();
+        assert!(limited
+            .call::<String>("eth_blockNumber", json!([]))
+            .await
+            .is_err());
+
+        let snap = rpc.stats().snapshot();
+        assert_eq!(snap["calls"], 2);
+        assert_eq!(snap["requests"], 2);
+        assert_eq!(snap["ok"], 2);
+        assert_eq!(snap["errors"], 0);
+        assert_eq!(snap["errorRateBps"], 0);
+        // lastOkMs is wall-clock ms, 0 means "never" — after successes it
+        // must be a sane timestamp, not the sentinel.
+        let last_ok = snap["lastOkMs"].as_u64().unwrap();
+        assert!(last_ok >= before_err_ms.saturating_sub(5_000));
+        assert_eq!(snap["lastErrorMs"], 0);
+
+        let snap = limited.stats().snapshot();
+        assert_eq!(snap["ok"], 0);
+        assert_eq!(snap["errors"], 1);
+        assert_eq!(snap["rateLimited"], 1, "429 must classify as rate limiting");
+        assert_eq!(snap["errorRateBps"], 10_000, "every request failed");
+        assert_eq!(
+            snap["avgLatencyMs"], 0,
+            "no successful round trips to average"
+        );
+        assert_eq!(snap["lastOkMs"], 0, "never succeeded");
+        assert!(snap["lastErrorMs"].as_u64().unwrap() >= before_err_ms);
+    }
 }

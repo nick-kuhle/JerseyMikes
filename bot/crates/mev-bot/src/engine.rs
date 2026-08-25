@@ -173,6 +173,13 @@ pub struct Engine {
     /// Reentrancy guard for the settle task (same shape as
     /// `own_reconciliation_running`).
     state_comparison_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Reentrancy guard for the canonical launch-discovery pass (work
+    /// order 4.1), same shape as `state_comparison_running`.
+    launch_scan_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Highest block the launch scan *successfully* read
+    /// (`launch_feed::CURSOR_NEVER` = never ran; a failed pass never
+    /// advances it, so its range is retried, not skipped).
+    launch_scan_cursor: std::sync::atomic::AtomicU64,
 }
 
 /// A delivered block waiting to be scored: the block and its transactions.
@@ -1137,6 +1144,10 @@ impl Engine {
             chain_blocks: chain_blocks_stats,
             state_comparisons: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             state_comparison_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            launch_scan_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            launch_scan_cursor: std::sync::atomic::AtomicU64::new(
+                crate::sniper::launch_feed::CURSOR_NEVER,
+            ),
         })
     }
 
@@ -1713,6 +1724,30 @@ impl Engine {
                 .observe(Stage::Discovery, started.elapsed().as_millis() as u64);
         }
 
+        // Work order 4.1: canonical launch discovery. A sealed-block
+        // getLogs scan of the chain's registered factories for
+        // pool-creation events, feeding the sniper's observation ledger.
+        // Gated on the sniper lane being boot-enabled: with the lane off
+        // (the default) this pass does not exist and no RPC shape changes
+        // for any configuration that has not asked for the sniper. Off the
+        // hot path and guarded so a slow scan neither overlaps nor delays
+        // strategies.
+        if self.sniper.boot_enabled()
+            && self.launch_factories_registered()
+            && !self
+                .launch_scan_running
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let engine = self.clone();
+            let head = head.clone();
+            tokio::spawn(async move {
+                engine.scan_launches(&head).await;
+                engine
+                    .launch_scan_running
+                    .store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
+
         // One task for the whole block tick rather than one per strategy: the
         // block cadence is 12 s, so the fan-out does not need its own spawn
         // per strategy to stay responsive, and keeping it in a single task
@@ -1758,6 +1793,200 @@ impl Engine {
         });
     }
 
+    /// Any factory the launch scan can read? Registry-driven: a chain
+    /// profile with no registered DEX factories has nothing to scan.
+    fn launch_factories_registered(&self) -> bool {
+        let addresses = &self.cfg.addresses;
+        !addresses.pair_factories().is_empty()
+            || addresses.univ3_factory.is_some()
+            || addresses.aerodrome_factory.is_some()
+    }
+
+    /// One canonical launch-discovery pass (work order 4.1): read the
+    /// window since the last successful pass for pool-creation logs on the
+    /// chain's registered factories, persist every decoded event with full
+    /// provenance, and shadow-gate each new one. A failed read leaves the
+    /// cursor where it was — the range is retried next pass, never dropped.
+    async fn scan_launches(self: &Arc<Self>, head: &BlockHead) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cursor = self.launch_scan_cursor.load(Relaxed);
+        let Some((from, to)) = crate::sniper::launch_feed::scan_window(cursor, head.number) else {
+            return;
+        };
+        let addresses = &self.cfg.addresses;
+        let events = crate::sniper::launch_feed::scan_launch_events(
+            &self.http,
+            from,
+            to,
+            &addresses.pair_factories(),
+            addresses.univ3_factory,
+            addresses.aerodrome_factory,
+            self.cfg.chain.weth,
+        )
+        .await;
+        let Some(events) = events else {
+            tracing::warn!(
+                target: "sniper",
+                from,
+                to,
+                "launch discovery scan failed — range will be retried"
+            );
+            return;
+        };
+        self.launch_scan_cursor.store(head.number, Relaxed);
+        for event in &events {
+            self.observe_launch(event).await;
+        }
+    }
+
+    /// Persist one decoded launch event and shadow-gate it exactly once.
+    /// Observation only (work order 4.1): the candidate is **not** admitted
+    /// for entry here — it is gated so the shadow record can answer "would
+    /// this have passed the armed gates?", but a canonical log can never be
+    /// the trigger of a competitive launch entry, and the token's one-shot
+    /// claim is never burned by observation.
+    async fn observe_launch(self: &Arc<Self>, event: &crate::sniper::launch_feed::LaunchEvent) {
+        let weth = self.cfg.chain.weth;
+        let token_hex = format!("{:?}", event.token);
+        let pair_hex = format!("{:?}", event.pair);
+
+        // Exactly-once: an already-persisted log is neither re-fetched,
+        // re-gated nor rewritten.
+        match self
+            .store
+            .sniper_launch_exists(&pair_hex, event.block_number, event.log_index)
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    target: "sniper",
+                    %error,
+                    pair = %pair_hex,
+                    "launch observation dedupe read failed — skipping (fail-closed)"
+                );
+                return;
+            }
+        }
+
+        // Resolves to the pool's WETH/token reserves at the creation block
+        // plus the per-pool fee where the venue prices off one. Any
+        // failure — RPC, or a pool whose token0/token1 contradicts the
+        // log — is unreadable state, never an invented quote.
+        let fetched: Option<(U256, U256, Option<u32>)> = match event.venue {
+            crate::dex::Venue::UniV2 | crate::dex::Venue::SushiV2 => {
+                match crate::dex::fetch_v2_pool(
+                    &self.http,
+                    event.pair,
+                    event.venue,
+                    30,
+                    event.block_number,
+                )
+                .await
+                {
+                    Ok(pool) if pool.other_token(weth) == Some(event.token) => pool
+                        .reserves_for(weth)
+                        .map(|(weth_r, token_r)| (weth_r, token_r, None)),
+                    _ => None,
+                }
+            }
+            crate::dex::Venue::AeroVolatile => {
+                match self.cfg.addresses.aerodrome_factory {
+                    Some(factory) => match crate::dex::fetch_aero_pool(
+                        &self.http,
+                        factory,
+                        event.pair,
+                        event.block_number,
+                    )
+                    .await
+                    {
+                        // Aerodrome fees are per-pool, read with the
+                        // reserves. A pool answering stable()=true
+                        // contradicts the decoded event; never quote it.
+                        Ok(pool) if !pool.stable && pool.other_token(weth) == Some(event.token) => {
+                            pool.reserves_for(weth)
+                                .map(|(weth_r, token_r)| (weth_r, token_r, Some(pool.fee_bps)))
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                }
+            }
+            crate::dex::Venue::UniV3 => None,
+        };
+
+        // Gate-result vocabulary beyond the admission rejection codes:
+        //   observation_only  — V3: persisted, no execution adapter, never gated
+        //   state_unreadable  — pool state could not be verified; nothing gated
+        //   admitted          — the armed gates would have passed (still no entry)
+        let gate_result = match event.venue {
+            crate::dex::Venue::UniV3 => "observation_only".to_string(),
+            _ => match fetched {
+                None => "state_unreadable".to_string(),
+                Some((weth_reserve, token_reserve, pool_fee_bps)) => {
+                    let candidate = crate::sniper::LaunchCandidate {
+                        token: event.token,
+                        pair: event.pair,
+                        venue: event.venue,
+                        pool_fee_bps,
+                        weth_reserve,
+                        token_reserve,
+                        // Fail-closed by construction: no probe has run, so
+                        // the verdict is unknown — and `admit` rejects it
+                        // under the default `require_honeypot_pass`. That
+                        // rejection is itself the shadow datum.
+                        verdict: crate::sniper::HoneypotVerdict::Unknown,
+                        lp_locked: None,
+                        blacklisted: self.sniper.is_blacklisted(event.token),
+                    };
+                    match self.sniper.admit(&candidate, now_ms()) {
+                        // `admit` counted the rejection into the gate funnel.
+                        Err(rejection) => rejection.code().to_string(),
+                        Ok(_) => {
+                            tracing::info!(
+                                target: "sniper",
+                                token = %token_hex,
+                                "canonical observation would pass admission gates — not entering (observation only)"
+                            );
+                            "admitted".to_string()
+                        }
+                    }
+                }
+            },
+        };
+
+        match self.store.record_sniper_launch(
+            &token_hex,
+            &pair_hex,
+            event.venue.as_str(),
+            event.block_number,
+            &format!("{:?}", event.tx_hash),
+            event.log_index,
+            "canonical_log",
+            fetched.map(|f| f.0),
+            fetched.map(|f| f.1),
+            &gate_result,
+        ) {
+            Ok(true) => tracing::info!(
+                target: "sniper",
+                venue = event.venue.as_str(),
+                token = %token_hex,
+                pair = %pair_hex,
+                block = event.block_number,
+                gate = %gate_result,
+                "new launch observed (canonical log)"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::error!(
+                target: "sniper",
+                %error,
+                pair = %pair_hex,
+                block = event.block_number,
+                "failed to persist launch observation"
+            ),
+        }
+    }
+
     async fn on_pending(self: Arc<Self>, tx: PendingTx) {
         Stats::bump(&self.stats.pending_seen);
         self.alerts.observe_pending();
@@ -1778,64 +2007,179 @@ impl Engine {
 
         if let Some(sel) = tx.selector() {
             let sel_hex = format!("0x{}", hex::encode(sel));
-            const GO_LIVE_SELECTORS: [&str; 6] = [
+            // 6 V2 selectors + 2 Aerodrome volatile selectors (work order 4.1
+            // optional extension). Mainnet aerodrome_router is None, so the
+            // Aero branch never matches there — byte-identical behavior.
+            const GO_LIVE_SELECTORS: [&str; 8] = [
                 "0xf305d719",
                 "0xe8078d94",
                 "0xc9567bf9",
                 "0x8a8c523c",
                 "0x7d1db4a5",
                 "0xa6334231",
+                "0xb7e0d4c0", // Aero addLiquidityETH(address,bool,uint256,uint256,uint256,address,uint256)
+                "0x5a47ddc3", // Aero addLiquidity(address,address,bool,uint256,uint256,uint256,uint256,address,uint256)
             ];
             if GO_LIVE_SELECTORS.contains(&sel_hex.as_str()) {
                 if let Some(target) = tx.to {
                     let weth = self.cfg.chain.weth;
-                    let token = if tx.input.len() >= 36 {
-                        let t = Address::from_slice(&tx.input[16..36]);
-                        if t == Address::ZERO {
-                            target
+                    let is_aero = self
+                        .cfg
+                        .addresses
+                        .aerodrome_router
+                        .is_some_and(|r| r == target)
+                        && (sel_hex == "0xb7e0d4c0" || sel_hex == "0x5a47ddc3");
+                    if is_aero {
+                        // Aerodrome path: venue-aware resolution, stable=false only.
+                        let token_opt = if sel_hex == "0xb7e0d4c0" {
+                            // addLiquidityETH(token, stable, ...): token at 16..36
+                            if tx.input.len() >= 36 {
+                                Some(Address::from_slice(&tx.input[16..36]))
+                            } else {
+                                None
+                            }
                         } else {
-                            t
+                            // addLiquidity(tokenA, tokenB, stable, ...): two addresses
+                            if tx.input.len() >= 68 {
+                                let a = Address::from_slice(&tx.input[16..36]);
+                                let b = Address::from_slice(&tx.input[48..68]);
+                                if a == weth && b != Address::ZERO {
+                                    Some(b)
+                                } else if b == weth && a != Address::ZERO {
+                                    Some(a)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(token) = token_opt {
+                            if token != Address::ZERO && token != weth {
+                                if let Some(factory) = self.cfg.addresses.aerodrome_factory {
+                                    let http = self.http.clone();
+                                    let pools = self.ctx.pools.clone();
+                                    let aero_pools = self.ctx.pools_aero.clone();
+                                    let exec = self.sniper_execution.clone();
+                                    let sniper = self.sniper.clone();
+                                    let chain_id = self.cfg.chain.chain_id;
+                                    let head = self.ctx.head();
+                                    let base_fee = tx.base_fee(&head);
+                                    let block_num = head.number;
+                                    // Off hot path: resolve the volatile pool via
+                                    // factory.getPool(token, weth, false). Mainnet
+                                    // never reaches here (router None), so no RPC
+                                    // shape change for non-Base chains.
+                                    tokio::spawn(async move {
+                                        let pair_opt = crate::dex::aero_get_pool(
+                                            &http, factory, token, weth, false,
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                        let pair = match pair_opt {
+                                            Some(p) => p,
+                                            None => {
+                                                // Fallback to cache lookup if factory
+                                                // call failed but cache knows it.
+                                                match pools
+                                                    .pair_for(
+                                                        weth,
+                                                        token,
+                                                        crate::dex::Venue::AeroVolatile,
+                                                    )
+                                                    .await
+                                                {
+                                                    Some(cached) => cached,
+                                                    None => return,
+                                                }
+                                            }
+                                        };
+                                        // Ensure the aero cache has the pool for the
+                                        // execution's quote path (it re-reads reserves
+                                        // + fee at quote time).
+                                        let _ = aero_pools.load(pair, block_num).await;
+                                        let candidate = crate::sniper::LaunchCandidate {
+                                            token,
+                                            pair,
+                                            venue: crate::dex::Venue::AeroVolatile,
+                                            pool_fee_bps: None, // fetched at quote time
+                                            weth_reserve: U256::from(
+                                                10_000_000_000_000_000_000u128,
+                                            ),
+                                            token_reserve: U256::from(
+                                                1_000_000_000_000_000_000u128,
+                                            ),
+                                            verdict: crate::sniper::HoneypotVerdict::Clean {
+                                                round_trip_bps: 9940,
+                                            },
+                                            lp_locked: None,
+                                            blacklisted: sniper.is_blacklisted(token),
+                                        };
+                                        let _ = exec
+                                            .process_launch(
+                                                &candidate,
+                                                weth,
+                                                chain_id,
+                                                block_num,
+                                                base_fee,
+                                                now_ms(),
+                                            )
+                                            .await;
+                                    });
+                                }
+                            }
                         }
                     } else {
-                        target
-                    };
-                    if token != Address::ZERO && token != weth {
-                        if let Some(pair) = self
-                            .ctx
-                            .pools
-                            .pair_for(weth, token, crate::dex::Venue::UniV2)
-                            .await
-                        {
-                            let head = self.ctx.head();
-                            let base_fee = tx.base_fee(&head);
-                            let candidate = crate::sniper::LaunchCandidate {
-                                token,
-                                pair,
-                                venue: crate::dex::Venue::UniV2,
-                                pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
-                                weth_reserve: U256::from(10_000_000_000_000_000_000u128),
-                                token_reserve: U256::from(1_000_000_000_000_000_000u128),
-                                verdict: crate::sniper::HoneypotVerdict::Clean {
-                                    round_trip_bps: 9940,
-                                },
-                                lp_locked: None,
-                                blacklisted: self.sniper.is_blacklisted(token),
-                            };
-                            let exec = self.sniper_execution.clone();
-                            let chain_id = self.cfg.chain.chain_id;
-                            let block_num = head.number;
-                            tokio::spawn(async move {
-                                let _ = exec
-                                    .process_launch(
-                                        &candidate,
-                                        weth,
-                                        chain_id,
-                                        block_num,
-                                        base_fee,
-                                        now_ms(),
-                                    )
-                                    .await;
-                            });
+                        // V2 path (original behavior preserved byte-identically).
+                        let token = if tx.input.len() >= 36 {
+                            let t = Address::from_slice(&tx.input[16..36]);
+                            if t == Address::ZERO {
+                                target
+                            } else {
+                                t
+                            }
+                        } else {
+                            target
+                        };
+                        if token != Address::ZERO && token != weth {
+                            if let Some(pair) = self
+                                .ctx
+                                .pools
+                                .pair_for(weth, token, crate::dex::Venue::UniV2)
+                                .await
+                            {
+                                let head = self.ctx.head();
+                                let base_fee = tx.base_fee(&head);
+                                let candidate = crate::sniper::LaunchCandidate {
+                                    token,
+                                    pair,
+                                    venue: crate::dex::Venue::UniV2,
+                                    pool_fee_bps: None, // UniV2's 30 bps is a protocol constant in the quote
+                                    weth_reserve: U256::from(10_000_000_000_000_000_000u128),
+                                    token_reserve: U256::from(1_000_000_000_000_000_000u128),
+                                    verdict: crate::sniper::HoneypotVerdict::Clean {
+                                        round_trip_bps: 9940,
+                                    },
+                                    lp_locked: None,
+                                    blacklisted: self.sniper.is_blacklisted(token),
+                                };
+                                let exec = self.sniper_execution.clone();
+                                let chain_id = self.cfg.chain.chain_id;
+                                let block_num = head.number;
+                                tokio::spawn(async move {
+                                    let _ = exec
+                                        .process_launch(
+                                            &candidate,
+                                            weth,
+                                            chain_id,
+                                            block_num,
+                                            base_fee,
+                                            now_ms(),
+                                        )
+                                        .await;
+                                });
+                            }
                         }
                     }
                 }
